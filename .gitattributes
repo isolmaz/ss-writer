@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.rs text eol=lf
+*.ftl text eol=lf
+tests/fixtures/** -text
+*.ttf binary
+*.png binary
+*.ico binary

@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ssw-core",
+    "crates/ssw-io",
+    "crates/ssw-convert",
+    "crates/ssw-render",
+    "crates/ssw-ui",
+    "crates/ssw-win",
+    "crates/ssw-app",
+    "crates/ssw-preview",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/isolmaz/ss-writer"
+authors = ["isolmaz <info@isolmaz.com>"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = true
+panic = "unwind"

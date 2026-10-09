@@ -1,0 +1,15 @@
+[package]
+name = "ssw-win"
+description = "Win32 platform layer: window, Direct2D, DirectWrite, TSF, UIA."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

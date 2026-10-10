@@ -1,0 +1,2 @@
+# Vendored upstream code keeps its own formatting (see FIXES.md).
+disable_all_formatting = true

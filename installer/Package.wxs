@@ -6,7 +6,7 @@
     Version      X.Y.Z from [workspace.package] in Cargo.toml
     ProductCode  braced GUID derived from the version
     BinDir       directory holding SSWriter.exe and ssw_preview.dll (target\release)
-    AssetsDir    the assets\ directory
+    AssetsDir    the assets\ directory (only the icons are used)
     LicenseFile  LICENSE
     NoticesFile  dist\THIRD-PARTY-NOTICES.txt
 
@@ -14,8 +14,10 @@
   registered under HKCU. Registration lives in Registration.wxs.
 
   Per-user packages should use HKCU key paths (ICE38) and remove their directories (ICE64);
-  every component below does. The harvested assets use file key paths, so `xtask dist` runs
-  `wix build` with -sice ICE38 -sice ICE64.
+  every hand-written component below does. A component holding files with a registry key path
+  cannot get an automatic GUID, so those components carry fixed GUIDs (never change them).
+  Fonts, localization files and the welcome document are embedded in SSWriter.exe, so no
+  assets folder is installed. `xtask dist` validates the package (ICE) after building it.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="SS Writer"
@@ -43,34 +45,31 @@
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="LocalProgramsFolder" Name="Programs">
-        <Directory Id="INSTALLFOLDER" Name="SS Writer">
-          <Directory Id="ASSETSFOLDER" Name="assets" />
-        </Directory>
+        <Directory Id="INSTALLFOLDER" Name="SS Writer" />
       </Directory>
     </StandardDirectory>
 
     <Feature Id="Main" Title="SS Writer" Level="1">
       <ComponentGroupRef Id="Application" />
-      <ComponentGroupRef Id="Assets" />
       <ComponentGroupRef Id="Registration" />
     </Feature>
   </Package>
 
   <Fragment>
     <ComponentGroup Id="Application" Directory="INSTALLFOLDER">
-      <Component Id="MainExecutable">
+      <Component Id="MainExecutable" Guid="7D4F0B68-B2B9-4590-A435-1143628932A1">
         <File Id="SSWriterExe" Source="$(var.BinDir)\SSWriter.exe" />
         <RegistryValue Root="HKCU" Key="Software\SS Writer\Components" Name="MainExecutable"
                        Type="integer" Value="1" KeyPath="yes" />
       </Component>
 
-      <Component Id="PreviewHandlerLibrary">
+      <Component Id="PreviewHandlerLibrary" Guid="5E802163-BE9F-40D0-8D0F-1019236A61D8">
         <File Id="SswPreviewDll" Source="$(var.BinDir)\ssw_preview.dll" />
         <RegistryValue Root="HKCU" Key="Software\SS Writer\Components" Name="PreviewHandlerLibrary"
                        Type="integer" Value="1" KeyPath="yes" />
       </Component>
 
-      <Component Id="LegalFiles">
+      <Component Id="LegalFiles" Guid="1A127F91-2235-440E-86A5-A65E9B31910E">
         <File Id="LicenseFile" Name="LICENSE" Source="$(var.LicenseFile)" />
         <File Id="ThirdPartyNoticesFile" Name="THIRD-PARTY-NOTICES.txt" Source="$(var.NoticesFile)" />
         <RegistryValue Root="HKCU" Key="Software\SS Writer\Components" Name="LegalFiles"
@@ -80,8 +79,8 @@
       <!-- Remove the (then empty) install folders on uninstall. User data lives in
            %LOCALAPPDATA%\SS Writer and %APPDATA%\SS Writer and is kept. -->
       <Component Id="InstallFolderCleanup">
-        <RemoveFolder Id="RemoveAssetsFolder" Directory="ASSETSFOLDER" On="uninstall" />
         <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveLocalProgramsFolder" Directory="LocalProgramsFolder" On="uninstall" />
         <RegistryValue Root="HKCU" Key="Software\SS Writer\Components" Name="InstallFolderCleanup"
                        Type="integer" Value="1" KeyPath="yes" />
       </Component>
@@ -103,10 +102,4 @@
     </ComponentGroup>
   </Fragment>
 
-  <Fragment>
-    <!-- Everything under assets\ (fonts, localization files), including subdirectories. -->
-    <ComponentGroup Id="Assets" Directory="ASSETSFOLDER">
-      <Files Include="$(var.AssetsDir)\**" />
-    </ComponentGroup>
-  </Fragment>
 </Wix>

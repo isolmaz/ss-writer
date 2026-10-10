@@ -120,8 +120,6 @@ pub fn build_args(inputs: &BuildInputs<'_>) -> Vec<OsString> {
         args.push(EULA_ID.into());
     }
     args.extend(["-arch", "x64", "-nologo", "-pdbtype", "none"].map(OsString::from));
-    // Files are installed under %LOCALAPPDATA%; the harvested components use file key paths.
-    args.extend(["-sice", "ICE38", "-sice", "ICE64"].map(OsString::from));
     for (name, value) in inputs.defines {
         args.push("-define".into());
         args.push(format!("{name}={value}").into());
@@ -132,9 +130,43 @@ pub fn build_args(inputs: &BuildInputs<'_>) -> Vec<OsString> {
     args
 }
 
+/// The arguments of `wix msi validate`: the Windows Installer consistency checks (ICE) of the
+/// built package. Warnings are reported; any ICE error fails the build.
+pub fn validate_args(msi: &Path, accept_eula: bool) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["msi".into(), "validate".into()];
+    if accept_eula {
+        args.push("-acceptEula".into());
+        args.push(EULA_ID.into());
+    }
+    args.push("-nologo".into());
+    args.push(msi.into());
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_args_name_the_package_and_the_optional_eula() {
+        let msi = PathBuf::from("out.msi");
+        assert_eq!(
+            validate_args(&msi, true),
+            [
+                "msi",
+                "validate",
+                "-acceptEula",
+                "wix7",
+                "-nologo",
+                "out.msi"
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(
+            validate_args(&msi, false),
+            ["msi", "validate", "-nologo", "out.msi"].map(OsString::from)
+        );
+    }
 
     #[test]
     fn plain_versions_parse_and_round_trip() {

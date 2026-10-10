@@ -136,6 +136,11 @@ pub fn run(workspace: &Workspace, args: &DistArgs) -> Result<(), Error> {
         .args(wix::build_args(&inputs))
         .current_dir(&workspace.root);
     run::run(&mut wix_build)?;
+    let mut wix_validate = run::tool(wix_program());
+    wix_validate
+        .args(wix::validate_args(&msi_path, args.accept_wix_eula))
+        .current_dir(&workspace.root);
+    run::run(&mut wix_validate)?;
 
     // Checksums and winget manifests.
     let msi_sha = hash::sha256_file(&msi_path)?;

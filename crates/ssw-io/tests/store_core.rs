@@ -98,7 +98,9 @@ fn environment_is_read_through_the_injected_lookup() {
     assert_eq!(bare.local_app_data, None);
     assert_eq!(bare.app_data, None);
 
-    let error = Environment::from_vars(|_| None, Path::new("C:\\")).unwrap_err();
+    // The same lookup (a non-capturing closure is `Copy`), so one instantiation of `from_vars`
+    // sees both outcomes.
+    let error = Environment::from_vars(get, Path::new("C:\\")).unwrap_err();
     assert!(matches!(error, PathsError::NoParent(_)));
     assert!(error.to_string().contains("C:\\"));
 }

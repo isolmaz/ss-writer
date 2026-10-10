@@ -605,8 +605,14 @@ pub fn pointer_id(wparam: WPARAM) -> u32 {
 /// that land on the scrollable area.
 #[must_use]
 pub fn pointer_client_position(hwnd: HWND, wparam: WPARAM) -> Option<(i32, i32)> {
-    let info = pointer_info(pointer_id(wparam))?;
-    screen_to_client(hwnd, info.ptPixelLocation)
+    client_position_of(hwnd, pointer_info(pointer_id(wparam)))
+}
+
+/// The position, in client pixels of `hwnd`, of the pointer `info` describes; `None` for a
+/// pointer the system does not know (`info` is `None`) or when the window cannot convert the
+/// position.
+fn client_position_of(hwnd: HWND, info: Option<POINTER_INFO>) -> Option<(i32, i32)> {
+    screen_to_client(hwnd, info?.ptPixelLocation)
 }
 
 /// The screen position `point` as a position in the client area of `hwnd`; `None` when the
@@ -857,7 +863,7 @@ impl ScrollDriver {
     /// # Errors
     /// Fails when the transform cannot be re-seated or the pointer is unknown.
     pub fn start_contact(&mut self, id: u32) -> Result<(), WinError> {
-        self.start_contact_with(id, DirectManipulation::set_contact)
+        self.start_contact_with(id, &mut DirectManipulation::set_contact)
     }
 
     /// [`start_contact`](Self::start_contact) with `hand_over` giving the pointer to the
@@ -869,7 +875,7 @@ impl ScrollDriver {
     pub fn start_contact_with(
         &mut self,
         id: u32,
-        hand_over: impl FnOnce(&DirectManipulation, u32) -> Result<(), WinError>,
+        hand_over: &mut dyn FnMut(&DirectManipulation, u32) -> Result<(), WinError>,
     ) -> Result<(), WinError> {
         self.scroller.stop();
         self.reseat()?;
@@ -1097,9 +1103,22 @@ mod tests {
         };
         assert_eq!(at(5, 7), Some((5, 7)));
         assert_eq!(at(-3, 0), Some((-3, 0)));
+        // A pointer is where its pixel location says, relative to the window's client area.
+        let pointer_at = |dx, dy| {
+            Some(POINTER_INFO {
+                ptPixelLocation: POINT {
+                    x: origin.x + dx,
+                    y: origin.y + dy,
+                },
+                ..POINTER_INFO::default()
+            })
+        };
+        assert_eq!(client_position_of(hwnd, pointer_at(12, 30)), Some((12, 30)));
+        assert_eq!(client_position_of(hwnd, None), None, "an unknown pointer");
         // SAFETY: destroys the window created above, on its own thread.
         unsafe { DestroyWindow(hwnd) }.unwrap();
         assert_eq!(at(5, 7), None);
+        assert_eq!(client_position_of(hwnd, pointer_at(12, 30)), None);
     }
 
     #[test]

@@ -322,7 +322,7 @@ impl<'a> Inl<'a> {
     }
 
     fn entity(&mut self, i: usize) -> usize {
-        if let Some((decoded, used)) = scan::decode_entity(&self.b[i..]) {
+        if let Some((decoded, used)) = scan::decode_entity(&self.s.buf[i..]) {
             let r = self.s.range(i, i + used);
             self.toks.push(leaf_tok(leaf(
                 r,
@@ -824,7 +824,7 @@ impl<'a> Inl<'a> {
 
     fn angle(&mut self, i: usize) -> usize {
         let b = self.b;
-        if let Some(end) = autolink_end(b, i) {
+        if let Some(end) = autolink_end(&self.s.buf, i) {
             let inner = &self.s.buf[i + 1..end - 1];
             let is_email = !is_uri(inner);
             let dest = if is_email {
@@ -1224,13 +1224,13 @@ fn is_uri(s: &str) -> bool {
 }
 
 /// End of the `<…>` autolink (URI or e-mail) at `i`.
-fn autolink_end(b: &[u8], i: usize) -> Option<usize> {
-    let close = b[i + 1..].iter().position(|&c| c == b'>')? + i + 1;
-    let inner = &b[i + 1..close];
-    if inner.iter().any(|&c| c <= 0x20 || c == b'<') {
+fn autolink_end(buf: &str, i: usize) -> Option<usize> {
+    let close = buf.as_bytes()[i + 1..].iter().position(|&c| c == b'>')? + i + 1;
+    // `<` and `>` are ASCII, so both ends of the slice are character boundaries.
+    let text = &buf[i + 1..close];
+    if text.bytes().any(|c| c <= 0x20 || c == b'<') {
         return None;
     }
-    let text = std::str::from_utf8(inner).ok()?;
     if is_uri(text) {
         return Some(close + 1);
     }

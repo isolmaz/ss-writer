@@ -63,10 +63,12 @@ pub struct StartupPlan {
     pub active_window: Option<usize>,
 }
 
+/// A new window showing `tabs` (never empty: every caller has at least one tab), the first one
+/// active.
 fn new_window(tabs: Vec<PlannedTab>) -> PlannedWindow {
     PlannedWindow {
         placement: None,
-        active_tab: if tabs.is_empty() { None } else { Some(0) },
+        active_tab: Some(0),
         tabs,
     }
 }
@@ -708,5 +710,176 @@ mod tests {
             None
         );
         assert!(!folder.join("Welcome.md").exists());
+    }
+
+    /// Runs `sql` on a second connection to the state database of [`manager`].
+    fn sabotage(tmp: &Path, sql: &str) {
+        rusqlite::Connection::open(tmp.join("state.db"))
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+    }
+
+    fn first_run_kind(error: &FirstRunError) -> &'static str {
+        match error {
+            FirstRunError::Fs(_) => "fs",
+            FirstRunError::Store(_) => "store",
+        }
+    }
+
+    #[test]
+    fn windows_without_a_restorable_tab_vanish_and_the_active_window_follows_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let file = |name: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        };
+        let (b, c) = (file("b.md"), file("c.md"));
+        let tab = |document: TabDocument| SessionTab {
+            document,
+            workspace: None,
+        };
+        let stored = Session {
+            windows: vec![
+                SessionWindow {
+                    placement: placement(1),
+                    tabs: vec![tab(TabDocument::File(tmp.path().join("gone.md")))],
+                    active_tab: Some(0),
+                },
+                SessionWindow {
+                    placement: placement(2),
+                    tabs: vec![
+                        tab(TabDocument::Untitled("lost".to_owned())),
+                        tab(TabDocument::File(b)),
+                    ],
+                    active_tab: Some(1),
+                },
+                SessionWindow {
+                    placement: placement(3),
+                    tabs: vec![tab(TabDocument::File(c))],
+                    active_tab: Some(0),
+                },
+            ],
+            active_window: Some(2),
+        };
+        let restored = sessions.restore(&stored);
+        assert_eq!(restored.skipped.len(), 1);
+        assert!(restored.skipped[0].0.ends_with("gone.md"));
+        let placements: Vec<WindowPlacement> = restored
+            .windows
+            .iter()
+            .map(|window| window.placement)
+            .collect();
+        assert_eq!(placements, [placement(2), placement(3)]);
+        // The untitled buffer without a stored text is dropped; the active tab is still b.md.
+        let second = &restored.windows[0];
+        assert_eq!(second.tabs.len(), 1);
+        assert_eq!(second.active_tab, Some(0));
+        assert!(second.tabs[0].entry.path().unwrap().ends_with("b.md"));
+        assert_eq!(restored.active_window, Some(1));
+        assert_eq!(docs.all().len(), 2);
+    }
+
+    #[test]
+    fn a_session_the_database_refuses_is_reported_and_stores_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let scratch = docs.new_untitled();
+        let windows = [WindowState {
+            placement: placement(5),
+            tabs: vec![TabState {
+                entry: Rc::clone(&scratch),
+                workspace: None,
+            }],
+            active_tab: Some(0),
+        }];
+        let described = SessionManager::describe(&windows, Some(0));
+        sabotage(tmp.path(), "DROP TABLE untitled_buffers");
+        let error = sessions.save(&described).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no such table: untitled_buffers"),
+            "{error}"
+        );
+        assert!(sessions.load().unwrap().windows.is_empty());
+    }
+
+    #[test]
+    fn a_tab_whose_view_cannot_be_stored_is_not_offered_for_reopening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let file = tmp.path().join("a.md");
+        std::fs::write(&file, "a").unwrap();
+        let entry = docs.open(&file).unwrap();
+        sabotage(tmp.path(), "DROP TABLE file_view_state");
+        let view = ViewState {
+            caret: 1,
+            scroll_anchor: 0,
+            scroll_delta: 0.0,
+            folds: vec![],
+        };
+        let error = sessions.tab_closed(&entry, None, &view).unwrap_err();
+        assert_eq!(error.message_id(), "app-error-file");
+        assert!(
+            error.to_string().contains("no such table: file_view_state"),
+            "{error}"
+        );
+        assert!(sessions.closed_tabs().is_empty());
+    }
+
+    #[test]
+    fn the_first_run_is_recorded_only_once_its_workspace_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store: SharedStore = Rc::new(RefCell::new(
+            Store::open(&tmp.path().join("state.db")).unwrap(),
+        ));
+        let welcome = "# Welcome\n";
+
+        // Documents is a file: the folder cannot be created and the run stays unrecorded.
+        let blocked = tmp.path().join("blocked");
+        std::fs::write(&blocked, "x").unwrap();
+        let error = first_run_workspace(&store, &RealFs, &blocked, welcome).unwrap_err();
+        assert_eq!(first_run_kind(&error), "fs");
+        assert_eq!(store.borrow().kv_get(FIRST_RUN_KEY).unwrap(), None);
+
+        // The database refuses to record it after the workspace was created.
+        let documents = tmp.path().join("Documents");
+        std::fs::create_dir(&documents).unwrap();
+        sabotage(
+            tmp.path(),
+            "CREATE TRIGGER refuse_kv BEFORE INSERT ON kv
+             BEGIN SELECT RAISE(ABORT, 'kv refused'); END;",
+        );
+        let error = first_run_workspace(&store, &RealFs, &documents, welcome).unwrap_err();
+        assert_eq!(first_run_kind(&error), "store");
+        assert!(error.to_string().contains("kv refused"), "{error}");
+        let folder = documents.join("SS Writer");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("Welcome.md")).unwrap(),
+            welcome
+        );
+        // The next start tries again, keeps the file and records the run.
+        sabotage(tmp.path(), "DROP TRIGGER refuse_kv");
+        assert_eq!(
+            first_run_workspace(&store, &RealFs, &documents, "# Changed\n").unwrap(),
+            Some(folder.clone())
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.join("Welcome.md")).unwrap(),
+            welcome
+        );
+        assert_eq!(
+            first_run_workspace(&store, &RealFs, &documents, welcome).unwrap(),
+            None
+        );
+
+        // A database that cannot even be asked.
+        sabotage(tmp.path(), "DROP TABLE kv");
+        let error = first_run_workspace(&store, &RealFs, &documents, welcome).unwrap_err();
+        assert_eq!(first_run_kind(&error), "store");
+        assert!(error.to_string().contains("no such table: kv"), "{error}");
     }
 }

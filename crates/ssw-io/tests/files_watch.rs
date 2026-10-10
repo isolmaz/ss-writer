@@ -768,6 +768,13 @@ fn a_rescan_rechecks_every_tracked_document() {
 
 const WAIT: Duration = Duration::from_secs(15);
 
+/// Starts a watcher whose wake-up callback does nothing. Every test that does not look at the
+/// callback goes through here, so that one instantiation of the generic `Watcher::start` sees
+/// all of its outcomes: a running watch, the missing folder and every failing OS step.
+fn start(root: &Path) -> Result<(Watcher, Receiver<FsEvent>), FsError> {
+    Watcher::start(root, || {})
+}
+
 fn same(a: &Path, b: &Path) -> bool {
     path_key(a) == path_key(b)
 }
@@ -835,7 +842,7 @@ fn the_watcher_reports_create_modify_rename_and_delete() {
 #[test]
 fn the_watcher_sees_the_whole_tree() {
     let dir = tempfile::tempdir().unwrap();
-    let (_watcher, receiver) = Watcher::start(dir.path(), || {}).unwrap();
+    let (_watcher, receiver) = start(dir.path()).unwrap();
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
     let created = wait_for(&receiver, "folder", |e| same(&e.path, &sub));
@@ -856,7 +863,7 @@ fn the_watcher_sees_the_whole_tree() {
 #[test]
 fn bursts_are_coalesced_and_short_lived_files_vanish() {
     let dir = tempfile::tempdir().unwrap();
-    let (_watcher, receiver) = Watcher::start(dir.path(), || {}).unwrap();
+    let (_watcher, receiver) = start(dir.path()).unwrap();
 
     // Many quick writes to one new file: one event.
     let busy = dir.path().join("busy.md");
@@ -890,7 +897,7 @@ fn own_saves_are_filtered_and_foreign_edits_are_flagged_end_to_end() {
     let first = save_atomic(&RealFs, &ThreadSleeper, &doc, b"first version").unwrap();
     let mut tracker = ExternalChanges::new(Arc::new(RealFs));
     tracker.track(&doc, first);
-    let (_watcher, receiver) = Watcher::start(dir.path(), || {}).unwrap();
+    let (_watcher, receiver) = start(dir.path()).unwrap();
 
     let second = save_atomic(
         &RealFs,
@@ -916,7 +923,7 @@ fn own_saves_are_filtered_and_foreign_edits_are_flagged_end_to_end() {
 #[test]
 fn dropping_the_watcher_stops_its_thread_and_closes_the_channel() {
     let dir = tempfile::tempdir().unwrap();
-    let (watcher, receiver) = Watcher::start(dir.path(), || {}).unwrap();
+    let (watcher, receiver) = start(dir.path()).unwrap();
     let started = Instant::now();
     drop(watcher);
     assert!(started.elapsed() < Duration::from_secs(10));
@@ -938,7 +945,7 @@ fn dropping_the_watcher_stops_its_thread_and_closes_the_channel() {
 fn watching_a_missing_folder_fails() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing");
-    let error = Watcher::start(&missing, || {}).unwrap_err();
+    let error = start(&missing).unwrap_err();
     assert_eq!(error, FsError::NotFound(missing));
 }
 
@@ -952,7 +959,7 @@ fn every_os_step_of_starting_a_watch_reports_its_failure() {
     let steps = [(0, 0x8000_4005_u32), (1, 0x8000_4005), (2, 1450)];
     for (step, code) in steps {
         fault::arm(step);
-        let error = Watcher::start(dir.path(), || {}).unwrap_err();
+        let error = start(dir.path()).unwrap_err();
         assert!(fault::tripped(), "step {step} was reached");
         assert_eq!(
             error,
@@ -964,7 +971,7 @@ fn every_os_step_of_starting_a_watch_reports_its_failure() {
         );
     }
     fault::arm(3);
-    let (watcher, _receiver) = Watcher::start(dir.path(), || {}).unwrap();
+    let (watcher, _receiver) = start(dir.path()).unwrap();
     assert!(
         !fault::tripped(),
         "starting a watch makes three checked calls"
@@ -976,7 +983,7 @@ fn every_os_step_of_starting_a_watch_reports_its_failure() {
 #[test]
 fn a_watcher_describes_the_folder_it_watches() {
     let dir = tempfile::tempdir().unwrap();
-    let (watcher, _receiver) = Watcher::start(dir.path(), || {}).unwrap();
+    let (watcher, _receiver) = start(dir.path()).unwrap();
     let text = format!("{watcher:?}");
     assert!(text.starts_with("Watcher { root: "), "{text}");
     assert!(text.contains(&format!("{:?}", dir.path())), "{text}");
@@ -986,11 +993,24 @@ fn a_watcher_describes_the_folder_it_watches() {
 #[test]
 fn a_watch_that_cannot_be_read_ends_with_a_rescan() {
     let (_dir, file) = temp_file("not a folder");
-    let (_watcher, receiver) = Watcher::start(&file, || {}).unwrap();
+    let (_watcher, receiver) = start(&file).unwrap();
     let rescan = wait_for(&receiver, "rescan", |e| e.kind == FsEventKind::Rescan);
     assert_eq!(rescan.path, file);
     match receiver.recv_timeout(WAIT) {
         Err(RecvTimeoutError::Disconnected) => {}
         other => panic!("the channel should close after the rescan, got {other:?}"),
     }
+}
+
+#[test]
+fn deleting_the_watched_folder_ends_the_watch_with_a_rescan_of_its_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("watched");
+    std::fs::create_dir(&root).unwrap();
+    let (_watcher, receiver) = start(&root).unwrap();
+    // The watch handle shares deletion, so the folder goes away under the pending request,
+    // which then completes with an error (or an overflow): either way the tree must be re-read.
+    std::fs::remove_dir(&root).unwrap();
+    let rescan = wait_for(&receiver, "rescan", |e| e.kind == FsEventKind::Rescan);
+    assert_eq!(rescan.path, root);
 }

@@ -39,8 +39,8 @@ impl TreePaths {
     /// The path of entry `key`.
     #[must_use]
     pub fn path(&self, key: NodeKey) -> Option<PathBuf> {
-        let index = usize::try_from(key).ok()?;
-        self.inner.borrow().paths.get(index).cloned()
+        // A `u64` key always fits a `usize` on Windows (x64).
+        self.inner.borrow().paths.get(key as usize).cloned()
     }
 
     /// The key of `path`, handing out a new one the first time.
@@ -217,6 +217,54 @@ mod tests {
         );
         assert!(tree.children(9999, &options).is_empty());
         assert_eq!(paths.path(9999), None);
+    }
+
+    #[test]
+    fn every_sort_key_and_filter_of_the_sidebar_reaches_the_listing() {
+        for (sort, expected) in [
+            (UiSortKey::Name, IoSortKey::Name),
+            (UiSortKey::Modified, IoSortKey::Modified),
+            (UiSortKey::Created, IoSortKey::Created),
+            (UiSortKey::Kind, IoSortKey::Kind),
+        ] {
+            let options = SidebarOptions {
+                sort,
+                descending: true,
+                folders_first: false,
+                show_hidden: true,
+                hide_images: true,
+                hide_non_markdown: true,
+                ..SidebarOptions::default()
+            };
+            assert_eq!(
+                view_options(&options),
+                ViewOptions {
+                    sort: expected,
+                    descending: true,
+                    folders_first: false,
+                    show_hidden: true,
+                    hide_images: true,
+                    hide_non_markdown: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_rescan_is_queued_for_the_root_of_an_opened_tree_and_not_for_an_empty_table() {
+        let paths = TreePaths::default();
+        paths.request_rescan();
+        assert!(paths.take_events().is_empty(), "no root, nothing to rescan");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = WorkspaceTree::open(Arc::new(RealFs), tmp.path()).unwrap();
+        let opened = tree.paths();
+        opened.request_rescan();
+        let events = opened.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, tmp.path());
+        assert!(matches!(events[0].kind, FsEventKind::Rescan));
+        assert!(opened.take_events().is_empty(), "taken once");
     }
 
     #[test]

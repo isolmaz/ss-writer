@@ -1048,6 +1048,16 @@ mod tests {
             background: Option<Color>,
             f: impl FnOnce(&mut D2dCanvas<'_>),
         ) -> Result<DecodedImage, WinError> {
+            self.draw_boxed(background, Box::new(f))
+        }
+
+        /// [`Rig::draw`] for every drawing closure: one copy of the frame code that every
+        /// test runs through, on its success and its error path alike.
+        fn draw_boxed(
+            &mut self,
+            background: Option<Color>,
+            f: Box<dyn FnOnce(&mut D2dCanvas<'_>) + '_>,
+        ) -> Result<DecodedImage, WinError> {
             let Rig {
                 target,
                 assets,

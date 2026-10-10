@@ -65,13 +65,18 @@ pub(crate) fn item_at(ast: &ast::Document, offset: usize) -> Option<ItemRef<'_>>
         .iter()
         .rposition(|b| matches!(b.kind, BlockKind::ListItem { .. }))?;
     let item = path[pos];
-    let list = path[pos.checked_sub(1)?];
+    // A list item is always a child of its list, which precedes it in the path.
+    let list = path[pos - 1];
     let parent = path[..pos - 1]
         .iter()
         .rev()
         .find(|b| matches!(b.kind, BlockKind::ListItem { .. }))
         .copied();
-    let index = list.children.iter().position(|c| std::ptr::eq(c, item))?;
+    let index = list
+        .children
+        .iter()
+        .position(|c| std::ptr::eq(c, item))
+        .expect("an item is one of its list's children");
     Some(ItemRef {
         item,
         list,
@@ -718,6 +723,19 @@ mod tests {
     }
 
     #[test]
+    fn indent_aligns_with_the_text_of_the_previous_sibling() {
+        fn align(c: Ctx<'_>) -> Option<Transaction> {
+            indent_items(c, ListIndent::Align)
+        }
+        // Up to four spaces behind the marker belong to it.
+        check("-   a\n- b‸", "-   a\n    - b‸", align);
+        // Five or more spaces start an indented code block and an empty item has no text:
+        // both count as a single space.
+        check("-      a\n- b‸", "-      a\n  - b‸", align);
+        check("-\n- b‸", "-\n  - b‸", align);
+    }
+
+    #[test]
     fn empty_items_indent_like_any_other() {
         fn align(c: Ctx<'_>) -> Option<Transaction> {
             indent_items(c, ListIndent::Align)
@@ -761,6 +779,8 @@ mod tests {
         check("- a\n\t- b‸", "- a\n- b‸", outdent_items);
         check(" - a‸", "- a‸", outdent_items);
         check("> - a\n>   - b‸", "> - a\n> - b‸", outdent_items);
+        // A lazy continuation line has no indentation to give up.
+        check("- a\n  - b‸\nlazy", "- a\n- b‸\nlazy", outdent_items);
         check(
             "- a\n  - b\n  - c\n«    - d\n- e»",
             "- a\n  - b\n  - c\n«  - d\n- e»",

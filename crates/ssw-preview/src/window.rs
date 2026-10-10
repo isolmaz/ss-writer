@@ -1372,6 +1372,46 @@ mod tests {
         assert!(!state.painting);
     }
 
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn a_frame_that_meets_a_lost_device_is_drawn_again_on_the_rebuilt_devices() {
+        let rig = rig("# Title\n\nSome text\n");
+        let mut state = rig.window.state.borrow_mut();
+        let generation = |state: &WindowState| {
+            state
+                .graphics
+                .as_ref()
+                .map(|graphics| graphics.devices.generation())
+        };
+        assert_eq!(generation(&state), Some(1));
+        // The n-th platform call of the frame reports the device as lost: the frames whose
+        // failure falls into the text layout before the drawing are no device loss; the
+        // first one that reaches the drawing is, and the retry on the rebuilt devices meets no
+        // failure.
+        let mut rebuilt_by = None;
+        for call in 0..32 {
+            ssw_win::fault::arm_with(call, ssw_win::com::D2DERR_RECREATE_TARGET);
+            state.paint();
+            let reached = ssw_win::fault::tripped();
+            ssw_win::fault::disarm();
+            assert!(reached, "the frame has a platform call number {call}");
+            assert!(!state.painting);
+            if generation(&state) == Some(2) {
+                rebuilt_by = Some(call);
+                break;
+            }
+            assert_eq!(generation(&state), Some(1), "only a lost device is rebuilt");
+        }
+        assert!(rebuilt_by.is_some(), "a lost device was never rebuilt");
+        let surface = state.graphics.as_ref().unwrap().surface.size_px();
+        assert_eq!(
+            surface,
+            (600, 400),
+            "the new swap chain has the window's size"
+        );
+        state.paint_once().unwrap();
+    }
+
     #[test]
     fn a_window_that_lost_its_graphics_stays_blank_when_asked_to_recover() {
         let rig = rig("text\n");

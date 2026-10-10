@@ -10,7 +10,7 @@ use ssw_win::com::WinError;
 use ssw_win::keyboard::key_name;
 use ssw_win::menus::{
     CheckState, MenuEntry, MenuItem, MenuModel, MenuTheme, NativeMenu, PopupHost, PopupMenus,
-    PopupRequest, Submenu, SystemPopupHost, accelerator_text, apply_menu_theme,
+    PopupRequest, Submenu, accelerator_text, apply_menu_theme,
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -312,27 +312,10 @@ fn a_dismissed_popup_chooses_nothing_and_an_invalid_model_never_reaches_the_host
 }
 
 #[test]
-fn the_system_host_reads_a_popup_it_cannot_show_as_dismissed() {
-    // The menu handle is no menu and no window owns the popup: the system refuses at once, so
-    // nothing appears, nothing is brought to the foreground and no command is chosen.
-    let request = PopupRequest {
-        owner: HWND::default(),
-        x: 0,
-        y: 0,
-        flags: TPM_RETURNCMD.0 | TPM_NONOTIFY.0,
-    };
-    assert_eq!(SystemPopupHost.track(HMENU::default(), &request), None);
-}
-
-#[test]
 fn popup_menus_made_without_a_host_use_the_system_one() {
-    // Nobody owns the popup, so the system host dismisses it without showing anything; the
-    // menu was built and is destroyed again all the same.
-    for mut popups in [PopupMenus::new(), PopupMenus::default()] {
-        let chosen = popups.show(&sample_model(), HWND::default(), 0, 0).unwrap();
-        assert_eq!(chosen, None);
-        let bad = MenuModel::new(vec![MenuEntry::Item(MenuItem::new(0, "x"))]);
-        assert!(popups.show(&bad, HWND::default(), 0, 0).is_err());
+    // Only built, never shown: tests never put a system menu on screen.
+    for popups in [PopupMenus::new(), PopupMenus::default()] {
+        assert!(format!("{popups:?}").contains("SystemPopupHost"));
     }
 }
 

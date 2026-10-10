@@ -33,17 +33,75 @@ pub const MARK_FIRST_CONTENT_PAINTED: &str = "first_content_painted";
 /// The first `Present` after [`MARK_FIRST_CONTENT_PAINTED`] returned.
 pub const MARK_FIRST_CONTENT_PRESENT: &str = "first_content_present";
 
+/// The stages of a frame that the code drawing it times with [`stage`]; their spans are
+/// summed per frame (see [`FrameSample::layout_ms`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// The layout pass of the whole view: every widget's arrange, the editor's lazy layout of
+    /// the newly visible blocks included.
+    Layout,
+    /// The editor's own layout (measuring the blocks that came into view); part of
+    /// [`Stage::Layout`].
+    EditorLayout,
+    /// Painting the editor (the draw calls of the visible blocks).
+    EditorPaint,
+}
+
+impl Stage {
+    /// Number of stages.
+    const COUNT: usize = 3;
+
+    fn index(self) -> usize {
+        match self {
+            Stage::Layout => 0,
+            Stage::EditorLayout => 1,
+            Stage::EditorPaint => 2,
+        }
+    }
+}
+
+/// The moments of one frame, in ms since process start (see [`Recorder::frame_timed`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameTimes {
+    /// The frame began: before the back buffer was wrapped.
+    pub start_ms: f64,
+    /// The back buffer is wrapped, `BeginDraw` ran and the target is cleared: the drawing code
+    /// starts.
+    pub ready_ms: f64,
+    /// The drawing code returned: every draw call was issued (layout included).
+    pub recorded_ms: f64,
+    /// `EndDraw` returned: the draw calls are flushed to the GPU.
+    pub drawn_ms: f64,
+    /// `Present` returned.
+    pub presented_ms: f64,
+}
+
 /// One presented frame (times in ms since process start).
+///
+/// A frame splits into: set-up (`start_ms` to `ready_ms`: wrap the back buffer, `BeginDraw`,
+/// clear), the drawing code (`ready_ms` to `recorded_ms`, of which `layout_ms` is layout and
+/// `editor_paint_ms` the editor's draw calls), `EndDraw` (`recorded_ms` to `drawn_ms`) and
+/// `Present` (`drawn_ms` to `presented_ms`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameSample {
     /// The phase set with [`Recorder::set_phase`] when the frame was presented.
     pub phase: u8,
     /// The frame began: before the back buffer was wrapped.
     pub start_ms: f64,
+    /// The drawing code starts (back buffer wrapped, `BeginDraw` and clear done).
+    pub ready_ms: f64,
+    /// The drawing code returned: every draw call was issued.
+    pub recorded_ms: f64,
     /// `EndDraw` returned: layout, drawing and GPU submission are done.
     pub drawn_ms: f64,
     /// `Present` returned.
     pub presented_ms: f64,
+    /// Time inside [`Stage::Layout`] during the drawing code (0 when nothing timed it).
+    pub layout_ms: f64,
+    /// Time inside [`Stage::EditorLayout`] (0 when nothing timed it).
+    pub editor_layout_ms: f64,
+    /// Time inside [`Stage::EditorPaint`] (0 when nothing timed it).
+    pub editor_paint_ms: f64,
 }
 
 /// A moment of a [`FrameSample`].
@@ -81,6 +139,8 @@ struct State {
     pending_input: Option<f64>,
     content_pending: bool,
     phase: u8,
+    /// Time of the stages of the frame being drawn, indexed by [`Stage::index`].
+    stages: [f64; Stage::COUNT],
 }
 
 /// Records `ms` under `name` unless the name exists; returns whether it was recorded.
@@ -227,23 +287,53 @@ impl Recorder {
         self.lock().phase = phase;
     }
 
-    /// Records one presented frame; resolves the pending input sample, if any.
+    /// Records one presented frame whose drawing code was not timed (set-up and drawing code
+    /// count as one span); resolves the pending input sample, if any.
     pub fn frame(&self, start_ms: f64, drawn_ms: f64, presented_ms: f64) {
-        let mut state = self.lock();
-        let phase = state.phase;
-        state.frames.push(FrameSample {
-            phase,
+        self.frame_timed(FrameTimes {
             start_ms,
+            ready_ms: start_ms,
+            recorded_ms: drawn_ms,
             drawn_ms,
             presented_ms,
         });
-        record_once(&mut state, MARK_FIRST_PRESENT, presented_ms);
+    }
+
+    /// Records one presented frame with the moments of its phases and the stage times
+    /// collected since [`Recorder::begin_frame`]; resolves the pending input sample, if any.
+    pub fn frame_timed(&self, times: FrameTimes) {
+        let mut state = self.lock();
+        let phase = state.phase;
+        let [layout_ms, editor_layout_ms, editor_paint_ms] = std::mem::take(&mut state.stages);
+        state.frames.push(FrameSample {
+            phase,
+            start_ms: times.start_ms,
+            ready_ms: times.ready_ms,
+            recorded_ms: times.recorded_ms,
+            drawn_ms: times.drawn_ms,
+            presented_ms: times.presented_ms,
+            layout_ms,
+            editor_layout_ms,
+            editor_paint_ms,
+        });
+        record_once(&mut state, MARK_FIRST_PRESENT, times.presented_ms);
         if std::mem::take(&mut state.content_pending) {
-            record_once(&mut state, MARK_FIRST_CONTENT_PRESENT, presented_ms);
+            record_once(&mut state, MARK_FIRST_CONTENT_PRESENT, times.presented_ms);
         }
         if let Some(received) = state.pending_input.take() {
-            state.latencies.push(presented_ms - received);
+            state.latencies.push(times.presented_ms - received);
         }
+    }
+
+    /// A frame is about to be drawn: the stage times of earlier spans (layout that ran for an
+    /// event, not for a frame) are forgotten.
+    pub fn begin_frame(&self) {
+        self.lock().stages = [0.0; Stage::COUNT];
+    }
+
+    /// Adds `ms` to `stage` of the frame being drawn.
+    pub fn add_stage(&self, stage: Stage, ms: f64) {
+        self.lock().stages[stage.index()] += ms;
     }
 
     /// A frame finished drawing; `has_content` tells whether it drew document content. The
@@ -360,30 +450,59 @@ pub fn content_painted(has_content: bool) {
     }
 }
 
-/// Times one frame: [`FrameTimer::begin`] before drawing, [`FrameTimer::drawn`] after
-/// `EndDraw`, [`FrameTimer::presented`] after `Present`. Inert (no clock reads) when the
-/// recorder is not enabled.
+/// Times one frame: [`FrameTimer::begin`] before the back buffer is wrapped,
+/// [`FrameTimer::ready`] when the drawing code is about to run, [`FrameTimer::recorded`] when
+/// it returned, [`FrameTimer::drawn`] after `EndDraw`, [`FrameTimer::presented`] after
+/// `Present`. A phase that is not marked ends where the previous one did. Inert (no clock
+/// reads) when the recorder is not enabled.
 #[derive(Debug)]
 pub struct FrameTimer {
     recorder: Option<&'static Recorder>,
     start_ms: f64,
+    ready_ms: f64,
+    recorded_ms: f64,
     drawn_ms: f64,
 }
 
 impl FrameTimer {
-    /// Starts timing a frame.
+    /// Starts timing a frame; the stage times of earlier spans are dropped.
     #[must_use]
     pub fn begin() -> Self {
-        let recorder = RECORDER.get();
-        let start_ms = recorder.map_or(0.0, Recorder::now_ms);
+        Self::on(RECORDER.get())
+    }
+
+    fn on(recorder: Option<&'static Recorder>) -> Self {
+        let start_ms = recorder.map_or(0.0, |recorder| {
+            recorder.begin_frame();
+            recorder.now_ms()
+        });
         Self {
             recorder,
             start_ms,
+            ready_ms: start_ms,
+            recorded_ms: start_ms,
             drawn_ms: start_ms,
         }
     }
 
-    /// Drawing finished.
+    /// Set-up finished: the drawing code runs next.
+    pub fn ready(&mut self) {
+        if let Some(recorder) = self.recorder {
+            self.ready_ms = recorder.now_ms();
+            self.recorded_ms = self.ready_ms;
+            self.drawn_ms = self.ready_ms;
+        }
+    }
+
+    /// The drawing code returned (`EndDraw` is next).
+    pub fn recorded(&mut self) {
+        if let Some(recorder) = self.recorder {
+            self.recorded_ms = recorder.now_ms();
+            self.drawn_ms = self.recorded_ms;
+        }
+    }
+
+    /// Drawing finished (`EndDraw` returned).
     pub fn drawn(&mut self) {
         if let Some(recorder) = self.recorder {
             self.drawn_ms = recorder.now_ms();
@@ -393,9 +512,49 @@ impl FrameTimer {
     /// `Present` returned: the frame is recorded.
     pub fn presented(self) {
         if let Some(recorder) = self.recorder {
-            recorder.frame(self.start_ms, self.drawn_ms, recorder.now_ms());
+            recorder.frame_timed(FrameTimes {
+                start_ms: self.start_ms,
+                ready_ms: self.ready_ms,
+                recorded_ms: self.recorded_ms,
+                drawn_ms: self.drawn_ms,
+                presented_ms: recorder.now_ms(),
+            });
         }
     }
+}
+
+/// Times a [`Stage`] of the frame being drawn: the span from [`stage`] to the drop of this
+/// value is added to the stage. Inert (no clock reads) when the recorder is not enabled.
+#[derive(Debug)]
+#[must_use = "a stage is timed until the value is dropped"]
+pub struct StageTimer {
+    recorder: Option<&'static Recorder>,
+    stage: Stage,
+    start_ms: f64,
+}
+
+impl StageTimer {
+    fn on(recorder: Option<&'static Recorder>, stage: Stage) -> Self {
+        Self {
+            recorder,
+            stage,
+            start_ms: recorder.map_or(0.0, Recorder::now_ms),
+        }
+    }
+}
+
+impl Drop for StageTimer {
+    fn drop(&mut self) {
+        if let Some(recorder) = self.recorder {
+            recorder.add_stage(self.stage, recorder.now_ms() - self.start_ms);
+        }
+    }
+}
+
+/// Starts timing `stage` on the process-wide recorder; nothing before [`enable`]. The stage
+/// lasts until the returned value is dropped.
+pub fn stage(stage: Stage) -> StageTimer {
+    StageTimer::on(RECORDER.get(), stage)
 }
 
 #[cfg(test)]
@@ -502,22 +661,134 @@ mod tests {
         assert_eq!(
             snapshot.frames,
             [
+                // A frame whose drawing code was not timed: set-up and drawing code are one
+                // span, no stage has a time.
                 FrameSample {
                     phase: 0,
                     start_ms: 10.0,
+                    ready_ms: 10.0,
+                    recorded_ms: 14.0,
                     drawn_ms: 14.0,
-                    presented_ms: 15.0
+                    presented_ms: 15.0,
+                    layout_ms: 0.0,
+                    editor_layout_ms: 0.0,
+                    editor_paint_ms: 0.0,
                 },
                 FrameSample {
                     phase: 2,
                     start_ms: 20.0,
+                    ready_ms: 20.0,
+                    recorded_ms: 22.0,
                     drawn_ms: 22.0,
-                    presented_ms: 33.0
+                    presented_ms: 33.0,
+                    layout_ms: 0.0,
+                    editor_layout_ms: 0.0,
+                    editor_paint_ms: 0.0,
                 },
             ]
         );
         // The second frame did not move the mark.
         assert_eq!(snapshot.marks, [(MARK_FIRST_PRESENT, 15.0)]);
+    }
+
+    #[test]
+    fn a_frame_keeps_the_moments_of_its_phases_and_the_stage_times_since_it_began() {
+        let recorder = manual(0.0);
+        // Layout that ran for an event before the frame began does not belong to the frame.
+        recorder.add_stage(Stage::Layout, 7.0);
+        recorder.begin_frame();
+        recorder.add_stage(Stage::Layout, 1.5);
+        recorder.add_stage(Stage::Layout, 0.5);
+        recorder.add_stage(Stage::EditorLayout, 1.25);
+        recorder.add_stage(Stage::EditorPaint, 3.0);
+        recorder.frame_timed(FrameTimes {
+            start_ms: 10.0,
+            ready_ms: 11.0,
+            recorded_ms: 18.0,
+            drawn_ms: 19.0,
+            presented_ms: 20.0,
+        });
+        // The times were handed to that frame: the next one starts from zero.
+        recorder.frame_timed(FrameTimes {
+            start_ms: 30.0,
+            ready_ms: 31.0,
+            recorded_ms: 32.0,
+            drawn_ms: 33.0,
+            presented_ms: 34.0,
+        });
+        let frames = recorder.snapshot().frames;
+        assert_eq!(
+            frames[0],
+            FrameSample {
+                phase: 0,
+                start_ms: 10.0,
+                ready_ms: 11.0,
+                recorded_ms: 18.0,
+                drawn_ms: 19.0,
+                presented_ms: 20.0,
+                layout_ms: 2.0,
+                editor_layout_ms: 1.25,
+                editor_paint_ms: 3.0,
+            }
+        );
+        assert_eq!(
+            (
+                frames[1].layout_ms,
+                frames[1].editor_layout_ms,
+                frames[1].editor_paint_ms
+            ),
+            (0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn a_frame_timer_marks_its_phases_in_order_and_a_stage_timer_adds_its_span() {
+        // The timers hold a `'static` recorder: this test's own, not the process-wide one.
+        static OWN: std::sync::LazyLock<Recorder> = std::sync::LazyLock::new(live);
+        let recorder: &'static Recorder = &OWN;
+        recorder.add_stage(Stage::EditorPaint, 99.0);
+        let mut timer = FrameTimer::on(Some(recorder));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        timer.ready();
+        {
+            let _layout = StageTimer::on(Some(recorder), Stage::Layout);
+            let _editor = StageTimer::on(Some(recorder), Stage::EditorLayout);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        timer.recorded();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        timer.drawn();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        timer.presented();
+        let frame = recorder.snapshot().frames[0];
+        assert!(frame.ready_ms - frame.start_ms >= 1.5, "{frame:?}");
+        assert!(frame.recorded_ms - frame.ready_ms >= 2.5, "{frame:?}");
+        assert!(frame.drawn_ms - frame.recorded_ms >= 1.5, "{frame:?}");
+        assert!(frame.presented_ms - frame.drawn_ms >= 1.5, "{frame:?}");
+        assert!(
+            frame.layout_ms >= 2.5 && frame.editor_layout_ms >= 2.5,
+            "{frame:?}"
+        );
+        assert!(frame.layout_ms < 50.0, "{frame:?}");
+        // The span before the frame began was dropped, and no one timed the editor's paint.
+        assert_eq!(frame.editor_paint_ms, 0.0);
+        // A phase that is not marked ends where the one before it did.
+        let mut lazy = FrameTimer::on(Some(recorder));
+        lazy.recorded();
+        lazy.presented();
+        let skipped = recorder.snapshot().frames[1];
+        assert_eq!(skipped.ready_ms, skipped.start_ms);
+        assert_eq!(skipped.drawn_ms, skipped.recorded_ms);
+    }
+
+    #[test]
+    fn timers_without_a_recorder_do_nothing() {
+        let mut timer = FrameTimer::on(None);
+        timer.ready();
+        timer.recorded();
+        timer.drawn();
+        timer.presented();
+        drop(StageTimer::on(None, Stage::Layout));
     }
 
     #[test]
@@ -591,6 +862,7 @@ mod tests {
         let mut inert = FrameTimer::begin();
         inert.drawn();
         inert.presented();
+        drop(stage(Stage::Layout));
         assert!(!enabled());
 
         let global = enable();
@@ -603,7 +875,10 @@ mod tests {
         content_painted(true);
         input_received();
         let mut timer = FrameTimer::begin();
-        std::thread::sleep(std::time::Duration::from_millis(3));
+        {
+            let _layout = stage(Stage::Layout);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
         timer.drawn();
         std::thread::sleep(std::time::Duration::from_millis(3));
         timer.presented();
@@ -621,6 +896,7 @@ mod tests {
         let frame = snapshot.frames[0];
         assert!(frame.drawn_ms - frame.start_ms >= 2.0);
         assert!(frame.presented_ms - frame.drawn_ms >= 2.0);
+        assert!(frame.layout_ms >= 2.0, "{frame:?}");
         assert_eq!(snapshot.input_latency_ms.len(), 1);
         reset();
         assert!(global.snapshot().marks.is_empty() && global.snapshot().frames.is_empty());

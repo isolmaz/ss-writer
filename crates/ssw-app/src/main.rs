@@ -61,7 +61,7 @@ fn main() -> ExitCode {
         // their launch to the user's running editor).
         let single = !args.test.any();
         let mut instance = WinInstance::new();
-        let mut shell = UiShell::new(single.then(|| instance.link()));
+        let mut shell = UiShell::new(single.then_some(instance.link()));
         let hook = single.then_some(&mut instance as &mut dyn InstanceHook);
         run(&args, process, &mut dialogs, hook, &mut shell)
     };

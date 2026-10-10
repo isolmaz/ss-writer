@@ -82,10 +82,15 @@ fn dispatch_queued() {
     }
 }
 
-/// Ticks `driver` like the message loop would, producing a frame per turn.
+/// Ticks `driver` like the message loop would, producing a frame per turn. The loop's idle
+/// handler runs more often than frames are produced: every turn ticks once before its frame
+/// (the scenario waits for the frame it asked for) and once after it.
 fn drive(app: &UiApp, driver: &mut PerfDriver) -> i32 {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
+        if let Tick::Finished(code) = driver.tick(app) {
+            return code;
+        }
         dispatch_queued();
         app.pump();
         if let Some(cell) = app.controller().active_window()

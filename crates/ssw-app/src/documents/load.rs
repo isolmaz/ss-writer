@@ -400,7 +400,7 @@ pub fn canonical_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use ssw_convert::import::LossKind;
-    use ssw_io::fs::RealFs;
+    use ssw_io::fs::{FaultFs, FsFailure, FsOp, RealFs};
 
     use super::*;
 
@@ -411,6 +411,15 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join(relative)
+    }
+
+    /// A failed load as text: which stage refused and what it said.
+    fn describe(error: &LoadError) -> String {
+        match error {
+            LoadError::Fs(error) => format!("file system: {error:?}"),
+            LoadError::Import(error) => format!("import: {error:?}"),
+            LoadError::Bundle(error) => format!("bundle: {error:?}"),
+        }
     }
 
     #[test]
@@ -472,10 +481,11 @@ mod tests {
     #[test]
     fn a_missing_file_is_a_not_found_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let error = load_file(&RealFs, &tmp.path().join("nope.md"), None).unwrap_err();
-        assert!(
-            matches!(error, LoadError::Fs(FsError::NotFound(_))),
-            "{error:?}"
+        let missing = tmp.path().join("nope.md");
+        let error = load_file(&RealFs, &missing, None).unwrap_err();
+        assert_eq!(
+            describe(&error),
+            format!("file system: {:?}", FsError::NotFound(missing))
         );
     }
 
@@ -525,10 +535,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(
-            matches!(error, LoadError::Import(ImportError::Encrypted)),
-            "{error:?}"
-        );
+        assert_eq!(describe(&error), "import: Encrypted");
     }
 
     #[test]
@@ -548,10 +555,7 @@ mod tests {
         assert!(!loaded.text.trim().is_empty());
         assert!(loaded.losses.is_empty(), "{:?}", loaded.losses);
         let encrypted = load_file(&RealFs, &fixture("doc/PasswordProtected.doc"), None);
-        assert!(matches!(
-            encrypted,
-            Err(LoadError::Import(ImportError::Encrypted))
-        ));
+        assert_eq!(describe(&encrypted.unwrap_err()), "import: Encrypted");
     }
 
     #[test]
@@ -587,28 +591,33 @@ mod tests {
         let path = tmp.path().join("pdf.doc");
         std::fs::write(&path, b"%PDF-1.4\n%binary").unwrap();
         let error = load_file(&RealFs, &path, None).unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                LoadError::Import(ImportError::WrongFormat {
-                    expected: "Word",
-                    detected: "PDF"
-                })
-            ),
-            "{error:?}"
-        );
-        assert!(error.to_string().contains("PDF"));
+        let expected = ImportError::WrongFormat {
+            expected: "Word",
+            detected: "PDF",
+        };
+        assert_eq!(describe(&error), format!("import: {expected:?}"));
+        assert_eq!(error.to_string(), expected.to_string());
     }
 
     #[test]
     fn a_broken_office_file_is_an_import_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("broken.docx");
-        std::fs::write(&path, b"this is not a zip archive").unwrap();
-        assert!(matches!(
-            load_file(&RealFs, &path, None).unwrap_err(),
-            LoadError::Import(_)
-        ));
+        let garbage: &[u8] = b"this is not a zip archive";
+        let expected = [
+            ("docx", ssw_convert::docx::import_docx(garbage, "broken")),
+            ("odt", ssw_convert::odt::import_odt(garbage, "broken")),
+            ("rtf", ssw_convert::rtf::import_rtf(garbage)),
+        ];
+        for (extension, imported) in expected {
+            let path = tmp.path().join(format!("broken.{extension}"));
+            std::fs::write(&path, garbage).unwrap();
+            let error = load_file(&RealFs, &path, None).unwrap_err();
+            assert_eq!(
+                describe(&error),
+                format!("import: {:?}", imported.unwrap_err()),
+                "{extension}"
+            );
+        }
     }
 
     #[test]
@@ -641,10 +650,39 @@ mod tests {
         assert_eq!(loaded.assets, [asset]);
 
         std::fs::write(tmp.path().join("bad.textpack"), b"nope").unwrap();
-        assert!(matches!(
-            load_file(&RealFs, &tmp.path().join("bad.textpack"), None).unwrap_err(),
-            LoadError::Bundle(_)
-        ));
+        let error = load_file(&RealFs, &tmp.path().join("bad.textpack"), None).unwrap_err();
+        assert_eq!(
+            describe(&error),
+            format!("bundle: {:?}", textbundle::read_pack(b"nope").unwrap_err())
+        );
+    }
+
+    #[test]
+    fn a_doc_extension_with_docx_content_is_routed_to_the_docx_importer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("really-docx.doc");
+        std::fs::copy(fixture("docx/poi_heading123.docx"), &path).unwrap();
+        let loaded = load_file(&RealFs, &path, None).unwrap();
+        assert_eq!(loaded.source, Source::Converted(ConvertedFormat::Docx));
+        assert!(
+            loaded.text.starts_with("# First paragraph"),
+            "{}",
+            loaded.text
+        );
+    }
+
+    #[test]
+    fn a_folder_without_a_text_file_is_no_bundle_and_a_missing_one_cannot_be_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty.textbundle");
+        std::fs::create_dir(&empty).unwrap();
+        let error = load_file(&RealFs, &empty, None).unwrap_err();
+        assert_eq!(error.to_string(), "the bundle has no text file");
+        let missing = bundle_text_file(&RealFs, &tmp.path().join("missing")).unwrap_err();
+        assert_eq!(
+            std::mem::discriminant(&missing),
+            std::mem::discriminant(&FsError::NotFound(PathBuf::new()))
+        );
     }
 
     #[test]
@@ -700,5 +738,54 @@ mod tests {
         let orphan = canonical_path(&tmp.path().join("missing").join("x.md"));
         assert!(orphan.ends_with(Path::new("missing").join("x.md")));
         assert!(orphan.is_absolute());
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_made_absolute_or_has_no_name_stays_as_given() {
+        // The empty path has no absolute form and neither a parent nor a file name.
+        assert_eq!(canonical_path(Path::new("")), PathBuf::new());
+    }
+
+    #[test]
+    fn a_forced_encoding_replaces_the_detected_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("latin.txt");
+        std::fs::write(&path, b"caf\xE9\n").unwrap();
+        let windows_1252 = TextEncoding::from_label("windows-1252").unwrap();
+        let forced = load_file_as(&RealFs, &path, None, Some(windows_1252)).unwrap();
+        assert_eq!(forced.text, "caf\u{E9}\n");
+        assert_eq!(forced.format.encoding, windows_1252);
+        assert!(!forced.lossy);
+        // As UTF-8 the byte is malformed: it is replaced and the file is not reproducible.
+        let utf8 = load_file_as(&RealFs, &path, None, Some(TextEncoding::Utf8)).unwrap();
+        assert_eq!(utf8.text, "caf\u{FFFD}\n");
+        assert_eq!(utf8.format.encoding, TextEncoding::Utf8);
+        assert!(utf8.lossy);
+    }
+
+    #[test]
+    fn a_file_system_that_fails_after_the_metadata_call_fails_the_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.md");
+        std::fs::write(&file, "x").unwrap();
+        let fault = FaultFs::new();
+        fault.fail(FsOp::Read, FsFailure::SharingViolation, 1);
+        let error = load_file(&fault, &file, None).unwrap_err();
+        assert_eq!(
+            describe(&error),
+            format!("file system: {:?}", FsError::SharingViolation(file.clone()))
+        );
+        // The failure was scripted once: the file reads now.
+        assert_eq!(load_file(&fault, &file, None).unwrap().text, "x");
+
+        let bundle = tmp.path().join("b.textbundle");
+        textbundle::write_dir(&bundle, "# B\n", &[]).unwrap();
+        fault.fail(FsOp::ListDir, FsFailure::AccessDenied, 1);
+        let error = load_file(&fault, &bundle, None).unwrap_err();
+        assert_eq!(
+            describe(&error),
+            format!("file system: {:?}", FsError::AccessDenied(bundle.clone()))
+        );
+        assert_eq!(load_file(&fault, &bundle, None).unwrap().text, "# B\n");
     }
 }

@@ -23,7 +23,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Theme: follows system light/dark and accent color live (`WM_SETTINGCHANGE "ImmersiveColorSet"`); overridable (System/Light/Dark; accent System/Blue `#1874D3`/custom). High contrast: all colors from `GetSysColor`.
 - Fonts: UI Segoe UI Variable; icons Segoe Fluent Icons; code Cascadia Mono (bundled, OFL). Editor text font default Segoe UI Variable Text 16 px, line height 1.75, color tokens per theme.
 - Per-monitor DPI v2. All geometry in DIPs.
-- Menus (File, Edit, Format, View, Help) are native popup menus; dark menus via uxtheme ordinals 135/136 when available, otherwise light.
+- Menus (File, Edit, Format, View, Window, Help) are native popup menus; dark menus via uxtheme ordinals 135/136 when available, otherwise light.
 - Single-file window (opened from Explorer) starts editor-only. Toggling the sidebar shows the file's parent folder as workspace.
 
 ## 2. Editor
@@ -143,8 +143,9 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Import reports what could not be represented (merged cells, headers/footers, columns, text boxes, comments, tracked changes, VML shapes, unsupported equations) in a banner with a details list. OMML equations convert to LaTeX for fractions, scripts, radicals, n-ary operators, delimiters, matrices; others become `[equation]` placeholders and are reported.
 
 ### 4.2 Encodings & line endings
-- Detection order: BOM → UTF-16/32 null-byte heuristic → valid UTF-8 → `chardetng` (legacy code pages incl. Windows-1254). Encoding and BOM are preserved on save; changeable from the status bar (reopen with / save with encoding).
-- Line endings: stored as `\n` internally; original style restored on save. Mixed files are normalized to the majority style and the user is notified once.
+- Detection order: BOM → UTF-16/32 null-byte heuristic → valid UTF-8 → `chardetng` (legacy code pages incl. Windows-1254). Encoding and BOM are preserved on save.
+- Status bar encoding menu (click the encoding): **Reopen with encoding** decodes the file on disk again (asks before it discards unsaved changes; disabled for a document without a file) and **Save with encoding** writes the document in another encoding at the next save (UTF-8 with or without BOM, UTF-16, UTF-32, legacy code pages). Both are disabled for documents that a converter writes (DOCX, ODT, RTF, TextBundle). The current choice is marked.
+- Line endings: stored as `\n` internally; original style restored on save. Mixed files are normalized to the majority style and the user is notified once. Status bar line-ending menu (click the EOL): LF, CRLF or CR for the next save, current style marked; disabled for documents that a converter writes.
 
 ### 4.3 Saving
 - Autosave default on: 1 s after typing stops, on tab switch, window deactivate and close. Off → classic `Ctrl+S`, dirty dot on the tab, close prompt **Save / Don't save / Cancel**.
@@ -186,7 +187,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Replace (`Ctrl+H`): Replace, Replace all (one undo step), regex capture groups `$1`.
 - Go to line (`Ctrl+G`).
 - Quick Open (`Ctrl+E`): fuzzy files (recent first); `#` headings in current doc; `>` commands. Turkish i/İ/ı/I equivalence in matching.
-- Command palette (`Ctrl+Shift+P`): every command with its shortcut.
+- Command palette (`Ctrl+Shift+P`, the same list as Quick Open's `>` mode): every command with its shortcut. Commands that do not apply to the active document (for example Save back to Word on a Markdown file) are listed disabled and do not run; the enablement is the one the menus use.
 - Search in folder (`Ctrl+Shift+F`): sidebar panel; case/word/regex; results grouped by file with line previews; click opens at match. Honors `.gitignore`; skips binaries; decodes legacy encodings.
 
 ## 8. Inspector & status bar

@@ -463,7 +463,7 @@ fn epub_container_points_at_the_package_document() {
         .expect("rootfile");
     assert_eq!(rootfile.attr("full-path"), Some("OEBPS/content.opf"));
     assert_eq!(
-        rootfile.attr("media-type"),
+        rootfile.attr("media-type"), // docs-check: not a message id
         Some("application/oebps-package+xml")
     );
 }
@@ -500,7 +500,7 @@ fn epub_package_lists_every_file_and_spines_the_chapters() {
                 e.attr("id").unwrap().to_string(),
                 (
                     e.attr("href").unwrap().to_string(),
-                    e.attr("media-type").unwrap().to_string(),
+                    e.attr("media-type").unwrap().to_string(), // docs-check: not a message id
                 ),
             )
         })

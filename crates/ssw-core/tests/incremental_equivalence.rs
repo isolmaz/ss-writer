@@ -311,6 +311,28 @@ fn front_matter_without_a_closing_line_is_not_front_matter() {
 }
 
 #[test]
+fn a_front_matter_fence_that_is_the_whole_text_opens_nothing_until_it_is_continued() {
+    let front_matter = |parser: &IncrementalParser| {
+        matches!(
+            parser.document().blocks.first().map(|block| &block.kind),
+            Some(BlockKind::FrontMatter { .. })
+        )
+    };
+    for (source, fence) in [("---\nkey: v", "---"), ("+++\nk = 1", "+++")] {
+        let mut text = String::from(source);
+        let mut parser = parser_for(&text);
+        let len = text.len();
+        // The fence line is the entire text: there is no line break after it.
+        edit(&mut parser, &mut text, 3..len, "");
+        assert_eq!(text, fence);
+        assert!(!front_matter(&parser), "{text:?}");
+        let end = text.len();
+        edit(&mut parser, &mut text, end..end, &format!("\nkey\n{fence}"));
+        assert!(front_matter(&parser), "{text:?}");
+    }
+}
+
+#[test]
 fn lazy_continuation_merges_and_unmerges_blocks() {
     for source in [
         "- item\n\nlazy text\n",

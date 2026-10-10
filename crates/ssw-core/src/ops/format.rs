@@ -650,6 +650,17 @@ mod tests {
     }
 
     #[test]
+    fn containers_thematic_breaks_and_empty_cells_are_no_regions() {
+        // The list, the thematic break and the empty header cell hold no inline content, so
+        // only the list item's text is formatted.
+        check(
+            "- «one»\n\n---\n\n| a |  |\n|---|---|\n| 1 | 2 |",
+            "- **«one»**\n\n---\n\n| a |  |\n|---|---|\n| 1 | 2 |",
+            style(InlineStyle::Bold),
+        );
+    }
+
+    #[test]
     fn reversed_selection_stays_reversed() {
         check("a »word« b", "a **»word«** b", style(InlineStyle::Bold));
         check("a **»word«** b", "a »word« b", style(InlineStyle::Bold));

@@ -285,6 +285,28 @@ fn allocated<T>(pointer: *mut T) -> windows::core::Result<*mut T> {
     }
 }
 
+/// Tells the caller the one target type a file target supports: writes it into `types`, the
+/// array the caller will free (null when allocating it failed, which is `E_OUTOFMEMORY`) and
+/// publishes count and array through the out pointers, which stay as they were on failure.
+///
+/// # Safety
+/// `targetcount` and `targettypes` are valid for writes; `types` is null or valid for writing
+/// one `GUID`.
+unsafe fn publish_target_types(
+    targetcount: *mut u32,
+    targettypes: *mut *mut GUID,
+    types: *mut GUID,
+) -> windows::core::Result<()> {
+    let types = allocated(types)?;
+    // SAFETY: by the caller's contract; `types` is not null.
+    unsafe {
+        types.write(ID_DOCUMENTPACKAGETARGET_MSXPS);
+        targetcount.write(1);
+        targettypes.write(types);
+    }
+    Ok(())
+}
+
 /// A print target that writes an XPS package to a file stream.
 #[implement(IPrintDocumentPackageTarget)]
 struct XpsFileTarget {
@@ -304,12 +326,12 @@ impl IPrintDocumentPackageTarget_Impl for XpsFileTarget_Impl {
         // SAFETY: both out pointers are non-null and valid for writes per the interface
         // contract; the array is CoTaskMem memory the caller frees.
         unsafe {
-            let types = allocated(CoTaskMemAlloc(size_of::<GUID>()).cast::<GUID>())?;
-            types.write(ID_DOCUMENTPACKAGETARGET_MSXPS);
-            targetcount.write(1);
-            targettypes.write(types);
+            publish_target_types(
+                targetcount,
+                targettypes,
+                CoTaskMemAlloc(size_of::<GUID>()).cast::<GUID>(),
+            )
         }
-        Ok(())
     }
 
     fn GetPackageTarget(
@@ -431,7 +453,8 @@ pub trait PrintDialogHost {
     ) -> Result<Option<PrintSelection>, WinError>;
 }
 
-/// The real [`PrintDialogHost`]: `PrintDlgEx`.
+/// The real [`PrintDialogHost`]: `PrintDlgEx` with all pages by default, no selection and no
+/// current page.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemPrintDialogHost;
 
@@ -566,8 +589,8 @@ pub fn dialog_ranges(
 ///
 /// # Errors
 /// Fails when there are no pages, the dialog fails or none of the chosen pages exist.
-pub fn choose<H: PrintDialogHost>(
-    host: &mut H,
+pub fn choose(
+    host: &mut dyn PrintDialogHost,
     owner: HWND,
     page_count: u32,
 ) -> Result<Option<PrintSelection>, WinError> {
@@ -628,7 +651,7 @@ pub fn print_selection(
     job_name: &str,
     pages: Vec<Scene>,
 ) -> Result<usize, WinError> {
-    print_selection_to(surface, selection, pages, || {
+    print_selection_to(surface, selection, pages, &mut || {
         printer_target(&selection.printer, job_name)
     })
 }
@@ -643,7 +666,7 @@ pub fn print_selection_to(
     surface: &mut PrintSurface<'_>,
     selection: &PrintSelection,
     pages: Vec<Scene>,
-    open_target: impl FnOnce() -> Result<IPrintDocumentPackageTarget, WinError>,
+    open_target: &mut dyn FnMut() -> Result<IPrintDocumentPackageTarget, WinError>,
 ) -> Result<usize, WinError> {
     let pages: Vec<Arc<Scene>> = pages.into_iter().map(Arc::new).collect();
     let plan: Vec<Arc<Scene>> = page_plan(selection, pages.len())
@@ -659,8 +682,8 @@ pub fn print_selection_to(
 ///
 /// # Errors
 /// See [`choose`] and [`print_selection`].
-pub fn print_with_dialog<H: PrintDialogHost>(
-    host: &mut H,
+pub fn print_with_dialog(
+    host: &mut dyn PrintDialogHost,
     owner: HWND,
     surface: &mut PrintSurface<'_>,
     job_name: &str,
@@ -806,5 +829,26 @@ mod tests {
         assert_eq!(error.code(), E_OUTOFMEMORY);
         let mut value = 7u8;
         assert_eq!(allocated(&raw mut value).unwrap(), &raw mut value);
+    }
+
+    #[test]
+    fn target_types_are_published_only_when_their_array_was_allocated() {
+        let (mut count, mut published) = (0u32, std::ptr::null_mut::<GUID>());
+        // SAFETY: valid out pointers; a null array stands for a failed allocation.
+        let error =
+            unsafe { publish_target_types(&mut count, &mut published, std::ptr::null_mut()) }
+                .unwrap_err();
+        assert_eq!(error.code(), E_OUTOFMEMORY);
+        assert_eq!(
+            (count, published),
+            (0, std::ptr::null_mut()),
+            "a failure publishes nothing"
+        );
+        let mut array = GUID::zeroed();
+        // SAFETY: valid out pointers and room for one `GUID`.
+        unsafe { publish_target_types(&mut count, &mut published, &raw mut array) }.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(published, &raw mut array);
+        assert_eq!(array, ID_DOCUMENTPACKAGETARGET_MSXPS);
     }
 }

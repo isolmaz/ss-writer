@@ -31,6 +31,8 @@
 //! - [`share`]: the Windows share sheet (`DataTransferManager`) for a file.
 //! - [`perf`]: the performance recorder behind `--perf-report` (marks, frame timings, input
 //!   latency; inert until enabled).
+//! - `testing` (feature `test-support`): the private desktop tests show and raise real windows
+//!   on, so nothing of them reaches the user's screen or focus.
 
 pub mod assoc;
 pub mod canvas;
@@ -55,6 +57,8 @@ pub mod services;
 pub mod share;
 pub mod spell;
 pub mod taskbar;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 pub mod theme;
 pub mod tsf;
 pub mod wic;

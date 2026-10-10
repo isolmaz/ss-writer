@@ -30,7 +30,7 @@ use ssw_ui::shell::export_dialog::ExportOptions;
 use ssw_ui::widgets::anim::Motion;
 use ssw_win::canvas::{CanvasAssets, ImageStore};
 use ssw_win::dwrite::DWriteEngine;
-use ssw_win::gfx::GfxDevices;
+use ssw_win::gfx::SharedDevices;
 use ssw_win::print::{PrintSurface, SystemPrintDialogHost, print_with_dialog};
 use ssw_win::share::{SharedFile, Sharer};
 use ssw_win::taskbar::Progress;
@@ -130,7 +130,7 @@ fn failed(service: &'static str, error: impl ToString) -> ServiceError {
 
 /// [`Printing`] over `ssw_win::print`: the system print dialog and `ID2D1PrintControl`.
 pub struct SystemPrinting {
-    devices: GfxDevices,
+    devices: SharedDevices,
     wic: Wic,
     text: DWriteEngine,
 }
@@ -142,15 +142,22 @@ impl fmt::Debug for SystemPrinting {
 }
 
 impl SystemPrinting {
-    /// Printing with the graphics devices of the application.
+    /// Printing with the graphics devices of the application: devices that exist, or the shared
+    /// devices of the window loop, which a print started in the first moments of a launch waits
+    /// for.
     #[must_use]
-    pub fn new(devices: GfxDevices, wic: Wic, text: DWriteEngine) -> Self {
-        Self { devices, wic, text }
+    pub fn new(devices: impl Into<SharedDevices>, wic: Wic, text: DWriteEngine) -> Self {
+        Self {
+            devices: devices.into(),
+            wic,
+            text,
+        }
     }
 }
 
 impl Printing for SystemPrinting {
     fn print(&mut self, job: PrintJob) -> Result<Option<usize>, ServiceError> {
+        let devices = self.devices.get().map_err(|error| failed("print", error))?;
         let mut assets = CanvasAssets::with_scene_renderer(
             ImageStore::new(self.wic.clone()),
             self.text.clone(),
@@ -158,7 +165,7 @@ impl Printing for SystemPrinting {
         )
         .map_err(|error| failed("print", error))?;
         let mut surface = PrintSurface {
-            devices: &self.devices,
+            devices: &devices,
             wic: &self.wic,
             assets: &mut assets,
         };
@@ -741,4 +748,149 @@ impl Controller {
 fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy()
         .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use ssw_io::paths::Environment;
+    use ssw_ui::services::{Clock, FakeClock, MemoryClipboard};
+    use ssw_ui::widgets::SharedClipboard;
+    use ssw_win::gfx::Driver;
+    use ssw_win::window::OsVersion;
+
+    use super::*;
+    use crate::app::AppCore;
+    use crate::args::Args;
+    use crate::startup::{Boot, ProcessEnv, boot};
+    use crate::ui::scripted_services::{DialogRecord, ScriptedServices};
+    use crate::workers::DeferredWaker;
+
+    /// A controller over a fresh profile below `root` with scripted dialogs.
+    fn controller(root: &Path, services: &ScriptedServices) -> Rc<Controller> {
+        let process = ProcessEnv {
+            os: OsVersion {
+                major: 10,
+                build: 22621,
+            },
+            env: Environment {
+                local_app_data: Some(root.join("local")),
+                app_data: Some(root.join("roaming")),
+                exe_dir: root.join("exe"),
+            },
+            os_language: "en-US".to_owned(),
+            driver: Driver::Warp,
+            install_crash_handler: false,
+        };
+        let mut dialogs = ScriptedServices::new().dialogs();
+        let core = match boot(&Args::default(), process, &mut *dialogs, None).unwrap() {
+            Boot::Ready(started) => AppCore::new(*started, Arc::new(DeferredWaker::new())),
+            Boot::Exit(code) => panic!("startup exited with {code}"),
+        };
+        let clipboard: SharedClipboard = Rc::new(RefCell::new(MemoryClipboard::default()));
+        let clock: Rc<dyn Clock> = Rc::new(FakeClock::default());
+        let plan = core.plan.clone();
+        let controller =
+            Controller::new(core, services.dialogs(), services.shell(), clipboard, clock);
+        controller.open_plan(&plan);
+        controller
+    }
+
+    fn label() -> Label {
+        Label {
+            name: "notes".to_owned(),
+            format: "PDF".to_owned(),
+        }
+    }
+
+    /// The (title, message) pairs of the dialogs shown so far.
+    fn shown(services: &ScriptedServices) -> Vec<(String, String)> {
+        services
+            .dialog_log()
+            .into_iter()
+            .map(|DialogRecord { title, message, .. }| (title, message))
+            .collect()
+    }
+
+    #[test]
+    fn file_names_lose_the_characters_windows_forbids() {
+        assert_eq!(
+            file_name_safe("a<b>c:d\"e/f\\g|h?i*j\tk"),
+            "a_b_c_d_e_f_g_h_i_j_k"
+        );
+        assert_eq!(file_name_safe("Meeting notes 2026"), "Meeting notes 2026");
+    }
+
+    #[test]
+    fn an_export_that_ended_without_a_file_to_name_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let services = ScriptedServices::new();
+        let controller = controller(tmp.path(), &services);
+        let failures = [
+            (
+                Err(JobError::Panicked("boom".to_owned())),
+                "The exporter stopped unexpectedly.",
+            ),
+            (
+                Ok(Err(ExportFailure::Empty)),
+                "The export produced no pages.",
+            ),
+            (
+                Ok(Err(ExportFailure::Diagram)),
+                "The diagram could not be drawn",
+            ),
+            (
+                Ok(Err(ExportFailure::Convert("the layout broke".to_owned()))),
+                "the layout broke",
+            ),
+        ];
+        for (outcome, reason) in failures {
+            controller.report_export(&label(), outcome);
+            let dialogs = shown(&services);
+            let (title, message) = dialogs.last().unwrap();
+            assert_eq!(title, "Export failed");
+            assert!(message.contains("could not be exported as"), "{message}");
+            assert!(message.contains(reason), "{message}");
+        }
+        // Finished with no file at all: there is nothing to open, so nothing is asked.
+        let before = shown(&services).len();
+        controller.report_export(&label(), Ok(Ok(Vec::new())));
+        assert_eq!(shown(&services).len(), before);
+    }
+
+    #[test]
+    fn a_print_that_ended_without_pages_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let services = ScriptedServices::new();
+        let controller = controller(tmp.path(), &services);
+        let outcomes = [
+            (Ok(Ok(Vec::new())), "The export produced no pages."),
+            (
+                Ok(Err(ExportFailure::Convert("the layout broke".to_owned()))),
+                "the layout broke",
+            ),
+            (
+                Err(JobError::Panicked("boom".to_owned())),
+                "The exporter stopped unexpectedly.",
+            ),
+        ];
+        for (outcome, reason) in outcomes {
+            controller.finish_print(None, "notes", outcome);
+            let dialogs = shown(&services);
+            let (title, message) = dialogs.last().unwrap();
+            assert_eq!(title, "Print");
+            assert!(message.contains("could not be printed"), "{message}");
+            assert!(message.contains(reason), "{message}");
+        }
+        // Pages but no printer left to take them.
+        controller.finish_print(None, "notes", Ok(Ok(vec![Scene::default()])));
+        let dialogs = shown(&services);
+        assert_eq!(
+            dialogs.last().unwrap(),
+            &(
+                "Print".to_owned(),
+                "Printing is not available in this window.".to_owned()
+            )
+        );
+        assert_eq!(dialogs.len(), 4);
+    }
 }

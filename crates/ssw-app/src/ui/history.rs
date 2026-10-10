@@ -456,15 +456,15 @@ impl Controller {
         let _ = self.core().borrow().workers.submit(
             spec,
             move |_| diff_hunks(&old, &new),
+            // A diff that panicked on its worker (`Err`) has nothing to show.
             move |outcome| {
-                let Ok(hunks) = outcome else {
-                    return;
-                };
-                let mut view = target.view.borrow_mut();
-                if view.history_mut().set_diff(id, hunks) {
-                    view.requests_mut().invalidate_all();
-                    target.dirty.set(true);
-                }
+                outcome.into_iter().for_each(|hunks| {
+                    let mut view = target.view.borrow_mut();
+                    if view.history_mut().set_diff(id, hunks) {
+                        view.requests_mut().invalidate_all();
+                        target.dirty.set(true);
+                    }
+                });
             },
         );
     }
@@ -514,7 +514,7 @@ impl Controller {
         let Some(text) = restored else {
             return Ok(false);
         };
-        replace_text(&mut entry.document().borrow_mut(), &text)?;
+        replace_text(&mut entry.document().borrow_mut(), &text);
         Ok(true)
     }
 }
@@ -532,6 +532,16 @@ mod tests {
         assert_eq!(civil_utc(951_782_400 + 86_399), (2000, 2, 29, 23, 59));
         // Before the epoch.
         assert_eq!(civil_utc(-1), (1969, 12, 31, 23, 59));
+    }
+
+    #[test]
+    fn a_year_the_date_format_cannot_show_is_written_in_iso_order() {
+        let i18n = crate::i18n::localizer_for("en");
+        // 100000-01-01 00:00:00 UTC: the year does not fit the 16 bits of a short date.
+        assert_eq!(
+            snapshot_time(&Locale::user_default(), &i18n, 3_093_527_980_800),
+            "100000-01-01 00:00 UTC"
+        );
     }
 
     #[test]

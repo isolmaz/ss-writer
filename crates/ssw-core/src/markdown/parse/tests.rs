@@ -1,8 +1,9 @@
 use super::scan;
 use super::source::Source;
 use crate::markdown::ast::{
-    Alignment, Block, BlockKind, CalloutKind, FrontMatterFormat, HighlightColor, ImageKind, Inline,
-    InlineKind, LinkKind, ListDelimiter, NodeRef, ReferenceForm,
+    Alignment, Block, BlockKind, CalloutKind, CodeBlock, FrontMatterFormat, HighlightColor,
+    HtmlBlock, Image, ImageKind, Inline, InlineKind, Link, LinkKind, LinkReferenceDefinition,
+    ListDelimiter, MathBlock, NodeRef, ReferenceForm, Table, Task, WikiLink,
 };
 use crate::markdown::definitions::{Definitions, LabelKind, LinkDefinition};
 use crate::markdown::parse_document;
@@ -27,11 +28,79 @@ fn only_block(src: &str) -> Block {
     doc.blocks[0].clone()
 }
 
+/// Range of the first occurrence of `needle` in `src`.
+fn span(src: &str, needle: &str) -> TextRange {
+    let start = src.find(needle).unwrap();
+    TextRange::new(start, start + needle.len())
+}
+
+fn code_of(kind: &BlockKind) -> Option<&CodeBlock> {
+    match kind {
+        BlockKind::CodeBlock(code) => Some(code),
+        _ => None,
+    }
+}
+
+fn math_of(kind: &BlockKind) -> Option<&MathBlock> {
+    match kind {
+        BlockKind::MathBlock(math) => Some(math),
+        _ => None,
+    }
+}
+
+fn table_of(kind: &BlockKind) -> Option<&Table> {
+    match kind {
+        BlockKind::Table(table) => Some(table),
+        _ => None,
+    }
+}
+
+fn html_of(kind: &BlockKind) -> Option<&HtmlBlock> {
+    match kind {
+        BlockKind::HtmlBlock(html) => Some(html),
+        _ => None,
+    }
+}
+
+fn link_of(kind: &InlineKind) -> Option<&Link> {
+    match kind {
+        InlineKind::Link(link) => Some(link),
+        _ => None,
+    }
+}
+
+fn image_of(kind: &InlineKind) -> Option<&Image> {
+    match kind {
+        InlineKind::Image(image) => Some(image),
+        _ => None,
+    }
+}
+
+fn wiki_of(kind: &InlineKind) -> Option<&WikiLink> {
+    match kind {
+        InlineKind::WikiLink(wiki) => Some(wiki),
+        _ => None,
+    }
+}
+
+#[test]
+fn the_payload_helpers_of_these_tests_return_nothing_for_other_kinds() {
+    let block = BlockKind::Paragraph;
+    assert!(code_of(&block).is_none());
+    assert!(math_of(&block).is_none());
+    assert!(table_of(&block).is_none());
+    assert!(html_of(&block).is_none());
+    let inline = InlineKind::Text;
+    assert!(link_of(&inline).is_none());
+    assert!(image_of(&inline).is_none());
+    assert!(wiki_of(&inline).is_none());
+}
+
 #[test]
 fn heading_marker_and_closing_run() {
     let src = "## Title ##\n";
     let b = only_block(src);
-    assert!(matches!(b.kind, BlockKind::Heading { level: 2, .. }));
+    assert_eq!(b.heading_level(), Some(2));
     assert_eq!(texts(src, &b.markers), ["##", "##"]);
     assert_eq!(at(src, b.content), "Title");
     assert_eq!(at(src, b.range), "## Title ##");
@@ -41,8 +110,8 @@ fn heading_marker_and_closing_run() {
 #[test]
 fn setext_underline_is_not_a_heading() {
     let doc = parse_document("Foo\n---\n");
-    assert!(matches!(doc.blocks[0].kind, BlockKind::Paragraph));
-    assert!(matches!(doc.blocks[1].kind, BlockKind::ThematicBreak));
+    assert_eq!(doc.blocks[0].kind, BlockKind::Paragraph);
+    assert_eq!(doc.blocks[1].kind, BlockKind::ThematicBreak);
 }
 
 #[test]
@@ -61,22 +130,19 @@ fn emphasis_family_markers() {
         assert_eq!(at(src, i.range), src, "{src}");
         assert_eq!(at(src, i.children[0].range), "a");
     }
-    assert!(matches!(first_inline("~a~").kind, InlineKind::Underline));
-    assert!(matches!(
-        first_inline("~~a~~").kind,
-        InlineKind::Strikethrough
-    ));
-    assert!(matches!(first_inline("**a**").kind, InlineKind::Strong));
+    assert_eq!(first_inline("~a~").kind, InlineKind::Underline);
+    assert_eq!(first_inline("~~a~~").kind, InlineKind::Strikethrough);
+    assert_eq!(first_inline("**a**").kind, InlineKind::Strong);
 }
 
 #[test]
 fn triple_star_nests_strong_inside_emphasis() {
     let src = "***a***";
     let i = first_inline(src);
-    assert!(matches!(i.kind, InlineKind::Emphasis));
+    assert_eq!(i.kind, InlineKind::Emphasis);
     assert_eq!(texts(src, &i.markers), ["*", "*"]);
     let inner = &i.children[0];
-    assert!(matches!(inner.kind, InlineKind::Strong));
+    assert_eq!(inner.kind, InlineKind::Strong);
     assert_eq!(texts(src, &inner.markers), ["**", "**"]);
 }
 
@@ -84,18 +150,18 @@ fn triple_star_nests_strong_inside_emphasis() {
 fn highlight_color_belongs_to_opening_marker() {
     let src = "=={red}x==";
     let i = first_inline(src);
-    assert!(matches!(
+    assert_eq!(
         i.kind,
         InlineKind::Highlight {
             color: Some(HighlightColor::Red)
         }
-    ));
+    );
     assert_eq!(texts(src, &i.markers), ["=={red}", "=="]);
     assert_eq!(at(src, i.content), "x");
-    assert!(matches!(
+    assert_eq!(
         first_inline("==x==").kind,
         InlineKind::Highlight { color: None }
-    ));
+    );
 }
 
 #[test]
@@ -104,7 +170,12 @@ fn code_span_markers_and_text() {
     let i = first_inline(src);
     assert_eq!(texts(src, &i.markers), ["``", "``"]);
     assert_eq!(at(src, i.content), " a`b ");
-    assert!(matches!(&i.kind, InlineKind::Code { text } if text == "a`b"));
+    assert_eq!(
+        i.kind,
+        InlineKind::Code {
+            text: "a`b".to_string()
+        }
+    );
 }
 
 #[test]
@@ -113,20 +184,17 @@ fn inline_link_markers_and_destination() {
     let i = first_inline(src);
     assert_eq!(texts(src, &i.markers), ["[", "](/url \"t\")"]);
     assert_eq!(at(src, i.content), "text");
-    let InlineKind::Link(link) = &i.kind else {
-        panic!("not a link")
-    };
+    let link = link_of(&i.kind).expect("a link");
     assert_eq!(link.dest, "/url");
     assert_eq!(link.title.as_deref(), Some("t"));
-    let LinkKind::Inline {
-        dest_range,
-        title_range,
-    } = &link.kind
-    else {
-        panic!("not inline")
-    };
-    assert_eq!(at(src, *dest_range), "/url");
-    assert_eq!(at(src, title_range.unwrap()), "t");
+    let title = span(src, "\"t\"");
+    assert_eq!(
+        link.kind,
+        LinkKind::Inline {
+            dest_range: span(src, "/url"),
+            title_range: Some(TextRange::new(title.start + 1, title.end - 1)),
+        }
+    );
 }
 
 #[test]
@@ -134,26 +202,30 @@ fn reference_link_resolves_through_definitions() {
     let src = "[Foo bar][ref]\n\n[ref]: /url 'title'\n";
     let doc = parse_document(src);
     let link = &doc.blocks[0].inlines[0];
-    let InlineKind::Link(l) = &link.kind else {
-        panic!("not a link")
-    };
+    let l = link_of(&link.kind).expect("a link");
     assert_eq!(l.dest, "/url");
     assert_eq!(l.title.as_deref(), Some("title"));
-    let LinkKind::Reference {
-        label,
-        form,
-        label_range,
-    } = &l.kind
-    else {
-        panic!("not a reference")
-    };
-    assert_eq!((label.as_str(), *form), ("ref", ReferenceForm::Full));
-    assert_eq!(at(src, *label_range), "ref");
+    assert_eq!(
+        l.kind,
+        LinkKind::Reference {
+            label: "ref".to_string(),
+            form: ReferenceForm::Full,
+            label_range: span(src, "ref"),
+        }
+    );
     assert_eq!(texts(src, &link.markers), ["[", "][ref]"]);
-    assert!(matches!(
+    let label_start = src.rfind("ref").unwrap();
+    assert_eq!(
         doc.blocks[1].kind,
-        BlockKind::LinkReferenceDefinition(_)
-    ));
+        BlockKind::LinkReferenceDefinition(LinkReferenceDefinition {
+            label: "ref".to_string(),
+            label_range: TextRange::new(label_start, label_start + 3),
+            dest: "/url".to_string(),
+            dest_range: span(src, "/url"),
+            title: Some("title".to_string()),
+            title_range: Some(span(src, "title")),
+        })
+    );
     assert_eq!(at(src, doc.blocks[1].range), "[ref]: /url 'title'");
     assert_eq!(texts(src, &doc.blocks[1].markers), ["[ref]:"]);
     assert!(doc.definitions.link("REF").is_some());
@@ -168,7 +240,7 @@ fn reference_link_resolves_through_definitions() {
 #[test]
 fn undefined_reference_stays_text() {
     let doc = parse_document("[nope]\n");
-    assert!(matches!(doc.blocks[0].inlines[0].kind, InlineKind::Text));
+    assert_eq!(doc.blocks[0].inlines[0].kind, InlineKind::Text);
     assert_eq!(doc.definitions.uses().len(), 1);
 }
 
@@ -176,18 +248,20 @@ fn undefined_reference_stays_text() {
 fn image_size_suffix_is_part_of_the_closing_marker() {
     let src = "![alt|300x200](p.png \"T\")";
     let i = first_inline(src);
-    let InlineKind::Image(img) = &i.kind else {
-        panic!("not an image")
-    };
+    let img = image_of(&i.kind).expect("an image");
     assert_eq!((img.width, img.height), (Some(300), Some(200)));
     assert_eq!(at(src, img.alt), "alt");
     assert_eq!(texts(src, &i.markers), ["![", "|300x200](p.png \"T\")"]);
     assert_eq!(at(src, i.children[0].range), "alt");
-    assert!(matches!(img.kind, ImageKind::Inline { .. }));
+    assert_eq!(
+        img.kind,
+        ImageKind::Inline {
+            dest_range: span(src, "p.png"),
+            title_range: Some(span(src, "T")),
+        }
+    );
     let only_width = first_inline("![a|50](x.png)");
-    let InlineKind::Image(img) = &only_width.kind else {
-        panic!("not an image")
-    };
+    let img = image_of(&only_width.kind).expect("an image");
     assert_eq!((img.width, img.height), (Some(50), None));
 }
 
@@ -196,30 +270,24 @@ fn html_img_tag_carries_size() {
     let src = "text <img src=\"a.png\" width=\"40\" height=\"30\" alt=\"x\">";
     let doc = parse_document(src);
     let img = &doc.blocks[0].inlines[1];
-    let InlineKind::Image(i) = &img.kind else {
-        panic!("not an image")
-    };
+    let i = image_of(&img.kind).expect("an image");
     assert_eq!(
         (i.dest.as_str(), i.width, i.height),
         ("a.png", Some(40), Some(30))
     );
     assert_eq!(at(src, i.alt), "x");
-    assert!(matches!(i.kind, ImageKind::Html));
+    assert_eq!(i.kind, ImageKind::Html);
     let block = parse_document("<img src=\"a.png\" width=\"40\">\n");
-    assert!(matches!(block.blocks[0].kind, BlockKind::HtmlBlock(_)));
-    assert!(matches!(
-        block.blocks[0].inlines[0].kind,
-        InlineKind::Image(_)
-    ));
+    assert!(html_of(&block.blocks[0].kind).is_some());
+    let image = image_of(&block.blocks[0].inlines[0].kind).expect("the lone tag is an image");
+    assert_eq!((image.dest.as_str(), image.width), ("a.png", Some(40)));
 }
 
 #[test]
 fn wikilink_parts() {
     let src = "[[Note#Part|alias]]";
     let i = first_inline(src);
-    let InlineKind::WikiLink(w) = &i.kind else {
-        panic!("not a wikilink")
-    };
+    let w = wiki_of(&i.kind).expect("a wikilink");
     assert_eq!(
         (w.target.as_str(), w.heading.as_deref(), w.alias.as_deref()),
         ("Note", Some("Part"), Some("alias"))
@@ -229,9 +297,7 @@ fn wikilink_parts() {
     assert_eq!(at(src, w.target_range), "Note");
     assert_eq!(at(src, w.heading_range.unwrap()), "Part");
     let plain = first_inline("[[#Head]]");
-    let InlineKind::WikiLink(w) = &plain.kind else {
-        panic!("not a wikilink")
-    };
+    let w = wiki_of(&plain.kind).expect("a wikilink");
     assert_eq!(
         (w.target.as_str(), w.heading.as_deref()),
         ("", Some("Head"))
@@ -243,12 +309,19 @@ fn footnote_reference_needs_a_definition() {
     let src = "a[^1]\n\n[^1]: note\n";
     let doc = parse_document(src);
     let r = &doc.blocks[0].inlines[1];
-    assert!(matches!(&r.kind, InlineKind::FootnoteRef { label } if label == "1"));
+    assert_eq!(
+        r.kind,
+        InlineKind::FootnoteRef {
+            label: "1".to_string()
+        }
+    );
     assert_eq!(texts(src, &r.markers), ["[^", "]"]);
-    let BlockKind::FootnoteDefinition { label } = &doc.blocks[1].kind else {
-        panic!("no footnote")
-    };
-    assert_eq!(label, "1");
+    assert_eq!(
+        doc.blocks[1].kind,
+        BlockKind::FootnoteDefinition {
+            label: "1".to_string()
+        }
+    );
     assert_eq!(texts(src, &doc.blocks[1].markers), ["[^1]:"]);
     assert_eq!(at(src, doc.blocks[1].range), "[^1]: note");
     assert!(doc.definitions.has_footnote("1"));
@@ -266,18 +339,24 @@ fn angle_and_extended_autolinks() {
     let src = "<http://a.b/c>";
     let i = first_inline(src);
     assert_eq!(texts(src, &i.markers), ["<", ">"]);
-    let InlineKind::Link(l) = &i.kind else {
-        panic!("not a link")
-    };
+    let l = link_of(&i.kind).expect("a link");
     assert_eq!(l.dest, "http://a.b/c");
-    assert!(matches!(l.kind, LinkKind::Autolink { angle: true }));
+    assert_eq!(l.kind, LinkKind::Autolink { angle: true });
     let mail = first_inline("<me@x.org>");
-    assert!(matches!(&mail.kind, InlineKind::Link(l) if l.dest == "mailto:me@x.org"));
-    let www = first_inline("www.example.com/a");
-    assert!(
-        matches!(&www.kind, InlineKind::Link(l) if l.dest == "http://www.example.com/a"
-        && matches!(l.kind, LinkKind::Autolink { angle: false }) && www.markers.is_empty())
+    assert_eq!(
+        link_of(&mail.kind).map(|l| l.dest.as_str()),
+        Some("mailto:me@x.org")
     );
+    let www = first_inline("www.example.com/a");
+    assert_eq!(
+        link_of(&www.kind),
+        Some(&Link {
+            dest: "http://www.example.com/a".to_string(),
+            title: None,
+            kind: LinkKind::Autolink { angle: false },
+        })
+    );
+    assert!(www.markers.is_empty());
 }
 
 #[test]
@@ -286,7 +365,7 @@ fn escapes_entities_and_breaks() {
     let doc = parse_document(src);
     let kinds: Vec<&InlineKind> = doc.blocks[0].inlines.iter().map(|i| &i.kind).collect();
     let esc = &doc.blocks[0].inlines[1];
-    assert!(matches!(esc.kind, InlineKind::Escape));
+    assert_eq!(esc.kind, InlineKind::Escape);
     assert_eq!(
         (texts(src, &esc.markers), at(src, esc.content)),
         (vec!["\\"], "*")
@@ -312,7 +391,7 @@ fn escapes_entities_and_breaks() {
 fn block_quote_has_one_marker_per_line() {
     let src = "> a\n> b\n";
     let b = only_block(src);
-    assert!(matches!(b.kind, BlockKind::BlockQuote));
+    assert_eq!(b.kind, BlockKind::BlockQuote);
     assert_eq!(texts(src, &b.markers), [">", ">"]);
     assert_eq!(at(src, b.children[0].range), "a\n> b");
     assert_eq!(at(src, b.range), "> a\n> b");
@@ -322,35 +401,34 @@ fn block_quote_has_one_marker_per_line() {
 fn lists_markers_tightness_and_tasks() {
     let src = "- [ ] a\n- [x] b\n\n  c\n";
     let list = only_block(src);
-    let BlockKind::List {
-        ordered: false,
-        delimiter: ListDelimiter::Dash,
-        tight: false,
-        ..
-    } = list.kind
-    else {
-        panic!("unexpected list {:?}", list.kind)
-    };
-    let first = &list.children[0];
-    let BlockKind::ListItem {
-        marker,
-        task: Some(t),
-    } = &first.kind
-    else {
-        panic!("no task")
-    };
     assert_eq!(
-        (at(src, *marker), t.checked, at(src, t.checkbox)),
-        ("-", false, "[ ]")
+        list.kind,
+        BlockKind::List {
+            ordered: false,
+            start: 0,
+            delimiter: ListDelimiter::Dash,
+            tight: false,
+        }
+    );
+    let first = &list.children[0];
+    assert_eq!(
+        first.kind,
+        BlockKind::ListItem {
+            marker: span(src, "-"),
+            task: Some(Task {
+                checked: false,
+                checkbox: span(src, "[ ]"),
+            }),
+        }
     );
     assert_eq!(texts(src, &first.markers), ["-", "[ ]"]);
     assert_eq!(at(src, first.children[0].range), "a");
     let second = &list.children[1];
-    assert!(matches!(&second.kind, BlockKind::ListItem { task: Some(t), .. } if t.checked));
+    assert_eq!(second.task().map(|t| t.checked), Some(true));
     assert_eq!(second.children.len(), 2);
 
     let tight = only_block("1. a\n2. b\n");
-    assert!(matches!(
+    assert_eq!(
         tight.kind,
         BlockKind::List {
             ordered: true,
@@ -358,17 +436,18 @@ fn lists_markers_tightness_and_tasks() {
             delimiter: ListDelimiter::Period,
             tight: true
         }
-    ));
+    );
     let src = "3) a\n";
     let paren = only_block(src);
-    assert!(matches!(
+    assert_eq!(
         paren.kind,
         BlockKind::List {
+            ordered: true,
             start: 3,
             delimiter: ListDelimiter::Paren,
-            ..
+            tight: true,
         }
-    ));
+    );
     assert_eq!(at(src, paren.children[0].markers[0]), "3)");
 }
 
@@ -376,9 +455,7 @@ fn lists_markers_tightness_and_tasks() {
 fn fenced_and_indented_code() {
     let src = "```rust title\nlet a;\n```\n";
     let b = only_block(src);
-    let BlockKind::CodeBlock(code) = &b.kind else {
-        panic!("no code")
-    };
+    let code = code_of(&b.kind).expect("a code block");
     let fence = code.fence.expect("fenced");
     assert_eq!((fence.ch, fence.len), ('`', 3));
     assert_eq!(at(src, fence.open), "```");
@@ -392,16 +469,12 @@ fn fenced_and_indented_code() {
 
     let src = "    a\n\n    b\n";
     let b = only_block(src);
-    let BlockKind::CodeBlock(code) = &b.kind else {
-        panic!("no code")
-    };
+    let code = code_of(&b.kind).expect("a code block");
     assert!(code.fence.is_none());
     assert_eq!(code.text(src), "a\n\nb\n");
 
     let open = only_block("~~~\nx");
-    let BlockKind::CodeBlock(code) = &open.kind else {
-        panic!("no code")
-    };
+    let code = code_of(&open.kind).expect("a code block");
     assert!(code.fence.expect("fenced").close.is_none());
 }
 
@@ -409,9 +482,7 @@ fn fenced_and_indented_code() {
 fn tab_indentation_pads_verbatim_lines() {
     let src = ">\t\tfoo\n";
     let b = only_block(src);
-    let BlockKind::CodeBlock(code) = &b.children[0].kind else {
-        panic!("no code")
-    };
+    let code = code_of(&b.children[0].kind).expect("a code block");
     assert_eq!(code.lines[0].pad, 2);
     assert_eq!(code.text(src), "  foo\n");
 }
@@ -420,9 +491,7 @@ fn tab_indentation_pads_verbatim_lines() {
 fn table_structure_and_ranges() {
     let src = "| a | b |\n|:--|--:|\n| 1 | **2** |\n";
     let b = only_block(src);
-    let BlockKind::Table(t) = &b.kind else {
-        panic!("no table")
-    };
+    let t = table_of(&b.kind).expect("a table");
     assert_eq!(t.alignments, [Alignment::Left, Alignment::Right]);
     assert_eq!(at(src, t.delimiter), "|:--|--:|");
     assert_eq!(texts(src, &b.markers), ["|:--|--:|"]);
@@ -432,20 +501,17 @@ fn table_structure_and_ranges() {
     assert_eq!(at(src, t.header.cells[0].content), "a");
     assert_eq!(t.rows.len(), 1);
     let strong = &t.rows[0].cells[1].inlines[0];
-    assert!(matches!(strong.kind, InlineKind::Strong));
+    assert_eq!(strong.kind, InlineKind::Strong);
     assert_eq!(texts(src, &strong.markers), ["**", "**"]);
     assert_eq!(at(src, b.range), "| a | b |\n|:--|--:|\n| 1 | **2** |");
-    assert!(!matches!(
-        parse_document("| a |\n").blocks[0].kind,
-        BlockKind::Table(_)
-    ));
+    assert!(table_of(&parse_document("| a |\n").blocks[0].kind).is_none());
 }
 
 #[test]
 fn math_inline_and_display() {
     let src = "a $x^2$ b";
     let i = &parse_document(src).blocks[0].inlines[1];
-    assert!(matches!(i.kind, InlineKind::InlineMath));
+    assert_eq!(i.kind, InlineKind::InlineMath);
     assert_eq!(texts(src, &i.markers), ["$", "$"]);
     assert_eq!(at(src, i.content), "x^2");
     let plain = parse_document("costs $5 and $6\n");
@@ -458,57 +524,59 @@ fn math_inline_and_display() {
 
     let src = "$$\na+b\n$$\n";
     let b = only_block(src);
-    let BlockKind::MathBlock(m) = &b.kind else {
-        panic!("no math")
-    };
+    let m = math_of(&b.kind).expect("a math block");
     assert!(m.closed);
     assert_eq!(m.text(src), "a+b");
     assert_eq!(texts(src, &b.markers), ["$$", "$$"]);
     assert_eq!(at(src, b.range), "$$\na+b\n$$");
     let one = only_block("$$x$$\n");
-    assert!(matches!(&one.kind, BlockKind::MathBlock(m) if m.closed && m.text("$$x$$\n") == "x"));
+    let m = math_of(&one.kind).expect("a math block");
+    assert!(m.closed);
+    assert_eq!(m.text("$$x$$\n"), "x");
     let unclosed = only_block("$$\nx\n");
-    assert!(matches!(&unclosed.kind, BlockKind::MathBlock(m) if !m.closed));
+    assert!(!math_of(&unclosed.kind).expect("a math block").closed);
 }
 
 #[test]
 fn front_matter_yaml_and_toml() {
     let src = "---\ntitle: x\n---\n# H\n";
     let doc = parse_document(src);
-    assert!(matches!(
+    assert_eq!(
         doc.blocks[0].kind,
         BlockKind::FrontMatter {
             format: FrontMatterFormat::Yaml
         }
-    ));
+    );
     assert_eq!(texts(src, &doc.blocks[0].markers), ["---", "---"]);
     assert_eq!(at(src, doc.blocks[0].content), "title: x\n");
-    assert!(matches!(doc.blocks[1].kind, BlockKind::Heading { .. }));
+    assert_eq!(doc.blocks[1].heading_level(), Some(1));
     let toml = parse_document("+++\na = 1\n+++\n");
-    assert!(matches!(
+    assert_eq!(
         toml.blocks[0].kind,
         BlockKind::FrontMatter {
             format: FrontMatterFormat::Toml
         }
-    ));
+    );
     let none = parse_document("---\nfoo\n");
-    assert!(matches!(none.blocks[0].kind, BlockKind::ThematicBreak));
+    assert_eq!(none.blocks[0].kind, BlockKind::ThematicBreak);
 }
 
 #[test]
 fn callout_tag_title_and_body() {
     let src = "> [!NOTE] My title\n> body text\n";
     let b = only_block(src);
-    let BlockKind::Callout { kind, tag, title } = &b.kind else {
-        panic!("no callout: {:?}", b.kind)
-    };
-    assert_eq!(*kind, CalloutKind::Note);
-    assert_eq!(at(src, *tag), "[!NOTE]");
-    assert_eq!(at(src, title.expect("title")), "My title");
+    assert_eq!(
+        b.kind,
+        BlockKind::Callout {
+            kind: CalloutKind::Note,
+            tag: span(src, "[!NOTE]"),
+            title: Some(span(src, "My title")),
+        }
+    );
     assert_eq!(texts(src, &b.markers), [">", "[!NOTE]", ">"]);
     assert_eq!(at(src, b.children[0].range), "body text");
     let plain = only_block("> [!NOPE] x\n");
-    assert!(matches!(plain.kind, BlockKind::BlockQuote));
+    assert_eq!(plain.kind, BlockKind::BlockQuote);
 }
 
 #[test]
@@ -528,7 +596,7 @@ fn callout_range_covers_the_tag_line_and_its_title() {
         let callout = doc
             .iter_blocks()
             .find(|b| matches!(b.kind, BlockKind::Callout { .. }))
-            .unwrap_or_else(|| panic!("no callout in {src:?}"));
+            .expect("the source holds a callout");
         assert_eq!(at(src, callout.range), range, "{src:?}");
         assert!(callout.range.contains_range(callout.content));
     }
@@ -541,9 +609,9 @@ fn callout_range_covers_the_tag_line_and_its_title() {
 fn page_break_and_thematic_break() {
     let src = "<!-- pagebreak -->\n\n***\n";
     let doc = parse_document(src);
-    assert!(matches!(doc.blocks[0].kind, BlockKind::PageBreak));
+    assert_eq!(doc.blocks[0].kind, BlockKind::PageBreak);
     assert_eq!(at(src, doc.blocks[0].range), "<!-- pagebreak -->");
-    assert!(matches!(doc.blocks[1].kind, BlockKind::ThematicBreak));
+    assert_eq!(doc.blocks[1].kind, BlockKind::ThematicBreak);
     assert_eq!(texts(src, &doc.blocks[1].markers), ["***"]);
 }
 
@@ -551,9 +619,7 @@ fn page_break_and_thematic_break() {
 fn raw_html_is_kept_as_nodes() {
     let src = "<div>\nx\n</div>\n\na <b>c</b>\n";
     let doc = parse_document(src);
-    let BlockKind::HtmlBlock(h) = &doc.blocks[0].kind else {
-        panic!("no html block")
-    };
+    let h = html_of(&doc.blocks[0].kind).expect("an html block");
     assert_eq!((h.kind, h.text(src)), (6, "<div>\nx\n</div>\n".to_string()));
     assert!(
         doc.blocks[1]
@@ -589,11 +655,18 @@ fn list_delimiters_report_their_marker_character() {
         ("1) a\n", Paren, ')'),
     ] {
         let list = only_block(src);
-        let BlockKind::List { delimiter: got, .. } = list.kind else {
-            panic!("not a list: {src:?}")
-        };
-        assert_eq!(got, delimiter, "{src:?}");
-        assert_eq!(got.as_char(), ch, "{src:?}");
+        let ordered = ".)".contains(ch);
+        assert_eq!(
+            list.kind,
+            BlockKind::List {
+                ordered,
+                start: u32::from(ordered),
+                delimiter,
+                tight: true,
+            },
+            "{src:?}"
+        );
+        assert_eq!(delimiter.as_char(), ch, "{src:?}");
         assert!(
             at(src, list.children[0].markers[0]).ends_with(ch),
             "{src:?}"
@@ -637,7 +710,7 @@ fn path_at_descends_through_table_rows_cells_and_inlines() {
     let innermost = doc.innermost_at(two).expect("inside a cell");
     assert_eq!(at(src, innermost.range()), "2");
     let block = doc.block_at(two).expect("inside the table");
-    assert!(matches!(block.kind, BlockKind::Table(_)));
+    assert!(table_of(&block.kind).is_some());
 }
 
 #[test]
@@ -794,31 +867,39 @@ fn changed_labels_report_additions_removals_and_edits() {
 #[test]
 fn html_block_condition_six_accepts_self_closing_block_tags_only() {
     let hr = only_block("<hr/>\n");
-    assert!(matches!(&hr.kind, BlockKind::HtmlBlock(h) if h.kind == 6));
+    assert_eq!(html_of(&hr.kind).map(|h| h.kind), Some(6));
     let not_a_tag = only_block("<hr/x>\n");
-    assert!(matches!(not_a_tag.kind, BlockKind::Paragraph));
+    assert_eq!(not_a_tag.kind, BlockKind::Paragraph);
 }
 
 #[test]
 fn footnote_range_reaches_the_end_of_a_nested_heading() {
     let src = "[^a]: # Title ##\n";
     let doc = parse_document(src);
-    assert!(matches!(
+    assert_eq!(
         doc.blocks[0].kind,
-        BlockKind::FootnoteDefinition { .. }
-    ));
+        BlockKind::FootnoteDefinition {
+            label: "a".to_string()
+        }
+    );
     let range = doc.definitions.footnote("a").expect("defined");
     assert_eq!(at(src, range), "[^a]: # Title ##");
+}
+
+#[test]
+fn footnote_range_reaches_the_end_of_a_nested_fence_info() {
+    // A fence that is never closed has no lines: its info string is the last thing it covers.
+    let src = "[^a]: x\n\n    ```rust\n";
+    let doc = parse_document(src);
+    let range = doc.definitions.footnote("a").expect("defined");
+    assert_eq!(at(src, range), "[^a]: x\n\n    ```rust");
 }
 
 #[test]
 fn malformed_link_reference_definitions_stay_paragraphs() {
     for src in ["[a]: )\n", "[\u{a0}]: /url\n", "[a]:\n", "[a]: <b\n"] {
         let doc = parse_document(src);
-        assert!(
-            matches!(doc.blocks[0].kind, BlockKind::Paragraph),
-            "{src:?}"
-        );
+        assert_eq!(doc.blocks[0].kind, BlockKind::Paragraph, "{src:?}");
         assert_eq!(doc.definitions.links().count(), 0, "{src:?}");
     }
 }
@@ -827,7 +908,7 @@ fn malformed_link_reference_definitions_stay_paragraphs() {
 fn highlight_color_suffix_that_cannot_open_falls_back_to_a_plain_highlight() {
     let src = "=={red} x==";
     let i = first_inline(src);
-    assert!(matches!(i.kind, InlineKind::Highlight { color: None }));
+    assert_eq!(i.kind, InlineKind::Highlight { color: None });
     assert_eq!(texts(src, &i.markers), ["==", "=="]);
     assert_eq!(at(src, i.content), "{red} x");
 
@@ -837,10 +918,7 @@ fn highlight_color_suffix_that_cannot_open_falls_back_to_a_plain_highlight() {
         ("=={red x==", "{red x"),
     ] {
         let i = first_inline(src);
-        assert!(
-            matches!(i.kind, InlineKind::Highlight { color: None }),
-            "{src}"
-        );
+        assert_eq!(i.kind, InlineKind::Highlight { color: None }, "{src}");
         assert_eq!(at(src, i.content), content, "{src}");
     }
 }
@@ -851,7 +929,7 @@ fn runs_of_equals_and_tildes_longer_than_a_marker_are_text() {
     for src in ["x ===a===", "x ~~~a~~~"] {
         let inlines = parse_document(src).blocks[0].inlines.clone();
         assert_eq!(inlines.len(), 1, "{src}");
-        assert!(matches!(inlines[0].kind, InlineKind::Text), "{src}");
+        assert_eq!(inlines[0].kind, InlineKind::Text, "{src}");
         assert_eq!(at(src, inlines[0].range), src);
     }
 }
@@ -860,7 +938,7 @@ fn runs_of_equals_and_tildes_longer_than_a_marker_are_text() {
 fn tilde_runs_of_different_lengths_do_not_pair() {
     let src = "~~a~ b~~";
     let i = first_inline(src);
-    assert!(matches!(i.kind, InlineKind::Strikethrough));
+    assert_eq!(i.kind, InlineKind::Strikethrough);
     assert_eq!(at(src, i.content), "a~ b");
 }
 
@@ -933,20 +1011,16 @@ fn html_img_tags_without_a_usable_src_stay_raw_html() {
 fn html_img_attributes_are_case_insensitive_and_may_be_unquoted_or_spaced() {
     let src = "x <IMG SRC='a.png' ALT=pic WIDTH=40px HEIGHT = \"tall\" title=\"T\"> y";
     let doc = parse_document(src);
-    let InlineKind::Image(img) = &doc.blocks[0].inlines[1].kind else {
-        panic!("not an image")
-    };
+    let img = image_of(&doc.blocks[0].inlines[1].kind).expect("an image");
     assert_eq!(img.dest, "a.png");
     assert_eq!(img.title.as_deref(), Some("T"));
     assert_eq!(at(src, img.alt), "pic");
     assert_eq!((img.width, img.height), (Some(40), None));
-    assert!(matches!(img.kind, ImageKind::Html));
+    assert_eq!(img.kind, ImageKind::Html);
 
     let src = "x <img src = \"a.png\"> y";
     let doc = parse_document(src);
-    let InlineKind::Image(img) = &doc.blocks[0].inlines[1].kind else {
-        panic!("not an image")
-    };
+    let img = image_of(&doc.blocks[0].inlines[1].kind).expect("an image");
     assert_eq!(img.dest, "a.png");
 }
 
@@ -1054,10 +1128,12 @@ fn email_autolinks_extend_over_prefixes_and_preceding_tokens() {
     let one = |text: &str, dest: &str| vec![(text.to_string(), dest.to_string())];
     assert_eq!(found("`x`ab@c.com"), one("ab@c.com", "mailto:ab@c.com"));
     let after_code = parse_document("`x`ab@c.com");
-    assert!(matches!(
+    assert_eq!(
         after_code.blocks[0].inlines[0].kind,
-        InlineKind::Code { .. }
-    ));
+        InlineKind::Code {
+            text: "x".to_string()
+        }
+    );
     assert_eq!(found("x a@b.com"), one("a@b.com", "mailto:a@b.com"));
     assert_eq!(found("a_b@c.com"), one("a_b@c.com", "mailto:a_b@c.com"));
     assert_eq!(
@@ -1083,9 +1159,7 @@ fn image_size_suffix_needs_complete_numbers() {
         ("![a|99999999999x2](u.png)", "a|99999999999x2"),
     ] {
         let i = first_inline(src);
-        let InlineKind::Image(img) = &i.kind else {
-            panic!("not an image: {src}")
-        };
+        let img = image_of(&i.kind).expect("an image");
         assert_eq!((img.width, img.height), (None, None), "{src}");
         assert_eq!(at(src, img.alt), alt, "{src}");
     }
@@ -1093,7 +1167,7 @@ fn image_size_suffix_needs_complete_numbers() {
 
 #[test]
 fn entity_decoding_handles_numeric_named_and_malformed_references() {
-    let decode = |s: &str| scan::decode_entity(s.as_bytes());
+    let decode = scan::decode_entity;
     let some = |text: &str, used: usize| Some((text.to_string(), used));
     assert_eq!(decode("x&amp;"), None, "must start at the ampersand");
     assert_eq!(decode("&amp;rest"), some("&", 5));
@@ -1131,6 +1205,11 @@ fn unescape_resolves_backslashes_and_entities_only() {
         "a*b \\a & © # &nope; & é"
     );
     assert_eq!(super::unescape_markdown("\\#x &lt;"), "#x <");
+    assert_eq!(
+        scan::unescape("ü\\*日\\&amp;😀&amp;"),
+        "ü*日&amp;😀&",
+        "characters of two, three and four bytes pass through whole"
+    );
 }
 
 #[test]
@@ -1221,8 +1300,11 @@ fn tags_are_recognized_with_their_attribute_syntax() {
     assert_eq!(closing("<a>"), None);
     assert_eq!(closing("</1>"), None);
     assert_eq!(closing("</a-b1 \n>"), Some(9));
+    assert_eq!(closing("</"), None, "nothing behind the slash");
 
     let open = |s: &str| scan::open_tag_end(s.as_bytes(), 0);
+    assert_eq!(open("<"), None, "nothing behind the bracket");
+    assert_eq!(open("<a b="), None, "the value is missing");
     assert_eq!(open("<a/>"), Some(4));
     assert_eq!(open("<a b>"), Some(5));
     assert_eq!(open("<a b= c>"), Some(8));
@@ -1298,10 +1380,7 @@ fn source_maps_joined_lines_back_to_document_offsets() {
 #[test]
 fn callout_tags_must_be_closed_and_followed_by_a_space() {
     for src in ["> [!NOTE\n", "> [!NOTE]x\n", "> plain\n"] {
-        assert!(
-            matches!(only_block(src).kind, BlockKind::BlockQuote),
-            "{src:?}"
-        );
+        assert_eq!(only_block(src).kind, BlockKind::BlockQuote, "{src:?}");
     }
 }
 
@@ -1318,10 +1397,11 @@ fn task_checkboxes_need_a_state_a_space_and_text() {
         ("- [ ]  \n", None),
     ] {
         let list = only_block(src);
-        let BlockKind::ListItem { task, .. } = &list.children[0].kind else {
-            panic!("not a list item: {src:?}")
-        };
-        assert_eq!(task.map(|t| t.checked), checked, "{src:?}");
+        assert_eq!(
+            list.children[0].task().map(|t| t.checked),
+            checked,
+            "{src:?}"
+        );
     }
 }
 
@@ -1342,8 +1422,6 @@ fn highlight_color_and_task_accessors_are_none_for_other_nodes() {
 
 #[test]
 fn code_language_and_math_text_of_degenerate_blocks() {
-    use crate::markdown::ast::{CodeBlock, MathBlock};
-
     // An info range that does not address the source (stale tree) has no language.
     let stale = CodeBlock {
         fence: None,
@@ -1364,4 +1442,196 @@ fn code_language_and_math_text_of_degenerate_blocks() {
         closed: false,
     };
     assert_eq!(empty.text("$$\n"), "");
+}
+
+// The cases below mirror `tests/parse_edges.rs`: the parser is compiled once for the unit tests
+// and once for everything else, and both builds must run these branches.
+
+fn top_kinds(src: &str) -> Vec<InlineKind> {
+    let doc = parse_document(src);
+    doc.blocks[0]
+        .inlines
+        .iter()
+        .map(|i| i.kind.clone())
+        .collect()
+}
+
+/// One paragraph in which nothing is a construct.
+fn is_plain_paragraph(src: &str) -> bool {
+    let doc = parse_document(src);
+    doc.blocks.len() == 1
+        && doc.blocks[0].kind == BlockKind::Paragraph
+        && doc.blocks[0]
+            .inlines
+            .iter()
+            .flat_map(Inline::descendants)
+            .all(|i| i.kind == InlineKind::Text)
+}
+
+fn autolink(dest: &str) -> InlineKind {
+    InlineKind::Link(Link {
+        dest: dest.to_string(),
+        title: None,
+        kind: LinkKind::Autolink { angle: false },
+    })
+}
+
+#[test]
+fn html_block_types_six_and_seven_differ_in_the_tag_boundary_and_in_interrupting() {
+    let hr = only_block("<hr/>\nx\n");
+    let html = html_of(&hr.kind).expect("an html block");
+    assert_eq!(
+        (html.kind, html.text("<hr/>\nx\n")),
+        (6, "<hr/>\nx\n".into())
+    );
+    let custom = only_block("<div-x>\nx\n");
+    let html = html_of(&custom.kind).expect("an html block");
+    assert_eq!(
+        (html.kind, html.text("<div-x>\nx\n")),
+        (7, "<div-x>\nx\n".into())
+    );
+    let interrupted = parse_document("para\n<hr/>\n");
+    assert_eq!(interrupted.blocks.len(), 2);
+    assert_eq!(interrupted.blocks[0].kind, BlockKind::Paragraph);
+    assert_eq!(
+        html_of(&interrupted.blocks[1].kind).map(|h| h.kind),
+        Some(6)
+    );
+    let continued = only_block("para\n<div-x>\n");
+    assert_eq!(continued.kind, BlockKind::Paragraph);
+}
+
+#[test]
+fn tags_that_the_text_cuts_short_are_not_html() {
+    for src in [
+        "</\n",
+        "<\n",
+        "<a b=\n",
+        "<a b=>\n",
+        "<a b='x\n",
+        "x </",
+        "x <",
+        "x <a b=",
+        "x <a b=>",
+    ] {
+        assert!(is_plain_paragraph(src), "{src:?}");
+    }
+}
+
+#[test]
+fn near_misses_of_blocks_stay_paragraphs() {
+    let footnote = parse_document("[^a] text\n");
+    assert_eq!(footnote.blocks.len(), 1);
+    assert_eq!(footnote.blocks[0].kind, BlockKind::Paragraph);
+    assert!(!footnote.definitions.has_footnote("a"));
+
+    let definition = parse_document("[a]: /url trailing\n");
+    assert_eq!(definition.blocks.len(), 1);
+    assert_eq!(definition.blocks[0].kind, BlockKind::Paragraph);
+    assert!(definition.definitions.link("a").is_none());
+
+    let delimiter = only_block("a\n:--\n");
+    assert_eq!(delimiter.kind, BlockKind::Paragraph);
+    assert!(table_of(&only_block("a\n|-|\n").kind).is_some());
+
+    let after_dollars = parse_document("$$a$$b\n");
+    assert!(
+        after_dollars
+            .blocks
+            .iter()
+            .all(|b| b.kind == BlockKind::Paragraph)
+    );
+    for src in ["$$$$\n", "$$ $$\n"] {
+        let blank = only_block(src);
+        let math = math_of(&blank.kind).expect("a math block");
+        assert!(math.closed && math.lines.is_empty(), "{src:?}");
+    }
+
+    let nine = only_block("999999999. a\n");
+    assert_eq!(
+        nine.kind,
+        BlockKind::List {
+            ordered: true,
+            start: 999_999_999,
+            delimiter: ListDelimiter::Period,
+            tight: true,
+        }
+    );
+    assert_eq!(only_block("1234567890. a\n").kind, BlockKind::Paragraph);
+}
+
+#[test]
+fn flanking_looks_at_punctuation_and_whitespace_on_both_sides_of_a_run() {
+    assert!(is_plain_paragraph("a*\"foo\"*"));
+    assert_eq!(
+        top_kinds("(*foo*)"),
+        [InlineKind::Text, InlineKind::Emphasis, InlineKind::Text]
+    );
+    // A color tag without content cannot open; the `==` is then judged by what follows it.
+    assert!(is_plain_paragraph("a=={red}"));
+    assert!(is_plain_paragraph(".=={red}"));
+}
+
+#[test]
+fn bracket_text_that_is_not_a_label_cannot_be_a_reference() {
+    assert!(is_plain_paragraph("[a [b] c][]"));
+    assert!(is_plain_paragraph("[a [b] c][x"));
+}
+
+#[test]
+fn extended_autolinks_depend_on_the_character_in_front() {
+    assert_eq!(
+        top_kinds("(www.example.com)"),
+        [
+            InlineKind::Text,
+            autolink("http://www.example.com"),
+            InlineKind::Text
+        ]
+    );
+    assert!(is_plain_paragraph("xwww.example.com"));
+    assert_eq!(
+        top_kinds("`x`foo@bar.com"),
+        [
+            InlineKind::Code {
+                text: "x".to_string()
+            },
+            autolink("mailto:foo@bar.com")
+        ]
+    );
+}
+
+#[test]
+fn angle_autolink_schemes_may_hold_plus_dot_and_dash_but_not_underscore() {
+    let dest = |src: &str| first_inline(src).kind;
+    assert_eq!(
+        link_of(&dest("<git+ssh://host/x>")).map(|l| l.dest.as_str()),
+        Some("git+ssh://host/x")
+    );
+    assert_eq!(
+        link_of(&dest("<a.b-c:d>")).map(|l| l.dest.as_str()),
+        Some("a.b-c:d")
+    );
+    assert!(link_of(&dest("<a_b:c>")).is_none());
+}
+
+#[test]
+fn image_sizes_need_a_bar_in_front_of_their_digits() {
+    for (src, alt) in [
+        ("![alt 300](p.png)", "alt 300"),
+        ("![300](p.png)", "300"),
+        ("![ax300](p.png)", "ax300"),
+    ] {
+        let inline = first_inline(src);
+        let image = image_of(&inline.kind).expect("an image");
+        assert_eq!((image.width, image.height), (None, None), "{src:?}");
+        assert_eq!(at(src, image.alt), alt, "{src:?}");
+    }
+}
+
+#[test]
+fn link_destinations_and_titles_keep_multi_byte_characters() {
+    let inline = first_inline("[a](/日本/😀 \"ü日😀\")");
+    let link = link_of(&inline.kind).expect("a link");
+    assert_eq!(link.dest, "/日本/😀");
+    assert_eq!(link.title.as_deref(), Some("ü日😀"));
 }

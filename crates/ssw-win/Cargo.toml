@@ -15,6 +15,8 @@ workspace = true
 [features]
 # Tests only: lets `fault::arm` make the n-th checked system call fail (see src/fault.rs).
 fault-injection = []
+# Tests only: `testing::PrivateDesktop`, a desktop of its own to show and raise windows on.
+test-support = []
 
 [dependencies]
 ssw-core = { path = "../ssw-core" }
@@ -68,6 +70,7 @@ windows = { version = "0.62", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Search",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",

@@ -294,3 +294,17 @@ fn only_panics_of_the_ui_thread_trigger_the_dump_and_emergency_save() {
     panic_on_new_thread(|| {});
     assert_eq!(second_probe.calls(), 1);
 }
+
+/// This test never calls `install`: when it runs first in its process (always, under nextest)
+/// the filter finds no handler configured and has nothing to dump or save. The verdict is the
+/// same when another test's handler is installed already, so it holds in a shared process too.
+#[test]
+fn the_exception_filter_without_a_handler_still_ends_the_process_quietly() {
+    let _serial = serial();
+    // SAFETY: a null pointer is allowed.
+    let verdict = unsafe { unhandled_exception_filter(std::ptr::null()) };
+    assert_eq!(verdict, EXCEPTION_EXECUTE_HANDLER);
+    // SAFETY: as above; the recursion guard was released by the first call.
+    let again = unsafe { unhandled_exception_filter(std::ptr::null()) };
+    assert_eq!(again, EXCEPTION_EXECUTE_HANDLER);
+}

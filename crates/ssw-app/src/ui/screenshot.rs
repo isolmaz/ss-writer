@@ -398,11 +398,15 @@ mod tests {
         }
     }
 
-    fn ready(state: ObjectState) -> ObjectInfo {
+    fn ready_info(state: ObjectState) -> Option<ObjectInfo> {
         match state {
-            ObjectState::Ready(info) => info,
-            other => panic!("expected a ready object, got {other:?}"),
+            ObjectState::Ready(info) => Some(info),
+            _ => None,
         }
+    }
+
+    fn ready(state: ObjectState) -> ObjectInfo {
+        ready_info(state).expect("a ready object")
     }
 
     #[test]
@@ -433,13 +437,14 @@ mod tests {
         );
         assert_eq!(visuals.objects.count(), 1);
         let diagram = request(ObjectKind::Mermaid, "graph TD\n  A[Start] --> B[End]\n");
-        assert!(matches!(
+        assert_eq!(
             ready(visuals.objects.object(&diagram)).visual,
-            ObjectVisual::Scene(_)
-        ));
+            ObjectVisual::Scene(SceneId(2))
+        );
         assert_eq!(visuals.objects.count(), 2);
         let broken = request(ObjectKind::Math, "\\frac{1");
         assert_eq!(visuals.objects.object(&broken), ObjectState::Failed);
+        assert_eq!(ready_info(visuals.objects.object(&broken)), None);
         let nonsense = request(ObjectKind::Mermaid, "this is not mermaid");
         assert_eq!(visuals.objects.object(&nonsense), ObjectState::Failed);
         assert_eq!(visuals.objects.count(), 2);
@@ -468,7 +473,7 @@ mod tests {
         visuals.set_base(Some(tmp.path().to_path_buf()));
         let natural = ready(visuals.objects.object(&pic));
         assert_eq!(natural.size, Size::new(4.0, 2.0));
-        assert!(matches!(natural.visual, ObjectVisual::Image(_)));
+        assert_eq!(natural.visual, ObjectVisual::Image(ImageId(1)));
         for (width, height, expected) in [
             (Some(8), None, Size::new(8.0, 4.0)),
             (None, Some(6), Size::new(12.0, 6.0)),
@@ -483,12 +488,14 @@ mod tests {
         }
         let absolute = tmp.path().join("pic.png");
         let absolute = absolute.to_string_lossy();
-        assert!(matches!(
-            visuals
-                .objects
-                .object(&request(ObjectKind::Image, &absolute)),
-            ObjectState::Ready(_)
-        ));
+        assert!(
+            ready_info(
+                visuals
+                    .objects
+                    .object(&request(ObjectKind::Image, &absolute))
+            )
+            .is_some()
+        );
         let remote = request(ObjectKind::Image, "https://example.com/a.png");
         assert_eq!(visuals.objects.object(&remote), ObjectState::Blocked);
         let missing = request(ObjectKind::Image, "missing.png");
@@ -509,9 +516,9 @@ mod tests {
                     draws += 1;
                     let state = objects.object(&request(ObjectKind::DisplayMath, "x^2"));
                     let info = ready(state);
-                    if let ObjectVisual::Scene(id) = info.visual {
-                        canvas.draw_scene(id, Rect::new(2.0, 2.0, 50.0, 30.0));
-                    }
+                    // The first (and only) object is the scene number one.
+                    assert_eq!(info.visual, ObjectVisual::Scene(SceneId(1)));
+                    canvas.draw_scene(SceneId(1), Rect::new(2.0, 2.0, 50.0, 30.0));
                     canvas.fill_rect(
                         Rect::new(0.0, 36.0, 60.0, 4.0),
                         Color::from_rgb_u32(0xFF0000),
@@ -563,13 +570,87 @@ mod tests {
     }
 
     #[test]
-    fn without_com_the_renderer_reports_why_it_cannot_start() {
-        // A fresh thread has no COM apartment.
-        let error = std::thread::spawn(|| Visuals::new().unwrap_err())
-            .join()
+    fn the_objects_describe_how_many_scenes_and_images_they_hold() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let visuals = Visuals::new().unwrap();
+        assert_eq!(
+            format!("{:?}", visuals.objects),
+            "OffscreenObjects { scenes: 0, images: 0, .. }"
+        );
+        ready(visuals.objects.object(&request(ObjectKind::Math, "x")));
+        assert_eq!(
+            format!("{:?}", visuals.objects),
+            "OffscreenObjects { scenes: 1, images: 0, .. }"
+        );
+    }
+
+    #[test]
+    fn diagrams_are_typeset_for_the_text_color_of_the_theme() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let visuals = Visuals::new().unwrap();
+        let source = "graph TD\n  A[Start] --> B[End]\n";
+        let dark_text = ObjectRequest {
+            text_color: Color::WHITE,
+            ..request(ObjectKind::Mermaid, source)
+        };
+        let dark = ready(visuals.objects.object(&dark_text));
+        let light = ready(
+            visuals
+                .objects
+                .object(&request(ObjectKind::Mermaid, source)),
+        );
+        assert_eq!(dark.visual, ObjectVisual::Scene(SceneId(1)));
+        assert_eq!(light.visual, ObjectVisual::Scene(SceneId(2)));
+        assert_eq!(visuals.objects.count(), 2, "one scene per theme");
+    }
+
+    #[test]
+    fn registered_images_are_drawn_and_a_damaged_one_fails_the_render() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let visuals = Visuals::new().unwrap();
+        let geometry = Geometry::new(20, 20, 1.0).unwrap();
+        visuals.objects.images.borrow_mut().push((
+            ImageId(7),
+            DecodedImage {
+                width: 2,
+                height: 2,
+                bgra: vec![255; 16],
+            },
+        ));
+        let png = visuals
+            .render(geometry, Color::WHITE, &mut |canvas: &mut dyn Canvas| {
+                canvas.draw_image(ImageId(7), Rect::new(0.0, 0.0, 10.0, 10.0), 1.0);
+            })
             .unwrap();
+        assert_eq!(visuals.wic.decode(&png).unwrap().width, 20);
+        // The buffer of the image does not fit its size: the bitmap cannot be registered.
+        visuals.objects.images.borrow_mut().push((
+            ImageId(8),
+            DecodedImage {
+                width: 4,
+                height: 4,
+                bgra: vec![0; 3],
+            },
+        ));
+        let error = visuals
+            .render(geometry, Color::WHITE, &mut |_: &mut dyn Canvas| {})
+            .unwrap_err();
         assert!(
-            error.contains("cannot start the screenshot renderer"),
+            error.starts_with("cannot render the screenshot:"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn a_renderer_that_cannot_start_reports_why() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        // The first system call of the renderer (creating the WIC factory) fails.
+        ssw_win::fault::arm(0);
+        let error = Visuals::new().unwrap_err();
+        ssw_win::fault::disarm();
+        assert!(
+            error.starts_with("cannot start the screenshot renderer: "),
             "{error}"
         );
     }

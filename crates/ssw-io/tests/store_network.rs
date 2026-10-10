@@ -459,6 +459,30 @@ fn a_body_that_does_not_match_its_content_length_is_rejected() {
 }
 
 #[test]
+fn a_connection_that_breaks_while_the_body_is_read_reports_that_failure() {
+    let http = ScriptedHttp::new();
+    let broken = NetError::Os {
+        call: "WinHttpReadData",
+        code: 12030,
+    };
+    http.respond_broken(
+        IMG,
+        &head(
+            "200 OK",
+            &[("Content-Type", "image/png"), ("Content-Length", "100")],
+        ),
+        b"first part",
+        broken.clone(),
+    );
+    // The part that arrived is not returned: the whole fetch fails with the break.
+    assert_eq!(
+        fetch(&http, IMG, &options(Accept::Image)).unwrap_err(),
+        broken
+    );
+    assert_eq!(http.requests(), [IMG]);
+}
+
+#[test]
 fn winhttp_reports_a_refused_connection_as_an_os_error() {
     let port = {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

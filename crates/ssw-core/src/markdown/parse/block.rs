@@ -503,7 +503,7 @@ impl<'a> BlockParser<'a> {
             NodeKind::Code {
                 fence: Some(fence),
                 fence_indent,
-                ..
+                info,
             } => {
                 if self.indent <= 3 && self.peek(self.next_nonspace) == Some(fence.ch as u8) {
                     let mut i = self.next_nonspace;
@@ -513,9 +513,14 @@ impl<'a> BlockParser<'a> {
                     let run = i - self.next_nonspace;
                     if run >= fence.len && is_blank_text(&self.src[i..self.line_end]) {
                         let close = TextRange::new(self.next_nonspace, i);
-                        if let NodeKind::Code { fence: Some(f), .. } = &mut self.nodes[id].kind {
-                            f.close = Some(close);
-                        }
+                        self.nodes[id].kind = NodeKind::Code {
+                            fence: Some(Fence {
+                                close: Some(close),
+                                ..fence
+                            }),
+                            fence_indent,
+                            info,
+                        };
                         self.nodes[id].markers.push(close);
                         self.finalize(id);
                         return Cont::LineDone;
@@ -553,7 +558,7 @@ impl<'a> BlockParser<'a> {
                     Cont::Matched
                 }
             }
-            NodeKind::Math { .. } => self.continue_math(id),
+            NodeKind::Math { open, .. } => self.continue_math(id, open),
         }
     }
 
@@ -573,7 +578,7 @@ impl<'a> BlockParser<'a> {
         }
     }
 
-    fn continue_math(&mut self, id: usize) -> Cont {
+    fn continue_math(&mut self, id: usize, open: TextRange) -> Cont {
         let line = &self.src[self.offset.min(self.line_end)..self.line_end];
         let trimmed = line.trim_end_matches([' ', '\t']);
         if trimmed.ends_with("$$") && !trimmed.ends_with("\\$$") {
@@ -586,9 +591,10 @@ impl<'a> BlockParser<'a> {
                 });
             }
             let close_range = TextRange::new(close_start, close_start + 2);
-            if let NodeKind::Math { close, .. } = &mut self.nodes[id].kind {
-                *close = Some(close_range);
-            }
+            self.nodes[id].kind = NodeKind::Math {
+                open,
+                close: Some(close_range),
+            };
             self.nodes[id].markers.push(close_range);
             self.finalize(id);
             Cont::LineDone
@@ -1032,7 +1038,10 @@ impl<'a> BlockParser<'a> {
                 Some(b')') => ListDelimiter::Paren,
                 _ => return None,
             };
-            let number: u32 = self.src[ns..i].parse().ok()?;
+            // At most nine digits, so the number fits in a `u32`.
+            let number = self.bytes[ns..i]
+                .iter()
+                .fold(0u32, |n, d| n * 10 + u32::from(d - b'0'));
             if matches!(self.kind(container), NodeKind::Paragraph) && number != 1 {
                 return None;
             }
@@ -1251,13 +1260,15 @@ impl<'a> BlockParser<'a> {
                 return;
             }
         }
-        if let Some(last) = self.nodes[id].lines.last_mut() {
-            let trimmed = trim_range(self.src, last.range);
-            last.range = TextRange::new(last.range.start, trimmed.end.max(last.range.start));
-        }
-        if let Some(start) = self.nodes[id].lines.first().map(|l| l.range.start) {
-            self.nodes[id].start = start;
-        }
+        // A paragraph is only ever finalized with a line: it starts with one, a table takes at
+        // most the lines before its delimiter row and leaves one, and the block above returns
+        // when the definitions take them all.
+        let src = self.src;
+        let node = &mut self.nodes[id];
+        let last = node.lines.last_mut().expect("paragraph has a line");
+        let trimmed = trim_range(src, last.range);
+        last.range = TextRange::new(last.range.start, trimmed.end.max(last.range.start));
+        node.start = node.lines[0].range.start;
     }
 
     /// Registers footnote definitions in document order (first definition of a label wins).
@@ -1458,7 +1469,8 @@ fn parse_delimiter_row(text: &str) -> Option<Vec<Alignment>> {
     let row = split_row(text, 0);
     let mut out = Vec::with_capacity(row.cells.len());
     for (_, content) in &row.cells {
-        let c = content.get(text)?;
+        // `split_row` cut the cells out of `text`, so the range is always valid.
+        let c = &text[content.start..content.end];
         let left = c.starts_with(':');
         let right = c.ends_with(':') && c.len() > 1;
         let dashes = c.trim_start_matches(':').trim_end_matches(':');
@@ -1472,12 +1484,9 @@ fn parse_delimiter_row(text: &str) -> Option<Vec<Alignment>> {
             (false, false) => Alignment::None,
         });
     }
-    // Everything outside the cells must be pipes or spaces.
-    let stripped: String = text
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '\t' | '|' | ':' | '-'))
-        .collect();
-    (!out.is_empty() && stripped.is_empty()).then_some(out)
+    // Outside the cells `split_row` leaves only pipes and the leading and trailing blanks, and
+    // every cell was checked above, so nothing else can be left over.
+    (!out.is_empty()).then_some(out)
 }
 
 // ------------------------------------------------------- link reference definitions

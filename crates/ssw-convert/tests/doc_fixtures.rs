@@ -38,7 +38,7 @@ fn golden_markdown() {
         "footnote",
         "endingnote",
         "innertable",
-        "table-merges",
+        "table-merges", // docs-check: not a message id
         "Lists",
         "test-fields",
         "HeaderFooterUnicode",

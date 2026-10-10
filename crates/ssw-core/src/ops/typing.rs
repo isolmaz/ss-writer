@@ -262,6 +262,17 @@ mod tests {
     }
 
     #[test]
+    fn enter_closes_nothing_after_a_fence_look_alike_in_indented_code() {
+        // Indented code is no fence: only the indentation is kept.
+        check("    ```‸", "    ```\n    ‸", enter_op);
+    }
+
+    #[test]
+    fn enter_in_an_item_whose_first_block_is_not_text_adds_no_item() {
+        check("- > a‸", "- > a\n‸", enter_op);
+    }
+
+    #[test]
     fn enter_continues_bullets_and_tasks() {
         for (before, after) in [
             ("- a‸", "- a\n- ‸"),

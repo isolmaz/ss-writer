@@ -185,16 +185,13 @@ impl Autosave {
         );
     }
 
-    fn back_up_untitled(&self, entry: &DocEntry, i18n: &Localizer) -> bool {
-        let Some(id) = entry.untitled_id() else {
-            return false;
-        };
+    fn back_up_untitled(&self, entry: &DocEntry, id: &str, i18n: &Localizer) -> bool {
         let text = entry.document().borrow().text();
         let env = self.docs.env();
         let now = env.clock.unix_seconds();
         let title = entry.title(i18n);
         let backup = RecoveryDoc {
-            id: &id,
+            id,
             kind: RecoveryKind::Untitled,
             original_path: None,
             display_name: &title,
@@ -208,7 +205,7 @@ impl Autosave {
                 u64::try_from(now).unwrap_or(0).saturating_mul(1000),
             )
             .is_ok();
-        let stored = env.store.borrow().untitled_put(&id, &text, now).is_ok();
+        let stored = env.store.borrow().untitled_put(id, &text, now).is_ok();
         recovered && stored
     }
 
@@ -304,21 +301,30 @@ impl Autosave {
                         self.emergency.remove(&recovery_id(entry));
                     }
                     Err(error) => {
-                        if let Some(track) = self.state.borrow_mut().tracks.get_mut(&entry.id()) {
-                            track.failed_version = Some(version);
-                        }
+                        // The track of this document was created above.
+                        self.state
+                            .borrow_mut()
+                            .tracks
+                            .entry(entry.id())
+                            .and_modify(|track| track.failed_version = Some(version));
                         report.failed.push((entry.id(), error));
                     }
                 }
             }
-            if dirty && backup_due && entry.is_untitled() && self.back_up_untitled(entry, i18n) {
+            if dirty
+                && backup_due
+                && let Some(id) = entry.untitled_id()
+                && self.back_up_untitled(entry, &id, i18n)
+            {
                 report.backed_up.push(entry.id());
             }
             if snapshot_pending && let Some(stored) = self.snapshot_if_due(entry) {
                 report.snapshots += usize::from(stored);
-                if let Some(track) = self.state.borrow_mut().tracks.get_mut(&entry.id()) {
-                    track.snapshot_version = version;
-                }
+                self.state
+                    .borrow_mut()
+                    .tracks
+                    .entry(entry.id())
+                    .and_modify(|track| track.snapshot_version = version);
             }
         }
         if purge_due {
@@ -740,14 +746,78 @@ mod tests {
             .unwrap();
         rig.clock.advance(HISTORY_PURGE_INTERVAL);
         let report = rig.autosave.tick(&rig.i18n);
+        let failure = report.purge_failed.expect("the purge was due");
         assert!(
-            matches!(report.purge_failed, Some(DocError::Store(_))),
-            "{:?}",
-            report.purge_failed
+            failure
+                .to_string()
+                .contains("no such table: history_snapshots"),
+            "{failure}"
         );
         assert_eq!(report.purged, 0);
         assert!(rig.autosave.tick(&rig.i18n).purge_failed.is_none());
         rig.clock.advance(HISTORY_PURGE_INTERVAL);
         assert!(rig.autosave.tick(&rig.i18n).purge_failed.is_some());
+    }
+
+    fn set_readonly(path: &std::path::Path, readonly: bool) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(readonly);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn a_failed_autosave_is_reported_once_and_the_crash_copy_stays() {
+        let rig = rig(true);
+        let (path, entry) = rig.file("a\n");
+        rig.autosave.tick(&rig.i18n);
+        // The file turns read-only behind the document's back: it still believes it can write.
+        set_readonly(&path, true);
+        type_text(&entry, "b\n");
+        rig.autosave.tick(&rig.i18n);
+        rig.advance(1000);
+        let report = rig.autosave.tick(&rig.i18n);
+        assert!(report.saved.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, entry.id());
+        assert_eq!(report.failed[0].1.message_id(), "app-error-read-only");
+        assert!(entry.is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+        // The same text is not tried again at every tick.
+        rig.advance(5000);
+        assert!(rig.autosave.tick(&rig.i18n).failed.is_empty());
+        // A tab switch (flush) does try, fails the same way and keeps the crash copy.
+        let flushed = rig.autosave.flush(&entry).expect("dirty and autosavable");
+        assert_eq!(flushed.unwrap_err().message_id(), "app-error-read-only");
+        assert_eq!(rig.emergency.len(), 1);
+        // Once the file is writable again, new typing is saved.
+        set_readonly(&path, false);
+        type_text(&entry, "c\n");
+        rig.autosave.tick(&rig.i18n);
+        rig.advance(1000);
+        assert_eq!(rig.autosave.tick(&rig.i18n).saved, [entry.id()]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc\n");
+        assert!(rig.emergency.is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_the_history_refuses_is_tried_again_at_the_next_tick() {
+        let rig = rig(true);
+        let (_, entry) = rig.file("a\n");
+        rig.autosave.tick(&rig.i18n);
+        let history = rusqlite::Connection::open(rig.tmp.path().join("state.db")).unwrap();
+        history
+            .execute_batch(
+                "CREATE TRIGGER refuse_history BEFORE INSERT ON history_snapshots
+                 BEGIN SELECT RAISE(ABORT, 'history refused'); END;",
+            )
+            .unwrap();
+        type_text(&entry, "b\n");
+        assert_eq!(rig.autosave.tick(&rig.i18n).snapshots, 0);
+        assert!(rig.versions(&entry).is_empty());
+        history
+            .execute_batch("DROP TRIGGER refuse_history")
+            .unwrap();
+        assert_eq!(rig.autosave.tick(&rig.i18n).snapshots, 1);
+        assert_eq!(rig.versions(&entry).len(), 1);
     }
 }

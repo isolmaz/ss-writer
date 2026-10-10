@@ -14,7 +14,16 @@
 //!   "details": { "doc_bytes": 3.1e6, ... },          // numbers describing the run
 //!   "marks":   { "window_shown": 91.2, ... },        // ms since process creation
 //!   "phases":  ["startup", "open", "scroll", "type"],
-//!   "frames":  { "phase": [0, ...], "start_ms": [...], "drawn_ms": [...], "presented_ms": [...] },
+//!   "frames":  { "phase": [0, ...],
+//!                "start_ms": [...],        // the frame began (before the back buffer is wrapped)
+//!                "ready_ms": [...],        // back buffer wrapped, BeginDraw + clear done
+//!                "recorded_ms": [...],     // the drawing code (layout + draw calls) returned
+//!                "drawn_ms": [...],        // EndDraw returned
+//!                "presented_ms": [...],    // Present returned
+//!                "layout_ms": [...],       // durations: layout pass of the view,
+//!                "editor_layout_ms": [...],// the editor's lazy layout (inside layout_ms),
+//!                "editor_paint_ms": [...]  // the editor's draw calls (inside recorded - ready)
+//!              },
 //!   "input_latency_ms": [ ... ]                      // WM_CHAR receipt -> Present returned
 //! }
 //! ```
@@ -127,8 +136,13 @@ pub fn build_report(snapshot: &Snapshot, meta: &ReportMeta) -> Value {
     let frames = json!({
         "phase": phases,
         "start_ms": column(&snapshot.frames, |frame| frame.start_ms),
+        "ready_ms": column(&snapshot.frames, |frame| frame.ready_ms),
+        "recorded_ms": column(&snapshot.frames, |frame| frame.recorded_ms),
         "drawn_ms": column(&snapshot.frames, |frame| frame.drawn_ms),
         "presented_ms": column(&snapshot.frames, |frame| frame.presented_ms),
+        "layout_ms": column(&snapshot.frames, |frame| frame.layout_ms),
+        "editor_layout_ms": column(&snapshot.frames, |frame| frame.editor_layout_ms),
+        "editor_paint_ms": column(&snapshot.frames, |frame| frame.editor_paint_ms),
     });
     let latency: Vec<f64> = snapshot
         .input_latency_ms
@@ -175,14 +189,24 @@ mod tests {
                 FrameSample {
                     phase: PHASE_STARTUP,
                     start_ms: 100.0,
+                    ready_ms: 100.5,
+                    recorded_ms: 103.0,
                     drawn_ms: 104.123_456,
                     presented_ms: 105.0,
+                    layout_ms: 1.234_567,
+                    editor_layout_ms: 0.5,
+                    editor_paint_ms: 0.75,
                 },
                 FrameSample {
                     phase: PHASE_SCROLL,
                     start_ms: 120.0,
+                    ready_ms: 121.0,
+                    recorded_ms: 122.0,
                     drawn_ms: 123.0,
                     presented_ms: 133.333_333,
+                    layout_ms: 0.0,
+                    editor_layout_ms: 0.0,
+                    editor_paint_ms: 0.0,
                 },
             ],
             input_latency_ms: vec![12.345_678, 20.0],
@@ -221,6 +245,11 @@ mod tests {
         assert_eq!(report["frames"]["start_ms"], json!([100.0, 120.0]));
         assert_eq!(report["frames"]["drawn_ms"], json!([104.123, 123.0]));
         assert_eq!(report["frames"]["presented_ms"], json!([105.0, 133.333]));
+        assert_eq!(report["frames"]["ready_ms"], json!([100.5, 121.0]));
+        assert_eq!(report["frames"]["recorded_ms"], json!([103.0, 122.0]));
+        assert_eq!(report["frames"]["layout_ms"], json!([1.235, 0.0]));
+        assert_eq!(report["frames"]["editor_layout_ms"], json!([0.5, 0.0]));
+        assert_eq!(report["frames"]["editor_paint_ms"], json!([0.75, 0.0]));
         assert_eq!(report["input_latency_ms"], json!([12.346, 20.0]));
     }
 
@@ -278,7 +307,8 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         let error = write_report(&file.join("report.json"), &json!({})).unwrap_err();
         assert!(!error.to_string().is_empty());
-        // A directory is not a file either.
+        // A directory is not a file either, and the empty path has no folder to create.
         assert!(write_report(tmp.path(), &json!({})).is_err());
+        assert!(write_report(Path::new(""), &json!({})).is_err());
     }
 }

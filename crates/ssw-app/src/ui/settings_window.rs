@@ -23,7 +23,7 @@ use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use ssw_core::command::CommandId;
 use ssw_core::i18n::{Arg, Localizer};
 use ssw_core::settings::{AccentMode, Appearance, Settings, Theme as ThemeSetting};
@@ -128,27 +128,26 @@ fn fallback_system() -> SystemTheme {
 /// that did not touch them.
 #[must_use]
 pub fn merge_changes(current: &Settings, base: &Settings, edited: &Settings) -> Settings {
-    let (Ok(mut merged), Ok(base), Ok(edited_value)) = (
-        serde_json::to_value(current),
-        serde_json::to_value(base),
-        serde_json::to_value(edited),
-    ) else {
-        return edited.clone();
-    };
-    merge_value(&mut merged, &base, &edited_value);
-    serde_json::from_value(merged).unwrap_or_else(|_| edited.clone())
+    let mut merged = to_object(current);
+    merge_object(&mut merged, &to_object(base), &to_object(edited));
+    serde_json::from_value(Value::Object(merged)).unwrap_or_else(|_| edited.clone())
 }
 
-fn merge_value(target: &mut Value, base: &Value, edited: &Value) {
-    if base == edited {
-        return;
-    }
-    let (Value::Object(target), Value::Object(base), Value::Object(edited)) =
-        (&mut *target, base, edited)
-    else {
-        *target = edited.clone();
-        return;
-    };
+/// The JSON object of `settings`. Plain data always serializes to an object (a struct with
+/// string keys), so the empty object is only what the type asks for, never what is returned.
+fn to_object(settings: &Settings) -> Map<String, Value> {
+    serde_json::to_value(settings)
+        .unwrap_or_default()
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn merge_object(
+    target: &mut Map<String, Value>,
+    base: &Map<String, Value>,
+    edited: &Map<String, Value>,
+) {
     for key in base.keys().filter(|key| !edited.contains_key(*key)) {
         target.remove(key);
     }
@@ -157,11 +156,10 @@ fn merge_value(target: &mut Value, base: &Value, edited: &Value) {
         if old == Some(new) {
             continue;
         }
-        let nested = new.is_object()
-            && old.is_some_and(Value::is_object)
-            && target.get(key).is_some_and(Value::is_object);
-        match (nested, target.get_mut(key), old) {
-            (true, Some(slot), Some(old)) => merge_value(slot, old, new),
+        match (new, old, target.get_mut(key)) {
+            (Value::Object(new), Some(Value::Object(old)), Some(Value::Object(slot))) => {
+                merge_object(slot, old, new);
+            }
             _ => {
                 target.insert(key.clone(), new.clone());
             }
@@ -232,25 +230,34 @@ pub struct WindowsKeyNames;
 
 impl KeyNames for WindowsKeyNames {
     fn chord_text(&self, chord: ssw_core::keymap::KeyChord) -> String {
-        let mut parts = Vec::new();
-        for (held, key) in [
-            (chord.ctrl, vk::CONTROL),
-            (chord.shift, vk::SHIFT),
-            (chord.alt, vk::MENU),
-        ] {
-            if held {
-                parts.push(key_name(key, 0).unwrap_or_else(|_| fallback_modifier(key)));
-            }
-        }
-        if chord.win {
-            parts.push("Win".to_owned());
-        }
-        match key_name(chord.vk, 0) {
-            Ok(name) => parts.push(name),
-            Err(_) => return chord.to_string(),
-        }
-        parts.join("+")
+        chord_text_with(chord, |key| key_name(key, 0).ok())
     }
+}
+
+/// `chord` named with `name_of`, the name the system has for a virtual key (if any). A modifier
+/// without a name is spelled in English; a chord whose key has none is shown as its stored form.
+fn chord_text_with(
+    chord: ssw_core::keymap::KeyChord,
+    name_of: impl Fn(u16) -> Option<String>,
+) -> String {
+    let mut parts = Vec::new();
+    for (held, key) in [
+        (chord.ctrl, vk::CONTROL),
+        (chord.shift, vk::SHIFT),
+        (chord.alt, vk::MENU),
+    ] {
+        if held {
+            parts.push(name_of(key).unwrap_or_else(|| fallback_modifier(key)));
+        }
+    }
+    if chord.win {
+        parts.push("Win".to_owned());
+    }
+    match name_of(chord.vk) {
+        Some(name) => parts.push(name),
+        None => return chord.to_string(),
+    }
+    parts.join("+")
 }
 
 fn fallback_modifier(key: u16) -> String {
@@ -502,6 +509,8 @@ impl SettingsView {
 pub struct SettingsCell {
     /// The window content.
     pub view: RefCell<SettingsView>,
+    /// The settings the window last showed: edits are merged relative to them.
+    base: RefCell<Settings>,
     /// The cursor the pointer position asks for; the loop owner applies it to the window.
     pub cursor: Cell<Cursor>,
     /// The window needs a repaint; the loop owner invalidates it.
@@ -544,15 +553,13 @@ type Stamp = Option<(SystemTime, u64)>;
 
 fn stamp_of(path: &Path) -> Stamp {
     let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
+    meta.modified().ok().map(|time| (time, meta.len()))
 }
 
 /// The Settings window and the persistence state of the settings (a field of [`Controller`]).
 #[derive(Default)]
 pub struct SettingsHub {
     cell: RefCell<Option<Rc<SettingsCell>>>,
-    /// The settings the window last showed: edits are merged relative to it.
-    base: RefCell<Option<Settings>>,
     /// When the pending change is to be written.
     due: Cell<Option<Duration>>,
     /// The last write failed and the user was told.
@@ -607,10 +614,10 @@ impl Controller {
         );
         let cell = Rc::new(SettingsCell {
             view: RefCell::new(view),
+            base: RefCell::new(settings),
             cursor: Cell::new(Cursor::Arrow),
             dirty: Cell::new(true),
         });
-        *self.settings_hub.base.borrow_mut() = Some(settings);
         *self.settings_hub.cell.borrow_mut() = Some(Rc::clone(&cell));
         cell
     }
@@ -619,7 +626,6 @@ impl Controller {
     pub fn close_settings(&self) {
         self.flush_settings();
         self.settings_hub.cell.take();
-        self.settings_hub.base.take();
     }
 
     /// Carries out something the user did in the Settings window.
@@ -665,7 +671,7 @@ impl Controller {
         let mut view = cell.view.borrow_mut();
         view.window_mut().set_settings(settings.clone());
         view.requests_mut().invalidate_all();
-        *self.settings_hub.base.borrow_mut() = Some(settings.clone());
+        *cell.base.borrow_mut() = settings.clone();
     }
 
     /// The window reported a change: merge it into the settings, apply and persist it.
@@ -674,16 +680,10 @@ impl Controller {
             return;
         };
         let edited = cell.view.borrow().window().settings().clone();
-        let base = self
-            .settings_hub
-            .base
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| edited.clone());
         let current = self.settings.borrow().clone();
-        let merged = merge_changes(&current, &base, &edited);
+        let merged = merge_changes(&current, &cell.base.borrow(), &edited);
         let language_changed = merged.general.language != current.general.language;
-        *self.settings_hub.base.borrow_mut() = Some(edited.clone());
+        *cell.base.borrow_mut() = edited.clone();
         let installed = self.install_settings(merged, true);
         if installed != edited {
             self.show_in_window(&installed);
@@ -1168,12 +1168,12 @@ impl SettingsNative {
             no_activate: hidden,
         };
         let host = WindowHost::create(&options, Box::new(glue), theme)?;
-        let assets = CanvasAssets::with_scene_renderer(
+        host.set_assets(CanvasAssets::with_scene_renderer(
             ImageStore::new(wic.clone()),
             env.text.clone(),
             wic.clone(),
-        )?;
-        host.attach_graphics(devices.clone(), assets)?;
+        )?);
+        host.attach_graphics(devices.clone())?;
         let info = host.info();
         cell.view.borrow_mut().resize(info.size_dip(), info.scale());
         let hwnd = host.hwnd();
@@ -1270,3 +1270,6 @@ impl SettingsNative {
         events
     }
 }
+
+#[cfg(test)]
+mod tests;

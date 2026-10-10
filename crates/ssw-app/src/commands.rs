@@ -109,6 +109,8 @@ pub fn category(command: CommandId) -> CommandCategory {
         | C::ViewRecenterCaret
         | C::ViewFoldAll
         | C::ViewUnfoldAll
+        | C::ViewWordWrap
+        | C::ViewRenderAsMarkdown
         | C::ViewNextPane => CommandCategory::View,
         C::FileNew
         | C::FileNewWindow
@@ -363,6 +365,15 @@ mod tests {
         document.apply(tx).unwrap();
     }
 
+    /// How a dispatch ended: "handled", "unhandled" or the message id of its failure.
+    fn ended(outcome: &Dispatch) -> &'static str {
+        match outcome {
+            Dispatch::Handled => "handled",
+            Dispatch::Unhandled => "unhandled",
+            Dispatch::Failed(error) => error.message_id(),
+        }
+    }
+
     #[test]
     fn categories_follow_the_command_groups() {
         for command in CommandId::all() {
@@ -406,17 +417,13 @@ mod tests {
         ];
         for command in CommandId::all() {
             let outcome = dispatcher.dispatch(command, &mut actions);
-            if command == CommandId::FileSaveBackToWord {
-                assert!(
-                    matches!(outcome, Dispatch::Failed(DocError::Unsupported(_))),
-                    "{outcome:?}"
-                );
+            let expected = if command == CommandId::FileSaveBackToWord {
+                // The buffer became a text file by the Save family before: nothing to save back.
+                "app-error-unsupported"
             } else {
-                assert!(
-                    matches!(outcome, Dispatch::Handled),
-                    "{command}: {outcome:?}"
-                );
-            }
+                "handled"
+            };
+            assert_eq!(ended(&outcome), expected, "{command}");
         }
         assert_eq!(actions.errors, 1);
         let forwarded: Vec<CommandId> = actions.seen.iter().map(|(_, command)| *command).collect();
@@ -450,10 +457,11 @@ mod tests {
             CommandId::FileSave,
             CommandId::EditUndo,
         ] {
-            assert!(matches!(
-                dispatcher.dispatch(command, &mut actions),
-                Dispatch::Unhandled
-            ));
+            assert_eq!(
+                ended(&dispatcher.dispatch(command, &mut actions)),
+                "unhandled",
+                "{command}"
+            );
         }
         assert_eq!(
             actions.seen.len(),
@@ -475,29 +483,29 @@ mod tests {
             errors: 0,
             accept: false,
         };
-        assert!(matches!(
-            dispatcher.dispatch(CommandId::EditUndo, &mut actions),
-            Dispatch::Handled
-        ));
+        assert_eq!(
+            ended(&dispatcher.dispatch(CommandId::EditUndo, &mut actions)),
+            "handled"
+        );
         assert_eq!(entry.document().borrow().text(), "");
-        assert!(matches!(
-            dispatcher.dispatch(CommandId::EditRedo, &mut actions),
-            Dispatch::Handled
-        ));
+        assert_eq!(
+            ended(&dispatcher.dispatch(CommandId::EditRedo, &mut actions)),
+            "handled"
+        );
         assert_eq!(entry.document().borrow().text(), "hello");
-        assert!(matches!(
-            dispatcher.dispatch(CommandId::EditSelectAll, &mut actions),
-            Dispatch::Handled
-        ));
+        assert_eq!(
+            ended(&dispatcher.dispatch(CommandId::EditSelectAll, &mut actions)),
+            "handled"
+        );
         assert_eq!(
             entry.document().borrow().primary_selection(),
             Selection::new(0, 5)
         );
         // Cancelling the Save as dialog is not an error.
-        assert!(matches!(
-            dispatcher.dispatch(CommandId::FileSaveAs, &mut actions),
-            Dispatch::Handled
-        ));
+        assert_eq!(
+            ended(&dispatcher.dispatch(CommandId::FileSaveAs, &mut actions)),
+            "handled"
+        );
         assert!(entry.is_untitled());
         assert!(actions.seen.is_empty() && actions.errors == 0);
     }

@@ -69,15 +69,15 @@ mod tests {
         let mut on_disk = BTreeSet::new();
         for locale in std::fs::read_dir(assets_dir().join("i18n")).unwrap() {
             let locale = locale.unwrap().path();
-            for file in std::fs::read_dir(&locale).unwrap() {
-                let file = file.unwrap().path();
-                if file.extension().is_some_and(|ext| ext == "ftl") {
-                    on_disk.insert((
-                        locale.file_name().unwrap().to_string_lossy().into_owned(),
-                        file.file_name().unwrap().to_string_lossy().into_owned(),
-                        std::fs::read_to_string(&file).unwrap(),
-                    ));
-                }
+            let files = std::fs::read_dir(&locale)
+                .unwrap()
+                .map(|file| file.unwrap().path());
+            for file in files.filter(|file| file.extension().is_some_and(|ext| ext == "ftl")) {
+                on_disk.insert((
+                    locale.file_name().unwrap().to_string_lossy().into_owned(),
+                    file.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read_to_string(&file).unwrap(),
+                ));
             }
         }
         let embedded: BTreeSet<_> = embedded::FTL_FILES
@@ -105,14 +105,17 @@ mod tests {
     #[test]
     fn every_command_and_group_label_exists_in_english() {
         let localizer = localizer_for("en");
-        for command in CommandId::all() {
-            assert!(
-                localizer.has_message(command.label_id()),
-                "missing {}",
-                command.label_id()
-            );
-            assert_ne!(localizer.text(command.label_id()), command.label_id());
-        }
+        let labels: Vec<&str> = CommandId::all().map(CommandId::label_id).collect();
+        let missing: Vec<&&str> = labels
+            .iter()
+            .filter(|label| !localizer.has_message(label))
+            .collect();
+        assert!(missing.is_empty(), "missing {missing:?}");
+        let untranslated: Vec<&&str> = labels
+            .iter()
+            .filter(|label| localizer.text(label) == **label)
+            .collect();
+        assert!(untranslated.is_empty(), "untranslated {untranslated:?}");
         for group in CommandGroup::ALL {
             assert!(localizer.has_message(group.label_id()));
         }
@@ -147,14 +150,14 @@ mod tests {
     #[test]
     fn every_welcome_file_on_disk_is_embedded() {
         let mut on_disk = BTreeSet::new();
-        for file in std::fs::read_dir(assets_dir().join("welcome")).unwrap() {
-            let file = file.unwrap().path();
-            if file.extension().is_some_and(|ext| ext == "md") {
-                on_disk.insert((
-                    file.file_stem().unwrap().to_string_lossy().into_owned(),
-                    std::fs::read_to_string(&file).unwrap(),
-                ));
-            }
+        let files = std::fs::read_dir(assets_dir().join("welcome"))
+            .unwrap()
+            .map(|file| file.unwrap().path());
+        for file in files.filter(|file| file.extension().is_some_and(|ext| ext == "md")) {
+            on_disk.insert((
+                file.file_stem().unwrap().to_string_lossy().into_owned(),
+                std::fs::read_to_string(&file).unwrap(),
+            ));
         }
         let embedded: BTreeSet<_> = embedded::WELCOME_FILES
             .iter()

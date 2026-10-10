@@ -1041,17 +1041,37 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"old");
     }
 
+    /// Runs `body` on a fresh thread: COM state and the failure countdown are per thread.
+    fn on_thread<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+        std::thread::scope(|scope| scope.spawn(body).join().unwrap())
+    }
+
+    #[test]
+    fn performing_a_queued_deletion_runs_it_and_reports_no_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gone.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let result = on_thread(|| {
+            let _apartment = enter_sta(&file).unwrap();
+            let operation = new_operation(&file).unwrap();
+            // The flags of `new_operation` minus undo: this deletes for good, so the Recycle
+            // Bin is never involved.
+            // SAFETY: valid COM object on its owning thread.
+            unsafe { operation.SetOperationFlags(FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) }
+                .unwrap();
+            queue_delete(&operation, &file).unwrap();
+            perform(&operation, &file)
+        });
+        assert_eq!(result, Ok(()));
+        assert!(!file.exists());
+    }
+
     #[cfg(feature = "fault-injection")]
     mod com_faults {
         use windows::Win32::Foundation::E_FAIL;
 
         use super::*;
         use crate::fault;
-
-        /// Runs `body` on a fresh thread: COM state and the failure countdown are per thread.
-        fn on_thread<T: Send>(body: impl FnOnce() -> T + Send) -> T {
-            std::thread::scope(|scope| scope.spawn(body).join().unwrap())
-        }
 
         fn injected(path: &Path) -> FsError {
             FsError::Os {
@@ -1076,6 +1096,27 @@ mod tests {
                 assert!(tripped, "checked call {call} was reached");
                 assert_eq!(result, Err(injected(first)), "checked call {call}");
             }
+        }
+
+        #[test]
+        fn a_failing_queue_step_ends_a_recycle_before_anything_is_performed() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("kept.txt");
+            std::fs::write(&file, b"kept").unwrap();
+            // Checked calls of a one-item recycle before `PerformOperations`: CoInitializeEx,
+            // CoCreateInstance, SetOperationFlags, SHCreateItemFromParsingName, DeleteItem.
+            // Failing either of the last two stops the recycle while the item is only queued,
+            // so the Recycle Bin is never involved.
+            for call in 3..5 {
+                let (result, tripped) = on_thread(|| {
+                    fault::arm(call);
+                    let result = recycle_on_sta(std::slice::from_ref(&file), &file);
+                    (result, fault::tripped())
+                });
+                assert!(tripped, "checked call {call} was reached");
+                assert_eq!(result, Err(injected(&file)), "checked call {call}");
+            }
+            assert_eq!(std::fs::read(&file).unwrap(), b"kept");
         }
 
         #[test]

@@ -705,6 +705,30 @@ mod tests {
     }
 
     #[test]
+    fn records_of_other_types_are_stepped_over() {
+        let png = [0x89, b'P', b'N', b'G', 1, 2];
+        let rec = pic_record(0x64, 0xF01E, 0x6E0, 1, &png, false);
+        // an OfficeArtFOPT property record (neither a container, an FBSE nor a BLIP) ahead of
+        // the blip is skipped by its length
+        let mut other = vec![0x03, 0x00];
+        other.extend_from_slice(&0xF00Bu16.to_le_bytes());
+        other.extend_from_slice(&4u32.to_le_bytes());
+        other.extend_from_slice(&[9, 9, 9, 9]);
+        let mut data = rec[..68].to_vec();
+        data.extend_from_slice(&other);
+        data.extend_from_slice(&rec[68..]);
+        let total = data.len() as u32;
+        data[0..4].copy_from_slice(&total.to_le_bytes());
+        assert_eq!(
+            extract(&data, 0),
+            Picture::Image {
+                ext: "png",
+                bytes: png.to_vec()
+            }
+        );
+    }
+
+    #[test]
     fn bit_masks_inside_an_extended_header_do_not_shift_the_pixels() {
         // A 52-byte header already contains the three masks, so the pixels start right after it
         // (a 40-byte header is followed by the masks and only then by the pixels).

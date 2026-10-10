@@ -122,6 +122,26 @@ fn containers_that_are_not_word_documents_are_corrupt() {
 }
 
 #[test]
+fn a_data_stream_that_cannot_be_read_is_corrupt() {
+    let mut bytes = container(&[
+        ("/WordDocument", &fib(0xA5EC, 0x00C1, 0)),
+        ("/0Table", b""),
+        ("/Data", b"pictures"),
+    ]);
+    // Point the directory entry of `Data` (UTF-16 name, start sector at byte 116 of its
+    // 128-byte entry) at a mini sector the container does not have.
+    let name = [b'D', 0, b'a', 0, b't', 0, b'a', 0, 0, 0];
+    let entry = bytes.windows(name.len()).position(|w| w == name).unwrap();
+    bytes[entry + 116..entry + 120].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    match doc::import(&bytes, "a") {
+        Err(ImportError::Corrupt(message)) => {
+            assert!(message.starts_with("stream /Data: "), "{message}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn a_well_formed_container_with_empty_tables_never_panics() {
     for flags in [0u16, 0x0200] {
         let bytes = container(&[

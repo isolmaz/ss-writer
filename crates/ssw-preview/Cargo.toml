@@ -16,8 +16,10 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [features]
-# Tests only: lets `fault::arm` make the n-th checked platform call fail (see src/fault.rs).
-fault-injection = []
+# Tests only: lets `fault::arm` make the n-th checked platform call fail (see src/fault.rs), and
+# `ssw_win::fault::arm_with` make a call of the platform layer fail with a given code (a lost
+# graphics device).
+fault-injection = ["ssw-win/fault-injection"]
 
 [dependencies]
 ssw-core = { path = "../ssw-core" }

@@ -29,7 +29,8 @@ pub(super) fn is_html_space(c: u8) -> bool {
 
 /// Decodes the character reference at the start of `s` (`s[0] == '&'`). Returns the decoded
 /// text and the number of bytes consumed.
-pub(super) fn decode_entity(s: &[u8]) -> Option<(String, usize)> {
+pub(super) fn decode_entity(text: &str) -> Option<(String, usize)> {
+    let s = text.as_bytes();
     if s.first() != Some(&b'&') {
         return None;
     }
@@ -74,8 +75,8 @@ pub(super) fn decode_entity(s: &[u8]) -> Option<(String, usize)> {
     if i == 1 || s.get(i) != Some(&b';') || i - 1 > 32 {
         return None;
     }
-    let name = std::str::from_utf8(&s[1..i]).ok()?;
-    let decoded = entities::lookup(name)?;
+    // Only ASCII bytes lie in `1..i`, so `i` is a character boundary.
+    let decoded = entities::lookup(&text[1..i])?;
     Some((decoded.to_string(), i + 1))
 }
 
@@ -91,7 +92,7 @@ pub(super) fn unescape(s: &str) -> String {
                 i += 2;
             }
             b'&' => {
-                if let Some((text, used)) = decode_entity(&b[i..]) {
+                if let Some((text, used)) = decode_entity(&s[i..]) {
                     out.push_str(&text);
                     i += used;
                 } else {
@@ -100,22 +101,14 @@ pub(super) fn unescape(s: &str) -> String {
                 }
             }
             _ => {
-                let ch_len = utf8_len(b[i]);
-                out.push_str(&s[i..i + ch_len]);
-                i += ch_len;
+                // `i` only ever advances over whole characters.
+                let ch = s[i..].chars().next().expect("i is inside the string");
+                out.push(ch);
+                i += ch.len_utf8();
             }
         }
     }
     out
-}
-
-fn utf8_len(first: u8) -> usize {
-    match first {
-        0..=0x7f => 1,
-        0xc0..=0xdf => 2,
-        0xe0..=0xef => 3,
-        _ => 4,
-    }
 }
 
 /// Link label `[...]` starting at `b[pos] == '['`. Returns the position after `]`. The label

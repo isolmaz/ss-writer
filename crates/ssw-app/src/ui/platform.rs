@@ -974,6 +974,10 @@ impl Platform {
     }
 
     fn apply_access_actions(&self) {
+        // A busy view leaves the actions queued for the next turn.
+        let Ok(mut view) = self.cell.view.try_borrow_mut() else {
+            return;
+        };
         let queued: Vec<(WidgetId, AccessAction)> = std::mem::take(
             &mut *self
                 .actions
@@ -984,9 +988,6 @@ impl Platform {
         if queued.is_empty() {
             return;
         }
-        let Ok(mut view) = self.cell.view.try_borrow_mut() else {
-            return;
-        };
         let mut shell_actions = Vec::new();
         for (id, action) in queued {
             shell_actions.extend(view.perform_access(id, &action, &self.env.text));
@@ -1026,11 +1027,15 @@ impl Platform {
                 return;
             };
             view.active_tab().map(|tab| {
-                let doc = tab.entry.document().borrow();
-                (tab.key, doc.version(), doc.primary_selection())
+                let document = Rc::clone(tab.entry.document());
+                let (version, selection) = {
+                    let doc = document.borrow();
+                    (doc.version(), doc.primary_selection())
+                };
+                (tab.key, version, selection, document)
             })
         };
-        let Some((tab, version, selection)) = current else {
+        let Some((tab, version, selection, document)) = current else {
             *self.shadow.borrow_mut() = None;
             return;
         };
@@ -1044,9 +1049,7 @@ impl Platform {
                 }
             }
             Some(last) if last.tab == tab => {
-                let Some(text) = self.active_text() else {
-                    return;
-                };
+                let text = document.borrow().text();
                 let (start, removed, inserted) = diff(&last.text, &text);
                 let (removed, inserted) = (removed.to_owned(), inserted.to_owned());
                 last.version = version;
@@ -1057,7 +1060,7 @@ impl Platform {
                 services.store().selection_changed();
             }
             _ => {
-                let text = self.active_text().unwrap_or_default();
+                let text = document.borrow().text();
                 *shadow = Some(TsfShadow {
                     tab,
                     version,
@@ -1068,11 +1071,6 @@ impl Platform {
                 services.store().layout_changed();
             }
         }
-    }
-
-    fn active_text(&self) -> Option<String> {
-        let view = self.cell.view.try_borrow().ok()?;
-        Some(view.active_tab()?.entry.document().borrow().text())
     }
 
     /// The layout changed (resize, DPI): text services and the caret follow.
@@ -1212,10 +1210,21 @@ impl Platform {
         let Some(hwnd) = self.hwnd.get() else {
             return;
         };
-        if pointer_is_pen(wparam) {
+        self.route_contact(
+            msg,
+            wparam,
+            pointer_is_pen(wparam),
+            pointer_client_position(hwnd, wparam),
+        );
+    }
+
+    /// [`Platform::start_contact`] once the system was asked about the pointer: whether it is a
+    /// pen and where it is (client pixels; `None` for a pointer the system does not know).
+    fn route_contact(&self, msg: u32, wparam: WPARAM, pen: bool, position: Option<(i32, i32)>) {
+        if pen {
             return;
         }
-        let Some(position) = pointer_client_position(hwnd, wparam) else {
+        let Some(position) = position else {
             return;
         };
         if !self.over_editor(position) {
@@ -1343,14 +1352,4 @@ fn diff<'a>(old: &'a str, new: &'a str) -> (usize, &'a str, &'a str) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::diff;
-
-    #[test]
-    fn diff_finds_the_changed_middle_on_char_boundaries() {
-        assert_eq!(diff("hello world", "hello brave world"), (6, "", "brave "));
-        assert_eq!(diff("abc", "abc"), (3, "", ""));
-        assert_eq!(diff("aéb", "aèb"), (1, "é", "è"));
-        assert_eq!(diff("", "x"), (0, "", "x"));
-    }
-}
+mod tests;

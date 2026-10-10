@@ -274,13 +274,14 @@ impl Args {
     /// # Errors
     /// [`PathsError`] when the executable location is unavailable.
     pub fn environment(&self) -> Result<Environment, PathsError> {
-        let mut env = Environment::from_process()?;
-        if let Some(profile) = &self.test.profile {
-            env.local_app_data = Some(profile.join("local"));
-            env.app_data = Some(profile.join("roaming"));
-            env.exe_dir = profile.join("exe");
-        }
-        Ok(env)
+        Environment::from_process().map(|mut env| {
+            if let Some(profile) = &self.test.profile {
+                env.local_app_data = Some(profile.join("local"));
+                env.app_data = Some(profile.join("roaming"));
+                env.exe_dir = profile.join("exe");
+            }
+            env
+        })
     }
 
     /// What is wrong with the `--perf-*` flags, if anything: an unusable value, a scenario or an
@@ -465,6 +466,7 @@ mod tests {
             [file.as_path(), missing.as_path()]
         );
         assert_eq!(launch.folders().collect::<Vec<_>>(), [folder.as_path()]);
+        assert_eq!(launch.items[0].path(), file.as_path());
         assert_eq!(launch.items[1].path(), folder.as_path());
         assert!(Launch::default().is_empty());
         assert!(

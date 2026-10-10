@@ -187,9 +187,11 @@ impl Documents {
             let Some(entry) = self.find_by_key(&path_key(&path)) else {
                 continue;
             };
-            if let Some(action) = self.apply_change(&entry, &path, change) {
-                outcomes.push(ExternalOutcome { entry, action });
-            }
+            // `classify` never reports an unchanged document, so every decision has an action.
+            outcomes.extend(
+                self.apply_change(&entry, &path, change)
+                    .map(|action| ExternalOutcome { entry, action }),
+            );
         }
         outcomes
     }
@@ -267,7 +269,7 @@ impl Documents {
         let tracked = !matches!(loaded.source, Source::TextBundle { .. });
         let version = {
             let mut document = entry.document.borrow_mut();
-            replace_text(&mut document, &loaded.text)?;
+            replace_text(&mut document, &loaded.text);
             document.version()
         };
         {

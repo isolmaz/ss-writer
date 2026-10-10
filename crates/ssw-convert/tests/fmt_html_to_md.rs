@@ -128,3 +128,12 @@ fn fenced_code_outgrows_backtick_runs() {
     assert!(fenced.starts_with("```\n## 📱") && fenced.ends_with("improvements\n```"));
     assert_eq!(fenced_code("a ``` b"), "````\na ``` b\n````");
 }
+
+#[test]
+fn a_word_list_paragraph_without_content_adds_no_item() {
+    // Word pads empty list paragraphs with a no-break space inside `<o:p>`.
+    let html = "<p class=MsoListParagraph style='mso-list:l0 level1 lfo1'>\
+                <span style='mso-list:Ignore'>o</span>A</p>\
+                <p style='mso-list:l0 level1 lfo1'><o:p>&nbsp;</o:p></p>";
+    assert_eq!(html_to_markdown(html, "assets").markdown, "- A\n");
+}

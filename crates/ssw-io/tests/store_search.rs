@@ -41,24 +41,28 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+/// Every search of this file goes through here, so that one instantiation of the generic
+/// `search_folder` sees all of its outcomes: results, rejected patterns and cancellation.
+fn try_search(
+    root: &Path,
+    options: &SearchOptions,
+    placeholder: &dyn Fn(&Path) -> bool,
+    cancel: &AtomicBool,
+) -> Result<(Vec<FileMatches>, SearchSummary), SearchError> {
+    let mut found = Vec::new();
+    let summary = search_folder(root, options, placeholder, cancel, |file| {
+        found.push(file);
+    })?;
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((found, summary))
+}
+
 fn search_with(
     root: &Path,
     options: &SearchOptions,
     placeholder: &dyn Fn(&Path) -> bool,
 ) -> (Vec<FileMatches>, SearchSummary) {
-    let mut found = Vec::new();
-    let summary = search_folder(
-        root,
-        options,
-        placeholder,
-        &AtomicBool::new(false),
-        |file| {
-            found.push(file);
-        },
-    )
-    .unwrap();
-    found.sort_by(|a, b| a.path.cmp(&b.path));
-    (found, summary)
+    try_search(root, options, placeholder, &AtomicBool::new(false)).unwrap()
 }
 
 fn search(root: &Path, options: &SearchOptions) -> (Vec<FileMatches>, SearchSummary) {
@@ -179,18 +183,12 @@ fn invalid_and_empty_patterns_are_rejected_before_searching() {
         regex: true,
         ..SearchOptions::literal("(")
     };
-    let error = search_folder(tmp.path(), &invalid, &|_| false, &cancel, |_| {}).unwrap_err();
+    let error = try_search(tmp.path(), &invalid, &|_| false, &cancel).unwrap_err();
     assert!(matches!(error, SearchError::InvalidPattern(_)));
     assert!(error.to_string().starts_with("invalid search pattern"));
 
-    let error = search_folder(
-        tmp.path(),
-        &SearchOptions::literal(""),
-        &|_| false,
-        &cancel,
-        |_| {},
-    )
-    .unwrap_err();
+    let error =
+        try_search(tmp.path(), &SearchOptions::literal(""), &|_| false, &cancel).unwrap_err();
     assert!(matches!(error, SearchError::EmptyPattern));
     assert!(error.to_string().contains("empty"));
 }
@@ -411,17 +409,15 @@ fn cancelling_stops_at_the_next_file() {
 
     // Cancelled before the first file.
     let cancel = AtomicBool::new(true);
-    let mut reported = 0;
-    let summary = search_folder(
+    let (found, summary) = try_search(
         tmp.path(),
         &SearchOptions::literal("hit"),
         &|_| false,
         &cancel,
-        |_| reported += 1,
     )
     .unwrap();
     assert!(summary.cancelled);
-    assert_eq!((reported, summary.files_searched), (0, 0));
+    assert_eq!((found.len(), summary.files_searched), (0, 0));
 
     // Cancelled from the result callback after the first file.
     let cancel = AtomicBool::new(false);

@@ -86,17 +86,14 @@ pub fn load_settings(path: &Path) -> Result<LoadedSettings, SettingsFileError> {
 /// Write `settings` to `path` atomically, creating the folder when needed.
 ///
 /// # Errors
-/// [`SettingsFileError::Settings`] when serialization fails and [`SettingsFileError::Io`] when
-/// the folder, the temporary file or the final rename fails (the temporary file is removed).
+/// [`SettingsFileError::Io`] when the folder, the temporary file or the final rename fails (the
+/// temporary file is removed).
 pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), SettingsFileError> {
-    write_atomic(path, settings.to_json_string_pretty())
+    write_atomic(path, &settings.to_json_string_pretty())
 }
 
-/// Write `text` (or report why the settings could not be serialized, writing nothing) to `path`
-/// through a temporary file. Split from [`save_settings`] so the serialization failure, which
-/// the settings model cannot produce today, still has a tested path.
-fn write_atomic(path: &Path, text: Result<String, SettingsError>) -> Result<(), SettingsFileError> {
-    let text = text?;
+/// Write `text` to `path` through a temporary file.
+fn write_atomic(path: &Path, text: &str) -> Result<(), SettingsFileError> {
     // A path without a parent (the empty path, a drive root) has no folder to create, which
     // `create_dir_all` accepts for the empty path.
     let parent = path.parent().unwrap_or(Path::new(""));
@@ -117,25 +114,4 @@ fn write_atomic(path: &Path, text: Result<String, SettingsError>) -> Result<(), 
             source,
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use serde::ser::Error as _;
-
-    use super::*;
-
-    #[test]
-    fn a_serialization_failure_is_reported_and_writes_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("settings.json");
-        let failure = SettingsError::Serialize(serde_json::Error::custom("not representable"));
-        let error = write_atomic(&path, Err(failure)).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "settings could not be serialized: not representable"
-        );
-        assert!(!path.exists());
-        assert!(!with_suffix(&path, ".tmp").exists());
-    }
 }

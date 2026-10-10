@@ -65,11 +65,8 @@ impl Reorder {
     }
 
     /// Where an offset of the old text ends up: inside an item it moves with the item, in the
-    /// text between items it stays between the same slots.
+    /// text between items it stays between the same slots. `offset` touches the span.
     fn map(&self, offset: usize) -> usize {
-        if !self.span.touches(offset) {
-            return offset;
-        }
         let slot_start = |slot: usize| {
             self.span.start
                 + (0..slot)
@@ -301,6 +298,17 @@ mod tests {
         );
         // A lone nested task just flips.
         check("- [ ] a\n  - [ ] a1‸", "- [ ] a\n  - [x] a1‸", toggle(true));
+    }
+
+    #[test]
+    fn a_nested_list_inside_a_reordered_span_is_not_reordered_on_its_own() {
+        // Both lists would reorder (`a` moves behind `b`, `a1` behind `a2`); the nested list
+        // moves along with its item and keeps its order.
+        check(
+            "«- [ ] a\n  - [ ] a1\n  - [x] a2»\n- [ ] b",
+            "- [ ] b\n«- [x] a\n  - [x] a1\n  - [x] a2»",
+            toggle(true),
+        );
     }
 
     #[test]

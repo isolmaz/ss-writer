@@ -122,15 +122,23 @@ impl AppCore {
         }
     }
 
+    /// Takes the device creation that runs in parallel with startup (once): the shell decides
+    /// whether to wait for it or to open its windows first.
+    ///
+    /// # Errors
+    /// [`WinError::Invalid`] when called twice.
+    pub fn take_devices(&mut self) -> Result<DeviceStartup, WinError> {
+        self.devices
+            .take()
+            .ok_or(WinError::Invalid("the device was already taken"))
+    }
+
     /// Waits for the Direct3D device created in parallel with startup (once).
     ///
     /// # Errors
     /// The device creation error; [`WinError::Invalid`] when called twice.
     pub fn wait_devices(&mut self) -> Result<GfxDevices, WinError> {
-        self.devices
-            .take()
-            .ok_or(WinError::Invalid("the device was already taken"))?
-            .wait()
+        self.take_devices()?.wait()
     }
 
     /// One turn of housekeeping for the message loop: deliver worker results, apply external

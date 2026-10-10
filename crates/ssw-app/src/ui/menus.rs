@@ -32,6 +32,14 @@ pub struct MenuState {
     pub full_screen: bool,
     /// Zen mode is on.
     pub zen: bool,
+    /// The active document is a plain-text file (spec §4.1): `.txt`, logs, source code. Only
+    /// these have "Render as Markdown" and, while shown as plain text, "Word wrap".
+    pub plain_file: bool,
+    /// The active plain-text file is shown as Markdown ("Render as Markdown" is on).
+    pub render_markdown: bool,
+    /// The active tab shows plain text and wraps its long lines at the window edge (off: the
+    /// lines run on and the view scrolls sideways).
+    pub word_wrap: bool,
     /// Another window is open: there is something for Window → Merge all windows to merge.
     pub other_windows: bool,
 }
@@ -49,18 +57,23 @@ impl MenuState {
             C::ViewFocusMode => Some(self.focus_mode),
             C::ViewFullScreen => Some(self.full_screen),
             C::ViewZenMode => Some(self.zen),
+            C::ViewWordWrap => Some(self.word_wrap),
+            C::ViewRenderAsMarkdown => Some(self.render_markdown),
             _ => None,
         }
     }
 
     /// Whether `command` can run now: the document commands need a document, merging needs a
-    /// second window, saving back needs an imported word-processor file. The menus and the
-    /// command palette both ask this.
+    /// second window, saving back needs an imported word-processor file, "Render as Markdown"
+    /// needs a plain-text file and "Word wrap" a plain-text file that is shown as plain text.
+    /// The menus and the command palette both ask this.
     #[must_use]
     pub fn enabled(&self, command: CommandId) -> bool {
         match command {
             C::WindowMergeAll => self.other_windows,
             C::FileSaveBackToWord => self.save_back,
+            C::ViewRenderAsMarkdown => self.plain_file,
+            C::ViewWordWrap => self.plain_file && !self.render_markdown,
             _ => self.has_document || !needs_document(command),
         }
     }
@@ -218,6 +231,7 @@ const VIEW: &[Section] = &[
         C::ViewRecenterCaret,
     ]),
     Section::Items(&[C::ViewFoldAll, C::ViewUnfoldAll]),
+    Section::Items(&[C::ViewWordWrap, C::ViewRenderAsMarkdown]),
     Section::Items(&[C::ViewNextPane]),
 ];
 
@@ -253,7 +267,8 @@ pub fn menu_id(command: CommandId) -> u32 {
 /// The command a chosen menu id stands for.
 #[must_use]
 pub fn command_for_menu_id(id: u32) -> Option<CommandId> {
-    let index = usize::try_from(id).ok()?.checked_sub(1)?;
+    // Ids start at 1 (0 is "nothing chosen"); a `u32` always fits a `usize` on Windows.
+    let index = id.checked_sub(1)? as usize;
     CommandId::ALL.get(index).copied()
 }
 
@@ -540,5 +555,115 @@ mod tests {
         };
         assert_eq!(history(true), Some(("Version history…".to_owned(), true)));
         assert_eq!(history(false), Some(("Version history…".to_owned(), false)));
+    }
+
+    /// The View menu's Word wrap and Render as Markdown items: (label, enabled, check mark).
+    fn plain_items(state: &MenuState) -> Vec<(String, bool, ssw_win::menus::CheckState)> {
+        let view = build_menu(
+            MenuKind::View,
+            &localizer_for("en"),
+            &Keymap::default(),
+            state,
+        );
+        [CommandId::ViewWordWrap, CommandId::ViewRenderAsMarkdown]
+            .map(|command| {
+                let entry = items(&view)
+                    .into_iter()
+                    .find(|entry| entry.id == menu_id(command))
+                    .unwrap_or_else(|| panic!("the View menu lists {command}"));
+                (entry.label.clone(), entry.enabled, entry.check)
+            })
+            .to_vec()
+    }
+
+    #[test]
+    fn word_wrap_and_render_as_markdown_are_checkable_view_items_for_plain_files() {
+        use ssw_win::menus::CheckState::{Check, None as Unchecked};
+        // No plain-text file in front: both are listed, disabled and unmarked (also with a
+        // Markdown document open).
+        for has_document in [false, true] {
+            let markdown = MenuState {
+                has_document,
+                ..MenuState::default()
+            };
+            assert_eq!(
+                plain_items(&markdown),
+                [
+                    ("Word wrap".to_owned(), false, Unchecked),
+                    ("Render as Markdown".to_owned(), false, Unchecked),
+                ]
+            );
+            assert!(!markdown.enabled(CommandId::ViewWordWrap));
+            assert!(!markdown.enabled(CommandId::ViewRenderAsMarkdown));
+        }
+
+        // A plain file shown as plain text: wrapping can be switched, Markdown rendering on.
+        let plain = MenuState {
+            has_document: true,
+            plain_file: true,
+            word_wrap: true,
+            ..MenuState::default()
+        };
+        assert_eq!(
+            plain_items(&plain),
+            [
+                ("Word wrap".to_owned(), true, Check),
+                ("Render as Markdown".to_owned(), true, Unchecked),
+            ]
+        );
+        let unwrapped = MenuState {
+            word_wrap: false,
+            ..plain
+        };
+        assert_eq!(
+            plain_items(&unwrapped)[0],
+            ("Word wrap".to_owned(), true, Unchecked)
+        );
+
+        // Rendered as Markdown: the switch stays enabled (and marked) so it can be turned off;
+        // there is no plain text left to wrap.
+        let rendered = MenuState {
+            render_markdown: true,
+            word_wrap: false,
+            ..plain
+        };
+        assert_eq!(
+            plain_items(&rendered),
+            [
+                ("Word wrap".to_owned(), false, Unchecked),
+                ("Render as Markdown".to_owned(), true, Check),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_plain_mode_items_have_no_default_shortcut_and_follow_the_folding_items() {
+        let i18n = localizer_for("en");
+        let keymap = Keymap::default();
+        for command in [CommandId::ViewWordWrap, CommandId::ViewRenderAsMarkdown] {
+            assert_eq!(keymap.chords_for(command).count(), 0, "{command}");
+        }
+        let view = build_menu(MenuKind::View, &i18n, &keymap, &MenuState::default());
+        let commands: Vec<_> = items(&view)
+            .iter()
+            .map(|entry| command_for_menu_id(entry.id).unwrap())
+            .collect();
+        let fold = commands
+            .iter()
+            .position(|&command| command == CommandId::ViewUnfoldAll)
+            .unwrap();
+        assert_eq!(
+            commands[fold + 1..fold + 3],
+            [CommandId::ViewWordWrap, CommandId::ViewRenderAsMarkdown]
+        );
+        let separators = view
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, MenuEntry::Separator))
+            .count();
+        assert_eq!(
+            separators, 5,
+            "a section of its own between folding and panes"
+        );
     }
 }

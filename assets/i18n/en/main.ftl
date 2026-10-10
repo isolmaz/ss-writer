@@ -169,6 +169,8 @@ cmd-view-zoom-reset = Reset zoom
 cmd-view-recenter-caret = Recenter caret
 cmd-view-fold-all = Fold all
 cmd-view-unfold-all = Unfold all
+cmd-view-word-wrap = Word wrap
+cmd-view-render-as-markdown = Render as Markdown
 cmd-view-next-pane = Next pane
 
 ## Sidebar

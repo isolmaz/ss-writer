@@ -198,3 +198,13 @@ fn unicode_round_trips_through_rtf_escapes() {
     assert!(back.contains("Çağrı — 日本語 😀"), "{back}");
     assert!(back.contains("end"), "{back}");
 }
+
+#[test]
+fn hidden_text_is_dropped_until_it_is_switched_off_and_reported_as_a_loss() {
+    let result = import_rtf(b"{\\rtf1 a{\\v hid\\v0 shown}b\\par}").unwrap();
+    assert_eq!(result.markdown, "ashownb\n");
+    assert_eq!(loss_kinds(&result), vec![LossKind::HiddenText]);
+
+    let all_hidden = import_rtf(b"{\\rtf1 {\\v secret}\\par}").unwrap();
+    assert_eq!(all_hidden.markdown.trim(), "");
+}

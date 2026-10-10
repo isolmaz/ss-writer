@@ -33,7 +33,7 @@ use ssw_win::canvas::{CanvasAssets, ImageStore};
 use ssw_win::com::WinError;
 use ssw_win::dragdrop::OleGuard;
 use ssw_win::dwrite::DWriteEngine;
-use ssw_win::gfx::GfxDevices;
+use ssw_win::gfx::{DeviceStartup, GfxDevices, SharedDevices};
 use ssw_win::instance::{Acquired, InstanceConfig, PrimaryInstance, Wake};
 use ssw_win::jumplist::{JumpList, set_process_app_id};
 use ssw_win::keyboard::ToUnicodeCharProbe;
@@ -46,7 +46,7 @@ use ssw_win::taskbar::{Progress, SystemTaskbars, TaskbarFactory};
 use ssw_win::theme::{Win32Settings, read_system_theme};
 use ssw_win::wic::Wic;
 use ssw_win::window::{
-    MessageWindow, WM_WAKE, WakeHandle, WindowHost, WindowOptions, apply_dark_mode,
+    MessageWindow, ShowMode, WM_WAKE, WakeHandle, WindowHost, WindowOptions, apply_dark_mode,
 };
 use windows::Win32::Foundation::HWND;
 
@@ -136,18 +136,54 @@ pub struct UiOptions {
     pub taskbar: Option<Rc<dyn TaskbarFactory>>,
 }
 
+/// When [`UiApp::start`] takes the graphics devices.
+#[derive(Debug)]
+pub enum DeviceStart {
+    /// Wait for the devices startup creates: every window has its swap chain from the first
+    /// turn (tests that draw at once; [`UiApp::new`]).
+    Wait,
+    /// Open the windows first: a window shows its backdrop at once and gets its swap chain when
+    /// the devices arrive, ready or not (the application).
+    Defer,
+    /// [`DeviceStart::Defer`] over `startup` instead of the one the process started (tests that
+    /// hold the devices back or fail them).
+    DeferOver(DeviceStartup),
+}
+
 /// What the instance hook and the shell share: the receiving window of later launches.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct InstanceInner {
+    app_id: String,
     primary: RefCell<Option<PrimaryInstance>>,
     window: RefCell<Option<MessageWindow>>,
 }
 
 /// The shell's end of the single-instance state ([`WinInstance::link`]).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InstanceLink(Rc<InstanceInner>);
 
+impl Default for InstanceLink {
+    fn default() -> Self {
+        Self::named(APP_ID)
+    }
+}
+
 impl InstanceLink {
+    fn named(app_id: impl Into<String>) -> Self {
+        Self(Rc::new(InstanceInner {
+            app_id: app_id.into(),
+            primary: RefCell::default(),
+            window: RefCell::default(),
+        }))
+    }
+
+    /// The AppUserModelID the single-instance state is named after: the process, its taskbar
+    /// button and its Jump List take it ([`APP_ID`] unless tests ask for an id of their own).
+    #[must_use]
+    pub fn app_id(&self) -> &str {
+        &self.0.app_id
+    }
+
     /// The launches later processes forwarded since the last call.
     fn take_launches(&self) -> Vec<Launch> {
         self.0
@@ -181,10 +217,20 @@ pub struct WinInstance {
 }
 
 impl WinInstance {
-    /// A hook that has not claimed anything yet.
+    /// A hook of the application ([`APP_ID`]) that has not claimed anything yet.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A hook of the application `app_id` instead of [`APP_ID`]: its single-instance mutex,
+    /// receiving window, process id and Jump List are named after `app_id`, so a test never
+    /// meets the running editor of the user.
+    #[must_use]
+    pub fn with_app_id(app_id: impl Into<String>) -> Self {
+        Self {
+            link: InstanceLink::named(app_id),
+        }
     }
 
     /// The shell's end of this hook.
@@ -202,7 +248,7 @@ impl InstanceHook for WinInstance {
             hwnd: window.hwnd(),
             message: WM_WAKE,
         };
-        match InstanceConfig::new(APP_ID)
+        match InstanceConfig::new(self.link.app_id())
             .acquire(Some(wake))
             .map_err(fail)?
         {
@@ -225,10 +271,6 @@ impl InstanceHook for WinInstance {
             }
         }
     }
-
-    fn take_launches(&mut self) -> Vec<Launch> {
-        self.link.take_launches()
-    }
 }
 
 /// One native window with everything that belongs to it.
@@ -240,11 +282,39 @@ struct NativeWindow {
     host: WindowHost,
 }
 
+/// Whether the graphics devices have reached the windows.
+enum Arrival {
+    /// Still being created: windows open without a swap chain and get it on arrival.
+    Waiting,
+    /// Here: every window has (or is given) a swap chain on them.
+    Here(GfxDevices),
+    /// Their creation failed; the application is leaving.
+    Failed,
+}
+
+impl Arrival {
+    /// The devices, once they are here.
+    fn devices(&self) -> Option<GfxDevices> {
+        match self {
+            Arrival::Here(devices) => Some(devices.clone()),
+            Arrival::Waiting | Arrival::Failed => None,
+        }
+    }
+}
+
+/// Gives `host` its swap chain on `devices`.
+fn attach_graphics(host: &WindowHost, devices: GfxDevices) -> Result<(), WinError> {
+    host.attach_graphics(devices)?;
+    ssw_win::perf::mark(crate::perf::GRAPHICS_ATTACHED);
+    Ok(())
+}
+
 /// The windows of the process and the loop that serves them.
 pub struct UiApp {
     controller: Rc<Controller>,
     env: Rc<WindowEnv>,
-    devices: GfxDevices,
+    devices: SharedDevices,
+    arrival: RefCell<Arrival>,
     wic: Wic,
     windows: RefCell<Vec<NativeWindow>>,
     settings: RefCell<Option<SettingsNative>>,
@@ -273,17 +343,47 @@ impl std::fmt::Debug for UiApp {
 }
 
 impl UiApp {
-    /// Builds the application over `core`: waits for the graphics device, connects the workers'
-    /// waker to the loop, makes the controller and queues the startup windows.
+    /// [`UiApp::start`] that waits for the graphics devices ([`DeviceStart::Wait`]): every
+    /// window has its swap chain from the first turn.
+    ///
+    /// # Errors
+    /// See [`UiApp::start`].
+    pub fn new(core: AppCore, options: UiOptions) -> Result<Self, WinError> {
+        Self::start(core, options, DeviceStart::Wait)
+    }
+
+    /// Builds the application over `core`: connects the workers' waker to the loop, makes the
+    /// controller and queues the startup windows. With a deferred [`DeviceStart`] the graphics
+    /// devices are still being created by their worker: the windows open first and
+    /// [`UiApp::pump`] gives them their swap chains when the devices arrive (the worker wakes
+    /// the loop).
     ///
     /// COM and OLE must be initialized on the calling thread ([`OleGuard`]) and outlive the
     /// returned value.
     ///
     /// # Errors
-    /// The graphics device, WIC, DirectWrite or the message window cannot be created.
-    pub fn new(mut core: AppCore, options: UiOptions) -> Result<Self, WinError> {
-        let devices = core.wait_devices()?;
-        ssw_win::perf::mark(crate::perf::DEVICES_RECEIVED);
+    /// The graphics device (when waited for), WIC, DirectWrite or the message window cannot be
+    /// created.
+    pub fn start(
+        mut core: AppCore,
+        options: UiOptions,
+        start: DeviceStart,
+    ) -> Result<Self, WinError> {
+        let (startup, defer) = match start {
+            DeviceStart::Wait => (core.take_devices()?, false),
+            DeviceStart::Defer => (core.take_devices()?, true),
+            DeviceStart::DeferOver(startup) => (startup, true),
+        };
+        let waker = Arc::clone(&core.waker);
+        startup.notify_on_ready(move || waker.wake());
+        let devices = SharedDevices::new(startup);
+        let arrival = if defer {
+            Arrival::Waiting
+        } else {
+            let here = devices.get()?;
+            ssw_win::perf::mark(crate::perf::DEVICES_RECEIVED);
+            Arrival::Here(here)
+        };
         let wic = Wic::new()?;
         let text = DWriteEngine::new()?;
         let message_window = match options
@@ -323,15 +423,19 @@ impl UiApp {
         let env = Rc::new(WindowEnv {
             controller: Rc::clone(&controller),
             text,
-            probe: ToUnicodeCharProbe::current(),
+            probe: Box::new(ToUnicodeCharProbe::current()),
             mica: Cell::new(system.transparency_effects),
             http: options.http.unwrap_or_else(|| Arc::new(WinHttp)),
             taskbar: options.taskbar.unwrap_or_else(|| Rc::new(SystemTaskbars)),
         });
+        let app_id = options
+            .instance
+            .as_ref()
+            .map_or(APP_ID, InstanceLink::app_id);
         let jump_list = options.jump_list.then(|| {
             let exe = std::env::current_exe().unwrap_or_default();
             JumpList::new(
-                APP_ID,
+                app_id,
                 exe,
                 i18n.text("window-jumplist-recent"),
                 i18n.text("window-jumplist-new-window"),
@@ -341,6 +445,7 @@ impl UiApp {
             controller,
             env,
             devices,
+            arrival: RefCell::new(arrival),
             wic,
             windows: RefCell::new(Vec::new()),
             settings: RefCell::new(None),
@@ -403,6 +508,14 @@ impl UiApp {
         self.offscreen.set(offscreen);
     }
 
+    /// Mirrors the recent files to `jump_list` from the next turn on (tests give it an
+    /// application id of their own, or a program the shell refuses).
+    pub fn set_jump_list(&mut self, jump_list: JumpList) {
+        self.jump_list = Some(jump_list);
+        self.recent_stale.set(true);
+        self.shown_recent.borrow_mut().clear();
+    }
+
     /// The platform wiring (text services, caret, accessibility) of window `id`.
     #[must_use]
     pub fn platform(&self, id: WindowId) -> Option<Rc<Platform>> {
@@ -439,26 +552,28 @@ impl UiApp {
             no_activate: self.hidden || offscreen,
         };
         let host = WindowHost::create(&options, Box::new(glue), theme)?;
-        let assets = CanvasAssets::with_scene_renderer(
+        // The assets (images, math scenes) need no device: registrations made before the
+        // swap chain exists are kept.
+        host.set_assets(CanvasAssets::with_scene_renderer(
             ImageStore::new(self.wic.clone()),
             self.env.text.clone(),
             self.wic.clone(),
-        )?;
-        host.attach_graphics(self.devices.clone(), assets)?;
-        ssw_win::perf::mark(crate::perf::GRAPHICS_ATTACHED);
+        )?);
+        // Devices still being created: the window shows its backdrop without a swap chain and
+        // `attach_devices` gives it one on arrival.
+        let devices = self.arrival.borrow().devices();
+        if let Some(devices) = devices {
+            attach_graphics(&host, devices)?;
+        }
         cell.hwnd.set(Some(host.hwnd()));
         let info = host.info();
         cell.view.borrow_mut().resize(info.size_dip(), info.scale());
         platform.attach(&host, &self.logger);
-        if !self.hidden {
-            if offscreen {
-                host.show_no_activate();
-            } else if placement.maximized {
-                host.show_maximized();
-            } else {
-                host.show();
-            }
-        }
+        host.show_mode(ShowMode::for_new_window(
+            self.hidden,
+            offscreen,
+            placement.maximized,
+        ));
         ssw_win::perf::mark(crate::perf::WINDOW_SHOWN);
         Ok(NativeWindow {
             cell,
@@ -702,7 +817,9 @@ impl UiApp {
         for launch in link.take_launches() {
             self.controller.open_launch(&launch);
             self.drain_requests();
-            if let Some(cell) = self.controller.active_window()
+            // A hidden application (tests) has nothing to bring to the foreground.
+            if !self.hidden
+                && let Some(cell) = self.controller.active_window()
                 && let Some(native) = self
                     .windows
                     .borrow()
@@ -749,11 +866,63 @@ impl UiApp {
         }
     }
 
-    /// One turn of the loop: requests, worker results, watchers, autosave, forwarded launches,
-    /// then the window synchronization. Returns whether another frame is wanted: an animation
-    /// frame was delivered or a window is scrolling (wheel spring, touch, inertia).
+    /// Takes the graphics devices once their worker is done and gives every open window its
+    /// swap chain and a repaint: the window that was showing only its backdrop gets its content.
+    /// A window that cannot take them is closed. Without devices there is nothing to show, so
+    /// the application leaves with [`EXIT_NO_DEVICE`].
+    fn attach_devices(&self) {
+        if !matches!(*self.arrival.borrow(), Arrival::Waiting) {
+            return;
+        }
+        let devices = match self.devices.poll() {
+            Ok(Some(devices)) => devices,
+            Ok(None) => return,
+            Err(error) => {
+                *self.arrival.borrow_mut() = Arrival::Failed;
+                self.logger.log(
+                    Level::Error,
+                    "startup",
+                    &format!("device creation failed: {error}"),
+                );
+                self.exit.set(Some(EXIT_NO_DEVICE));
+                ssw_win::window::quit(EXIT_NO_DEVICE);
+                return;
+            }
+        };
+        ssw_win::perf::mark(crate::perf::DEVICES_RECEIVED);
+        *self.arrival.borrow_mut() = Arrival::Here(devices.clone());
+        let failed: Vec<(WindowId, WinError)> = self
+            .windows
+            .borrow()
+            .iter()
+            .filter_map(
+                |native| match attach_graphics(&native.host, devices.clone()) {
+                    Ok(()) => {
+                        native.host.invalidate();
+                        None
+                    }
+                    Err(error) => Some((native.cell.id, error)),
+                },
+            )
+            .collect();
+        for (id, error) in failed {
+            self.logger.log(
+                Level::Error,
+                "window",
+                &format!("cannot give window {} its graphics: {error}", id.0),
+            );
+            self.controller.close_window(id);
+        }
+    }
+
+    /// One turn of the loop: requests, the arrival of the graphics devices, worker results,
+    /// watchers, autosave, forwarded launches, then the window synchronization. Returns whether
+    /// another frame is wanted: an animation frame was delivered or a window is scrolling (wheel
+    /// spring, touch, inertia).
     pub fn pump(&self) -> bool {
         self.drain_requests();
+        // After the requests: a window made in this turn is shown before the devices count.
+        self.attach_devices();
         let report = self.controller.core().borrow_mut().pump();
         self.controller.pump_files();
         if report.jobs > 0 || !report.external.is_empty() || !report.tick.saved.is_empty() {
@@ -838,15 +1007,19 @@ impl UiApp {
             size: WINDOW_SIZE,
             scale,
         });
-        match SettingsNative::create(
-            &self.env,
-            &self.devices,
-            &self.wic,
-            &self.logger,
-            cell,
-            rect,
-            self.hidden,
-        ) {
+        // Opened before the devices arrived (the first moments of a launch): waits for them.
+        let created = self.devices.get().and_then(|devices| {
+            SettingsNative::create(
+                &self.env,
+                &devices,
+                &self.wic,
+                &self.logger,
+                cell,
+                rect,
+                self.hidden,
+            )
+        });
+        match created {
             Ok(native) => *self.settings.borrow_mut() = Some(native),
             Err(error) => {
                 self.logger.log(
@@ -953,7 +1126,11 @@ impl ShellHost for UiShell {
                 return EXIT_NO_SHELL;
             }
         };
-        if let Err(error) = set_process_app_id(APP_ID) {
+        let app_id = self
+            .instance
+            .as_ref()
+            .map_or_else(|| APP_ID.to_owned(), |link| link.app_id().to_owned());
+        if let Err(error) = set_process_app_id(&app_id) {
             logger.log(
                 Level::Warn,
                 "startup",
@@ -968,7 +1145,9 @@ impl ShellHost for UiShell {
             http: None,
             taskbar: None,
         };
-        let app = match UiApp::new(core, options) {
+        // The window first: its backdrop is up while the worker still creates the devices, and
+        // the swap chain follows on arrival (`UiApp::pump`).
+        let app = match UiApp::start(core, options, DeviceStart::Defer) {
             Ok(app) => app,
             Err(error) => {
                 logger.log(

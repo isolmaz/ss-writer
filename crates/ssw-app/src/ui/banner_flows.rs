@@ -250,8 +250,9 @@ impl Controller {
                 self.remote_images().set_disabled(entry.id(), true);
                 self.remote_images_changed(cell);
             }
-            // The update banner's Download needs no document: `handle_action` opens the page.
-            (BannerAction::Download, _) | (_, None) => {}
+            // The update banner's Download needs no document.
+            (BannerAction::Download, _) => self.open_update_page(),
+            (_, None) => {}
         }
     }
 
@@ -369,22 +370,17 @@ impl Controller {
         let recovery = &self.docs().env().recovery;
         let mut failed = Vec::new();
         for entry in offer.entries {
-            let restored = recovery
-                .restore(&entry.id)
-                .map_err(|error| error.to_string())
-                .and_then(|restored| {
-                    self.docs()
-                        .restore_recovered(restored)
-                        .map_err(|error| error.to_string())
-                });
-            match restored {
-                Ok(document) => self.show_recovered(cell, document),
-                Err(reason) => {
+            match recovery.restore(&entry.id) {
+                Ok(restored) => {
+                    let document = self.docs().restore_recovered(restored);
+                    self.show_recovered(cell, document);
+                }
+                Err(error) => {
                     self.show_error(self.i18n().format(
                         "flows-recovery-failed",
                         &[
                             ("name", Arg::Str(&entry.display_name)),
-                            ("reason", Arg::Str(&reason)),
+                            ("reason", Arg::Str(&error.to_string())),
                         ],
                     ));
                     failed.push(entry);

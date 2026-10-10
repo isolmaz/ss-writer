@@ -105,17 +105,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed={}", i18n.display());
     println!("cargo:rerun-if-changed={}", welcome.display());
 
-    // The executable needs Common-Controls v6 (TaskDialogIndirect), per-monitor DPI v2, UTF-8
-    // and long paths. `embed-manifest` links it into the binary targets; the integration test
-    // executables get the same manifest, because they create real windows and task dialogs.
+    // Every executable of this package (the app, the unit-test and the integration-test
+    // executables, which create real windows) needs Common-Controls v6 (TaskDialogIndirect),
+    // per-monitor DPI v2, UTF-8 and long paths: the linker embeds the manifest into each.
     if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let manifest_file = manifest.join("SSWriter.manifest");
         println!("cargo:rerun-if-changed={}", manifest_file.display());
-        embed_manifest::embed_manifest_file(&manifest_file)
-            .map_err(|error| format!("cannot embed the application manifest: {error}"))?;
-        println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
         println!(
-            "cargo:rustc-link-arg-tests=/MANIFESTINPUT:{}",
+            "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
             manifest_file.display()
         );
 

@@ -178,7 +178,7 @@ impl Rig {
 
     /// Replaces the text of the active document with one unsaved edit.
     fn set_text(&self, text: &str) {
-        let changed = replace_text(&mut self.active().document().borrow_mut(), text).unwrap();
+        let changed = replace_text(&mut self.active().document().borrow_mut(), text);
         assert!(changed, "the text differs");
         self.controller.refresh_all();
     }

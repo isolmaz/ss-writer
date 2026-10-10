@@ -232,7 +232,8 @@ pub(crate) fn control_type(role: Role) -> UIA_CONTROLTYPE_ID {
 
 /// A SAFEARRAY of `i32` values (runtime ids).
 pub(crate) fn safe_array_i32(values: &[i32]) -> windows::core::Result<*mut SAFEARRAY> {
-    safe_array(VT_I4.0, values.len(), |data: *mut i32| {
+    safe_array(VT_I4.0, values.len(), &mut |data: *mut c_void| {
+        let data = data.cast::<i32>();
         for (index, value) in values.iter().enumerate() {
             // SAFETY: `data` points at `values.len()` writable i32 slots (see `safe_array`).
             unsafe { data.add(index).write(*value) };
@@ -242,7 +243,8 @@ pub(crate) fn safe_array_i32(values: &[i32]) -> windows::core::Result<*mut SAFEA
 
 /// A SAFEARRAY of `f64` values (bounding rectangles).
 pub(crate) fn safe_array_f64(values: &[f64]) -> windows::core::Result<*mut SAFEARRAY> {
-    safe_array(VT_R8.0, values.len(), |data: *mut f64| {
+    safe_array(VT_R8.0, values.len(), &mut |data: *mut c_void| {
+        let data = data.cast::<f64>();
         for (index, value) in values.iter().enumerate() {
             // SAFETY: `data` points at `values.len()` writable f64 slots (see `safe_array`).
             unsafe { data.add(index).write(*value) };
@@ -265,12 +267,12 @@ pub(crate) fn safe_array_empty_unknown() -> windows::core::Result<*mut SAFEARRAY
     allocated(unsafe { SafeArrayCreateVector(VT_UNKNOWN, 0, 0) })
 }
 
-/// A new SAFEARRAY vector of `len` elements of type `T` (matching the variant type `vt`) that
-/// `fill` initializes through a pointer to its first element.
-fn safe_array<T>(
+/// A new SAFEARRAY vector of `len` elements of the type `vt` names that `fill` initializes
+/// through a pointer to its first element (the caller casts it to the element type).
+fn safe_array(
     vt: u16,
     len: usize,
-    fill: impl FnOnce(*mut T),
+    fill: &mut dyn FnMut(*mut c_void),
 ) -> windows::core::Result<*mut SAFEARRAY> {
     let count = u32::try_from(len).map_err(|_| Error::from(E_FAIL))?;
     // SAFETY: creating a vector of `count` elements of the given element type.
@@ -279,9 +281,9 @@ fn safe_array<T>(
     });
     array.inspect(|array| {
         // SAFETY: the vector was just created and nobody else holds it, so its data pointer
-        // (`count` elements of type `T`) can be written without locking it.
+        // (`count` elements of the array's type) can be written without locking it.
         let data = unsafe { (**array).pvData };
-        fill(data.cast::<T>());
+        fill(data);
     })
 }
 
@@ -390,7 +392,7 @@ mod tests {
         // Refused before anything is allocated or filled.
         let too_many = u32::MAX as usize + 1;
         let error =
-            safe_array::<u8>(VT_I4.0, too_many, drop).expect_err("too many elements for a vector");
+            safe_array(VT_I4.0, too_many, &mut drop).expect_err("too many elements for a vector");
         assert_eq!(error.code(), E_FAIL);
     }
 }

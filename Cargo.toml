@@ -39,3 +39,8 @@ codegen-units = 1
 opt-level = 3
 strip = true
 panic = "unwind"
+
+# Dependencies (Typst, the Mermaid renderer, image codecs) are optimized in dev and test builds:
+# debug builds of them are slow enough to exceed the renderers' time limits under load.
+[profile.dev.package."*"]
+opt-level = 2

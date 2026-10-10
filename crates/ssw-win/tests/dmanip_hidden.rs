@@ -750,7 +750,7 @@ fn a_contact_the_viewport_accepted_is_tracked_until_the_system_says_it_is_gone()
     // No pointer is injected: the closure stands in for the viewport accepting a touch pointer.
     let mut handed = Vec::new();
     driver
-        .start_contact_with(0x7777, |dm, id| {
+        .start_contact_with(0x7777, &mut |dm, id| {
             handed.push(id);
             assert!(!dm.status().unwrap().is_moving());
             Ok(())
@@ -759,7 +759,7 @@ fn a_contact_the_viewport_accepted_is_tracked_until_the_system_says_it_is_gone()
     assert_eq!(handed, [0x7777]);
     assert!(driver.has_contact());
     // A viewport that refuses another pointer leaves the tracked contact alone.
-    let refused = driver.start_contact_with(0x8888, |_, _| Err(WinError::Invalid("refused")));
+    let refused = driver.start_contact_with(0x8888, &mut |_, _| Err(WinError::Invalid("refused")));
     assert!(refused.is_err());
     assert!(driver.has_contact());
     // The system does not know pointer 0x7777 (it never was one): the contact is over by the

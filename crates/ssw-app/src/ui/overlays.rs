@@ -127,25 +127,20 @@ impl fmt::Debug for OverlayEnv<'_> {
     }
 }
 
-/// Runs `widget.event` with a fresh context; a focus request is granted.
+/// Runs `widget.event` with a fresh context. The overlays move the focus between their own
+/// controls and never answer with a focus request for the host to grant.
 fn route<W: Control>(widget: &mut W, event: &Event, env: &mut OverlayEnv<'_>) -> EventResult {
     let id = widget.id();
-    let result = {
-        let mut cx = EventCx::new(
-            id,
-            env.theme,
-            env.scale,
-            env.text,
-            env.focus,
-            env.capture,
-            env.requests,
-        );
-        widget.event(&mut cx, event)
-    };
-    if result.request_focus {
-        env.focus.focus(id);
-    }
-    result
+    let mut cx = EventCx::new(
+        id,
+        env.theme,
+        env.scale,
+        env.text,
+        env.focus,
+        env.capture,
+        env.requests,
+    );
+    widget.event(&mut cx, event)
 }
 
 /// What the editor-side of an overlay event needs from the document.
@@ -930,6 +925,11 @@ const FILE_LIST_LIMIT: usize = 50_000;
 /// skipped unless `show_hidden`; `.git` never is listed. The walk stops at 50 000 files.
 #[must_use]
 pub fn list_workspace_files(root: &std::path::Path, show_hidden: bool) -> Vec<String> {
+    list_files(root, show_hidden, FILE_LIST_LIMIT)
+}
+
+/// [`list_workspace_files`] stopping at `limit` files.
+fn list_files(root: &std::path::Path, show_hidden: bool, limit: usize) -> Vec<String> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     'walk: while let Some(dir) = stack.pop() {
@@ -942,17 +942,17 @@ pub fn list_workspace_files(root: &std::path::Path, show_hidden: bool) -> Vec<St
             if name == ".git" || (!show_hidden && name.starts_with('.')) {
                 continue;
             }
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
+            // The type of a Windows directory entry comes with the listing and is always there
+            // (`std` returns `Ok` unconditionally), so a missing one is only ever skipped.
+            let kind = entry.file_type().ok();
             let path = entry.path();
-            if kind.is_dir() {
+            if kind.is_some_and(|kind| kind.is_dir()) {
                 stack.push(path);
-            } else if kind.is_file()
+            } else if kind.is_some_and(|kind| kind.is_file())
                 && let Ok(relative) = path.strip_prefix(root)
             {
                 files.push(relative.to_string_lossy().replace('\\', "/"));
-                if files.len() >= FILE_LIST_LIMIT {
+                if files.len() >= limit {
                     break 'walk;
                 }
             }
@@ -990,4 +990,25 @@ pub fn panel_files(
                 .collect(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list_files;
+
+    #[test]
+    fn the_walk_stops_at_the_limit_and_lists_everything_below_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        for name in ["a.md", "b.md", "c.md", "sub/d.md", "sub/e.md"] {
+            std::fs::write(tmp.path().join(name), "x").unwrap();
+        }
+        assert_eq!(
+            list_files(tmp.path(), false, 100),
+            ["a.md", "b.md", "c.md", "sub/d.md", "sub/e.md"]
+        );
+        let limited = list_files(tmp.path(), false, 3);
+        assert_eq!(limited.len(), 3);
+        assert!(limited.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
+    }
 }

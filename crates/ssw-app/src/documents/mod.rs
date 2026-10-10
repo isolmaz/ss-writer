@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use ssw_convert::import::{Asset, Loss};
 use ssw_core::document::Document;
-use ssw_core::edit::{EditError, Selection};
+use ssw_core::edit::Selection;
 use ssw_core::i18n::{Arg, Localizer};
 use ssw_io::encoding::{EncodeError, TextFormat};
 use ssw_io::fs::{FileSystem, FsError};
@@ -70,9 +70,6 @@ pub enum DocError {
     /// The state database failed.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// The document rejected an edit.
-    #[error(transparent)]
-    Edit(#[from] EditError),
     /// Converting to a word-processor format or bundle failed.
     #[error("conversion failed: {0}")]
     Convert(String),
@@ -101,7 +98,7 @@ impl DocError {
             Self::Load(LoadError::Import(_) | LoadError::Bundle(_)) | Self::Convert(_) => {
                 "app-error-conversion"
             }
-            Self::Load(_) | Self::Fs(_) | Self::Store(_) | Self::Edit(_) => "app-error-file",
+            Self::Load(_) | Self::Fs(_) | Self::Store(_) => "app-error-file",
             Self::Save(SaveError::ReadOnly(_)) => "app-error-read-only",
             Self::Save(SaveError::SharingViolation(_)) => "app-error-in-use",
             Self::Save(SaveError::DiskFull(_)) => "app-error-disk-full",
@@ -148,6 +145,9 @@ struct DocState {
     assets: Vec<Asset>,
     lossy: bool,
     mixed_endings_notice: bool,
+    /// "Render as Markdown" (spec §4.1) is on: a plain-text file is shown and edited as
+    /// Markdown. Only the presentation changes; the file is written as it was.
+    render_markdown: bool,
 }
 
 /// One open document and everything the app tracks about it.
@@ -222,9 +222,8 @@ impl DocEntry {
                 )
             };
         }
-        let Some(path) = &state.path else {
-            return i18n.text("app-untitled");
-        };
+        // Every entry has a path or an untitled number: the empty path is never reached.
+        let path = state.path.as_deref().unwrap_or(Path::new(""));
         let markdown = path.extension().is_some_and(|extension| {
             let extension = extension.to_string_lossy().to_ascii_lowercase();
             matches!(extension.as_str(), "md" | "markdown" | "mdx")
@@ -260,13 +259,43 @@ impl DocEntry {
         )
     }
 
-    /// How the editor treats the document.
+    /// How the editor treats the document: what the file type says, except that a plain-text
+    /// file the user chose to "Render as Markdown" is treated as Markdown.
     #[must_use]
     pub fn mode(&self) -> DocMode {
+        match self.file_mode() {
+            DocMode::Plain if self.render_as_markdown() => DocMode::Markdown,
+            mode => mode,
+        }
+    }
+
+    /// What the file type alone says about the document (spec §4.1): Markdown for untitled
+    /// buffers, Markdown files and converted documents, Mermaid for `.mmd`, plain for every
+    /// other file. [`DocEntry::mode`] differs for plain files rendered as Markdown.
+    #[must_use]
+    pub fn file_mode(&self) -> DocMode {
         match &self.state.borrow().path {
             Some(path) => mode_for_path(path),
             None => DocMode::Markdown,
         }
+    }
+
+    /// Whether "Render as Markdown" is on for this document.
+    #[must_use]
+    pub fn render_as_markdown(&self) -> bool {
+        self.state.borrow().render_markdown
+    }
+
+    /// Switches "Render as Markdown" (spec §4.1) on or off. Only plain-text files have it:
+    /// returns `false` and changes nothing for any other document. The switch changes how the
+    /// document is shown, never what is written: the path, encoding, line endings and bytes of
+    /// the next save are those of the plain file.
+    pub fn set_render_as_markdown(&self, render: bool) -> bool {
+        if self.file_mode() != DocMode::Plain {
+            return false;
+        }
+        self.state.borrow_mut().render_markdown = render;
+        true
     }
 
     /// Whether the file can be written.
@@ -485,6 +514,7 @@ impl Documents {
             assets: loaded.assets,
             lossy: loaded.lossy,
             mixed_endings_notice: loaded.format.had_mixed_endings,
+            render_markdown: false,
         };
         if tracked {
             self.tracker.borrow_mut().track(&canonical, loaded.stamp);
@@ -523,6 +553,7 @@ impl Documents {
             assets: Vec::new(),
             lossy: false,
             mixed_endings_notice: false,
+            render_markdown: false,
         }
     }
 
@@ -548,20 +579,18 @@ impl Documents {
     }
 
     /// Restores a document from the recovery folder: an untitled buffer, or the file the text
-    /// belongs to with the recovered text as unsaved edits. The recovery entry is discarded.
-    ///
-    /// # Errors
-    /// [`DocError::Load`] when the original file cannot be opened to take its identity.
-    pub fn restore_recovered(&self, restored: RestoredDoc) -> Result<Rc<DocEntry>, DocError> {
+    /// belongs to with the recovered text as unsaved edits (a file that cannot be opened any more
+    /// keeps the text as an untitled buffer). The recovery entry is discarded.
+    #[must_use]
+    pub fn restore_recovered(&self, restored: RestoredDoc) -> Rc<DocEntry> {
         let RestoredDoc { entry, text } = restored;
         let result = match (entry.kind, entry.original_path.as_deref()) {
             (RecoveryKind::Dirty, Some(path)) => {
-                let document = self.open(path).or_else(|_| {
-                    // The file vanished: keep the recovered text as an untitled buffer.
-                    Ok::<_, DocError>(self.restore_untitled(&entry.id, &text))
-                })?;
+                let document = self
+                    .open(path)
+                    .unwrap_or_else(|_| self.restore_untitled(&entry.id, &text));
                 if !document.is_untitled() {
-                    replace_text(&mut document.document.borrow_mut(), &text)?;
+                    replace_text(&mut document.document.borrow_mut(), &text);
                     document.state.borrow_mut().saved_version = u64::MAX;
                     document.state.borrow_mut().format = entry.format;
                 }
@@ -575,7 +604,7 @@ impl Documents {
         };
         // The recovery entry is consumed even when it was already gone.
         let _ = self.env.recovery.discard(&entry.id);
-        Ok(result)
+        result
     }
 
     /// Takes a snapshot of a file document in the version history.

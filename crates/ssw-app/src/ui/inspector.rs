@@ -216,13 +216,10 @@ pub struct InspectorFeeds {
 }
 
 impl InspectorFeeds {
-    /// Brings the inspector of `view` up to date with its active tab. Does nothing while the
-    /// inspector is hidden; the next call after it is shown recomputes.
+    /// Brings the inspector of `view` up to date with its active tab. The caller calls this
+    /// only while the inspector is shown (`Controller::sync_inspector` forgets the window
+    /// otherwise, so the next call after it is shown recomputes).
     pub fn sync(&mut self, window: WindowId, view: &mut ShellView, env: &FeedEnv<'_>) {
-        if !view.layout().inspector_visible() {
-            self.windows.remove(&window);
-            return;
-        }
         let Some((tab_key, entry, workspace)) = view
             .active_tab()
             .map(|tab| (tab.key, Rc::clone(&tab.entry), tab.workspace.clone()))

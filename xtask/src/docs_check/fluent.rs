@@ -59,6 +59,9 @@ pub fn defined_ids(sources: &[(String, String)], report: &mut Report) -> Defined
     defined
 }
 
+/// A trailing comment that marks the literals of its line as not being message ids.
+pub const NOT_AN_ID: &str = "// docs-check: not a message id";
+
 /// A whole string literal shaped like a message id: lowercase words joined by `-`.
 fn id_literal() -> Regex {
     // The pattern is a constant; every test of this module compiles and uses it.
@@ -67,7 +70,8 @@ fn id_literal() -> Regex {
 
 /// Message ids written as string literals in `source`: `(line number, id)`. Only literals
 /// whose first segment is one of `areas` count, which keeps strings such as `"ssw-core"` out.
-/// Comment lines are skipped.
+/// Comment lines are skipped, and so are lines marked with [`NOT_AN_ID`] (script keywords or
+/// XML names that merely look like ids).
 pub fn referenced_ids<'a>(
     source: &'a str,
     areas: &BTreeSet<&str>,
@@ -75,17 +79,23 @@ pub fn referenced_ids<'a>(
 ) -> Vec<(usize, &'a str)> {
     let mut found = Vec::new();
     for (index, line) in source.lines().enumerate() {
-        if line.trim_start().starts_with("//") {
+        if line.trim_start().starts_with("//") || line.contains(NOT_AN_ID) {
             continue;
         }
         for capture in literal.captures_iter(line) {
             let Some(id) = capture.get(1).map(|m| m.as_str()) else {
                 continue;
             };
-            if id
-                .split('-')
-                .next()
-                .is_some_and(|area| areas.contains(area))
+            // `name="table-cell"` inside an XML template is an attribute value: rustfmt never
+            // writes Rust code without a space before a string literal.
+            let attribute = capture
+                .get(0)
+                .is_some_and(|whole| line[..whole.start()].ends_with('='));
+            if !attribute
+                && id
+                    .split('-')
+                    .next()
+                    .is_some_and(|area| areas.contains(area))
             {
                 found.push((index + 1, id));
             }
@@ -228,6 +238,8 @@ fn labels() {
     let missing = loc.text(\"cmd-file-nope\");
     let unrelated = \"ssw-core\";
     let other_area = \"zzz-not-an-area\";
+    let keyword = \"cmd-script-word\"; // docs-check: not a message id
+    let xml = r#\"<a family=\"cmd-xml-value\"/>\"#;
 }
 ";
         check_references(

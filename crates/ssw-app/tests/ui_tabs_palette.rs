@@ -159,7 +159,7 @@ impl Rig {
         let window = self.window();
         let view = window.view.borrow();
         let entry = Rc::clone(&view.active_tab().expect("a tab is open").entry);
-        let changed = replace_text(&mut entry.document().borrow_mut(), text).unwrap();
+        let changed = replace_text(&mut entry.document().borrow_mut(), text);
         assert!(changed, "the text differs");
     }
 

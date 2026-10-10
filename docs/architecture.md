@@ -72,14 +72,14 @@ Prototype code and full reports live outside the repo in `ssw-spikes/{a-window,b
 
 ## Engineering rules
 
-- Edition 2024, toolchain pinned in `rust-toolchain.toml`. `cargo fmt`, `cargo clippy -D warnings` clean.
+- Edition 2024, toolchain pinned in `rust-toolchain.toml`. `cargo fmt --all` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` clean.
 - Errors: `thiserror` enums per crate; no `unwrap`/`expect` outside tests except on invariants proven by types (with a comment).
 - No dead code, no stubs, no `todo!()`/`unimplemented!()` in committed code.
 - Release profile: `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`, `strip = true`, `panic = "unwind"`.
 
 ## Testing
 
-- Gate: `cargo xtask coverage` → `cargo llvm-cov nextest --workspace` with `--fail-under-lines 100 --fail-under-regions 100 --fail-under-functions 100`. No exclusions: no `#[coverage(off)]`, no ignore-filename regex beyond `tests/` and `xtask/`. Branch coverage is reported on nightly, not gated.
+- Gate: `cargo xtask coverage` → `cargo llvm-cov nextest --workspace --all-features` (so the test-only `fault-injection` features of `ssw-io`, `ssw-win`, `ssw-convert` and `ssw-preview` are on) with `--fail-under-lines 100 --fail-under-regions 100 --fail-under-functions 100`. No exclusions: no `#[coverage(off)]`, no ignore-filename regex beyond `tests/` and `xtask/`. Branch coverage is reported on nightly, not gated.
 - `cargo xtask mutants` runs `cargo-mutants`; every surviving mutant gets a real test or a written justification in the PR.
 - Tests assert observable behavior: document text, file bytes on disk, pixels drawn, AST shape, emitted events. No tests of wiring, mock echoes, or source text.
 - Platform tests create real hidden windows, real D2D/DirectWrite objects, WIC bitmap render targets for pixel checks, real TSF/UIA objects in-process. The binary is exercised by tests that launch `SSWriter.exe` with test flags.

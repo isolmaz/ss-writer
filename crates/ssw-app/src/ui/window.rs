@@ -19,9 +19,9 @@ use ssw_ui::geometry::Point;
 use ssw_ui::input::{Event, KeyEvent};
 use ssw_ui::shell::layout::{CaptionButton, ChromeHit, ResizeEdge};
 use ssw_ui::shell::titlebar::{MenuKind, TitleEvent};
-use ssw_ui::shortcuts::ShortcutOutcome;
+use ssw_ui::shortcuts::{CharProbe, ShortcutOutcome};
 use ssw_win::dwrite::DWriteEngine;
-use ssw_win::keyboard::{ToUnicodeCharProbe, caps_lock_on};
+use ssw_win::keyboard::caps_lock_on;
 use ssw_win::menus::{MenuTheme, apply_menu_theme};
 use ssw_win::taskbar::TaskbarFactory;
 use ssw_win::theme::SystemTheme;
@@ -40,8 +40,9 @@ pub struct WindowEnv {
     pub controller: Rc<Controller>,
     /// The text layout engine the views lay out and hit test with.
     pub text: DWriteEngine,
-    /// The layout's character probe for the AltGr rule (spec §11).
-    pub probe: ToUnicodeCharProbe,
+    /// The layout's character probe for the AltGr rule (spec §11): the keyboard layout of the
+    /// user (`ssw_win::keyboard::ToUnicodeCharProbe`), a scripted layout in tests.
+    pub probe: Box<dyn CharProbe>,
     /// The backdrop is transparent (Mica): off when the system turned transparency off.
     pub mica: Cell<bool>,
     /// The network seam of the remote images (real WinHTTP, scripted in tests).
@@ -141,7 +142,7 @@ impl WindowGlue {
         let outcome = self
             .env
             .controller
-            .route_key(key, &self.env.probe, caps_lock_on());
+            .route_key(key, self.env.probe.as_ref(), caps_lock_on());
         match outcome {
             ShortcutOutcome::Command(command) => {
                 self.env
@@ -160,9 +161,15 @@ impl WindowGlue {
         }
     }
 
-    /// Delivers `event` to the view and queues what the user asked for.
+    /// Delivers `event` to the view and queues what the user asked for. Nothing is delivered
+    /// while the view is borrowed (a modal loop runs) and for the move of a contact that
+    /// DirectManipulation scrolls with: that touch does not select text as well.
     fn deliver(&self, event: &Event) {
-        let Ok(mut view) = self.cell.view.try_borrow_mut() else {
+        let scrolling = match event {
+            Event::Pointer(pointer) => self.platform.is_scrolling_contact(pointer),
+            _ => false,
+        };
+        let (false, Ok(mut view)) = (scrolling, self.cell.view.try_borrow_mut()) else {
             return;
         };
         let actions = view.event(event, &self.env.text);
@@ -219,8 +226,6 @@ impl WindowHandler for WindowGlue {
         match &event {
             // The platform animates the editor's wheel scrolling.
             Event::Wheel(wheel) => self.platform.wheel(wheel, || self.deliver(&event)),
-            // A touch that DirectManipulation scrolls with does not select text as well.
-            Event::Pointer(pointer) if self.platform.is_scrolling_contact(pointer) => {}
             _ => self.deliver(&event),
         }
     }

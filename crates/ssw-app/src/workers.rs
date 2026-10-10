@@ -139,9 +139,6 @@ pub enum SubmitError {
     /// The owning window was already cancelled.
     #[error("the window of the job was closed")]
     WindowClosed,
-    /// The pool is shutting down.
-    #[error("the worker pool is shutting down")]
-    ShuttingDown,
 }
 
 /// Lets a running job notice that its result will be dropped.
@@ -340,8 +337,7 @@ impl Workers {
     /// with its value, unless the result is stale or the window was cancelled.
     ///
     /// # Errors
-    /// [`SubmitError::WindowClosed`] for a cancelled window, [`SubmitError::ShuttingDown`] when
-    /// the pool is being dropped.
+    /// [`SubmitError::WindowClosed`] for a cancelled window.
     pub fn submit<T, F, D>(&self, spec: JobSpec, job: F, on_done: D) -> Result<JobId, SubmitError>
     where
         T: Send + 'static,
@@ -381,25 +377,20 @@ impl Workers {
                 Ok(Box::new(job(&token)) as Box<dyn Any + Send>)
             }),
         };
-        let deliver = Box::new(move |outcome: Outcome| match outcome {
-            Ok(value) => match value.downcast::<T>() {
-                Ok(value) => on_done(Ok(*value)),
-                // The type is fixed by `submit`; a mismatch cannot happen.
-                Err(_) => on_done(Err(JobError::Panicked("result type mismatch".to_owned()))),
-            },
-            Err(error) => on_done(Err(error)),
+        let deliver = Box::new(move |outcome: Outcome| {
+            on_done(outcome.map(|value| {
+                *value
+                    .downcast::<T>()
+                    .expect("the value of a job has the type its submit fixed")
+            }));
         });
-        {
-            let mut guard = self
-                .queue
-                .tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.1 {
-                return Err(SubmitError::ShuttingDown);
-            }
-            guard.0.push_back(task);
-        }
+        // The pool only shuts down in `Drop`, which needs `&mut self`: no submit is running.
+        self.queue
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            .push_back(task);
         self.pending
             .borrow_mut()
             .insert(id, Pending { spec, deliver });
@@ -511,6 +502,27 @@ mod tests {
         }
     }
 
+    /// A callback that stores the value that arrived. Shared by the jobs of a test, so the
+    /// callback of a result that is dropped as stale is the code of the one that is delivered.
+    fn record<T: 'static>(
+        sink: &Rc<RefCell<Vec<T>>>,
+    ) -> impl FnOnce(Result<T, JobError>) + 'static {
+        let sink = Rc::clone(sink);
+        move |result| sink.borrow_mut().push(result.unwrap())
+    }
+
+    /// A callback that notes `what` when its result is delivered.
+    fn note(
+        sink: &Rc<RefCell<Vec<&'static str>>>,
+        what: &'static str,
+    ) -> impl FnOnce(Result<(), JobError>) + 'static {
+        let sink = Rc::clone(sink);
+        move |_| sink.borrow_mut().push(what)
+    }
+
+    /// The callback of results nobody looks at.
+    fn ignore<T>(_: Result<T, JobError>) {}
+
     #[test]
     fn a_result_is_delivered_on_the_polling_thread_and_wakes_the_loop() {
         let waker = Arc::new(CountingWaker::default());
@@ -554,7 +566,6 @@ mod tests {
         let (release, gate) = channel::<()>();
         let (started, running) = channel::<()>();
         let delivered = Rc::new(RefCell::new(Vec::new()));
-        let first = Rc::clone(&delivered);
         // Generation 1 is blocked until generation 2 has been submitted.
         workers
             .submit(
@@ -564,16 +575,15 @@ mod tests {
                     gate.recv_timeout(Duration::from_secs(5)).unwrap();
                     (1, token.is_cancelled())
                 },
-                move |result| first.borrow_mut().push(result.unwrap()),
+                record(&delivered),
             )
             .unwrap();
         running.recv_timeout(Duration::from_secs(5)).unwrap();
-        let second = Rc::clone(&delivered);
         workers
             .submit(
                 spec(7, 2),
                 |token| (2, token.is_cancelled()),
-                move |result| second.borrow_mut().push(result.unwrap()),
+                record(&delivered),
             )
             .unwrap();
         release.send(()).unwrap();
@@ -587,23 +597,61 @@ mod tests {
     #[test]
     fn supersede_marks_results_obsolete_without_a_new_job() {
         let workers = Workers::new(1, Arc::new(CountingWaker::default()));
-        let ran = Rc::new(Cell::new(false));
-        let flag = Rc::clone(&ran);
+        let ran = Rc::new(RefCell::new(Vec::new()));
         workers
-            .submit(spec(3, 5), |_| (), move |_| flag.set(true))
+            .submit(spec(3, 5), |_| (), note(&ran, "obsolete"))
             .unwrap();
         workers.supersede(JobKey(3), 6);
         pump(&workers, || workers.pending() == 0);
-        assert!(!ran.get());
+        assert!(ran.borrow().is_empty());
         assert_eq!(workers.stats().dropped, 1);
         // An older supersede never lowers the marker.
         workers.supersede(JobKey(3), 2);
-        let flag = Rc::clone(&ran);
         workers
-            .submit(spec(3, 6), |_| (), move |_| flag.set(true))
+            .submit(spec(3, 6), |_| (), note(&ran, "current"))
             .unwrap();
         pump(&workers, || workers.pending() == 0);
-        assert!(ran.get());
+        assert_eq!(*ran.borrow(), ["current"]);
+    }
+
+    #[test]
+    fn a_queued_job_of_an_obsolete_generation_never_starts() {
+        let workers = Workers::new(1, Arc::new(CountingWaker::default()));
+        let (release, gate) = channel::<()>();
+        let (started, running) = channel::<()>();
+        let started_jobs = Arc::new(AtomicUsize::new(0));
+        // Both jobs count themselves; only the first one holds the single pool thread.
+        let job = |hold: Option<(Sender<()>, Receiver<()>)>| {
+            let started_jobs = Arc::clone(&started_jobs);
+            move |_: &CancelToken| {
+                hold.into_iter().for_each(|(started, gate)| {
+                    started.send(()).unwrap();
+                    let _ = gate.recv_timeout(Duration::from_secs(5));
+                });
+                started_jobs.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        workers
+            .submit(spec(1, 1), job(Some((started, gate))), ignore)
+            .unwrap();
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+        workers.submit(spec(2, 1), job(None), ignore).unwrap();
+        workers.supersede(JobKey(2), 2);
+        release.send(()).unwrap();
+        pump(&workers, || workers.pending() == 0);
+        assert_eq!(
+            started_jobs.load(Ordering::SeqCst),
+            1,
+            "the obsolete job was dropped before it started"
+        );
+        assert_eq!(
+            workers.stats(),
+            WorkerStats {
+                delivered: 1,
+                dropped: 1,
+                panics: 0
+            }
+        );
     }
 
     #[test]
@@ -668,7 +716,6 @@ mod tests {
         let ran = Rc::new(RefCell::new(Vec::new()));
         let mut owned = spec(1, 1);
         owned.window = Some(window);
-        let sink = Rc::clone(&ran);
         workers
             .submit(
                 owned,
@@ -678,30 +725,20 @@ mod tests {
                     let _ = gate.recv_timeout(Duration::from_secs(5));
                     observed.store(token.is_cancelled(), Ordering::SeqCst);
                 },
-                move |_| sink.borrow_mut().push("window job"),
+                note(&ran, "window job"),
             )
             .unwrap();
         running.recv_timeout(Duration::from_secs(5)).unwrap();
         // Queued behind the blocked job: cancelled before it can start.
         let mut queued = spec(2, 1);
         queued.window = Some(window);
-        let sink = Rc::clone(&ran);
         workers
-            .submit(
-                queued,
-                |_| (),
-                move |_| sink.borrow_mut().push("queued job"),
-            )
+            .submit(queued, |_| (), note(&ran, "queued job"))
             .unwrap();
         let mut unrelated = spec(3, 1);
         unrelated.window = Some(other);
-        let sink = Rc::clone(&ran);
         workers
-            .submit(
-                unrelated,
-                |_| (),
-                move |_| sink.borrow_mut().push("other window"),
-            )
+            .submit(unrelated, |_| (), note(&ran, "other window"))
             .unwrap();
 
         workers.cancel_window(window);
@@ -780,27 +817,22 @@ mod tests {
         let (release, gate) = channel::<()>();
         let (started, running) = channel::<()>();
         let workers = Workers::new(1, Arc::new(CountingWaker::default()));
-        let counter = Arc::clone(&ran);
-        workers
-            .submit(
-                spec(1, 1),
-                move |_| {
+        // Both jobs add to the counter; only the first one holds still until it is released.
+        let adder = |amount: usize, hold: Option<(Sender<()>, Receiver<()>)>| {
+            let counter = Arc::clone(&ran);
+            move |_: &CancelToken| {
+                hold.into_iter().for_each(|(started, gate)| {
                     started.send(()).unwrap();
                     let _ = gate.recv_timeout(Duration::from_secs(5));
-                    counter.fetch_add(1, Ordering::SeqCst);
-                },
-                |_| (),
-            )
-            .unwrap();
-        let counter = Arc::clone(&ran);
+                });
+                counter.fetch_add(amount, Ordering::SeqCst);
+            }
+        };
         workers
-            .submit(
-                spec(2, 1),
-                move |_| {
-                    counter.fetch_add(100, Ordering::SeqCst);
-                },
-                |_| (),
-            )
+            .submit(spec(1, 1), adder(1, Some((started, gate))), |_| ())
+            .unwrap();
+        workers
+            .submit(spec(2, 1), adder(100, None), |_| ())
             .unwrap();
         // The first job is running and the second queued behind it. A helper releases the first
         // job a moment after the pool starts dropping, so the second job is already discarded.

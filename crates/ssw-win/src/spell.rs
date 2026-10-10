@@ -53,7 +53,7 @@ pub struct SpellingError {
 /// for [`CORRECTIVE_ACTION_REPLACE`].
 fn corrective_action(
     code: CORRECTIVE_ACTION,
-    replacement: impl FnOnce() -> Result<String, WinError>,
+    replacement: &mut dyn FnMut() -> Result<String, WinError>,
 ) -> Result<CorrectiveAction, WinError> {
     Ok(match code {
         CORRECTIVE_ACTION_GET_SUGGESTIONS => CorrectiveAction::Suggest,
@@ -124,7 +124,7 @@ fn read_errors(found: &IEnumSpellingError) -> Result<Vec<RawError>, WinError> {
                 check(error.CorrectiveAction()).ctx("ISpellingError::CorrectiveAction")?,
             )
         };
-        let action = corrective_action(code, || read_replacement(&error))?;
+        let action = corrective_action(code, &mut || read_replacement(&error))?;
         errors.push(RawError {
             start: start as usize,
             length: length as usize,
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn corrective_actions_map_from_the_system_codes() {
         let reads = Cell::new(0);
-        let read_replacement = || -> Result<String, WinError> {
+        let mut read_replacement = || -> Result<String, WinError> {
             reads.set(reads.get() + 1);
             Ok("the".to_owned())
         };
@@ -379,15 +379,18 @@ mod tests {
             // An unknown code is "nothing specific", not a failure.
             (CORRECTIVE_ACTION(99), CorrectiveAction::None),
         ] {
-            assert_eq!(corrective_action(code, read_replacement).unwrap(), expected);
+            assert_eq!(
+                corrective_action(code, &mut read_replacement).unwrap(),
+                expected
+            );
         }
         assert_eq!(reads.get(), 0, "the replacement is only read for REPLACE");
         assert_eq!(
-            corrective_action(CORRECTIVE_ACTION_REPLACE, read_replacement).unwrap(),
+            corrective_action(CORRECTIVE_ACTION_REPLACE, &mut read_replacement).unwrap(),
             CorrectiveAction::Replace("the".to_owned())
         );
         assert_eq!(reads.get(), 1);
-        let failing = corrective_action(CORRECTIVE_ACTION_REPLACE, || {
+        let failing = corrective_action(CORRECTIVE_ACTION_REPLACE, &mut || {
             Err(WinError::from_os("replacement", E_FAIL.into()))
         });
         assert!(failing.is_err());
@@ -452,6 +455,9 @@ mod tests {
         let single = same_language_checker(&factory, 1);
         let twice = same_language_checker(&factory, 2);
         assert_eq!(twice.languages().count(), 2);
+        // No text, no misspelling: the system is not even asked.
+        assert!(single.check("").unwrap().is_empty());
+        assert!(twice.check("").unwrap().is_empty());
         // Surrogate pairs and multi-byte characters shift UTF-8 and UTF-16 offsets apart.
         let text = "\u{1F600} \u{2603} xqzvkjwp \u{00FC}\u{011F} qwrtzxcvbn";
         let errors = twice.check(text).unwrap();
@@ -541,7 +547,10 @@ mod tests {
         }
         assert_eq!(read_replacement(&offered).unwrap(), "Çay 😀");
         assert_eq!(
-            corrective_action(CORRECTIVE_ACTION_REPLACE, || read_replacement(&offered)).unwrap(),
+            corrective_action(CORRECTIVE_ACTION_REPLACE, &mut || read_replacement(
+                &offered
+            ))
+            .unwrap(),
             CorrectiveAction::Replace("Çay 😀".to_owned())
         );
         let broken: ISpellingError = OfferedError {

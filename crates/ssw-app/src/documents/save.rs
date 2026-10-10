@@ -66,6 +66,11 @@ impl AssetProvider for LocalAssets<'_> {
     }
 }
 
+/// A failed conversion step (an exporter, the TextBundle writer) by its message.
+fn conversion_failed(error: impl ToString) -> DocError {
+    DocError::Convert(error.to_string())
+}
+
 /// The bytes of `markdown` in the word-processor format `format`.
 fn export_bytes(
     format: ConvertedFormat,
@@ -86,7 +91,7 @@ fn export_bytes(
                 math: &mut math,
             };
             ssw_convert::docx::export_docx(markdown, &options, &mut resources)
-                .map_err(|error| DocError::Convert(error.to_string()))
+                .map_err(conversion_failed)
         }
         ConvertedFormat::Odt => {
             let mut resources = Resources {
@@ -94,7 +99,7 @@ fn export_bytes(
                 math: &mut math,
             };
             ssw_convert::odt::export_odt(markdown, &options, &mut resources)
-                .map_err(|error| DocError::Convert(error.to_string()))
+                .map_err(conversion_failed)
         }
         ConvertedFormat::Rtf => {
             Ok(ssw_convert::rtf::markdown_to_rtf(markdown, provider).into_bytes())
@@ -145,8 +150,7 @@ impl Documents {
             )?,
             Source::TextPack => {
                 let assets = entry.state.borrow().assets.clone();
-                let bytes = textbundle::write_pack(&text, &assets)
-                    .map_err(|error| DocError::Convert(error.to_string()))?;
+                let bytes = textbundle::write_pack(&text, &assets).map_err(conversion_failed)?;
                 save_atomic(
                     self.env.fs.as_ref(),
                     self.env.sleeper.as_ref(),
@@ -183,12 +187,13 @@ impl Documents {
         }
     }
 
-    /// "Save back to Word / ODT / RTF": snapshots the Markdown text in the version history,
-    /// converts it and replaces the original file.
+    /// "Save back to Word / ODT / RTF": converts the Markdown text, snapshots it in the version
+    /// history and replaces the original file.
     ///
     /// # Errors
     /// [`DocError::Unsupported`] for `.doc` (import only) and for documents that were not
-    /// imported, [`DocError::Convert`] when the exporter fails, [`DocError::Save`] for write
+    /// imported, [`DocError::Convert`] when the exporter fails, [`DocError::Store`] when the
+    /// snapshot cannot be taken (nothing is replaced then), [`DocError::Save`] for write
     /// failures.
     pub fn save_back(&self, entry: &DocEntry) -> Result<Saved, DocError> {
         let (path, source) = {
@@ -199,10 +204,6 @@ impl Documents {
         let Source::Converted(format) = source else {
             return Err(DocError::Unsupported("non-converted"));
         };
-        if !format.can_save_back() {
-            return Err(DocError::Unsupported("Word 97-2003"));
-        }
-        self.snapshot(entry, SnapshotReason::BeforeSaveBack)?;
         let (text, version) = {
             let document = entry.document.borrow();
             (document.text(), document.version())
@@ -215,6 +216,7 @@ impl Documents {
             assets: &assets,
         };
         let bytes = export_bytes(format, &text, &title_of(&path), &provider)?;
+        self.snapshot(entry, SnapshotReason::BeforeSaveBack)?;
         let stamp = save_atomic(
             self.env.fs.as_ref(),
             self.env.sleeper.as_ref(),
@@ -235,9 +237,8 @@ impl Documents {
             }
             let relative: PathBuf = asset.relative_path.split('/').collect();
             let target = dir.join(relative);
-            if let Some(parent) = target.parent() {
-                self.env.fs.create_dir_all(parent)?;
-            }
+            // The path has at least one part, so the target always has a parent.
+            self.env.fs.create_dir_all(target.parent().unwrap_or(dir))?;
             save_atomic(
                 self.env.fs.as_ref(),
                 self.env.sleeper.as_ref(),
@@ -281,11 +282,10 @@ impl Documents {
         let mut new_format = TextFormat::default();
         let mut keep_assets = Vec::new();
         let mut tracked = true;
-        let (stamp, new_source) = match extension.as_str() {
-            "doc" => return Err(DocError::Unsupported("Word 97-2003")),
-            "docx" | "odt" | "rtf" => {
-                let format = ConvertedFormat::from_extension(&extension)
-                    .ok_or(DocError::Unsupported("word processor"))?;
+        let converted = ConvertedFormat::from_extension(&extension);
+        let (stamp, new_source) = match (converted, extension.as_str()) {
+            // `.doc` is a converted format too: its exporter refuses it.
+            (Some(format), _) => {
                 let provider = LocalAssets {
                     fs,
                     base_dir: &base_dir,
@@ -297,15 +297,13 @@ impl Documents {
                     Source::Converted(format),
                 )
             }
-            "textpack" => {
-                let bytes = textbundle::write_pack(&text, &assets)
-                    .map_err(|error| DocError::Convert(error.to_string()))?;
+            (None, "textpack") => {
+                let bytes = textbundle::write_pack(&text, &assets).map_err(conversion_failed)?;
                 keep_assets = assets.clone();
                 (save_atomic(fs, sleeper, &target, &bytes)?, Source::TextPack)
             }
-            "textbundle" => {
-                textbundle::write_dir(&target, &text, &assets)
-                    .map_err(|error| DocError::Convert(error.to_string()))?;
+            (None, "textbundle") => {
+                textbundle::write_dir(&target, &text, &assets).map_err(conversion_failed)?;
                 tracked = false;
                 let meta = fs.metadata(&target)?;
                 (
@@ -315,7 +313,7 @@ impl Documents {
                     },
                 )
             }
-            _ => {
+            (None, _) => {
                 if matches!(old_source, Source::Text) {
                     new_format = old_format;
                 }
@@ -346,5 +344,77 @@ impl Documents {
             path: target,
             stamp,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ssw_io::fs::RealFs;
+
+    use super::*;
+
+    #[test]
+    fn images_come_from_the_importer_first_then_from_next_to_the_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("img")).unwrap();
+        std::fs::write(tmp.path().join("img").join("disk.png"), b"disk").unwrap();
+        std::fs::write(tmp.path().join("plain.JPG"), b"jpeg").unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), b"text").unwrap();
+        let assets = [Asset {
+            relative_path: "img/disk.png".to_owned(),
+            bytes: b"imported".to_vec(),
+        }];
+        let provider = LocalAssets {
+            fs: &RealFs,
+            base_dir: tmp.path(),
+            assets: &assets,
+        };
+        // The importer's copy wins over the file of the same name.
+        assert_eq!(
+            provider.image("img/disk.png"),
+            Some((b"imported".to_vec(), "image/png"))
+        );
+        // Anything else is read below the document's folder, the MIME type from the extension.
+        assert_eq!(
+            provider.image("plain.JPG"),
+            Some((b"jpeg".to_vec(), "image/jpeg"))
+        );
+        assert_eq!(provider.image("gone.png"), None);
+        // Files that are no images and addresses on the web are never read.
+        assert_eq!(provider.image("notes.txt"), None);
+        assert_eq!(provider.read("notes.txt"), Some(b"text".to_vec()));
+        assert_eq!(provider.read("https://example.com/a.png"), None);
+        assert_eq!(provider.image("https://example.com/a.png"), None);
+    }
+
+    #[test]
+    fn math_and_diagrams_are_not_rendered_for_exports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = LocalAssets {
+            fs: &RealFs,
+            base_dir: tmp.path(),
+            assets: &[],
+        };
+        assert_eq!(provider.math_svg("x^2", false), None);
+        assert_eq!(provider.math_svg("x^2", true), None);
+        assert_eq!(provider.mermaid_svg("graph TD\n  A --> B"), None);
+    }
+
+    #[test]
+    fn every_word_processor_format_has_its_own_package_and_doc_cannot_be_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = LocalAssets {
+            fs: &RealFs,
+            base_dir: tmp.path(),
+            assets: &[],
+        };
+        let export = |format| export_bytes(format, "# Title\n\nBody $x$\n", "Title", &provider);
+        assert!(export(ConvertedFormat::Docx).unwrap().starts_with(b"PK"));
+        assert!(export(ConvertedFormat::Odt).unwrap().starts_with(b"PK"));
+        assert!(export(ConvertedFormat::Rtf).unwrap().starts_with(b"{\\rtf"));
+        assert_eq!(
+            export(ConvertedFormat::Doc).unwrap_err().message_id(),
+            "app-error-unsupported"
+        );
     }
 }

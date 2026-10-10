@@ -949,7 +949,13 @@ mod tests {
         ] {
             let m = model(text, 0);
             assert_eq!(m.raw_reason(), Some(reason), "{text:?}");
-            assert!(matches!(m, TableModel::Raw { .. }));
+            assert_eq!(
+                m,
+                TableModel::Raw {
+                    table: m.table().clone(),
+                    reason
+                }
+            );
         }
         // Closed code spans and backtick runs of different lengths stay grid tables.
         for text in [
@@ -957,7 +963,7 @@ mod tests {
             "| ` | `` |\n|---|---|",
             "| a | b |\n|---|---|",
         ] {
-            assert!(matches!(model(text, 0), TableModel::Cells(_)), "{text:?}");
+            assert_eq!(model(text, 0).raw_reason(), None, "{text:?}");
         }
         let buffer = Buffer::from_text("para\n\n| a |\n|---|");
         let ast = parse_document("para\n\n| a |\n|---|");
@@ -1023,6 +1029,11 @@ mod tests {
         assert_eq!(
             grid_of("| a |\n|---|").to_html(),
             "<table>\n<thead>\n<tr><th>a</th></tr>\n</thead>\n</table>"
+        );
+        assert_eq!(
+            grid_of("| ![alt](a.png) |\n|---|").to_html(),
+            "<table>\n<thead>\n<tr><th><img src=\"a.png\" alt=\"alt\"></th></tr>\n</thead>\n</table>",
+            "an image without a title has no title attribute"
         );
         assert_eq!(
             grid_of("| <br/> <BR /> |\n|---|").rows[0].cells[0].plain,
@@ -1502,7 +1513,7 @@ mod tests {
         doc.set_selections(Selection::caret(3), &[]);
         let tx = format_table(doc.ctx()).expect("not yet aligned");
         doc.apply(tx).expect("apply");
-        assert!(matches!(doc.ast().blocks[0].kind, BlockKind::Table(_)));
+        assert_eq!(doc.ast().blocks.len(), 1, "the table is the only block");
         let rendered = TableModel::from_ast(doc.ast(), doc.buffer(), 3).expect("a table at 3");
         assert_eq!(rendered.raw_reason(), None, "expected a grid table");
         assert_eq!(rendered.table().columns(), 2);

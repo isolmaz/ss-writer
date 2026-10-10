@@ -36,7 +36,8 @@ const SMALL_STEP_OF_PAGE: f32 = 0.25;
 
 /// A SAFEARRAY of interface pointers (selection results).
 pub(crate) fn safe_array_of<I: Interface>(items: &[I]) -> windows::core::Result<*mut SAFEARRAY> {
-    safe_array(VT_UNKNOWN.0, items.len(), |slots: *mut *mut c_void| {
+    safe_array(VT_UNKNOWN.0, items.len(), &mut |slots: *mut c_void| {
+        let slots = slots.cast::<*mut c_void>();
         for (index, item) in items.iter().enumerate() {
             // SAFETY: `slots` has room for `items.len()` pointers (see `safe_array`). The array
             // owns one reference per slot and releases it when destroyed: it is the one taken

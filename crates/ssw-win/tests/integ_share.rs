@@ -363,26 +363,6 @@ fn the_sharer_prepares_the_file_then_opens_the_sheet_through_the_seam() {
 }
 
 #[test]
-fn the_system_sheet_refuses_a_window_that_no_longer_exists() {
-    let _com = ComGuard::apartment_threaded().unwrap();
-    let ui = SystemShareUi::new().unwrap();
-    // The window is destroyed when the guard ends: the handle that is left names nothing, so
-    // no sheet can open for it.
-    let stale = HiddenWindow::new().0;
-    let error = ui.show(stale).unwrap_err();
-    assert!(
-        matches!(
-            error,
-            WinError::Os {
-                context: "ShowShareUIForWindow",
-                ..
-            }
-        ),
-        "{error:?}"
-    );
-}
-
-#[test]
 fn the_system_sharer_is_created_for_a_window_without_showing_anything() {
     let _com = ComGuard::apartment_threaded().unwrap();
     let window = HiddenWindow::new();

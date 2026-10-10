@@ -221,6 +221,81 @@ pub fn phase_frames(run: &Value, phase: u64) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// One stage of the frames of `phase`, in order: `Span(to, from)` is the time between two
+/// moments of a frame, `Duration(name)` a column that already holds a duration. A frame of a
+/// report that predates the column has no value.
+#[derive(Debug, Clone, Copy)]
+pub enum Stage {
+    Span(&'static str, &'static str),
+    Duration(&'static str),
+}
+
+/// The values of `stage` for the frames of `phase`, in order.
+pub fn phase_stage(run: &Value, phase: u64, stage: Stage) -> Vec<f64> {
+    let phases: Vec<u64> = run["frames"]["phase"]
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    let (first, second) = match stage {
+        Stage::Span(to, from) => (column(run, to), Some(column(run, from))),
+        Stage::Duration(name) => (column(run, name), None),
+    };
+    let value = |index: usize| -> Option<f64> {
+        let first = *first.get(index)?;
+        match &second {
+            Some(second) => Some(first - second.get(index)?),
+            None => Some(first),
+        }
+    };
+    phases
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| **p == phase)
+        .filter_map(|(i, _)| value(i))
+        .collect()
+}
+
+/// The stages the scroll report breaks a frame into (info only): the names of the per-run
+/// median and p95 metrics and the stage. `scroll_code_*` is the whole drawing code (layout
+/// and draw calls); layout and editor paint are parts of it.
+const SCROLL_STAGES: [(&str, &str, Stage); 7] = [
+    (
+        "scroll_setup_median_ms",
+        "scroll_setup_p95_ms",
+        Stage::Span("ready_ms", "start_ms"),
+    ),
+    (
+        "scroll_code_median_ms",
+        "scroll_code_p95_ms",
+        Stage::Span("recorded_ms", "ready_ms"),
+    ),
+    (
+        "scroll_layout_median_ms",
+        "scroll_layout_p95_ms",
+        Stage::Duration("layout_ms"),
+    ),
+    (
+        "scroll_editor_layout_median_ms",
+        "scroll_editor_layout_p95_ms",
+        Stage::Duration("editor_layout_ms"),
+    ),
+    (
+        "scroll_editor_paint_median_ms",
+        "scroll_editor_paint_p95_ms",
+        Stage::Duration("editor_paint_ms"),
+    ),
+    (
+        "scroll_enddraw_median_ms",
+        "scroll_enddraw_p95_ms",
+        Stage::Span("drawn_ms", "recorded_ms"),
+    ),
+    (
+        "scroll_present_median_ms",
+        "scroll_present_p95_ms",
+        Stage::Span("presented_ms", "drawn_ms"),
+    ),
+];
+
 /// The metrics of the runs of one scenario (`runs`: the parsed reports).
 pub fn metrics_for(scenario: &str, runs: &[Value]) -> Vec<Metric> {
     let per_run =
@@ -288,7 +363,16 @@ pub fn metrics_for(scenario: &str, runs: &[Value]) -> Vec<Metric> {
             let scroll = |r: &Value| phase_frames(r, 2);
             let intervals =
                 |r: &Value| -> Vec<f64> { scroll(r).windows(2).map(|w| w[1].1 - w[0].1).collect() };
-            vec![
+            let stages = SCROLL_STAGES
+                .iter()
+                .flat_map(|(median_name, p95_name, stage)| {
+                    let values = |r: &Value| phase_stage(r, 2, *stage);
+                    [
+                        metric(median_name, per_run(&|r| median(&values(r))), None),
+                        metric(p95_name, per_run(&|r| percentile(&values(r), 95.0)), None),
+                    ]
+                });
+            let mut metrics = vec![
                 metric(
                     "open_ms",
                     per_run(&|r| between(r, "doc_open_begin", "doc_presented")),
@@ -345,7 +429,9 @@ pub fn metrics_for(scenario: &str, runs: &[Value]) -> Vec<Metric> {
                     per_run(&|r| Some(scroll(r).len() as f64)),
                     None,
                 ),
-            ]
+            ];
+            metrics.extend(stages);
+            metrics
         }
         "folder-10k" => vec![
             metric(
@@ -689,6 +775,50 @@ mod tests {
         // A run without the marks contributes nothing instead of a bogus value.
         let sparse = metrics_for("folder-10k", &[json!({ "marks": {} })]);
         assert!(sparse.iter().all(|m| m.values.is_empty()));
+    }
+
+    #[test]
+    fn the_scroll_frames_break_into_their_stages() {
+        let run = json!({
+            "refresh_hz": 100.0,
+            "frames": {
+                "phase": [0, 2, 2],
+                "start_ms": [10.0, 100.0, 120.0],
+                "ready_ms": [11.0, 101.0, 122.0],
+                "recorded_ms": [12.0, 109.0, 133.0],
+                "drawn_ms": [13.0, 111.0, 136.0],
+                "presented_ms": [14.0, 112.0, 137.0],
+                "layout_ms": [0.5, 4.0, 6.0],
+                "editor_layout_ms": [0.0, 3.0, 5.0],
+                "editor_paint_ms": [0.0, 1.0, 2.0]
+            }
+        });
+        let stage = |name: &'static str| {
+            phase_stage(
+                &run,
+                2,
+                SCROLL_STAGES.iter().find(|s| s.0 == name).unwrap().2,
+            )
+        };
+        assert_eq!(stage("scroll_setup_median_ms"), [1.0, 2.0]);
+        assert_eq!(stage("scroll_code_median_ms"), [8.0, 11.0]);
+        assert_eq!(stage("scroll_layout_median_ms"), [4.0, 6.0]);
+        assert_eq!(stage("scroll_editor_layout_median_ms"), [3.0, 5.0]);
+        assert_eq!(stage("scroll_editor_paint_median_ms"), [1.0, 2.0]);
+        assert_eq!(stage("scroll_enddraw_median_ms"), [2.0, 3.0]);
+        assert_eq!(stage("scroll_present_median_ms"), [1.0, 1.0]);
+        let open = metrics_for("open-60k", &[run.clone(), run]);
+        let get = |name: &str| open.iter().find(|m| m.name == name).unwrap().clone();
+        assert_eq!(get("scroll_layout_median_ms").values, [5.0, 5.0]);
+        assert_eq!(get("scroll_layout_p95_ms").values, [6.0, 6.0]);
+        assert_eq!(get("scroll_present_p95_ms").target, None);
+        // A report without the columns contributes nothing instead of a bogus value.
+        let old = metrics_for("open-60k", &[run_report()]);
+        let none = old
+            .iter()
+            .find(|m| m.name == "scroll_layout_median_ms")
+            .unwrap();
+        assert!(none.values.is_empty());
     }
 
     #[test]

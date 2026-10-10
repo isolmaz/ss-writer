@@ -5,12 +5,17 @@
 //!   over through a channel. A generation counter identifies a device incarnation; after a
 //!   device loss [`GfxDevices::recreate`] produces the next generation and every dependent
 //!   resource is rebuilt.
+//! - [`SharedDevices`]: what the UI thread holds while the worker creates them: windows open
+//!   first and take the devices when [`SharedDevices::poll`] has them.
 //! - [`WindowSurface`]: a per-window DirectComposition visual showing a premultiplied flip
 //!   swap chain, drawn through a D2D device context.
 //! - [`WicTarget`]: a WIC bitmap render target for tests and export (same `Canvas`).
 
+use std::cell::RefCell;
 use std::mem::ManuallyDrop;
-use std::sync::mpsc::{Receiver, channel};
+use std::rc::Rc;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use ssw_ui::geometry::Color;
@@ -208,11 +213,76 @@ struct Handoff(Result<GfxDevices, WinError>);
 // never touches the objects again, so ownership moves cleanly to the receiving thread.
 unsafe impl Send for Handoff {}
 
+/// What runs when the device thread is done (see [`DeviceStartup::notify_on_ready`]).
+type ReadyHook = Box<dyn FnOnce() + Send>;
+
+/// The "result is waiting" signal of a [`DeviceStartup`], shared with its worker thread.
+///
+/// A hook registered before the worker finishes runs on the worker right after it handed the
+/// result over; one registered after runs at once on the registering thread. Either way it
+/// runs exactly once, and never while the lock is held.
+#[derive(Default)]
+struct Ready {
+    state: Mutex<ReadyState>,
+}
+
+#[derive(Default)]
+struct ReadyState {
+    done: bool,
+    hook: Option<ReadyHook>,
+}
+
+impl std::fmt::Debug for Ready {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ready").finish_non_exhaustive()
+    }
+}
+
+impl Ready {
+    fn lock(&self) -> MutexGuard<'_, ReadyState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Registers `hook` (a hook that did not run yet is replaced); runs it now when the worker
+    /// is done.
+    fn on_ready(&self, hook: ReadyHook) {
+        let mut state = self.lock();
+        if state.done {
+            drop(state);
+            hook();
+        } else {
+            state.hook = Some(hook);
+        }
+    }
+
+    /// The worker is done: runs the registered hook.
+    fn complete(&self) {
+        let hook = {
+            let mut state = self.lock();
+            state.done = true;
+            state.hook.take()
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// Device creation running on a worker thread.
 #[derive(Debug)]
 pub struct DeviceStartup {
     receiver: Receiver<Handoff>,
     worker: JoinHandle<()>,
+    ready: Arc<Ready>,
+}
+
+/// What [`DeviceStartup::poll`] found.
+#[derive(Debug)]
+pub enum DevicePoll {
+    /// The worker is still creating the devices: the startup, to poll again.
+    Pending(DeviceStartup),
+    /// The worker is done: the devices, or why there are none.
+    Done(Result<GfxDevices, WinError>),
 }
 
 impl DeviceStartup {
@@ -225,20 +295,45 @@ impl DeviceStartup {
     /// Starts creating generation 1 on `driver` (no hardware fallback).
     #[must_use]
     pub fn spawn_with(driver: Driver) -> Self {
+        Self::spawn_with_factory(move || {
+            if driver == Driver::Hardware {
+                GfxDevices::create(1)
+            } else {
+                GfxDevices::create_on(driver, 1)
+            }
+        })
+    }
+
+    /// Runs `create` on a new thread (COM initialized there for it) and hands its result over.
+    /// [`DeviceStartup::spawn_with`] passes the real creation; tests pass one that holds the
+    /// devices back or fails, to see what the application does while they are not there.
+    #[must_use]
+    pub fn spawn_with_factory(
+        create: impl FnOnce() -> Result<GfxDevices, WinError> + Send + 'static,
+    ) -> Self {
         let (sender, receiver) = channel();
+        let ready = Arc::new(Ready::default());
+        let signal = Arc::clone(&ready);
         let worker = std::thread::spawn(move || {
-            let result = ComGuard::multi_threaded().and_then(|_com| {
-                if driver == Driver::Hardware {
-                    GfxDevices::create(1)
-                } else {
-                    GfxDevices::create_on(driver, 1)
-                }
-            });
+            let result = ComGuard::multi_threaded().and_then(|_com| create());
             crate::perf::mark(crate::perf::MARK_DEVICE_READY);
             // The receiver may be gone when the process shuts down early.
             let _ = sender.send(Handoff(result));
+            signal.complete();
         });
-        Self { receiver, worker }
+        Self {
+            receiver,
+            worker,
+            ready,
+        }
+    }
+
+    /// Runs `hook` when the result can be taken without waiting: on the worker thread right
+    /// after the devices were created, or at once on this thread when they already were. The
+    /// hook must not block; it is meant to wake the UI thread (`PostMessageW`). A later call
+    /// replaces a hook that did not run yet.
+    pub fn notify_on_ready(&self, hook: impl FnOnce() + Send + 'static) {
+        self.ready.on_ready(Box::new(hook));
     }
 
     /// Blocks until the devices are ready.
@@ -246,12 +341,104 @@ impl DeviceStartup {
     /// # Errors
     /// Returns the creation error, or [`WinError::Invalid`] when the worker died.
     pub fn wait(self) -> Result<GfxDevices, WinError> {
-        let received = self.receiver.recv();
+        let received = self.receiver.recv().ok();
+        self.finish(received)
+    }
+
+    /// Takes the devices when the worker is done, without blocking.
+    #[must_use]
+    pub fn poll(self) -> DevicePoll {
+        match self.receiver.try_recv() {
+            Ok(received) => DevicePoll::Done(self.finish(Some(received))),
+            Err(TryRecvError::Empty) => DevicePoll::Pending(self),
+            Err(TryRecvError::Disconnected) => DevicePoll::Done(self.finish(None)),
+        }
+    }
+
+    /// Joins the finished worker and turns what it handed over into the outcome.
+    fn finish(self, received: Option<Handoff>) -> Result<GfxDevices, WinError> {
         let _ = self.worker.join();
         match received {
-            Ok(Handoff(result)) => result,
-            Err(_) => Err(WinError::Invalid("device thread ended without a result")),
+            Some(Handoff(result)) => result,
+            None => Err(WinError::Invalid("device thread ended without a result")),
         }
+    }
+}
+
+/// What the devices were reported as when nothing is left to report.
+const DEVICES_GONE: &str = "the graphics devices are not available";
+
+/// Where the devices stand for the UI thread.
+#[derive(Debug)]
+enum DevicesState {
+    /// The worker is creating them.
+    Creating(DeviceStartup),
+    /// They are here.
+    Ready(GfxDevices),
+    /// Their creation failed; the call that saw the failure got its error.
+    Gone,
+}
+
+/// The graphics devices as the UI thread uses them: created by a worker while the first window
+/// opens, taken without blocking ([`SharedDevices::poll`]) whenever a window can use them, or
+/// with blocking ([`SharedDevices::get`]) where nothing can go on without them. Clones share
+/// one state. Not `Send`: the UI thread owns it (the devices themselves are free threaded).
+#[derive(Debug, Clone)]
+pub struct SharedDevices {
+    state: Rc<RefCell<DevicesState>>,
+}
+
+impl From<GfxDevices> for SharedDevices {
+    /// Devices that exist already.
+    fn from(devices: GfxDevices) -> Self {
+        Self {
+            state: Rc::new(RefCell::new(DevicesState::Ready(devices))),
+        }
+    }
+}
+
+impl SharedDevices {
+    /// The devices `startup` creates.
+    #[must_use]
+    pub fn new(startup: DeviceStartup) -> Self {
+        Self {
+            state: Rc::new(RefCell::new(DevicesState::Creating(startup))),
+        }
+    }
+
+    /// The devices when they are ready; `Ok(None)` while the worker still creates them.
+    ///
+    /// # Errors
+    /// The creation error (once), then [`WinError::Invalid`]: there are no devices.
+    pub fn poll(&self) -> Result<Option<GfxDevices>, WinError> {
+        self.resolve(false)
+    }
+
+    /// The devices; waits for the worker when it is not done.
+    ///
+    /// # Errors
+    /// The creation error (once), then [`WinError::Invalid`]: there are no devices.
+    pub fn get(&self) -> Result<GfxDevices, WinError> {
+        self.resolve(true)?.ok_or(WinError::Invalid(DEVICES_GONE))
+    }
+
+    fn resolve(&self, wait: bool) -> Result<Option<GfxDevices>, WinError> {
+        let mut state = self.state.borrow_mut();
+        let outcome = match std::mem::replace(&mut *state, DevicesState::Gone) {
+            DevicesState::Creating(startup) if wait => startup.wait(),
+            DevicesState::Creating(startup) => match startup.poll() {
+                DevicePoll::Pending(startup) => {
+                    *state = DevicesState::Creating(startup);
+                    return Ok(None);
+                }
+                DevicePoll::Done(outcome) => outcome,
+            },
+            DevicesState::Ready(devices) => Ok(devices),
+            DevicesState::Gone => Err(WinError::Invalid(DEVICES_GONE)),
+        };
+        let devices = outcome?;
+        *state = DevicesState::Ready(devices.clone());
+        Ok(Some(devices))
     }
 }
 
@@ -439,7 +626,9 @@ impl WindowSurface {
             self.context.SetDpi(self.dpi, self.dpi);
             let scope = DrawScope::begin(&target);
             target.Clear(Some(&clear_color(Color::TRANSPARENT)));
+            timer.ready();
             let drawn = draw(&target);
+            timer.recorded();
             let ended = scope.end();
             drop(back_buffer);
             timer.drawn();
@@ -632,6 +821,9 @@ mod tests {
     use super::*;
     #[cfg(feature = "fault-injection")]
     use crate::fault::{all_failed, failed_step};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::Sender;
+    use std::time::{Duration, Instant};
     use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -681,9 +873,143 @@ mod tests {
         let startup = DeviceStartup {
             receiver,
             worker: std::thread::spawn(|| {}),
+            ready: Arc::default(),
         };
         let error = startup.wait().unwrap_err();
         assert_eq!(error.to_string(), "device thread ended without a result");
+    }
+
+    #[test]
+    fn polling_a_worker_that_ended_without_a_result_is_an_error() {
+        let (sender, receiver) = channel::<Handoff>();
+        drop(sender);
+        let startup = DeviceStartup {
+            receiver,
+            worker: std::thread::spawn(|| {}),
+            ready: Arc::default(),
+        };
+        match startup.poll() {
+            DevicePoll::Done(Err(error)) => {
+                assert_eq!(error.to_string(), "device thread ended without a result");
+            }
+            other => panic!("expected the end of the device thread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_ready_hook_runs_once_whichever_side_comes_first() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let hook = || -> ReadyHook {
+            let runs = Arc::clone(&runs);
+            Box::new(move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let ready = Ready::default();
+        assert_eq!(format!("{ready:?}"), "Ready { .. }");
+        // Registered before the worker is done: runs when the worker completes, once.
+        ready.on_ready(hook());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        ready.complete();
+        ready.complete();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        // Registered after the worker was done: runs at once.
+        ready.on_ready(hook());
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        // A hook that did not run yet is replaced by the next one.
+        let fresh = Ready::default();
+        fresh.on_ready(hook());
+        fresh.on_ready(hook());
+        fresh.complete();
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+        // Nothing registered: nothing to run.
+        Ready::default().complete();
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
+
+    /// A startup whose worker waits for the returned sender before it creates WARP devices.
+    fn held_back() -> (DeviceStartup, Sender<()>) {
+        let (release, released) = channel::<()>();
+        let startup = DeviceStartup::spawn_with_factory(move || {
+            let _ = released.recv();
+            GfxDevices::create_on(Driver::Warp, 1)
+        });
+        (startup, release)
+    }
+
+    #[test]
+    fn a_startup_tells_its_hook_and_is_polled_without_blocking() {
+        let (startup, release) = held_back();
+        let (told, heard) = channel::<()>();
+        startup.notify_on_ready(move || {
+            let _ = told.send(());
+        });
+        // The worker is held back: there is nothing to take yet.
+        let startup = match startup.poll() {
+            DevicePoll::Pending(startup) => startup,
+            DevicePoll::Done(_) => panic!("the devices cannot be there before the release"),
+        };
+        release.send(()).unwrap();
+        heard.recv_timeout(Duration::from_secs(60)).unwrap();
+        // The hook runs after the hand-over: the devices are waiting.
+        match startup.poll() {
+            DevicePoll::Done(devices) => assert_eq!(devices.unwrap().generation(), 1),
+            DevicePoll::Pending(_) => panic!("the hook runs after the hand-over"),
+        }
+    }
+
+    /// Polls `shared` until the worker is done with it.
+    fn poll_until_done(shared: &SharedDevices) -> Result<GfxDevices, WinError> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(outcome) = shared.poll().transpose() {
+                return outcome;
+            }
+            assert!(Instant::now() < deadline, "the devices never arrived");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn shared_devices_are_polled_until_the_worker_has_them_and_stay_ready() {
+        let (startup, release) = held_back();
+        let shared = SharedDevices::new(startup);
+        let other = shared.clone();
+        assert!(shared.poll().unwrap().is_none(), "the worker is held back");
+        release.send(()).unwrap();
+        // Clones share one state: what one clone took, the other sees.
+        assert_eq!(poll_until_done(&other).unwrap().generation(), 1);
+        assert_eq!(shared.poll().unwrap().unwrap().generation(), 1);
+        assert_eq!(shared.get().unwrap().generation(), 1);
+        assert!(format!("{shared:?}").contains("Ready"));
+    }
+
+    #[test]
+    fn getting_shared_devices_waits_and_existing_devices_are_ready_at_once() {
+        let shared = SharedDevices::new(DeviceStartup::spawn_with(Driver::Warp));
+        let devices = shared.get().unwrap();
+        assert_eq!((devices.generation(), devices.driver()), (1, Driver::Warp));
+        let existing = SharedDevices::from(devices);
+        assert_eq!(existing.poll().unwrap().unwrap().generation(), 1);
+    }
+
+    #[test]
+    fn a_failed_creation_is_reported_once_and_then_there_are_no_devices() {
+        let failing = || {
+            SharedDevices::new(DeviceStartup::spawn_with_factory(|| {
+                Err(WinError::Invalid("no adapter"))
+            }))
+        };
+        let polled = failing();
+        assert_eq!(
+            poll_until_done(&polled).unwrap_err().to_string(),
+            "no adapter"
+        );
+        for error in [polled.poll().unwrap_err(), polled.get().unwrap_err()] {
+            assert_eq!(error.to_string(), DEVICES_GONE);
+        }
+        // A blocking get sees the failure as well.
+        assert_eq!(failing().get().unwrap_err().to_string(), "no adapter");
     }
 
     /// A top-level window of the system `STATIC` class that is never shown or activated.
@@ -921,7 +1247,17 @@ mod tests {
         let devices = GfxDevices::create(1).unwrap();
         let window = HiddenWindow::new();
         let mut surface = WindowSurface::new(&devices, window.0, 64, 48, 96.0).unwrap();
-        let steps = crate::fault::sweep(|| failed_step(surface.paint(|_| Ok(()))));
+        // One drawing closure for every frame below: the frame code is exercised on all its
+        // paths in one instantiation.
+        let broken = std::cell::Cell::new(false);
+        let frame = |_: &ID2D1RenderTarget| -> Result<(), WinError> {
+            if broken.get() {
+                Err(WinError::Invalid("draw failed"))
+            } else {
+                Ok(())
+            }
+        };
+        let steps = crate::fault::sweep(|| failed_step(surface.paint(frame)));
         assert_eq!(
             steps,
             all_failed(&[
@@ -932,6 +1268,11 @@ mod tests {
                 "Present",
             ])
         );
+        broken.set(true);
+        let error = surface.paint(frame).unwrap_err();
+        assert_eq!(error.to_string(), "draw failed");
+        broken.set(false);
+        surface.paint(frame).unwrap();
         assert_eq!(surface.paint(|_| Ok(1)).unwrap(), 1);
     }
 
@@ -947,8 +1288,23 @@ mod tests {
             all_failed(&["create WIC bitmap", "create WIC render target"])
         );
         let target = WicTarget::new(&factory, &wic, 4, 3, 96.0).unwrap();
-        let steps = crate::fault::sweep(|| failed_step(target.paint(None, |_| Ok(()))));
+        // One drawing closure for every frame below: the frame code is exercised on all its
+        // paths in one instantiation.
+        let broken = std::cell::Cell::new(false);
+        let frame = |_: &ID2D1RenderTarget| -> Result<(), WinError> {
+            if broken.get() {
+                Err(WinError::Invalid("draw failed"))
+            } else {
+                Ok(())
+            }
+        };
+        let steps = crate::fault::sweep(|| failed_step(target.paint(None, frame)));
         assert_eq!(steps, all_failed(&["EndDraw"]));
+        broken.set(true);
+        let error = target.paint(None, frame).unwrap_err();
+        assert_eq!(error.to_string(), "draw failed");
+        broken.set(false);
+        target.paint(None, frame).unwrap();
         let steps = crate::fault::sweep(|| failed_step(target.pixels()));
         assert_eq!(steps, all_failed(&["copy pixels"]));
     }

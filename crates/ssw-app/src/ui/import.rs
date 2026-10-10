@@ -34,28 +34,10 @@ pub fn is_import(path: &Path) -> bool {
         .is_some()
 }
 
-/// Whether two paths name the same file (case-insensitive on Windows, canonical when possible).
-fn same_file(a: &Path, b: &Path) -> bool {
-    let canonical =
-        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    canonical(a)
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&canonical(b).to_string_lossy())
-}
-
 /// Starts importing `path` for window `cell`. A file that a tab of the window shows already is
 /// just activated. The tab appears when the worker is done.
 pub(super) fn open_import(controller: &Controller, cell: &Rc<WindowCell>, path: &Path) {
-    let open_here = cell
-        .view
-        .borrow()
-        .tabs()
-        .iter()
-        .any(|tab| tab.entry.path().is_some_and(|open| same_file(&open, path)));
-    if open_here {
-        if let Err(error) = controller.open_file(cell, path) {
-            controller.report(&error);
-        }
+    if controller.activate_shown(cell, path) {
         return;
     }
     let env = controller.docs().env();

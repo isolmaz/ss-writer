@@ -273,7 +273,7 @@ impl Rig {
 
     /// Replaces the text of the active document with one unsaved edit.
     fn set_text(&self, text: &str) {
-        let changed = replace_text(&mut self.active().document().borrow_mut(), text).unwrap();
+        let changed = replace_text(&mut self.active().document().borrow_mut(), text);
         assert!(changed, "the text differs");
         self.controller.refresh_all();
     }
@@ -1230,8 +1230,14 @@ fn a_state_database_that_cannot_be_opened_leaves_the_index_unbuilt() {
         let good = std::mem::replace(&mut rig.controller.core().borrow_mut().paths, broken);
 
         rig.show();
-        std::fs::write(rig.work.join(".gitignore"), "x\n").unwrap();
+        // The first turn starts the watcher (and the first full index, which fails too).
         rig.wait_for("the sidebar", || rig.has_row("a"));
+        rig.settle();
+        // A change the watcher sees queues a full walk: its job cannot open the database.
+        std::fs::write(rig.work.join(".gitignore"), "x\n").unwrap();
+        rig.wait_for("the index job", || {
+            rig.controller.core().borrow().workers.pending() > 0
+        });
         rig.settle();
         assert!(rig.indexed().is_empty());
 
@@ -1462,5 +1468,451 @@ fn a_placeholder_that_cannot_be_read_is_reported_and_a_closed_window_reads_nothi
                 .begin_hydration(&window, &rig.work.join("a.md"))
         );
         assert!(!rig.controller.begin_hydration(&window, &rig.work));
+    });
+}
+
+#[test]
+fn a_wikilink_resolves_through_the_index_once_the_workspace_is_indexed() {
+    let files = vec![
+        text_file("note.md", "# Note\n"),
+        text_file("sub/target.md", "# T\n\n## Part\nbody\n"),
+    ];
+    with_rig(files, "note.md", nothing, |rig| {
+        rig.show();
+        rig.index_ready(2);
+        rig.wiki("target", Some("Part"));
+        assert_eq!(rig.path(), rig.work.join("sub").join("target.md"));
+        assert_eq!(rig.caret(), "# T\n\n".len());
+    });
+}
+
+#[test]
+fn a_window_without_a_tab_is_left_alone_while_the_others_are_fed() {
+    let files = vec![text_file("a.md", "# A\n"), text_file("b.md", "# B\n")];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        rig.index_ready(2);
+        let empty = rig
+            .controller
+            .create_window(None, Size::new(800.0, 600.0), 1.0);
+        rig.pump();
+        assert!(empty.view.borrow().active_tab().is_none());
+        assert_eq!(rig.completion(""), ["a.md", "b.md"]);
+    });
+}
+
+#[test]
+fn changes_on_disk_still_reach_the_index_of_a_window_whose_sidebar_was_removed() {
+    let files = vec![text_file("a.md", "# A\n")];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        rig.index_ready(1);
+        rig.window().view.borrow_mut().set_workspace(None);
+        std::fs::write(rig.work.join("b.md"), "# B\n").unwrap();
+        rig.wait_for("b.md in the index", || {
+            rig.indexed().iter().any(|rel| rel == "b.md")
+        });
+        assert!(rig.window().view.borrow().sidebar().is_none());
+    });
+}
+
+#[test]
+fn the_completion_outline_is_fed_when_the_caret_enters_a_wikilink_after_the_files() {
+    let files = vec![
+        text_file("note.md", "# One\n## Two\n\nplain"),
+        text_file("t.md", "x\n"),
+    ];
+    with_rig(files, "note.md", nothing, |rig| {
+        rig.show();
+        rig.index_ready(2);
+        rig.pump();
+        // Files are fed; now the caret enters a `[[`: only the headings are fed.
+        rig.set_text("# One\n## Two\n\nSee [[");
+        let end = rig.text().len();
+        rig.window()
+            .view
+            .borrow_mut()
+            .active_tab_mut()
+            .unwrap()
+            .editor
+            .go_to(Selection::caret(end));
+        rig.pump();
+        assert_eq!(rig.completion("#"), ["One", "Two"]);
+        assert_eq!(rig.completion(""), ["note.md", "t.md"]);
+    });
+}
+
+/// The real disk, except that reads panic while the flag is set.
+#[derive(Debug)]
+struct PanickingRead(std::sync::atomic::AtomicBool);
+
+impl PanickingRead {
+    fn arm(&self, armed: bool) {
+        self.0.store(armed, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl FileSystem for PanickingRead {
+    fn read(&self, path: &Path) -> Result<Vec<u8>, ssw_io::fs::FsError> {
+        assert!(
+            !self.0.load(std::sync::atomic::Ordering::SeqCst),
+            "the disk went away"
+        );
+        RealFs.read(path)
+    }
+    fn metadata(&self, path: &Path) -> Result<ssw_io::fs::FileMeta, ssw_io::fs::FsError> {
+        RealFs.metadata(path)
+    }
+    fn write_new(&self, path: &Path, data: &[u8]) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.write_new(path, data)
+    }
+    fn replace_file(&self, target: &Path, with: &Path) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.replace_file(target, with)
+    }
+    fn move_replace(&self, from: &Path, to: &Path) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.move_replace(from, to)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.rename(from, to)
+    }
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.copy_file(from, to)
+    }
+    fn delete_file(&self, path: &Path) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.delete_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.remove_dir(path)
+    }
+    fn create_dir(&self, path: &Path) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.create_dir(path)
+    }
+    fn create_dir_all(&self, path: &Path) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &Path) -> Result<Vec<ssw_io::fs::DirEntry>, ssw_io::fs::FsError> {
+        RealFs.list_dir(path)
+    }
+    fn set_attributes(&self, path: &Path, attrs: Attributes) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.set_attributes(path, attrs)
+    }
+    fn is_writable(&self, path: &Path) -> Result<bool, ssw_io::fs::FsError> {
+        RealFs.is_writable(path)
+    }
+    fn recycle(&self, paths: &[PathBuf]) -> Result<(), ssw_io::fs::FsError> {
+        RealFs.recycle(paths)
+    }
+}
+
+/// Runs `body` like [`with_rig`], over documents that read through `fs`.
+fn with_rig_on(
+    fs: &Arc<PanickingRead>,
+    files: Vec<(String, Vec<u8>)>,
+    open: &str,
+    body: impl FnOnce(&Rig),
+) {
+    let installed = Arc::clone(fs);
+    with_rig(
+        files,
+        open,
+        move |core, _| {
+            let env = ssw_app::documents::DocEnv {
+                fs: installed,
+                ..core.docs.env().clone()
+            };
+            core.docs = Rc::new(ssw_app::documents::Documents::new(env));
+        },
+        body,
+    );
+}
+
+#[test]
+fn a_file_read_that_panics_is_reported_like_any_other_failure_to_read_it() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        text_file("cloud.md", "# Cloud\n"),
+    ];
+    let fs = Arc::new(PanickingRead(std::sync::atomic::AtomicBool::new(false)));
+    with_rig_on(&fs, files, "a.md", |rig| {
+        let cloud = rig.work.join("cloud.md");
+        make_placeholder(&cloud);
+        let window = rig.window();
+        rig.answer(MessageBoxResult::Ok);
+        fs.arm(true);
+        rig.controller.open_file(&window, &cloud).unwrap();
+        rig.wait_for("the error", || !rig.messages().is_empty());
+        fs.arm(false);
+        assert_eq!(rig.messages(), ["The file could not be read or written."]);
+        assert_eq!(rig.tab_count(), 1);
+    });
+}
+
+fn rtf_fixture() -> Vec<u8> {
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/rtf/testRTFBoldItalic.rtf"),
+    )
+    .unwrap()
+}
+
+fn open_in_sidebar(rig: &Rig, path: &Path) {
+    let key = rig.key(path);
+    rig.controller.handle_action(
+        rig.id(),
+        ShellAction::Sidebar(SidebarEvent::Open {
+            key,
+            new_tab: false,
+        }),
+    );
+}
+
+#[test]
+fn a_word_processor_file_is_imported_once_and_opening_it_again_shows_its_tab() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        byte_file("doc.rtf", &rtf_fixture()),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        let doc = rig.work.join("doc.rtf");
+        open_in_sidebar(rig, &doc);
+        rig.wait_for("the import", || rig.tab_count() == 2);
+        assert_eq!(rig.path(), canonical_path(&doc));
+
+        // Back to the first tab; opening the file again activates its tab, nothing is imported.
+        let first = rig.window().view.borrow().tabs()[0].key;
+        rig.window().view.borrow_mut().activate_tab(first);
+        assert_eq!(rig.path(), canonical_path(&rig.work.join("a.md")));
+        // The workspace index of the sidebar may still be running: let it end first, so that
+        // a job submitted by the second open is the only one that can be pending.
+        rig.settle();
+        open_in_sidebar(rig, &doc);
+        assert_eq!(rig.tab_count(), 2);
+        assert_eq!(rig.path(), canonical_path(&doc));
+        assert_eq!(
+            rig.controller.core().borrow().workers.pending(),
+            0,
+            "no import was started"
+        );
+    });
+}
+
+#[test]
+fn converted_and_untitled_tabs_never_take_part_in_a_link_update() {
+    let files = vec![
+        text_file("a.md", "[t](target.md)\n"),
+        text_file("target.md", "# Target\n"),
+        byte_file("doc.rtf", &rtf_fixture()),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        rig.index_ready(3);
+        open_in_sidebar(rig, &rig.work.join("doc.rtf"));
+        rig.wait_for("the import", || rig.tab_count() == 2);
+        rig.controller.new_untitled(&rig.window());
+        assert_eq!(rig.tab_count(), 3);
+        rig.answer(MessageBoxResult::Yes);
+        rig.rename(&rig.work.join("target.md"), "moved.md");
+        assert_eq!(
+            rig.messages(),
+            ["The links in 1 other file point to moved.md. Update them to its new location?"]
+        );
+        let docs = rig.controller.docs().all();
+        let linking = docs
+            .iter()
+            .find(|entry| entry.path().is_some_and(|path| path.ends_with("a.md")))
+            .expect("a.md is open");
+        assert_eq!(linking.document().borrow().text(), "[t](moved.md)\n");
+    });
+}
+
+#[test]
+fn files_that_vanish_or_stop_being_files_before_the_update_are_skipped() {
+    let files = vec![
+        text_file("target.md", "# Target\n"),
+        text_file("gone.md", "[g](target.md)\n"),
+        text_file("cloud.md", "[c](target.md)\n"),
+        text_file("folder.md", "[f](target.md)\n"),
+        text_file("locked.md", "[l](target.md)\n"),
+        text_file("ok.md", "[o](target.md)\n"),
+    ];
+    with_rig(files, "target.md", nothing, |rig| {
+        rig.show();
+        rig.index_ready(6);
+        // Nothing is pumped from here on: the index still lists the old state.
+        std::fs::remove_file(rig.work.join("gone.md")).unwrap();
+        make_placeholder(&rig.work.join("cloud.md"));
+        std::fs::remove_file(rig.work.join("folder.md")).unwrap();
+        std::fs::create_dir(rig.work.join("folder.md")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(rig.work.join("locked.md"))
+            .unwrap();
+        rig.answer(MessageBoxResult::Yes);
+        rig.rename(&rig.work.join("target.md"), "moved.md");
+        drop(lock);
+        assert_eq!(
+            rig.messages(),
+            ["The links in 1 other file point to moved.md. Update them to its new location?"]
+        );
+        assert_eq!(read(&rig.work.join("ok.md")), "[o](moved.md)\n");
+        assert_eq!(read(&rig.work.join("locked.md")), "[l](target.md)\n");
+    });
+}
+
+#[test]
+fn files_that_cannot_be_read_or_became_bundles_while_the_question_was_open_stay_as_they_are() {
+    let files = vec![
+        text_file("target.md", "# Target\n"),
+        text_file("locked.md", "[l](target.md)\n"),
+        text_file("bundle.md", "[b](target.md)\n"),
+        text_file("ok.md", "[o](target.md)\n"),
+    ];
+    with_rig(files, "target.md", nothing, |rig| {
+        rig.show();
+        rig.index_ready(4);
+        let lock: Rc<RefCell<Option<std::fs::File>>> = Rc::default();
+        let held = Rc::clone(&lock);
+        let locked = rig.work.join("locked.md");
+        let bundle = rig.work.join("bundle.md");
+        rig.on_next_message(move || {
+            // Another program locks one file and swaps another for a bundle folder.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&locked)
+                .unwrap();
+            *held.borrow_mut() = Some(file);
+            std::fs::remove_file(&bundle).unwrap();
+            std::fs::create_dir(&bundle).unwrap();
+            std::fs::write(bundle.join("text.markdown"), "[b](target.md)\n").unwrap();
+        });
+        rig.answer(MessageBoxResult::Yes);
+        rig.answer(MessageBoxResult::Ok);
+        rig.rename(&rig.work.join("target.md"), "moved.md");
+        lock.borrow_mut().take();
+
+        assert_eq!(
+            rig.messages(),
+            [
+                "The links in 3 other files point to moved.md. Update them to its new location?",
+                "2 files could not be updated. Their links still point to the old location."
+            ]
+        );
+        assert_eq!(read(&rig.work.join("locked.md")), "[l](target.md)\n");
+        assert_eq!(
+            read(&rig.work.join("bundle.md").join("text.markdown")),
+            "[b](target.md)\n"
+        );
+        assert_eq!(read(&rig.work.join("ok.md")), "[o](moved.md)\n");
+    });
+}
+
+#[test]
+fn a_workspace_whose_watch_is_lost_has_its_index_rebuilt_by_a_full_run() {
+    let files = vec![text_file("a.md", "# A\n")];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.settle();
+        let delivered = || rig.controller.core().borrow().workers.stats().delivered;
+        let before = delivered();
+        let lost = rig.work.parent().unwrap().join("lost");
+        std::fs::create_dir(&lost).unwrap();
+        std::fs::write(lost.join("n.md"), "# N\n").unwrap();
+        rig.controller.show_workspace(&rig.window(), &lost);
+        // The folder is a file by the time the first housekeeping turn starts its watcher: a
+        // watch that cannot be read ends with a "changes were lost" event for the root.
+        std::fs::remove_dir_all(&lost).unwrap();
+        std::fs::write(&lost, "no folder any more").unwrap();
+        // One full run starts with the new workspace; the lost watch asks for a second one.
+        rig.wait_for("the second full index run", || delivered() >= before + 2);
+    });
+}
+
+#[test]
+fn a_document_the_recent_list_refuses_is_reported_after_its_background_read() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        text_file("cloud.md", "# Cloud\n"),
+        byte_file("doc.rtf", &rtf_fixture()),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        let database = rig.controller.core().borrow().paths.state_db();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TABLE recent_items;")
+            .unwrap();
+        make_placeholder(&rig.work.join("cloud.md"));
+        rig.answer(MessageBoxResult::Ok);
+        rig.answer(MessageBoxResult::Ok);
+        // A placeholder is read on a worker, a word-processor file is imported on one.
+        rig.controller
+            .open_file(&rig.window(), &rig.work.join("cloud.md"))
+            .unwrap();
+        open_in_sidebar(rig, &rig.work.join("doc.rtf"));
+        rig.wait_for("both errors", || rig.messages().len() == 2);
+        assert_eq!(
+            rig.messages(),
+            [
+                "The file could not be read or written.",
+                "The file could not be read or written."
+            ]
+        );
+        assert_eq!(rig.tab_count(), 1);
+    });
+}
+
+#[test]
+fn an_import_whose_worker_panics_is_reported_as_a_failed_conversion() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        byte_file("doc.rtf", &rtf_fixture()),
+    ];
+    let fs = Arc::new(PanickingRead(std::sync::atomic::AtomicBool::new(false)));
+    with_rig_on(&fs, files, "a.md", |rig| {
+        rig.show();
+        rig.answer(MessageBoxResult::Ok);
+        fs.arm(true);
+        open_in_sidebar(rig, &rig.work.join("doc.rtf"));
+        rig.wait_for("the error", || !rig.messages().is_empty());
+        fs.arm(false);
+        assert_eq!(rig.messages(), ["The document could not be converted."]);
+        assert_eq!(rig.tab_count(), 1);
+    });
+}
+
+#[test]
+fn an_import_that_finishes_after_its_window_was_merged_away_opens_nothing() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        byte_file("doc.rtf", &rtf_fixture()),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        let doc = rig.work.join("doc.rtf");
+        let first = Rc::downgrade(&rig.window());
+        open_in_sidebar(rig, &doc);
+        let second = rig
+            .controller
+            .create_window(None, Size::new(800.0, 600.0), 1.0);
+        // Window > Merge all windows in the second window: the first one ends while its import
+        // is still under way.
+        let _ = rig
+            .controller
+            .run_command(second.id, ssw_core::command::CommandId::WindowMergeAll);
+        assert!(first.upgrade().is_none(), "the merged window is gone");
+        rig.settle();
+
+        assert_eq!(second.view.borrow().tabs().len(), 1, "only a.md");
+        assert!(
+            rig.controller
+                .docs()
+                .all()
+                .iter()
+                .all(|entry| entry.path() != Some(canonical_path(&doc))),
+            "the import was dropped before it was registered"
+        );
+        assert_eq!(rig.messages(), Vec::<String>::new());
     });
 }

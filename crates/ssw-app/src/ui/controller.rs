@@ -20,7 +20,7 @@ use ssw_core::settings::Settings;
 use ssw_io::session::{Session, ViewState, WindowPlacement};
 use ssw_ui::editor::blocks_media::MediaEvent;
 use ssw_ui::editor::{
-    EditorEvent, LinkTarget, MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, ZOOM_STEP_PERCENT,
+    DocumentKind, EditorEvent, LinkTarget, MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, ZOOM_STEP_PERCENT,
 };
 use ssw_ui::geometry::Size;
 use ssw_ui::input::Cursor;
@@ -28,7 +28,7 @@ use ssw_ui::services::{
     Clock, Dialogs, FileFilter, MessageBoxButtons, MessageBoxIcon, MessageBoxOptions,
     MessageBoxResult, OpenFileOptions, PickFolderOptions, SaveFileOptions, Shell,
 };
-use ssw_ui::shell::banners::{BannerAction, BannerKind, HostEvent};
+use ssw_ui::shell::banners::{BannerKind, HostEvent};
 use ssw_ui::shell::layout::ShellMode;
 use ssw_ui::shell::sidebar::SidebarEvent;
 use ssw_ui::shell::tabs::TabsEvent;
@@ -39,11 +39,11 @@ use ssw_ui::widgets::SharedClipboard;
 
 use super::menus::MenuState;
 use super::overlays::{OverlayAction, list_workspace_files, panel_files};
-use super::shell_view::{ShellAction, ShellView, ViewConfig, sidebar_options};
+use super::shell_view::{ShellAction, ShellView, TabView, ViewConfig, sidebar_options};
 use super::tree_source::{TreePaths, WorkspaceTree};
 use crate::app::AppCore;
 use crate::commands::{AppActions, Dispatch};
-use crate::documents::{DocEntry, DocError};
+use crate::documents::{DocEntry, DocError, DocMode};
 use crate::session::{PlannedDocument, SessionManager, StartupPlan, TabState, WindowState};
 use crate::workers::{JobKey, JobKind, JobSpec, WindowId};
 
@@ -497,10 +497,6 @@ impl Controller {
         match action {
             ShellAction::Title(event) => self.title_event(&cell, event),
             ShellAction::Sidebar(event) => self.sidebar_event(&cell, event),
-            ShellAction::Banner(HostEvent::Action {
-                action: BannerAction::Download,
-                ..
-            }) => self.open_update_page(),
             ShellAction::Banner(HostEvent::Action { action, .. }) => {
                 self.banner_action(&cell, action)
             }
@@ -559,15 +555,10 @@ impl Controller {
         let Some(event) = self.sidebar_file_event(cell, event) else {
             return;
         };
-        if let SidebarEvent::Open { key, new_tab } = event {
-            let path = cell
-                .tree
-                .borrow()
-                .as_ref()
-                .and_then(|paths| paths.path(key));
-            if let Some(path) = path {
-                self.open_path(cell, &path, new_tab);
-            }
+        if let SidebarEvent::Open { key, new_tab } = event
+            && let Some(path) = Self::tree_path(cell, key)
+        {
+            self.open_path(cell, &path, new_tab);
         }
     }
 
@@ -584,17 +575,22 @@ impl Controller {
                 let target = Path::new(&url);
                 if url.starts_with("http://") || url.starts_with("https://") {
                     let _ = self.shell.borrow_mut().open_url(&url);
-                } else if let Some(base) = cell
-                    .view
-                    .borrow()
-                    .active_tab()
-                    .and_then(|tab| tab.entry.path())
-                    .and_then(|path| path.parent().map(Path::to_path_buf))
-                    && target.extension().is_some_and(|ext| {
-                        ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
-                    })
-                {
-                    self.open_path(cell, &base.join(target), false);
+                } else {
+                    // The folder is read before the file opens: opening borrows the view
+                    // mutably, and the guard of an `if let` scrutinee lives through its body.
+                    let base = cell
+                        .view
+                        .borrow()
+                        .active_tab()
+                        .and_then(|tab| tab.entry.path())
+                        .and_then(|path| path.parent().map(Path::to_path_buf));
+                    if let Some(base) = base
+                        && target.extension().is_some_and(|ext| {
+                            ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
+                        })
+                    {
+                        self.open_path(cell, &base.join(target), false);
+                    }
                 }
             }
             _ => {}
@@ -632,8 +628,8 @@ impl Controller {
         }
     }
 
-    /// Opens `path` in window `cell`: an already open tab of the window is activated.
-    pub fn open_file(&self, cell: &Rc<WindowCell>, path: &Path) -> Result<(), DocError> {
+    /// Activates the tab of `cell` that shows `path`; false when no tab of the window does.
+    pub(super) fn activate_shown(&self, cell: &Rc<WindowCell>, path: &Path) -> bool {
         let existing = cell
             .view
             .borrow()
@@ -641,8 +637,12 @@ impl Controller {
             .iter()
             .find(|tab| tab.entry.path().is_some_and(|open| same_file(&open, path)))
             .map(|tab| tab.key);
-        if let Some(key) = existing {
-            self.activate_tab(cell, key);
+        existing.map(|key| self.activate_tab(cell, key)).is_some()
+    }
+
+    /// Opens `path` in window `cell`: an already open tab of the window is activated.
+    pub fn open_file(&self, cell: &Rc<WindowCell>, path: &Path) -> Result<(), DocError> {
+        if self.activate_shown(cell, path) {
             return Ok(());
         }
         // A OneDrive placeholder downloads while it is read: that happens on a worker.
@@ -842,17 +842,8 @@ impl Controller {
             return;
         };
         self.core.borrow().workers.cancel_window(id);
-        let keys: Vec<u64> = cell
-            .view
-            .borrow()
-            .tabs()
-            .iter()
-            .map(|tab| tab.key)
-            .collect();
-        for key in keys {
-            if let Some(tab) = cell.view.borrow_mut().close_tab(key) {
-                self.docs.release(&tab.entry);
-            }
+        while let Some(tab) = close_first_tab(&cell) {
+            self.docs.release(&tab.entry);
         }
         self.windows.borrow_mut().retain(|window| window.id != id);
         self.inspector_feeds.borrow_mut().forget(id);
@@ -888,19 +879,10 @@ impl Controller {
             if other.id == cell.id {
                 continue;
             }
-            let keys: Vec<u64> = other
-                .view
-                .borrow()
-                .tabs()
-                .iter()
-                .map(|tab| tab.key)
-                .collect();
-            for key in keys {
-                if let Some(tab) = other.view.borrow_mut().close_tab(key) {
-                    cell.view
-                        .borrow_mut()
-                        .add_tab(Rc::clone(&tab.entry), tab.workspace.clone());
-                }
+            while let Some(tab) = close_first_tab(&other) {
+                cell.view
+                    .borrow_mut()
+                    .add_tab(Rc::clone(&tab.entry), tab.workspace.clone());
             }
             self.windows
                 .borrow_mut()
@@ -1002,9 +984,41 @@ fn search_key(id: WindowId) -> JobKey {
     JobKey(u64::MAX - id.0)
 }
 
+/// Removes the leftmost tab of `cell` and returns it; `None` when the window has no tab.
+fn close_first_tab(cell: &WindowCell) -> Option<TabView> {
+    let key = cell.view.borrow().tabs().first()?.key;
+    cell.view.borrow_mut().close_tab(key)
+}
+
+/// The work of a folder search (it runs on a worker): the files with matches and the totals,
+/// or `None` for a pattern that is empty or not a valid regular expression. `cancelled` is
+/// asked at every file with matches; once it says yes the search stops at the next file.
+#[must_use]
+pub fn search_job(
+    root: &Path,
+    options: &ssw_io::folder_search::SearchOptions,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<(
+    Vec<ssw_io::folder_search::FileMatches>,
+    ssw_io::folder_search::SearchSummary,
+)> {
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut files = Vec::new();
+    let summary =
+        ssw_io::folder_search::search_folder(root, options, &|_| false, &cancel, |file| {
+            if cancelled() {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            files.push(file);
+        })
+        .ok()?;
+    Some((files, summary))
+}
+
 impl Controller {
     /// Runs the find, Go to line, Quick Open, palette and folder search commands of `cell`.
-    fn run_overlay_command(&self, cell: &Rc<WindowCell>, command: CommandId) {
+    /// Returns false for any other command.
+    fn run_overlay_command(&self, cell: &Rc<WindowCell>, command: CommandId) -> bool {
         use ssw_ui::shell::quick_open::QuickOpenMode;
         match command {
             CommandId::SearchFind => cell.view.borrow_mut().overlays_mut().open_find(false),
@@ -1026,10 +1040,11 @@ impl Controller {
                 }
                 view.overlays_mut().open_folder_search(seed.as_deref());
             }
-            _ => return,
+            _ => return false,
         }
         cell.view.borrow_mut().requests_mut().invalidate_all();
         cell.dirty.set(true);
+        true
     }
 
     /// Ctrl+E / Ctrl+Shift+P: lists the workspace's files (open documents count as recent)
@@ -1094,9 +1109,16 @@ impl Controller {
         let (typewriter, focus_mode) = active.map_or((false, false), |tab| {
             (tab.editor.typewriter(), tab.editor.focus_mode())
         });
+        let word_wrap = active.is_some_and(|tab| {
+            let config = tab.editor.config();
+            config.document_kind == DocumentKind::PlainText && config.wrap
+        });
         MenuState {
             has_document: active.is_some(),
             save_back: active.is_some_and(|tab| tab.entry.can_save_back()),
+            plain_file: active.is_some_and(|tab| tab.entry.file_mode() == DocMode::Plain),
+            render_markdown: active.is_some_and(|tab| tab.entry.render_as_markdown()),
+            word_wrap,
             sidebar: layout.sidebar_visible(),
             inspector: layout.inspector_visible(),
             status_bar: layout.status_bar_visible(),
@@ -1156,7 +1178,7 @@ impl Controller {
         root: PathBuf,
         request: ssw_ui::shell::folder_search::FolderSearchRequest,
     ) {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::Ordering;
         let generation = SEARCH_GENERATION.fetch_add(1, Ordering::Relaxed);
         let options = ssw_io::folder_search::SearchOptions {
             pattern: request.pattern,
@@ -1176,25 +1198,9 @@ impl Controller {
         let target = Rc::clone(cell);
         let _ = self.core.borrow().workers.submit(
             spec,
-            move |token| {
-                let cancel = AtomicBool::new(false);
-                let mut files = Vec::new();
-                let summary = ssw_io::folder_search::search_folder(
-                    &job_root,
-                    &options,
-                    &|_| false,
-                    &cancel,
-                    |file| {
-                        if token.is_cancelled() {
-                            cancel.store(true, Ordering::Relaxed);
-                        }
-                        files.push(file);
-                    },
-                );
-                summary.map(|summary| (files, summary)).map_err(|_| ())
-            },
+            move |token| search_job(&job_root, &options, &|| token.is_cancelled()),
             move |outcome| {
-                let Ok(Ok((files, summary))) = outcome else {
+                let Ok(Some((files, summary))) = outcome else {
                     return;
                 };
                 target.view.borrow_mut().overlays_mut().set_folder_results(
@@ -1289,26 +1295,21 @@ impl AppActions for WindowActions<'_> {
         let controller = self.controller;
         match command {
             CommandId::ViewToggleSidebar => {
-                let needs_workspace = {
+                // A single file's window shows the file's folder (spec §1).
+                let folder = {
                     let view = self.cell.view.borrow();
-                    !view.layout().sidebar_visible()
-                        && self.cell.tree.borrow().is_none()
-                        && view
-                            .active_tab()
-                            .is_some_and(|tab| tab.entry.path().is_some())
+                    let hidden = !view.layout().sidebar_visible();
+                    let no_workspace = self.cell.tree.borrow().is_none();
+                    let file = view.active_tab().and_then(|tab| tab.entry.path());
+                    (hidden && no_workspace)
+                        .then_some(file)
+                        .flatten()
+                        .and_then(|path| path.parent().map(Path::to_path_buf))
                 };
-                if needs_workspace {
-                    // A single file's window shows the file's folder (spec §1).
-                    let parent = self
-                        .active_document()
-                        .and_then(|entry| entry.path())
-                        .and_then(|path| path.parent().map(Path::to_path_buf));
-                    if let Some(parent) = parent {
-                        controller.show_workspace(&self.cell, &parent);
-                        return true;
-                    }
+                match folder {
+                    Some(folder) => controller.show_workspace(&self.cell, &folder),
+                    None => self.cell.view.borrow_mut().toggle_sidebar(),
                 }
-                self.cell.view.borrow_mut().toggle_sidebar();
                 true
             }
             CommandId::ViewToggleInspector => {
@@ -1342,6 +1343,11 @@ impl AppActions for WindowActions<'_> {
                 self.cell.view.borrow_mut().next_pane(true);
                 true
             }
+            // Spec §4.1: the plain-text file's own switches; they decline other documents.
+            CommandId::ViewWordWrap => self.cell.view.borrow_mut().toggle_word_wrap(),
+            CommandId::ViewRenderAsMarkdown => {
+                self.cell.view.borrow_mut().toggle_render_as_markdown()
+            }
             CommandId::ViewZoomIn | CommandId::ViewZoomOut | CommandId::ViewZoomReset => {
                 let current = controller.settings.borrow().appearance.zoom_percent;
                 let next = match command {
@@ -1352,18 +1358,7 @@ impl AppActions for WindowActions<'_> {
                 controller.set_zoom(next);
                 true
             }
-            CommandId::SearchFind
-            | CommandId::SearchReplace
-            | CommandId::SearchGoToLine
-            | CommandId::SearchFindNext
-            | CommandId::SearchFindPrevious
-            | CommandId::SearchQuickOpen
-            | CommandId::SearchCommandPalette
-            | CommandId::SearchInFolder => {
-                controller.run_overlay_command(&self.cell, command);
-                true
-            }
-            _ => self.run_in_editor(command),
+            _ => controller.run_overlay_command(&self.cell, command) || self.run_in_editor(command),
         }
     }
 

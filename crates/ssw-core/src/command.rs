@@ -232,6 +232,8 @@ define_commands! {
     ViewRecenterCaret = View, "view.recenter_caret", "cmd-view-recenter-caret";
     ViewFoldAll = View, "view.fold_all", "cmd-view-fold-all";
     ViewUnfoldAll = View, "view.unfold_all", "cmd-view-unfold-all";
+    ViewWordWrap = View, "view.word_wrap", "cmd-view-word-wrap";
+    ViewRenderAsMarkdown = View, "view.render_as_markdown", "cmd-view-render-as-markdown";
     ViewNextPane = View, "view.next_pane", "cmd-view-next-pane";
     SidebarOpen = Sidebar, "sidebar.open", "cmd-sidebar-open";
     SidebarOpenInNewTab = Sidebar, "sidebar.open_in_new_tab", "cmd-sidebar-open-in-new-tab";
@@ -436,6 +438,8 @@ mod tests {
             "view.recenter_caret",
             "view.fold_all",
             "view.unfold_all",
+            "view.word_wrap",
+            "view.render_as_markdown",
             "view.next_pane",
             "settings.open",
             "export.pdf",

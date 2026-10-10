@@ -28,7 +28,7 @@ use ssw_ui::shell::settings::{DisplayKeyNames, KeyNames};
 
 use super::controller::{Controller, WindowCell};
 use super::shell_view::ShellView;
-use crate::documents::DocError;
+use crate::documents::{DocError, canonical_path};
 use crate::i18n::welcome_text;
 use crate::workers::{JobKey, JobKind, JobSpec};
 
@@ -254,18 +254,20 @@ impl Controller {
         if let Err(error) = self.open_file(cell, &path) {
             return self.report(&error);
         }
-        if let Some(editor) = cell.view.borrow_mut().active_editor_mut() {
-            editor.set_read_only(true);
-        }
-        // Help pages are not the user's files: keep them out of the recent list.
-        if let Some(open) = self.docs().find(&path).and_then(|entry| entry.path()) {
-            let _ = self
-                .docs()
-                .env()
-                .store
-                .borrow()
-                .recent_remove(RecentKind::File, &open);
-        }
+        // `open_file` made the page's tab the active one, so its editor is always there.
+        cell.view
+            .borrow_mut()
+            .active_editor_mut()
+            .into_iter()
+            .for_each(|editor| editor.set_read_only(true));
+        // Help pages are not the user's files: keep them out of the recent list (the open page
+        // is recorded under its canonical path).
+        let _ = self
+            .docs()
+            .env()
+            .store
+            .borrow()
+            .recent_remove(RecentKind::File, &canonical_path(&path));
     }
 
     fn submit_update_check(&self, manual: bool) {
@@ -439,6 +441,16 @@ mod tests {
         assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
         assert!(text.contains("MIT"), "{text}");
         assert!(!THIRD_PARTY_NOTICES.is_empty());
+    }
+
+    #[test]
+    fn the_weekly_check_needs_the_state_database_and_does_not_ask_the_network_without_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The database's folder is a file: the store cannot be opened (the schedule lives in it).
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let outcome = run_check(false, &blocker.join("state.db"), &WinHttp, 0);
+        assert!(matches!(outcome, Err(UpdateError::Store(_))), "{outcome:?}");
     }
 
     #[test]

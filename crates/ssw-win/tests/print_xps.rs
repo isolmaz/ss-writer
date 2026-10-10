@@ -534,7 +534,7 @@ fn the_chosen_pages_are_printed_into_the_given_target_with_their_copies() {
     ];
     // Pages 2 and 3, two collated copies: 2 3 2 3.
     let chosen = selection(vec![2..=3], 2, true);
-    let printed = print_selection_to(&mut rig.surface(), &chosen, pages, || {
+    let printed = print_selection_to(&mut rig.surface(), &chosen, pages, &mut || {
         xps_file_target(file.path())
     })
     .unwrap();
@@ -552,7 +552,7 @@ fn the_chosen_pages_are_printed_into_the_given_target_with_their_copies() {
     }
 
     // A target that cannot be opened fails the job before any page is drawn.
-    let error = print_selection_to(&mut rig.surface(), &chosen, Vec::new(), || {
+    let error = print_selection_to(&mut rig.surface(), &chosen, Vec::new(), &mut || {
         Err(WinError::Invalid("no target"))
     })
     .unwrap_err();

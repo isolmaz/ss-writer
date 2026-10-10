@@ -8,12 +8,19 @@ use crate::workspace::Workspace;
 /// Files excluded from the report: test sources and xtask itself, nothing else.
 const IGNORE_FILENAME_REGEX: &str = r"(^|[\\/])(tests|xtask)[\\/]";
 
-/// Runs every test under instrumentation, writes `lcov.info` (workspace root) and
+/// Runs every test under instrumentation with all features (the test-only `fault-injection`
+/// features of the platform crates included), writes `lcov.info` (workspace root) and
 /// `target/coverage-summary.txt`, and fails unless lines, regions and functions are all at 100 %.
 pub fn run(workspace: &Workspace) -> Result<(), Error> {
     let mut collect = run::cargo();
     collect
-        .args(["llvm-cov", "nextest", "--workspace", "--no-report"])
+        .args([
+            "llvm-cov",
+            "nextest",
+            "--workspace",
+            "--all-features",
+            "--no-report",
+        ])
         .current_dir(&workspace.root);
     run::run(&mut collect)?;
 

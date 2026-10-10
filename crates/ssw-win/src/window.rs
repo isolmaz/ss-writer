@@ -48,17 +48,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, IDC_WAIT, IsZoomed,
     LoadCursorW, MINMAXINFO, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx,
     NCCALCSIZE_PARAMS, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, QS_ALLINPUT,
-    RegisterClassExW, SIZE_MINIMIZED, SM_CXPADDEDBORDER, SM_CYSIZEFRAME, SPI_GETWHEELSCROLLLINES,
-    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_PAINT, WM_POINTERDOWN,
-    WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    RegisterClassExW, SHOW_WINDOW_CMD, SIZE_MINIMIZED, SM_CXPADDEDBORDER, SM_CYSIZEFRAME,
+    SPI_GETWHEELSCROLLLINES, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWMAXIMIZED,
+    SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE,
+    WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCACTIVATE, WM_NCCALCSIZE, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_NCLBUTTONDOWN,
+    WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_PAINT, WM_POINTERDOWN, WM_POINTERLEAVE,
+    WM_POINTERUP, WM_POINTERUPDATE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
@@ -323,6 +324,47 @@ pub struct WindowOptions {
     pub dark: bool,
     /// Never activate or take focus (tests, background windows).
     pub no_activate: bool,
+}
+
+/// How a window that was just created goes on screen ([`WindowHost::show_mode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowMode {
+    /// It stays hidden (the windows of a test run).
+    Hidden,
+    /// It is shown without taking the focus (`--perf-offscreen`).
+    NoActivate,
+    /// It is shown maximized and activated (the window was maximized when it was stored).
+    Maximized,
+    /// It is shown at its normal size and activated.
+    Normal,
+}
+
+impl ShowMode {
+    /// The mode of a new window: a hidden application shows nothing, an off-screen window must
+    /// not take the focus, and otherwise the stored `maximized` state decides.
+    #[must_use]
+    pub fn for_new_window(hidden: bool, offscreen: bool, maximized: bool) -> Self {
+        if hidden {
+            Self::Hidden
+        } else if offscreen {
+            Self::NoActivate
+        } else if maximized {
+            Self::Maximized
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// The `ShowWindow` command of the mode; `None` for a window that stays hidden.
+    #[must_use]
+    pub fn command(self) -> Option<SHOW_WINDOW_CMD> {
+        match self {
+            Self::Hidden => None,
+            Self::NoActivate => Some(SW_SHOWNOACTIVATE),
+            Self::Maximized => Some(SW_SHOWMAXIMIZED),
+            Self::Normal => Some(SW_SHOW),
+        }
+    }
 }
 
 /// Sets `DWMWA_USE_IMMERSIVE_DARK_MODE`.
@@ -679,11 +721,11 @@ impl Drop for MessageWindow {
     }
 }
 
+/// What depends on the graphics devices: gone with them, rebuilt after a device loss.
 struct Graphics {
     devices: GfxDevices,
     surface: WindowSurface,
     resources: TargetResources,
-    assets: CanvasAssets,
 }
 
 struct WindowState {
@@ -693,6 +735,9 @@ struct WindowState {
     size_px: (i32, i32),
     chrome: ChromeState,
     theme: Theme,
+    /// Images and scenes the content draws from: the window's own from `set_assets` on, so
+    /// registrations survive until (and across) the graphics devices.
+    assets: Option<CanvasAssets>,
     graphics: Option<Graphics>,
     pending_high_surrogate: Option<u16>,
     clicks: ClickTracker,
@@ -846,14 +891,12 @@ impl WindowState {
             ..self.chrome
         };
         let tokens = self.theme.tokens;
-        let Some(graphics) = self.graphics.as_mut() else {
+        // Without the devices, or before the assets are set, there is nothing to draw with.
+        let (Some(graphics), Some(assets)) = (self.graphics.as_mut(), self.assets.as_mut()) else {
             return Ok(());
         };
         let Graphics {
-            surface,
-            resources,
-            assets,
-            ..
+            surface, resources, ..
         } = graphics;
         let handler = &mut self.handler;
         surface.paint(|target| {
@@ -873,7 +916,6 @@ impl WindowState {
             devices,
             surface,
             resources,
-            assets,
         } = old;
         // The composition target must be released before a new one is made for this HWND.
         drop(surface);
@@ -891,7 +933,6 @@ impl WindowState {
             devices,
             surface,
             resources,
-            assets,
         });
     }
 
@@ -1254,6 +1295,7 @@ impl WindowState {
                 let info = self.info();
                 self.handler.on_destroy(&info);
                 self.graphics = None;
+                self.assets = None;
                 (Some(LRESULT(0)), After::None)
             }
             _ => (None, After::None),
@@ -1389,6 +1431,7 @@ impl WindowHost {
             size_px: (0, 0),
             chrome: ChromeState::default(),
             theme,
+            assets: None,
             graphics: None,
             pending_high_surrogate: None,
             clicks: ClickTracker::new(
@@ -1478,15 +1521,20 @@ impl WindowHost {
         Ok(host)
     }
 
-    /// Creates the swap chain, D2D resources and canvas assets; the window renders from now on.
+    /// Gives the window the canvas assets its content draws from (replacing earlier ones).
+    /// They need no graphics devices, so a window can take images and scenes before
+    /// [`WindowHost::attach_graphics`] and keeps them across a device loss.
+    pub fn set_assets(&self, assets: CanvasAssets) {
+        self.state.borrow_mut().assets = Some(assets);
+    }
+
+    /// Creates the swap chain and D2D resources on `devices`; the window renders from now on
+    /// (once it has assets, see [`WindowHost::set_assets`]). It is not repainted here: the
+    /// caller of a window that is already showing asks with [`WindowHost::invalidate`].
     ///
     /// # Errors
     /// Fails when the composition surface cannot be created.
-    pub fn attach_graphics(
-        &self,
-        devices: GfxDevices,
-        assets: CanvasAssets,
-    ) -> Result<(), WinError> {
+    pub fn attach_graphics(&self, devices: GfxDevices) -> Result<(), WinError> {
         let mut state = self.state.borrow_mut();
         let (width, height) = (state.size_px.0.max(1) as u32, state.size_px.1.max(1) as u32);
         let surface = WindowSurface::new(&devices, self.hwnd, width, height, state.dpi as f32)?;
@@ -1495,7 +1543,6 @@ impl WindowHost {
             devices,
             surface,
             resources,
-            assets,
         });
         Ok(())
     }
@@ -1546,13 +1593,10 @@ impl WindowHost {
     }
 
     /// Mutable access to the canvas assets (image and scene registration); `None` before
-    /// [`WindowHost::attach_graphics`].
+    /// [`WindowHost::set_assets`].
     pub fn with_assets<R>(&self, f: impl FnOnce(&mut CanvasAssets) -> R) -> Option<R> {
         let mut state = self.state.borrow_mut();
-        state
-            .graphics
-            .as_mut()
-            .map(|graphics| f(&mut graphics.assets))
+        state.assets.as_mut().map(f)
     }
 
     /// The generation of the graphics devices in use.
@@ -1577,11 +1621,15 @@ impl WindowHost {
         true
     }
 
-    /// Shows the window without activating it.
-    pub fn show_no_activate(&self) {
+    /// Puts the window on screen the way `mode` says (nothing happens for
+    /// [`ShowMode::Hidden`]).
+    pub fn show_mode(&self, mode: ShowMode) {
+        let Some(command) = mode.command() else {
+            return;
+        };
         // SAFETY: shows our own window.
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(self.hwnd, command);
         }
     }
 
@@ -1604,17 +1652,6 @@ impl WindowHost {
                 let _ = ShowWindow(self.hwnd, SW_RESTORE);
             }
             let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(self.hwnd);
-        }
-    }
-
-    /// Shows the window maximized (activating it).
-    pub fn show_maximized(&self) {
-        // SAFETY: shows our own window.
-        unsafe {
-            let _ = ShowWindow(
-                self.hwnd,
-                windows::Win32::UI::WindowsAndMessaging::SW_SHOWMAXIMIZED,
-            );
         }
     }
 
@@ -1642,10 +1679,7 @@ impl WindowHost {
 
     /// Shows the window normally (activating it).
     pub fn show(&self) {
-        // SAFETY: shows our own window.
-        unsafe {
-            let _ = ShowWindow(self.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
-        }
+        self.show_mode(ShowMode::Normal);
     }
 
     /// Destroys the window now (the close request is not consulted).
@@ -2219,7 +2253,13 @@ mod tests {
         let wic = crate::wic::Wic::new().unwrap();
         let engine = crate::dwrite::DWriteEngine::new().unwrap();
         let assets = CanvasAssets::new(crate::canvas::ImageStore::new(wic), engine);
-        host.attach_graphics(devices, assets).unwrap();
+        // The assets belong to the window and need no devices; nothing is painted without them.
+        host.set_assets(assets);
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(host.with_assets(|assets| assets.images.len()), Some(0));
+        send(&host, WM_PAINT, 0, 0);
+        assert_eq!(log.borrow().paints, 0, "no devices, no frame");
+        host.attach_graphics(devices).unwrap();
         assert_eq!(host.graphics_generation(), Some(1));
         assert_eq!(host.with_assets(|assets| assets.images.len()), Some(0));
         send(&host, WM_PAINT, 0, 0);
@@ -2287,6 +2327,29 @@ mod tests {
             (rect.right - rect.left, rect.bottom - rect.top),
             (min_width, min_height)
         );
+    }
+
+    #[test]
+    fn a_frame_needs_the_devices_and_the_assets_and_destroying_the_window_releases_both() {
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, log) = host(true, false);
+        let devices = crate::gfx::GfxDevices::create_on(crate::gfx::Driver::Warp, 1).unwrap();
+        host.attach_graphics(devices).unwrap();
+        assert_eq!(host.with_assets(|_| ()), None);
+        send(&host, WM_PAINT, 0, 0);
+        assert_eq!(log.borrow().paints, 0, "devices alone have nothing to draw");
+        let wic = crate::wic::Wic::new().unwrap();
+        let engine = crate::dwrite::DWriteEngine::new().unwrap();
+        host.set_assets(CanvasAssets::new(
+            crate::canvas::ImageStore::new(wic),
+            engine,
+        ));
+        send(&host, WM_PAINT, 0, 0);
+        assert_eq!(log.borrow().paints, 1);
+        assert_eq!(host.graphics_generation(), Some(1));
+        host.destroy();
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(host.with_assets(|_| ()), None);
     }
 
     #[test]
@@ -2804,8 +2867,11 @@ mod tests {
         let devices = crate::gfx::GfxDevices::create(1).unwrap();
         let wic = crate::wic::Wic::new().unwrap();
         let engine = crate::dwrite::DWriteEngine::new().unwrap();
-        let assets = CanvasAssets::new(crate::canvas::ImageStore::new(wic), engine);
-        host.attach_graphics(devices, assets).unwrap();
+        host.set_assets(CanvasAssets::new(
+            crate::canvas::ImageStore::new(wic),
+            engine,
+        ));
+        host.attach_graphics(devices).unwrap();
     }
 
     #[cfg(feature = "fault-injection")]
@@ -2814,11 +2880,8 @@ mod tests {
         let _com = crate::com::ComGuard::apartment_threaded().unwrap();
         let (host, _log) = host(true, false);
         let devices = crate::gfx::GfxDevices::create(1).unwrap();
-        let wic = crate::wic::Wic::new().unwrap();
-        let engine = crate::dwrite::DWriteEngine::new().unwrap();
-        let assets = CanvasAssets::new(crate::canvas::ImageStore::new(wic), engine);
         crate::fault::arm(0);
-        let error = host.attach_graphics(devices, assets).unwrap_err();
+        let error = host.attach_graphics(devices).unwrap_err();
         crate::fault::disarm();
         assert!(
             error.to_string().starts_with("DXGI adapter failed"),

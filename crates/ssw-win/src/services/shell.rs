@@ -407,6 +407,54 @@ mod tests {
     }
 
     #[test]
+    fn the_operation_calls_recycling_never_makes_are_not_implemented() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let operation: IFileOperation = ScriptedOperation {
+            failing: None,
+            aborted: false,
+            calls: Rc::clone(&calls),
+            flags: Rc::new(RefCell::new(None)),
+        }
+        .into();
+        let (no_sink, no_item, no_items) = (
+            None::<&IFileOperationProgressSink>,
+            None::<&IShellItem>,
+            None::<&IUnknown>,
+        );
+        let name = PCWSTR::null();
+        // SAFETY: calls into the live scripted operation, which ignores its arguments.
+        let failures = unsafe {
+            [
+                operation.Advise(no_sink).err(),
+                operation.Unadvise(0).err(),
+                operation.SetProgressMessage(name).err(),
+                operation
+                    .SetProgressDialog(None::<&IOperationsProgressDialog>)
+                    .err(),
+                operation.SetProperties(None::<&IPropertyChangeArray>).err(),
+                operation.SetOwnerWindow(HWND::default()).err(),
+                operation.ApplyPropertiesToItem(no_item).err(),
+                operation.ApplyPropertiesToItems(no_items).err(),
+                operation.RenameItem(no_item, name, no_sink).err(),
+                operation.RenameItems(no_items, name).err(),
+                operation.MoveItem(no_item, no_item, name, no_sink).err(),
+                operation.MoveItems(no_items, no_item).err(),
+                operation.CopyItem(no_item, no_item, name, no_sink).err(),
+                operation.CopyItems(no_items, no_item).err(),
+                operation.DeleteItems(no_items).err(),
+                operation.NewItem(no_item, 0, name, name, no_sink).err(),
+            ]
+        };
+        for failure in failures {
+            assert_eq!(failure.unwrap().code(), E_NOTIMPL);
+        }
+        assert!(
+            calls.borrow().is_empty(),
+            "none of them is a recycling step"
+        );
+    }
+
+    #[test]
     fn an_aborted_operation_is_not_a_recycled_file() {
         let _com = ComGuard::apartment_threaded().unwrap();
         let (outcome, calls, _) = recycle_through(None, true);

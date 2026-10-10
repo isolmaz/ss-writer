@@ -885,6 +885,8 @@ enum Reply {
         head: String,
         body: Vec<u8>,
         delay: Duration,
+        /// The failure the connection ends with once `body` has been read.
+        broken: Option<NetError>,
     },
     Failure(NetError),
 }
@@ -938,6 +940,21 @@ impl ScriptedHttp {
                 head: head.to_owned(),
                 body: body.to_vec(),
                 delay,
+                broken: None,
+            },
+        );
+    }
+
+    /// Like [`ScriptedHttp::respond`], but the connection fails with `error` once `body` (the
+    /// part of the body that arrives) has been read.
+    pub fn respond_broken(&self, url: &str, head: &str, body: &[u8], error: NetError) {
+        self.push(
+            url,
+            Reply::Response {
+                head: head.to_owned(),
+                body: body.to_vec(),
+                delay: Duration::ZERO,
+                broken: Some(error),
             },
         );
     }
@@ -970,14 +987,23 @@ impl Http for ScriptedHttp {
                     code: 12029,
                 }))
         };
-        let (head, body, delay) = match reply {
+        let (head, body, delay, broken) = match reply {
             Reply::Failure(error) => return Err(error),
-            Reply::Response { head, body, delay } => (head, body, delay),
+            Reply::Response {
+                head,
+                body,
+                delay,
+                broken,
+            } => (head, body, delay, broken),
         };
         std::thread::sleep(delay);
         let mut remaining = body.as_slice();
         complete(&head, request, started, |buffer| {
             let count = remaining.len().min(buffer.len());
+            if count == 0 {
+                // The body is used up: the end of the stream, or the break the script announced.
+                return broken.clone().map_or(Ok(0), Err);
+            }
             buffer[..count].copy_from_slice(&remaining[..count]);
             remaining = &remaining[count..];
             Ok(count)
@@ -1002,6 +1028,28 @@ mod tests {
                 code: 5
             })
         );
+    }
+
+    #[test]
+    fn an_opened_session_is_kept_by_the_exchange_and_closed_with_it() {
+        // Opening a session sends nothing: the address is never contacted.
+        let url = Url::parse("http://127.0.0.1:1/").unwrap();
+        let mut exchange = Exchange {
+            request: HttpRequest {
+                url: &url,
+                timeout: Duration::from_secs(1),
+                max_body: 10,
+                accept: Accept::Any,
+            },
+            http_request: None,
+            connection: None,
+            session: None,
+            raw_head: String::new(),
+        };
+        assert!(raw_of(&exchange.session).is_null());
+        open_session(&mut exchange).unwrap();
+        assert!(!raw_of(&exchange.session).is_null());
+        assert!(exchange.connection.is_none() && exchange.http_request.is_none());
     }
 
     #[test]

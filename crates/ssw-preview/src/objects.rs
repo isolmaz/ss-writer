@@ -220,11 +220,17 @@ mod tests {
         }
     }
 
-    fn ready(state: ObjectState) -> ObjectInfo {
-        let mut info = None;
-        if let ObjectState::Ready(ready) = state {
-            info = Some(ready);
+    /// The object of `state` when it can be drawn.
+    fn ready_info(state: ObjectState) -> Option<ObjectInfo> {
+        if let ObjectState::Ready(info) = state {
+            Some(info)
+        } else {
+            None
         }
+    }
+
+    fn ready(state: ObjectState) -> ObjectInfo {
+        let info = ready_info(state);
         assert!(info.is_some(), "expected a ready object, got {state:?}");
         info.unwrap()
     }
@@ -359,13 +365,12 @@ mod tests {
     #[test]
     fn images_are_never_loaded() {
         let objects = PreviewObjects::new(false);
-        assert_eq!(
-            objects.object(&request(
-                ObjectKind::Image,
-                "https://example.com/a.png",
-                400.0
-            )),
-            ObjectState::Pending
-        );
+        let state = objects.object(&request(
+            ObjectKind::Image,
+            "https://example.com/a.png",
+            400.0,
+        ));
+        assert_eq!(state, ObjectState::Pending);
+        assert_eq!(ready_info(state), None, "an image is never drawable");
     }
 }

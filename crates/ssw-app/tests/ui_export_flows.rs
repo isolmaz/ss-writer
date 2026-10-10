@@ -307,7 +307,10 @@ fn sharing_saves_unsaved_changes_first_and_shares_the_file() {
             let view = window.view.borrow();
             Rc::clone(&view.active_tab().expect("a tab").entry)
         };
-        assert!(replace_text(&mut entry.document().borrow_mut(), "# Edited\n").unwrap());
+        assert!(replace_text(
+            &mut entry.document().borrow_mut(),
+            "# Edited\n"
+        ));
         assert!(entry.is_dirty());
         rig.run(CommandId::FileShare);
         let shared = shared.borrow();

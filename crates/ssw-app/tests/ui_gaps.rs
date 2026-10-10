@@ -329,7 +329,7 @@ fn reopening_with_an_encoding_decodes_the_file_again_and_the_status_bar_follows(
 #[test]
 fn reopening_a_document_with_unsaved_changes_asks_before_discarding_them() {
     with_rig(&[("cyr.md", CYRILLIC_1251)], |rig| {
-        replace_text(&mut rig.entry().document().borrow_mut(), "edited\n").unwrap();
+        replace_text(&mut rig.entry().document().borrow_mut(), "edited\n");
         assert!(rig.entry().is_dirty());
 
         let popup = rig.status_popup(StatusSegment::Encoding);

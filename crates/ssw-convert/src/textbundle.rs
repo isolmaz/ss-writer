@@ -252,13 +252,19 @@ fn zip_into<W: Write + Seek>(sink: W, text: &str, assets: &[Asset]) -> Result<W,
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     let mut zip = zip::ZipWriter::new(sink);
-    zip.start_file("info.json", options)?;
-    zip.write_all(INFO_JSON.as_bytes())?;
-    zip.start_file("text.markdown", options)?;
-    zip.write_all(text.as_bytes())?;
-    for a in assets {
-        zip.start_file(a.relative_path.as_str(), options)?;
-        zip.write_all(&a.bytes)?;
+    let entries = [
+        ("info.json", INFO_JSON.as_bytes()),
+        ("text.markdown", text.as_bytes()),
+    ]
+    .into_iter()
+    .chain(
+        assets
+            .iter()
+            .map(|a| (a.relative_path.as_str(), a.bytes.as_slice())),
+    );
+    for (name, bytes) in entries {
+        zip.start_file(name, options)?;
+        zip.write_all(bytes)?;
     }
     Ok(zip.finish()?)
 }
@@ -266,7 +272,7 @@ fn zip_into<W: Write + Seek>(sink: W, text: &str, assets: &[Asset]) -> Result<W,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_sink::Limited;
+    use crate::test_sink::{Limited, noise};
 
     fn asset(path: &str, bytes: &[u8]) -> Asset {
         Asset {
@@ -589,6 +595,31 @@ mod tests {
         };
         let written = zip_into(sink, "text ü", &assets).unwrap();
         assert_eq!(written.inner.into_inner(), full);
+    }
+
+    #[test]
+    fn a_sink_that_gives_out_while_large_entries_are_deflated_fails_the_pack() {
+        // Incompressible entries: the deflater passes output on to the sink during the write of
+        // the entry itself, so these budgets fail inside the text and inside the asset.
+        let text: String = noise(150_000)
+            .iter()
+            .map(|b| char::from(b'a' + b % 26))
+            .collect();
+        let assets = [asset("assets/big.bin", &noise(150_000))];
+        let full = write_pack(&text, &assets).unwrap();
+        let step = full.len() / 40;
+        for budget in (0..full.len() as u64).step_by(step) {
+            let sink = Limited {
+                inner: Cursor::new(Vec::new()),
+                budget,
+            };
+            let err = zip_into(sink, &text, &assets)
+                .expect_err(&format!("a budget of {budget} bytes cannot hold the pack"));
+            assert!(err.to_string().contains("sink is full"), "{budget}: {err}");
+        }
+        let back = read_pack(&full).unwrap();
+        assert_eq!(back.text, text);
+        assert_eq!(back.assets, assets);
     }
 
     /// Asserts that `result` fails with an I/O error.

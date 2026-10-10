@@ -15,13 +15,12 @@ use crate::keymap::{Keymap, Overrides};
 /// Keys not modelled by this version of the app, preserved verbatim.
 pub type Extra = BTreeMap<String, Value>;
 
-/// Failure to read or write `settings.json` content.
+/// Failure to read `settings.json` content. (Writing cannot fail: every value of the model is
+/// a string-keyed JSON value, which always serializes.)
 #[derive(Debug, Error)]
 pub enum SettingsError {
     #[error("settings.json is not valid: {0}")]
     Parse(#[source] serde_json::Error),
-    #[error("settings could not be serialized: {0}")]
-    Serialize(#[source] serde_json::Error),
 }
 
 /// The settings pages, in display order.
@@ -477,13 +476,14 @@ impl Settings {
 
     /// Pretty-printed JSON with a trailing newline.
     ///
-    /// # Errors
-    /// [`SettingsError::Serialize`] if a value cannot be represented in JSON (for example a
-    /// non-finite float).
-    pub fn to_json_string_pretty(&self) -> Result<String, SettingsError> {
-        let mut text = serde_json::to_string_pretty(self).map_err(SettingsError::Serialize)?;
+    /// Serialization cannot fail: every map is keyed by strings and a non-finite float is
+    /// written as `null`.
+    #[must_use]
+    pub fn to_json_string_pretty(&self) -> String {
+        let mut text =
+            serde_json::to_string_pretty(self).expect("settings serialize to string-keyed JSON");
         text.push('\n');
-        Ok(text)
+        text
     }
 
     /// The effective keymap: spec §11 defaults with the `shortcuts` overrides applied.
@@ -570,14 +570,12 @@ mod tests {
 
     #[test]
     fn invalid_documents_are_errors() {
-        assert!(matches!(
-            Settings::from_json_str("{"),
-            Err(SettingsError::Parse(_))
-        ));
-        assert!(matches!(
-            Settings::from_json_str(r#"{"appearance":{"theme":"sepia"}}"#),
-            Err(SettingsError::Parse(_))
-        ));
+        let SettingsError::Parse(truncated) = Settings::from_json_str("{").unwrap_err();
+        assert!(truncated.is_eof(), "{truncated}");
+        let SettingsError::Parse(unknown_theme) =
+            Settings::from_json_str(r#"{"appearance":{"theme":"sepia"}}"#).unwrap_err();
+        assert!(unknown_theme.is_data(), "{unknown_theme}");
+        assert!(unknown_theme.to_string().contains("sepia"));
     }
 
     #[test]
@@ -606,7 +604,7 @@ mod tests {
         assert!(!settings.general.autosave);
         assert_eq!(settings.editor.font_size, 20.0);
 
-        let text = settings.to_json_string_pretty().expect("serialize");
+        let text = settings.to_json_string_pretty();
         assert!(text.ends_with("}\n"));
         assert!(text.contains('\n'), "pretty printed");
         let out: Value = serde_json::from_str(&text).expect("valid json");
@@ -616,8 +614,8 @@ mod tests {
             match (superset, subset) {
                 (Value::Object(sup), Value::Object(sub)) => {
                     for (k, v) in sub {
-                        let got = sup.get(k).unwrap_or_else(|| panic!("lost key {path}/{k}"));
-                        contains(got, v, &format!("{path}/{k}"));
+                        assert!(sup.contains_key(k), "lost key {path}/{k}");
+                        contains(&sup[k], v, &format!("{path}/{k}"));
                     }
                 }
                 (Value::Array(sup), Value::Array(sub)) if sup.len() == sub.len() => {
@@ -637,21 +635,20 @@ mod tests {
         // And the whole thing is stable.
         let again = Settings::from_json_str(&text).expect("reparse");
         assert_eq!(again, settings);
-        assert_eq!(again.to_json_string_pretty().expect("serialize"), text);
+        assert_eq!(again.to_json_string_pretty(), text);
     }
 
     #[test]
     fn defaults_serialize_and_reload_identically() {
-        let text = Settings::default()
-            .to_json_string_pretty()
-            .expect("serialize");
+        let text = Settings::default().to_json_string_pretty();
         assert_eq!(
             Settings::from_json_str(&text).expect("reparse"),
             Settings::default()
         );
         let value: Value = serde_json::from_str(&text).expect("json");
         for section in SettingsSection::ALL {
-            assert!(value.get(section.key()).is_some(), "{}", section.key());
+            let key = section.key();
+            assert!(value.get(key).is_some(), "{key}");
         }
         assert_eq!(value["editor"]["list_indent"], json!("align"));
     }
@@ -663,7 +660,7 @@ mod tests {
         settings
             .shortcuts
             .insert("view.fold_all".to_owned(), vec![chord]);
-        let text = settings.to_json_string_pretty().expect("serialize");
+        let text = settings.to_json_string_pretty();
         let reloaded = Settings::from_json_str(&text).expect("reparse");
         assert_eq!(
             reloaded.keymap().lookup(chord),

@@ -9,6 +9,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -118,10 +119,151 @@ impl EngineInner {
     }
 }
 
-/// The DirectWrite [`TextLayoutEngine`]. Cloning is cheap and shares the font collection.
+/// Most layouts [`DWriteEngine`] keeps for requests that may come again.
+const LAYOUT_CACHE_LIMIT: usize = 512;
+/// Longest text (bytes) whose layout [`DWriteEngine`] keeps: a long block is the editor's to
+/// cache, it would only push the short texts of the chrome out.
+const LAYOUT_CACHE_MAX_TEXT: usize = 4096;
+
+/// A request a cached layout answers, with the layout.
+#[derive(Debug)]
+struct CacheEntry {
+    base: TextStyle,
+    ranges: Vec<StyledRange>,
+    objects: Vec<InlineObject>,
+    width_bits: u32,
+    /// The value of [`LayoutCache::clock`] when the entry was made or last used.
+    used: u64,
+    layout: DWriteLayout,
+}
+
+/// The layouts of the latest requests, by a hash of the whole request. The window chrome asks
+/// for the same few dozen texts every frame; shaping them again each time costs milliseconds
+/// per frame. Lives next to (not inside) [`EngineInner`]: the layouts keep that alive.
+#[derive(Debug, Default)]
+struct LayoutCache {
+    entries: HashMap<u64, CacheEntry>,
+    clock: u64,
+}
+
+fn hash_color(color: Option<Color>, hasher: &mut impl Hasher) {
+    color
+        .map(|c| [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()])
+        .hash(hasher);
+}
+
+fn hash_style(style: &TextStyle, hasher: &mut impl Hasher) {
+    style.family.hash(hasher);
+    style.size.to_bits().hash(hasher);
+    style.weight.hash(hasher);
+    (style.italic, style.underline, style.strikethrough).hash(hasher);
+    hash_color(style.color, hasher);
+    hash_color(style.background, hasher);
+    style.baseline_shift.to_bits().hash(hasher);
+    style
+        .line_height
+        .map(|height| match height {
+            LineHeight::Multiple(factor) => (0u8, factor.to_bits()),
+            LineHeight::Absolute(height) => (1u8, height.to_bits()),
+        })
+        .hash(hasher);
+}
+
+/// A hash of everything a layout depends on.
+fn request_key(
+    text: &str,
+    base: &TextStyle,
+    ranges: &[StyledRange],
+    objects: &[InlineObject],
+    max_width: f32,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hash_style(base, &mut hasher);
+    ranges.len().hash(&mut hasher);
+    for styled in ranges {
+        (styled.range.start, styled.range.end).hash(&mut hasher);
+        hash_style(&styled.style, &mut hasher);
+    }
+    objects.len().hash(&mut hasher);
+    for object in objects {
+        (object.at, object.id).hash(&mut hasher);
+        (
+            object.size.width.to_bits(),
+            object.size.height.to_bits(),
+            object.baseline.to_bits(),
+        )
+            .hash(&mut hasher);
+    }
+    max_width.to_bits().hash(&mut hasher);
+    hasher.finish()
+}
+
+impl LayoutCache {
+    /// The layout kept for exactly this request, if any.
+    fn get(
+        &mut self,
+        key: u64,
+        text: &str,
+        base: &TextStyle,
+        ranges: &[StyledRange],
+        objects: &[InlineObject],
+        max_width: f32,
+    ) -> Option<DWriteLayout> {
+        let entry = self.entries.get_mut(&key)?;
+        let same = entry.layout.text == text
+            && entry.base == *base
+            && entry.ranges == ranges
+            && entry.objects == objects
+            && entry.width_bits == max_width.to_bits();
+        if !same {
+            return None;
+        }
+        self.clock += 1;
+        entry.used = self.clock;
+        Some(entry.layout.clone())
+    }
+
+    /// Keeps `layout`, the answer to this request (the oldest quarter makes room when full).
+    fn insert(
+        &mut self,
+        key: u64,
+        base: &TextStyle,
+        ranges: &[StyledRange],
+        objects: &[InlineObject],
+        max_width: f32,
+        layout: &DWriteLayout,
+    ) {
+        if layout.text.len() > LAYOUT_CACHE_MAX_TEXT {
+            return;
+        }
+        if self.entries.len() >= LAYOUT_CACHE_LIMIT {
+            let mut used: Vec<u64> = self.entries.values().map(|entry| entry.used).collect();
+            used.sort_unstable();
+            let cutoff = used[used.len() / 4];
+            self.entries.retain(|_, entry| entry.used > cutoff);
+        }
+        self.clock += 1;
+        self.entries.insert(
+            key,
+            CacheEntry {
+                base: base.clone(),
+                ranges: ranges.to_vec(),
+                objects: objects.to_vec(),
+                width_bits: max_width.to_bits(),
+                used: self.clock,
+                layout: layout.clone(),
+            },
+        );
+    }
+}
+
+/// The DirectWrite [`TextLayoutEngine`]. Cloning is cheap and shares the font collection and
+/// the layouts it kept (see [`DWriteEngine::cached_layouts`]).
 #[derive(Debug, Clone)]
 pub struct DWriteEngine {
     inner: Rc<EngineInner>,
+    cache: Rc<RefCell<LayoutCache>>,
 }
 
 impl DWriteEngine {
@@ -186,8 +328,15 @@ impl DWriteEngine {
                     bundled,
                     resolved: RefCell::new(HashMap::new()),
                 }),
+                cache: Rc::default(),
             })
         }
+    }
+
+    /// How many layouts the engine keeps for requests that may come again.
+    #[must_use]
+    pub fn cached_layouts(&self) -> usize {
+        self.cache.borrow().entries.len()
     }
 
     /// The DirectWrite factory.
@@ -276,8 +425,21 @@ impl TextLayoutEngine for DWriteEngine {
         objects: &[InlineObject],
         max_width: f32,
     ) -> Box<dyn TextLayout> {
+        let key = request_key(text, base, ranges, objects, max_width);
+        let kept = self
+            .cache
+            .borrow_mut()
+            .get(key, text, base, ranges, objects, max_width);
+        if let Some(layout) = kept {
+            return Box::new(layout);
+        }
         match self.create_layout(text, base, ranges, objects, max_width) {
-            Ok(layout) => Box::new(layout),
+            Ok(layout) => {
+                self.cache
+                    .borrow_mut()
+                    .insert(key, base, ranges, objects, max_width, &layout);
+                Box::new(layout)
+            }
             Err(_) => Box::new(FailedLayout::new(text)),
         }
     }
@@ -422,7 +584,9 @@ struct RunPaint {
     shift: f32,
 }
 
-/// A DirectWrite layout with UTF-8 offsets.
+/// A DirectWrite layout with UTF-8 offsets. A clone shares the DirectWrite layout object: the
+/// drawing effects [`DWriteLayout::draw`] sets are always set afresh before every pass.
+#[derive(Clone)]
 pub struct DWriteLayout {
     /// Keeps the font data and collection alive.
     _engine: Rc<EngineInner>,
@@ -1521,6 +1685,162 @@ mod tests {
         );
         assert!((grown.line_metrics(0).unwrap().height - 50.0).abs() < 0.2);
         assert!((grown.line_metrics(1).unwrap().height - 50.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn the_same_request_gets_the_kept_layout_and_any_change_makes_a_new_one() {
+        let (_com, engine) = engine();
+        assert_eq!(engine.cached_layouts(), 0);
+        let first = lay(&engine, "Hello world", 90.0);
+        assert_eq!(engine.cached_layouts(), 1);
+        let again = lay(&engine, "Hello world", 90.0);
+        assert_eq!(engine.cached_layouts(), 1, "answered from the cache");
+        assert_eq!(again.text(), first.text());
+        assert_eq!(again.size(), first.size());
+        assert_eq!(again.line_count(), first.line_count());
+        assert_eq!(again.range_rects(0..5), first.range_rects(0..5));
+        // A clone of the engine shares what it kept.
+        let shared = engine.clone();
+        assert_eq!(shared.cached_layouts(), 1);
+        let _ = lay(&shared, "Hello world", 90.0);
+        assert_eq!(engine.cached_layouts(), 1);
+        // Text, width, base style, ranges and objects each tell requests apart.
+        let ranges = [StyledRange {
+            range: 0..5,
+            style: style(16.0).with_weight(ssw_ui::text::FontWeight::BOLD),
+        }];
+        let object = InlineObject {
+            at: 0,
+            size: Size::new(10.0, 10.0),
+            baseline: 8.0,
+            id: 1,
+        };
+        let base = style(16.0)
+            .with_color(Color::BLACK)
+            .with_background(Color::WHITE)
+            .with_line_height(LineHeight::Multiple(1.5));
+        let absolute = style(16.0).with_line_height(LineHeight::Absolute(30.0));
+        let relative = style(16.0).with_line_height(LineHeight::Multiple(30.0));
+        let plain = style(16.0);
+        let ask = |text: &str,
+                   base: &TextStyle,
+                   ranges: &[StyledRange],
+                   objects: &[InlineObject],
+                   width: f32| {
+            let _ = engine.layout(text, base, ranges, objects, width);
+            engine.cached_layouts()
+        };
+        assert_eq!(ask("Hello there", &plain, &[], &[], 90.0), 2);
+        assert_eq!(ask("Hello world", &plain, &[], &[], 91.0), 3);
+        assert_eq!(ask("Hello world", &style(17.0), &[], &[], 90.0), 4);
+        assert_eq!(ask("Hello world", &plain, &ranges, &[], 90.0), 5);
+        assert_eq!(ask("Hello world", &plain, &[], &[object], 90.0), 6);
+        assert_eq!(ask("Hello world", &base, &[], &[], 90.0), 7);
+        assert_eq!(ask("Hello world", &absolute, &[], &[], 90.0), 8);
+        assert_eq!(ask("Hello world", &relative, &[], &[], 90.0), 9);
+        // Every one of them is answered from the cache the second time.
+        assert_eq!(ask("Hello world", &relative, &[], &[], 90.0), 9);
+        assert_eq!(ask("Hello world", &plain, &ranges, &[], 90.0), 9);
+    }
+
+    #[test]
+    fn a_kept_layout_draws_as_often_as_it_is_asked_to() {
+        let (_com, engine) = engine();
+        let wic = Wic::new().unwrap();
+        let factory = d2d_factory(false).unwrap();
+        let ranges = [StyledRange {
+            range: 0..1,
+            style: style(20.0).with_color(RED),
+        }];
+        let draw_once = || {
+            let layout = engine.layout("MMMM", &style(20.0), &ranges, &[], f32::INFINITY);
+            let target = WicTarget::new(&factory, &wic, 80, 40, 96.0).unwrap();
+            target
+                .paint(Some(Color::WHITE), |render_target| {
+                    let layout = layout.as_any().downcast_ref::<DWriteLayout>().unwrap();
+                    let mut brushes = |color: Color| solid_brush(render_target, color);
+                    layout.draw(
+                        render_target,
+                        Point::new(2.0, 2.0),
+                        Color::BLACK,
+                        &mut brushes,
+                    )
+                })
+                .unwrap();
+            reddish(&target)
+        };
+        let first = draw_once();
+        assert!(first > 0);
+        assert_eq!(engine.cached_layouts(), 1);
+        assert_eq!(draw_once(), first, "the kept layout looks the same");
+        assert_eq!(engine.cached_layouts(), 1);
+    }
+
+    #[test]
+    fn failed_and_long_layouts_are_not_kept_and_the_oldest_make_room() {
+        let (_com, engine) = engine();
+        let _ = engine.layout("keep me", &style(-1.0), &[], &[], 100.0);
+        assert_eq!(
+            engine.cached_layouts(),
+            0,
+            "a failed request is asked again"
+        );
+        let long = "a".repeat(LAYOUT_CACHE_MAX_TEXT + 1);
+        let _ = lay(&engine, &long, f32::INFINITY);
+        assert_eq!(
+            engine.cached_layouts(),
+            0,
+            "a long text is the caller's to keep"
+        );
+        let _ = lay(&engine, &"a".repeat(LAYOUT_CACHE_MAX_TEXT), f32::INFINITY);
+        assert_eq!(engine.cached_layouts(), 1);
+
+        // Fill the cache; `used` is the oldest request, `recent` was asked for again last.
+        let width = f32::INFINITY;
+        for index in 0..LAYOUT_CACHE_LIMIT - 1 {
+            let _ = lay(&engine, &format!("t{index}"), width);
+        }
+        assert_eq!(engine.cached_layouts(), LAYOUT_CACHE_LIMIT);
+        let _ = lay(&engine, "t0", width);
+        let _ = lay(&engine, "overflow", width);
+        // A quarter of the entries went, the one used again stayed.
+        let kept = engine.cached_layouts();
+        assert!(
+            kept < LAYOUT_CACHE_LIMIT && kept > LAYOUT_CACHE_LIMIT / 2,
+            "{kept}"
+        );
+        let _ = lay(&engine, "t0", width);
+        assert_eq!(engine.cached_layouts(), kept, "t0 survived the eviction");
+        let _ = lay(&engine, "t1", width);
+        assert_eq!(engine.cached_layouts(), kept + 1, "t1 was among the oldest");
+    }
+
+    #[test]
+    fn an_entry_answers_only_the_request_it_was_made_for() {
+        let (_com, engine) = engine();
+        let layout = engine
+            .create_layout("Hello", &style(16.0), &[], &[], 90.0)
+            .unwrap();
+        let mut cache = LayoutCache::default();
+        let key = request_key("Hello", &style(16.0), &[], &[], 90.0);
+        cache.insert(key, &style(16.0), &[], &[], 90.0, &layout);
+        // The same hash with another request (a collision) is a miss.
+        assert!(
+            cache
+                .get(key, "Other", &style(16.0), &[], &[], 90.0)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(key, "Hello", &style(16.0), &[], &[], 90.0)
+                .is_some()
+        );
+        let other = key.wrapping_add(1);
+        assert!(
+            cache
+                .get(other, "Hello", &style(16.0), &[], &[], 90.0)
+                .is_none()
+        );
     }
 
     #[test]

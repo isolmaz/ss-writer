@@ -72,6 +72,27 @@ const TYPE_TIMEOUT: Duration = Duration::from_secs(3);
 /// The characters that get typed, in a loop.
 const TYPED_TEXT: &[u8] = b"the quick brown fox jumps over the lazy dog ";
 
+/// How long a scenario may take, in whole and in its parts, before it failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// A scenario that has not ended by then failed.
+    pub timeout: Duration,
+    /// Frames of a scroll sweep that has not reached the end of the document are a failure.
+    pub scroll_frames: u32,
+    /// A typed character that has no frame after this long failed.
+    pub type_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            timeout: TIMEOUT,
+            scroll_frames: MAX_SCROLL_FRAMES,
+            type_timeout: TYPE_TIMEOUT,
+        }
+    }
+}
+
 /// What one tick of the driver decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tick {
@@ -118,6 +139,7 @@ pub struct PerfDriver {
     scenario: Option<PerfScenario>,
     target: Option<PathBuf>,
     step: f32,
+    limits: Limits,
     began: Instant,
     stage: Stage,
     details: Vec<(&'static str, f64)>,
@@ -152,6 +174,12 @@ impl PerfDriver {
     /// process-wide recorder when it did not run yet.
     #[must_use]
     pub fn new(args: &Args) -> Option<Self> {
+        Self::with_limits(args, Limits::default())
+    }
+
+    /// [`PerfDriver::new`] with other limits than the ones a real run keeps.
+    #[must_use]
+    pub fn with_limits(args: &Args, limits: Limits) -> Option<Self> {
         let report = args.test.perf_report.clone()?;
         Some(Self {
             recorder: ssw_win::perf::enable(),
@@ -159,6 +187,7 @@ impl PerfDriver {
             scenario: args.test.perf_scenario,
             target: args.test.perf_target.clone(),
             step: args.test.perf_scroll_step.unwrap_or(DEFAULT_SCROLL_STEP) as f32,
+            limits,
             began: Instant::now(),
             stage: Stage::Booting { settled_at: None },
             details: Vec::new(),
@@ -185,10 +214,10 @@ impl PerfDriver {
         if let Some(code) = self.finished {
             return Tick::Finished(code);
         }
-        let outcome = if self.began.elapsed() > TIMEOUT {
+        let outcome = if self.began.elapsed() > self.limits.timeout {
             Err(format!(
                 "timed out after {} s in {:?}",
-                TIMEOUT.as_secs(),
+                self.limits.timeout.as_secs(),
                 self.stage
             ))
         } else {
@@ -323,7 +352,7 @@ impl PerfDriver {
                 self.details.push(("scroll_step_dip", f64::from(self.step)));
                 recorder.set_phase(PHASE_SCROLL);
                 recorder.mark_latest(SCROLL_BEGIN);
-                self.scroll_to(app, &cell, self.step, 1)?;
+                self.scroll_to(app, &cell, self.step, 1);
                 Ok(false)
             }
             Stage::Scrolling {
@@ -344,13 +373,13 @@ impl PerfDriver {
                         .push(("scroll_end_offset_dip", f64::from(actual)));
                     return Ok(true);
                 }
-                if requests >= MAX_SCROLL_FRAMES {
+                if requests >= self.limits.scroll_frames {
                     return Err(format!(
-                        "the document did not end within {MAX_SCROLL_FRAMES} frames \
-                         (offset {actual})"
+                        "the document did not end within {} frames (offset {actual})",
+                        self.limits.scroll_frames
                     ));
                 }
-                self.scroll_to(app, &cell, actual + self.step, requests + 1)?;
+                self.scroll_to(app, &cell, actual + self.step, requests + 1);
                 Ok(false)
             }
             Stage::AwaitTree { frame } => {
@@ -381,7 +410,7 @@ impl PerfDriver {
             Stage::Typing { sent, base, last } => {
                 // Every posted character must get its own frame before the next one goes.
                 if recorder.latency_count() - base < sent as usize {
-                    if last.elapsed() > TYPE_TIMEOUT {
+                    if last.elapsed() > self.limits.type_timeout {
                         return Err(format!("no frame followed typed character {sent}"));
                     }
                     return Ok(false);
@@ -467,19 +496,14 @@ impl PerfDriver {
         Ok(())
     }
 
-    /// Asks the editor of `cell` for the offset `y`, repaints and waits for the frame.
-    fn scroll_to(
-        &mut self,
-        app: &UiApp,
-        cell: &WindowCell,
-        y: f32,
-        requests: u32,
-    ) -> Result<(), String> {
+    /// Asks the editor of `cell` for the offset `y`, repaints and waits for the frame. Both
+    /// callers just read that editor in the same turn, so there is one.
+    fn scroll_to(&mut self, app: &UiApp, cell: &WindowCell, y: f32, requests: u32) {
         {
             let mut view = cell.view.borrow_mut();
-            view.active_editor_mut()
-                .ok_or_else(|| "the window has no editor".to_owned())?
-                .set_scroll_y(y);
+            if let Some(editor) = view.active_editor_mut() {
+                editor.set_scroll_y(y);
+            }
             view.requests_mut().invalidate_all();
         }
         let seen = self.recorder.frame_count();
@@ -489,6 +513,5 @@ impl PerfDriver {
             requests,
             seen,
         };
-        Ok(())
     }
 }

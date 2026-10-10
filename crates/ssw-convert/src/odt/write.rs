@@ -1140,12 +1140,16 @@ fn zip_package<W: Write + Seek>(
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("mimetype", stored)?;
     zip.write_all(MIME.as_bytes())?;
-    for (name, xml) in parts {
-        zip.start_file(*name, deflated)?;
-        zip.write_all(xml.as_bytes())?;
-    }
-    for (file, _, bytes) in media {
-        zip.start_file(format!("Pictures/{file}"), deflated)?;
+    let entries = parts
+        .iter()
+        .map(|(name, xml)| (name.to_string(), xml.as_bytes()))
+        .chain(
+            media
+                .iter()
+                .map(|(file, _, bytes)| (format!("Pictures/{file}"), bytes.as_slice())),
+        );
+    for (name, bytes) in entries {
+        zip.start_file(name, deflated)?;
         zip.write_all(bytes)?;
     }
     Ok(zip.finish()?)
@@ -1157,7 +1161,7 @@ mod tests {
 
     use super::*;
     use crate::docx::{MathImage, PageSize};
-    use crate::test_sink::Limited;
+    use crate::test_sink::{Limited, noise};
 
     fn png(w: u32, h: u32) -> Vec<u8> {
         let mut v = vec![
@@ -1243,6 +1247,47 @@ mod tests {
         };
         let written = zip_package(sink, &parts, &media).unwrap();
         assert_eq!(written.inner.into_inner(), full);
+    }
+
+    #[test]
+    fn a_sink_that_gives_out_while_large_entries_are_deflated_fails_the_package() {
+        // Incompressible entries: the deflater passes output on to the sink during the write
+        // of the entry itself, so these budgets fail inside the XML part and inside the picture.
+        let xml: String = noise(150_000)
+            .iter()
+            .map(|b| char::from(b'a' + b % 26))
+            .collect();
+        let parts = [("content.xml", xml)];
+        let media = [("big.bin".to_string(), "image/png", noise(150_000))];
+        let full = zip_package(Cursor::new(Vec::new()), &parts, &media)
+            .unwrap()
+            .into_inner();
+        let step = full.len() as u64 / 40;
+        for budget in (0..full.len() as u64).step_by(step as usize) {
+            let sink = Limited {
+                inner: Cursor::new(Vec::new()),
+                budget,
+            };
+            let err = zip_package(sink, &parts, &media).expect_err(&format!(
+                "a budget of {budget} bytes cannot hold the package"
+            ));
+            assert!(err.to_string().contains("sink is full"), "{budget}: {err}");
+        }
+        let mut archive = zip::ZipArchive::new(Cursor::new(&full[..])).unwrap();
+        let mut content = String::new();
+        archive
+            .by_name("content.xml")
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert_eq!(content, parts[0].1);
+        let mut picture = Vec::new();
+        archive
+            .by_name("Pictures/big.bin")
+            .unwrap()
+            .read_to_end(&mut picture)
+            .unwrap();
+        assert_eq!(picture, media[0].2);
     }
 
     fn export_with(

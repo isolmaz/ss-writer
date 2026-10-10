@@ -55,9 +55,6 @@ pub trait InstanceHook {
     /// [`InstanceError`] when the handshake cannot be performed; the process then continues as
     /// if it were the only instance.
     fn claim(&mut self, launch: &Launch) -> Result<InstanceRole, InstanceError>;
-
-    /// Launches forwarded by later processes since the last call (primary instance only).
-    fn take_launches(&mut self) -> Vec<Launch>;
 }
 
 /// Everything startup takes from the process, injectable for tests.
@@ -129,6 +126,17 @@ pub enum Boot {
     Ready(Box<Started>),
     /// The process must exit with this code (unsupported Windows, forwarded launch).
     Exit(i32),
+}
+
+impl Boot {
+    /// The exit code when the process must end; `None` when the application runs.
+    #[must_use]
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Exit(code) => Some(*code),
+            Self::Ready(_) => None,
+        }
+    }
 }
 
 /// Shows the localized "Windows 11 22H2 required" message and returns the exit code when
@@ -277,43 +285,19 @@ fn log_settings_failure(logger: &Logger, error: &SettingsFileError) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use ssw_io::encoding::TextFormat;
     use ssw_io::history::SnapshotReason;
     use ssw_io::recovery::{RecoveryDoc, RecoveryKind};
-    use ssw_ui::services::{
-        MessageBoxResult, OpenFileOptions, PickFolderOptions, SaveFileOptions, ServiceError,
-    };
 
     use super::*;
     use crate::app::{AppCore, EXIT_STARTUP_FAILED, ShellHost, run};
+    use crate::ui::scripted_services::ScriptedServices;
 
-    #[derive(Default)]
-    struct RecordingDialogs {
-        shown: Vec<MessageBoxOptions>,
-    }
-
-    impl Dialogs for RecordingDialogs {
-        fn open_file(&mut self, _: &OpenFileOptions) -> Result<Option<Vec<PathBuf>>, ServiceError> {
-            Ok(None)
-        }
-
-        fn save_file(&mut self, _: &SaveFileOptions) -> Result<Option<PathBuf>, ServiceError> {
-            Ok(None)
-        }
-
-        fn pick_folder(&mut self, _: &PickFolderOptions) -> Result<Option<PathBuf>, ServiceError> {
-            Ok(None)
-        }
-
-        fn message_box(
-            &mut self,
-            options: &MessageBoxOptions,
-        ) -> Result<MessageBoxResult, ServiceError> {
-            self.shown.push(options.clone());
-            Ok(MessageBoxResult::Ok)
-        }
+    /// Dialogs nobody answers (and nobody expects).
+    fn quiet() -> Box<dyn Dialogs> {
+        ScriptedServices::new().dialogs()
     }
 
     struct FakeHook {
@@ -325,10 +309,6 @@ mod tests {
         fn claim(&mut self, launch: &Launch) -> Result<InstanceRole, InstanceError> {
             self.claimed.push(launch.clone());
             self.answer.clone().map_err(InstanceError)
-        }
-
-        fn take_launches(&mut self) -> Vec<Launch> {
-            Vec::new()
         }
     }
 
@@ -356,20 +336,23 @@ mod tests {
     #[test]
     fn an_old_windows_build_shows_the_message_and_exits_with_the_os_code() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut dialogs = RecordingDialogs::default();
+        let services = ScriptedServices::new();
+        let mut dialogs = services.dialogs();
         let outcome = boot(
             &Args::default(),
             process(tmp.path(), 19045),
-            &mut dialogs,
+            &mut *dialogs,
             None,
         )
         .unwrap();
-        assert!(
-            matches!(outcome, Boot::Exit(code) if code == ssw_win::window::EXIT_UNSUPPORTED_OS)
+        assert_eq!(
+            outcome.exit_code(),
+            Some(ssw_win::window::EXIT_UNSUPPORTED_OS)
         );
-        assert_eq!(dialogs.shown.len(), 1);
-        assert!(dialogs.shown[0].message.contains("22621"));
-        assert!(dialogs.shown[0].message.contains("19045"));
+        let shown = services.dialog_log();
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].message.contains("22621"));
+        assert!(shown[0].message.contains("19045"));
         assert!(
             !tmp.path().join("local").exists(),
             "nothing is created on an unsupported system"
@@ -387,11 +370,11 @@ mod tests {
         let outcome = boot(
             &args,
             process(tmp.path(), 22621),
-            &mut RecordingDialogs::default(),
+            &mut *quiet(),
             Some(&mut hook),
         )
         .unwrap();
-        assert!(matches!(outcome, Boot::Exit(EXIT_FORWARDED)));
+        assert_eq!(outcome.exit_code(), Some(EXIT_FORWARDED));
         assert_eq!(hook.claimed.len(), 1);
         assert!(hook.claimed[0].new_window);
         assert!(!tmp.path().join("local").exists());
@@ -406,12 +389,12 @@ mod tests {
         let outcome = boot(
             &test_args,
             process(tmp.path(), 22621),
-            &mut RecordingDialogs::default(),
+            &mut *quiet(),
             Some(&mut other),
         )
         .unwrap();
         assert!(other.claimed.is_empty());
-        assert!(matches!(outcome, Boot::Ready(_)));
+        assert_eq!(outcome.exit_code(), None);
     }
 
     #[test]
@@ -447,7 +430,7 @@ mod tests {
             boot(
                 &Args::default(),
                 process(tmp.path(), 22621),
-                &mut RecordingDialogs::default(),
+                &mut *quiet(),
                 Some(&mut hook),
             )
             .unwrap(),
@@ -481,7 +464,7 @@ mod tests {
             boot(
                 &Args::default(),
                 process(tmp.path(), 22621),
-                &mut RecordingDialogs::default(),
+                &mut *quiet(),
                 None,
             )
             .unwrap(),
@@ -517,15 +500,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let started = ready(
-            boot(
-                &Args::default(),
-                process,
-                &mut RecordingDialogs::default(),
-                None,
-            )
-            .unwrap(),
-        );
+        let started = ready(boot(&Args::default(), process, &mut *quiet(), None).unwrap());
         let kept: Vec<usize> = started
             .store
             .borrow()
@@ -546,7 +521,7 @@ mod tests {
             boot(
                 &Args::default(),
                 process(tmp.path(), 22621),
-                &mut RecordingDialogs::default(),
+                &mut *quiet(),
                 None,
             )
             .unwrap(),
@@ -587,7 +562,7 @@ mod tests {
         let code = run(
             &Args::default(),
             process(tmp.path(), 22621),
-            &mut RecordingDialogs::default(),
+            &mut *quiet(),
             None,
             &mut shell,
         );
@@ -597,7 +572,7 @@ mod tests {
         let code = run(
             &Args::default(),
             process(tmp.path(), 100),
-            &mut RecordingDialogs::default(),
+            &mut *quiet(),
             None,
             &mut old_shell,
         );
@@ -610,16 +585,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut process = process(tmp.path(), 22621);
         process.env.local_app_data = None;
-        let mut dialogs = RecordingDialogs::default();
+        let services = ScriptedServices::new();
+        let mut dialogs = services.dialogs();
         let mut shell = ExitCodeShell { ran: false };
-        let code = run(&Args::default(), process, &mut dialogs, None, &mut shell);
+        let code = run(&Args::default(), process, &mut *dialogs, None, &mut shell);
         assert_eq!(code, EXIT_STARTUP_FAILED);
         assert!(!shell.ran);
-        assert_eq!(dialogs.shown.len(), 1);
-        assert!(
-            dialogs.shown[0].message.contains("LOCALAPPDATA"),
-            "{}",
-            dialogs.shown[0].message
-        );
+        let shown = services.dialog_log();
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].message.contains("LOCALAPPDATA"));
     }
 }

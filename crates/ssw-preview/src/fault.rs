@@ -86,7 +86,7 @@ mod injection {
             assert_eq!(check(Ok(2)).unwrap(), 2);
             assert!(!tripped());
             let error = check(Ok(3)).unwrap_err();
-            assert!(matches!(error, WinError::Invalid(_)), "{error:?}");
+            assert_eq!(error.to_string(), "injected fault");
             assert!(tripped());
             assert_eq!(check(Ok(4)).unwrap(), 4, "a failure is injected once");
         }

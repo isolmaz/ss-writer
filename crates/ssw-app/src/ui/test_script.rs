@@ -608,9 +608,9 @@ fn parse_line(line: &str) -> Parsed<Vec<Op>> {
         }
         "select-text" => Op::SelectText(text_arg(name, rest)?),
         "answer" => parse_answer(rest)?,
-        "clipboard-text" => Op::ClipboardText(text_arg(name, rest)?),
-        "clipboard-html" => Op::ClipboardHtml(path_arg(name, rest)?),
-        "clipboard-image" => Op::ClipboardImage(path_arg(name, rest)?),
+        "clipboard-text" => Op::ClipboardText(text_arg(name, rest)?), // docs-check: not a message id
+        "clipboard-html" => Op::ClipboardHtml(path_arg(name, rest)?), // docs-check: not a message id
+        "clipboard-image" => Op::ClipboardImage(path_arg(name, rest)?), // docs-check: not a message id
         "paste" | "paste-plain" => {
             no_args(name, rest)?;
             Op::Paste {
@@ -693,6 +693,7 @@ fn parse_line(line: &str) -> Parsed<Vec<Op>> {
         "screenshot" => Op::Screenshot(parse_shot(name, rest, WINDOW_SHOT)?),
         "screenshot-settings" => Op::ScreenshotSettings(parse_shot(name, rest, SETTINGS_SHOT)?),
         "settings-page" => {
+            // docs-check: not a message id
             let page = one(name, rest)?;
             Op::SettingsPage(
                 SettingsSection::ALL
@@ -1542,15 +1543,22 @@ impl ShellHost for ScriptHost {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use ssw_io::paths::Environment;
     use ssw_win::gfx::Driver;
     use ssw_win::window::OsVersion;
 
     use super::*;
-    use crate::startup::{Boot, ProcessEnv, boot};
-    use crate::workers::DeferredWaker;
+    use crate::startup::ProcessEnv;
+
+    /// Hands the core of a real startup to the test.
+    struct TakeCore(Option<AppCore>);
+
+    impl ShellHost for TakeCore {
+        fn run(&mut self, core: AppCore, _args: &Args) -> i32 {
+            self.0 = Some(core);
+            0
+        }
+    }
 
     fn core(root: &Path) -> AppCore {
         let process = ProcessEnv {
@@ -1568,10 +1576,10 @@ mod tests {
             install_crash_handler: false,
         };
         let mut dialogs = ScriptedServices::new().dialogs();
-        match boot(&Args::default(), process, &mut *dialogs, None).unwrap() {
-            Boot::Ready(started) => AppCore::new(*started, Arc::new(DeferredWaker::new())),
-            Boot::Exit(code) => panic!("startup exited with {code}"),
-        }
+        let mut host = TakeCore(None);
+        let code = crate::app::run(&Args::default(), process, &mut *dialogs, None, &mut host);
+        assert_eq!(code, 0, "the startup ran the shell");
+        host.0.take().unwrap()
     }
 
     fn settings(root: &Path, json: &str) {
@@ -1585,10 +1593,10 @@ mod tests {
     }
 
     fn failure(result: Result<(), ScriptError>) -> (usize, String) {
-        match result.unwrap_err() {
-            ScriptError::Failed { line, message } => (line, message),
-            other @ ScriptError::Syntax { .. } => panic!("{other}"),
-        }
+        // The scripts of these tests parse (`run` unwraps that), so the error is a failed step.
+        let (ScriptError::Failed { line, message } | ScriptError::Syntax { line, message }) =
+            result.unwrap_err();
+        (line, message)
     }
 
     fn quoted(path: &Path) -> String {
@@ -1894,19 +1902,98 @@ quit
             ("screenshot a.png 800 600 big", "found `big`"),
             ("screenshot a.png 1 2 3 4", "each optional"),
             (
-                "settings-page",
+                "settings-page", // docs-check: not a message id
                 "settings-page takes 1 argument(s), found 0",
             ),
             ("settings-page colors", "unknown settings page `colors`"),
+            ("open \"a b\\\"", "a quote is not closed"),
+            ("save now", "save takes no arguments"),
+            ("command", "command takes 1 argument(s), found 0"),
+            ("key", "key takes 1 argument(s), found 0"),
+            ("select 1 b", "select needs a number, found `b`"),
+            ("select-text", "select-text needs text"),
+            ("clipboard-text", "clipboard-text needs text"),
+            (
+                "clipboard-html",
+                "clipboard-html takes 1 argument(s), found 0",
+            ),
+            (
+                "clipboard-image",
+                "clipboard-image takes 1 argument(s), found 0",
+            ),
+            ("paste now", "paste takes no arguments"),
+            ("paste-text", "paste-text needs text"),
+            ("paste-html", "paste-html takes 1 argument(s), found 0"),
+            ("paste-image", "paste-image takes 1 argument(s), found 0"),
+            ("tab", "tab takes 1 argument(s), found 0"),
+            ("tab x", "tab needs a number, found `x`"),
+            ("advance", "advance takes 1 argument(s), found 0"),
+            ("sleep", "sleep takes 1 argument(s), found 0"),
+            (
+                "sleep soon",
+                "sleep needs a number of milliseconds, found `soon`",
+            ),
+            ("wait-idle now", "wait-idle takes no arguments"),
+            ("wait-external \"a", "a quote is not closed"),
+            (
+                "wait-external soon",
+                "needs a number of milliseconds, found `soon`",
+            ),
+            ("external-write \"a", "a quote is not closed"),
+            ("external-write a.md bad\\q", "unknown escape `\\q`"),
+            ("assert-text", "assert-text takes 1 argument(s), found 0"),
+            ("assert-text-is bad\\q", "unknown escape `\\q`"),
+            (
+                "assert-file a.md",
+                "assert-file takes 2 argument(s), found 1",
+            ),
+            (
+                "assert-exists",
+                "assert-exists takes 1 argument(s), found 0",
+            ),
+            (
+                "assert-no-file",
+                "assert-no-file takes 1 argument(s), found 0",
+            ),
+            (
+                "assert-magic a.bin",
+                "assert-magic takes 2 argument(s), found 1",
+            ),
+            ("assert-dirty", "assert-dirty takes 1 argument(s), found 0"),
+            ("assert-tabs", "assert-tabs takes 1 argument(s), found 0"),
+            ("assert-tabs x", "assert-tabs needs a number, found `x`"),
+            (
+                "assert-selection 1",
+                "assert-selection takes 2 argument(s), found 1",
+            ),
+            ("assert-selection a 1", "needs a number, found `a`"),
+            ("assert-selection 1 b", "needs a number, found `b`"),
+            (
+                "assert-clipboard",
+                "assert-clipboard takes 1 argument(s), found 0",
+            ),
+            ("assert-dialog \"a", "a quote is not closed"),
+            ("assert-dialog popup text", "unknown dialog kind `popup`"),
+            ("dump-state", "dump-state takes 1 argument(s), found 0"),
+            ("quit now", "quit takes no arguments"),
+            ("screenshot \"a", "a quote is not closed"),
+            (
+                "screenshot a.png 10 600 2",
+                "needs a size between 64 and 8192 DIPs, found `10`",
+            ),
+            ("screenshot a.png 800 9000 2", "found `9000`"),
+            ("answer open-file \"a", "a quote is not closed"),
         ] {
             let error = Script::parse(&format!("\nnew\n{line}")).unwrap_err();
-            let ScriptError::Syntax {
+            // `Script::parse` only fails with syntax errors; the display below proves it.
+            let (ScriptError::Syntax {
                 line: at,
                 message: found,
-            } = error
-            else {
-                panic!("{line}: not a syntax error");
-            };
+            }
+            | ScriptError::Failed {
+                line: at,
+                message: found,
+            }) = error;
             assert_eq!(at, 3, "{line}");
             assert!(found.contains(message), "{line}: {found}");
             assert_eq!(
@@ -1918,6 +2005,64 @@ quit
                 format!("line 3: {found}")
             );
         }
+    }
+
+    #[test]
+    fn every_message_box_button_and_the_carriage_return_escape_parse() {
+        let script = Script::parse(
+            "answer message-box ok\nanswer message-box cancel\nanswer message-box yes\n\
+             answer message-box no\nanswer message-box save\ntype a\\rb\n",
+        )
+        .unwrap();
+        let ops: Vec<Op> = script.steps().iter().map(|step| step.op.clone()).collect();
+        let button = |button| Op::Answer(DialogKind::MessageBox, Answer::Button(button));
+        assert_eq!(
+            ops,
+            [
+                button(MessageBoxResult::Ok),
+                button(MessageBoxResult::Cancel),
+                button(MessageBoxResult::Yes),
+                button(MessageBoxResult::No),
+                button(MessageBoxResult::Save),
+                Op::Type("a\rb".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn ctrl_alt_chords_are_shortcuts_because_the_harness_has_no_altgr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = ran(
+            tmp.path(),
+            "new\ntype keep\nkey ctrl+alt+q\nassert-text-is keep\n",
+        );
+        runner.finish();
+    }
+
+    #[test]
+    fn a_close_request_of_the_settings_window_closes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = ran(tmp.path(), "command settings.open\n");
+        assert!(runner.controller().settings_cell().is_some());
+        runner.controller().push(Request::CloseSettings);
+        runner.run(&Script::parse("new\n").unwrap()).unwrap();
+        assert!(runner.controller().settings_cell().is_none());
+        runner.finish();
+    }
+
+    #[test]
+    fn files_that_differ_only_in_length_differ_where_the_shorter_one_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (short, long) = (tmp.path().join("short.txt"), tmp.path().join("long.txt"));
+        std::fs::write(&short, "abc").unwrap();
+        std::fs::write(&long, "abcd").unwrap();
+        let script = format!("assert-file {} {}\n", quoted(&short), quoted(&long));
+        let (line, message) = failure(run(tmp.path(), &script));
+        assert_eq!(line, 1);
+        assert!(
+            message.contains("3 bytes against 4 bytes, first difference at byte 3"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -2351,6 +2496,11 @@ quit
         let mut runner = ScriptRunner::start(core(tmp.path()));
         let id = runner.controller().active_window().unwrap().id;
         let controller = Rc::clone(runner.controller());
+        // A command for a window that does not exist is nobody's: the dump says so.
+        controller.push(Request::Command(
+            crate::workers::WindowId(9_999),
+            CommandId::FileNew,
+        ));
         controller.push(Request::Command(id, CommandId::FileNew));
         controller.push(Request::Action(
             id,
@@ -2363,14 +2513,43 @@ quit
         let dump: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         assert_eq!(dump["windows"][0]["sidebar_visible"], true);
         let unhandled = dump["unhandled_requests"].as_array().unwrap();
-        assert_eq!(unhandled.len(), 1, "{unhandled:?}");
-        assert!(unhandled[0].as_str().unwrap().contains("CloseRequested"));
+        assert_eq!(unhandled.len(), 2, "{unhandled:?}");
+        assert!(unhandled[0].as_str().unwrap().starts_with("command "));
+        assert!(unhandled[1].as_str().unwrap().contains("CloseRequested"));
+    }
+
+    #[test]
+    fn an_autosave_that_fails_is_noted_in_the_state_dump() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        settings(tmp.path(), r#"{"general":{"autosave_delay_ms":200}}"#);
+        let file = tmp.path().join("locked.md");
+        std::fs::write(&file, "start\n").unwrap();
+        let state = tmp.path().join("state.json");
+        let mut runner = ScriptRunner::start(core(tmp.path()));
+        let edit = format!("open {}\nkey ctrl+end\ntype more\n", quoted(&file));
+        runner.run(&Script::parse(&edit).unwrap()).unwrap();
+        // Another program takes the file before the autosave delay is over.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&file)
+            .unwrap();
+        let wait = format!("sleep 600\ndump-state {}\n", quoted(&state));
+        runner.run(&Script::parse(&wait).unwrap()).unwrap();
+        drop(lock);
+        runner.finish();
+        let dump: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        let errors = dump["autosave_errors"].as_array().unwrap();
+        assert!(!errors.is_empty(), "{dump}");
+        assert!(!errors[0].as_str().unwrap().is_empty());
     }
 
     /// The pixel size from the header of a PNG file and the number of distinct colors.
     fn png_facts(path: &Path) -> ((u32, u32), usize) {
         let bytes = std::fs::read(path).unwrap();
-        assert!(Magic::Png.matches(&bytes), "{} is a PNG", path.display());
+        assert!(Magic::Png.matches(&bytes), "{path:?} is a PNG");
         let side = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
         let image = ssw_win::wic::Wic::new().unwrap().decode(&bytes).unwrap();
         let colors: std::collections::HashSet<[u8; 4]> = (0..image.height)

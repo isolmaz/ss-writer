@@ -518,4 +518,63 @@ mod tests {
         );
         assert_eq!(services.dialog_log().len(), 1);
     }
+
+    /// A sink that accepts `limit` pieces of text and then refuses (a full pipe).
+    struct Refusing {
+        limit: usize,
+        taken: usize,
+    }
+
+    impl fmt::Write for Refusing {
+        fn write_str(&mut self, _: &str) -> fmt::Result {
+            if self.taken == self.limit {
+                return Err(fmt::Error);
+            }
+            self.taken += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_dialog_record_reports_a_sink_that_refuses_its_text() {
+        use fmt::Write as _;
+
+        let record = |message: &str| DialogRecord {
+            kind: DialogKind::MessageBox,
+            title: "Error".to_owned(),
+            message: message.to_owned(),
+            answered: true,
+        };
+        // How many pieces the first line takes: `message-box`, ` "`, `Error`, `"`.
+        let mut counter = Refusing {
+            limit: usize::MAX,
+            taken: 0,
+        };
+        write!(counter, "{}", record("")).unwrap();
+        let first_line = counter.taken;
+        assert_eq!(first_line, 4);
+
+        // The sink refuses at the first piece, in the middle of the first line, and right
+        // after it (where the message would start): the error reaches the caller each time.
+        for limit in [0, 2, first_line] {
+            let mut sink = Refusing { limit, taken: 0 };
+            assert!(
+                write!(sink, "{}", record("Boom")).is_err(),
+                "a sink that takes {limit} pieces"
+            );
+        }
+        // Without a message nothing follows the first line, so a sink that takes it is enough.
+        let mut sink = Refusing {
+            limit: first_line,
+            taken: 0,
+        };
+        assert!(write!(sink, "{}", record("")).is_ok());
+        // With a message the sink takes it whole when it has room for every piece.
+        let mut roomy = Refusing {
+            limit: usize::MAX,
+            taken: 0,
+        };
+        assert!(write!(roomy, "{}", record("Boom")).is_ok());
+        assert_eq!(roomy.taken, first_line + 2, "`: ` and the message follow");
+    }
 }

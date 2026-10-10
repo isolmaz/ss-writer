@@ -480,17 +480,26 @@ mod tests {
         Store::open(&tmp.path().join("state.db")).unwrap()
     }
 
+    /// A transaction body that does nothing.
+    fn nothing(_: &Transaction<'_>) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     #[test]
     fn a_transaction_commits_what_its_body_wrote() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = open_store(&tmp);
         let rows = store
             .in_transaction(|tx| {
-                tx.execute("INSERT INTO kv (key, value) VALUES ('a', '1')", [])?;
+                tx.execute("INSERT INTO kv (key, value) VALUES ('a', '1')", [])
+                    .unwrap();
                 Ok(7)
             })
             .unwrap();
         assert_eq!(rows, 7);
+        assert_eq!(store.kv_get("a").unwrap().as_deref(), Some("1"));
+        // An empty body commits too, and leaves the stored data as it was.
+        store.in_transaction(nothing).unwrap();
         assert_eq!(store.kv_get("a").unwrap().as_deref(), Some("1"));
     }
 
@@ -500,7 +509,8 @@ mod tests {
         let mut store = open_store(&tmp);
         let error = store
             .in_transaction(|tx| {
-                tx.execute("INSERT INTO kv (key, value) VALUES ('a', '1')", [])?;
+                tx.execute("INSERT INTO kv (key, value) VALUES ('a', '1')", [])
+                    .unwrap();
                 Err::<(), StoreError>(StoreError::Cancelled)
             })
             .unwrap_err();
@@ -523,7 +533,8 @@ mod tests {
             .unwrap();
         let error = store
             .in_transaction(|tx| {
-                tx.execute("INSERT INTO child (parent_id) VALUES (7)", [])?;
+                tx.execute("INSERT INTO child (parent_id) VALUES (7)", [])
+                    .unwrap();
                 Ok(())
             })
             .unwrap_err();
@@ -543,7 +554,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = open_store(&tmp);
         store.conn.execute_batch("BEGIN").unwrap();
-        let error = store.in_transaction(|_| Ok(())).unwrap_err();
+        let error = store.in_transaction(nothing).unwrap_err();
         assert!(
             error.to_string().contains("within a transaction"),
             "{error}"

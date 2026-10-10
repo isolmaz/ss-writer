@@ -2,7 +2,7 @@
 //! was: a line diff turns the new text into small edits, and the selections map through them.
 
 use ssw_core::document::Document;
-use ssw_core::edit::{Edit, EditError, Transaction};
+use ssw_core::edit::{Edit, Transaction};
 use ssw_core::text::TextRange;
 use ssw_io::diff::diff_lines;
 
@@ -41,19 +41,24 @@ pub fn line_edits(old: &str, new: &str) -> Vec<Edit> {
 /// selections follow the edits (a caret inside replaced lines moves to the edge of the new
 /// text). Returns whether the text changed.
 ///
-/// # Errors
-/// [`EditError`] when the document rejects the transaction (never for the edits built here).
-pub fn replace_text(document: &mut Document, new_text: &str) -> Result<bool, EditError> {
+/// # Panics
+/// Never: the document rejects a transaction only for edits that are out of order, out of range
+/// or inside a character, and [`line_edits`] builds its edits from the document's own text, one
+/// per run of whole lines (starts at line starts, so on character boundaries; ascending and
+/// disjoint because the diff walks both texts forward).
+pub fn replace_text(document: &mut Document, new_text: &str) -> bool {
     let old_text = document.text();
     let edits = line_edits(&old_text, new_text);
     if edits.is_empty() {
-        return Ok(false);
+        return false;
     }
     let before = document.primary_selection();
     let mut transaction = Transaction::new(edits, before, before);
     transaction.selection_after = before.map_through(&transaction).clamped(new_text.len());
-    document.apply(transaction)?;
-    Ok(true)
+    document
+        .apply(transaction)
+        .expect("line edits of the document's own text always apply");
+    true
 }
 
 #[cfg(test)]
@@ -117,8 +122,7 @@ mod tests {
         let changed = replace_text(
             &mut document,
             "intro line\nalpha\nBETA!\nbeta two\ngamma\nomega\n",
-        )
-        .unwrap();
+        );
         assert!(changed);
         assert_eq!(
             document.text(),
@@ -131,7 +135,7 @@ mod tests {
     #[test]
     fn the_reload_is_one_undo_step() {
         let mut document = Document::new("a\nb\n");
-        assert!(replace_text(&mut document, "a\nx\ny\n").unwrap());
+        assert!(replace_text(&mut document, "a\nx\ny\n"));
         assert_eq!(document.text(), "a\nx\ny\n");
         assert!(document.undo().unwrap());
         assert_eq!(document.text(), "a\nb\n");
@@ -141,7 +145,7 @@ mod tests {
     fn identical_text_changes_nothing() {
         let mut document = Document::new("same\n");
         let version = document.version();
-        assert!(!replace_text(&mut document, "same\n").unwrap());
+        assert!(!replace_text(&mut document, "same\n"));
         assert_eq!(document.version(), version);
         assert!(!document.can_undo());
     }
@@ -150,7 +154,7 @@ mod tests {
     fn a_caret_after_removed_text_is_clamped() {
         let mut document = Document::new("keep\nremove me\n");
         document.set_selections(Selection::caret(document.text().len()), &[]);
-        assert!(replace_text(&mut document, "keep\n").unwrap());
+        assert!(replace_text(&mut document, "keep\n"));
         assert_eq!(document.primary_selection(), Selection::caret(5));
     }
 }

@@ -473,6 +473,7 @@ impl SecondaryInstance {
 mod tests {
     use super::*;
     use std::path::Path;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
     fn os(text: &str) -> OsString {
         OsString::from(text)
@@ -581,6 +582,16 @@ mod tests {
         );
         // The class is gone again: the same name registers and creates a window now.
         let hwnd = create_window(&class, &state, HWND_MESSAGE).unwrap();
+        // The class is registered now: a second window of the same name is refused by the
+        // registration, which is reported as such and leaves the first window alone.
+        let again = create_window(&class, &state, HWND_MESSAGE).unwrap_err();
+        assert!(
+            again.to_string().starts_with("RegisterClassExW failed"),
+            "{again}"
+        );
+        assert!(!again.is_device_lost());
+        // SAFETY: a plain query of the first window, still alive.
+        assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
         // SAFETY: destroys the window created above on its own thread and removes its class.
         unsafe {
             DestroyWindow(hwnd).unwrap();

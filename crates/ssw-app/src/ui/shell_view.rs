@@ -531,6 +531,51 @@ impl ShellView {
         self.requests.invalidate_all();
     }
 
+    /// View → Word wrap (spec §4.1): wraps long lines at the window edge or lets them run on
+    /// and scroll sideways, for the active tab. Only a tab that shows plain text has the
+    /// choice: `false` (and nothing changes) for a Markdown or Mermaid tab, a plain file shown
+    /// as Markdown and a window without tabs. The choice belongs to the tab, like the other
+    /// ways of presenting it, and starts wrapped.
+    pub fn toggle_word_wrap(&mut self) -> bool {
+        let Some(editor) = self
+            .active_tab_mut()
+            .map(|tab| &mut tab.editor)
+            .filter(|editor| editor.config().document_kind == DocumentKind::PlainText)
+        else {
+            return false;
+        };
+        let mut config = editor.config().clone();
+        config.wrap = !config.wrap;
+        editor.set_config(config);
+        self.requests.invalidate_all();
+        true
+    }
+
+    /// View → Render as Markdown (spec §4.1): shows the active plain-text file as live
+    /// Markdown, or back as plain lines. The document is the same, so every tab that shows it
+    /// follows; the file is saved exactly as before. `false` (and nothing changes) for a
+    /// document that is not a plain-text file and without a tab.
+    pub fn toggle_render_as_markdown(&mut self) -> bool {
+        let Some(entry) = self.active_tab().map(|tab| Rc::clone(&tab.entry)) else {
+            return false;
+        };
+        if !entry.set_render_as_markdown(!entry.render_as_markdown()) {
+            return false;
+        }
+        for tab in self
+            .tabs
+            .iter_mut()
+            .filter(|tab| Rc::ptr_eq(&tab.entry, &entry))
+        {
+            present_as(&mut tab.editor, entry.mode());
+        }
+        // The word count of the status bar follows the document's kind.
+        self.words = None;
+        self.status_key = None;
+        self.requests.invalidate_all();
+        true
+    }
+
     /// Changes the display mode (normal, editor-only, full screen, Zen).
     pub fn set_mode(&mut self, mode: ShellMode) {
         self.layout.set_mode(mode);
@@ -733,10 +778,17 @@ impl ShellView {
 
     // ----- panes and focus -----------------------------------------------------------------
 
-    /// F6: moves the keyboard focus to the next (or previous) pane.
+    /// F6: moves the keyboard focus to the next (or previous) pane and returns it. The title
+    /// bar owns the focus of the title row and of the command row, so they are one stop: from
+    /// the title bar F6 goes on to the pane below the command row (stepping onto the command
+    /// row would leave the focus where it is, forever), and Shift+F6 lands on the title row.
     pub fn next_pane(&mut self, forward: bool) -> Pane {
         let current = self.focused_pane();
-        let pane = self.layout.next_pane(Some(current), forward);
+        let pane = match self.layout.next_pane(Some(current), forward) {
+            Pane::CommandRow if forward => self.layout.next_pane(Some(Pane::CommandRow), true),
+            Pane::CommandRow => Pane::TitleRow,
+            pane => pane,
+        };
         self.focus_target = match pane {
             Pane::TitleRow | Pane::CommandRow => Target::Title,
             Pane::Sidebar => Target::Sidebar,
@@ -785,6 +837,7 @@ impl ShellView {
     // ----- layout and paint ----------------------------------------------------------------
 
     fn arrange(&mut self, text: &dyn TextLayoutEngine) {
+        let _layout = ssw_win::perf::stage(ssw_win::perf::Stage::Layout);
         let rects = self.layout.rects();
         let theme = self.theme;
         let scale = self.layout.scale();
@@ -835,6 +888,7 @@ impl ShellView {
             }
             if let Some(tab) = self.active.and_then(|index| self.tabs.get_mut(index)) {
                 let id = tab.editor.id();
+                let _editor = ssw_win::perf::stage(ssw_win::perf::Stage::EditorLayout);
                 tab.editor.arrange(&mut cx.for_widget(id), editor_rect);
             }
             self.history.arrange(&mut cx, editor_rect);
@@ -943,7 +997,10 @@ impl ShellView {
         }
         if let Some(tab) = self.active_tab() {
             canvas.push_clip_rect(rects.editor);
-            tab.editor.paint(&cx.for_widget(tab.editor.id()), canvas);
+            {
+                let _editor = ssw_win::perf::stage(ssw_win::perf::Stage::EditorPaint);
+                tab.editor.paint(&cx.for_widget(tab.editor.id()), canvas);
+            }
             canvas.pop_clip();
         }
         self.history.paint(&cx, canvas);
@@ -1175,12 +1232,9 @@ impl ShellView {
         result.handled && !matches!(event, Event::Timer(_) | Event::AnimationFrame(_))
     }
 
-    /// Offers `event` to the open version history panel. True when it took it (timer and
-    /// animation ticks are also the business of the other widgets).
+    /// Offers `event` to the version history panel (it ignores everything while closed). True
+    /// when it took it (timer and animation ticks are also the business of the other widgets).
     fn deliver_history(&mut self, event: &Event, text: &dyn TextLayoutEngine) -> bool {
-        if !self.history.is_open() {
-            return false;
-        }
         let theme = self.theme;
         let scale = self.layout.scale();
         let Self {

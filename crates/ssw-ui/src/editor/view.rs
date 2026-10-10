@@ -610,6 +610,21 @@ impl EditorView {
         (widest - (self.bounds.width - 2.0 * MIN_MARGIN)).max(0.0)
     }
 
+    /// How far the view can scroll sideways: [`EditorView::max_scroll_x`] while the lines are
+    /// not wrapped, nothing otherwise.
+    fn horizontal_extent(&self) -> f32 {
+        if self.is_unwrapped() {
+            self.max_scroll_x()
+        } else {
+            0.0
+        }
+    }
+
+    /// The width of text visible at once, at least 1 DIP so that ratios stay finite.
+    fn shown_width(&self) -> f32 {
+        (self.bounds.width - 2.0 * MIN_MARGIN).max(1.0)
+    }
+
     /// The scrollable content height: the blocks with their padding and, in typewriter mode, the
     /// room past the end that lets the last line reach the caret position.
     fn content_height(&self, cache: &Cache) -> f32 {
@@ -979,11 +994,7 @@ impl EditorView {
                 break;
             }
         }
-        let max_x = if self.is_unwrapped() {
-            self.max_scroll_x()
-        } else {
-            0.0
-        };
+        let max_x = self.horizontal_extent();
         self.scroll_x.set(self.scroll_x.get().clamp(0.0, max_x));
     }
 
@@ -1151,16 +1162,22 @@ impl Widget for EditorView {
             .unwrap_or_default();
         let max = self.max_scroll(&cache);
         let content = TOP_PAD + cache.heights.total() as f32 + BOTTOM_PAD;
+        let max_x = self.horizontal_extent();
+        let shown = self.shown_width();
         let scroll = ScrollInfo {
-            horizontal_percent: 0.0,
+            horizontal_percent: if max_x > 0.0 {
+                self.scroll_x.get() / max_x * 100.0
+            } else {
+                0.0
+            },
             vertical_percent: if max > 0.0 {
                 cache.scroll_y / max * 100.0
             } else {
                 0.0
             },
-            horizontal_view_percent: 100.0,
+            horizontal_view_percent: shown / (shown + max_x) * 100.0,
             vertical_view_percent: (self.bounds.height / content * 100.0).min(100.0),
-            horizontally_scrollable: false,
+            horizontally_scrollable: max_x > 0.0,
             vertically_scrollable: max > 0.0,
         };
         drop(cache);
@@ -1203,13 +1220,23 @@ impl Widget for EditorView {
                 true
             }
             AccessAction::ScrollTo {
-                vertical: Some(percent),
-                ..
+                horizontal,
+                vertical,
             } => {
-                let max = self.max_scroll(&self.cache.borrow());
-                self.cache.get_mut().scroll_y = (percent / 100.0).clamp(0.0, 1.0) * max;
-                cx.invalidate(self.bounds);
-                true
+                let sideways = horizontal.filter(|_| self.is_unwrapped());
+                if let Some(percent) = vertical {
+                    let max = self.max_scroll(&self.cache.borrow());
+                    self.cache.get_mut().scroll_y = (percent / 100.0).clamp(0.0, 1.0) * max;
+                }
+                if let Some(percent) = sideways {
+                    self.scroll_x
+                        .set((percent / 100.0).clamp(0.0, 1.0) * self.max_scroll_x());
+                }
+                let scrolled = vertical.is_some() || sideways.is_some();
+                if scrolled {
+                    cx.invalidate(self.bounds);
+                }
+                scrolled
             }
             _ => false,
         }

@@ -199,10 +199,9 @@ impl<'a> Builder<'a> {
         self.entries.push(MenuEntry::Submenu(submenu));
     }
 
-    fn finish(mut self, at: Point) -> Popup {
-        while matches!(self.entries.last(), Some(MenuEntry::Separator)) {
-            self.entries.pop();
-        }
+    /// Every menu ends with a command, custom item or submenu: `separator` is only called
+    /// between items, so there is no trailing separator to trim.
+    fn finish(self, at: Point) -> Popup {
         Popup {
             model: MenuModel::new(self.entries),
             at,

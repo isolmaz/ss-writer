@@ -983,4 +983,25 @@ mod tests {
         };
         assert_eq!(render_inlines(&[link], Ctx::Body), "[x](<a b>)");
     }
+
+    #[test]
+    fn probe_names_every_emphasis_kind_and_reads_leaf_text() {
+        use probe::{expect, runs};
+        let cases: [(&str, &[(&str, &str)]); 10] = [
+            ("**b**", &[("b", "b")]),
+            ("*i*", &[("i", "i")]),
+            ("~~s~~", &[("s", "s")]),
+            ("~u~", &[("u", "u")]),
+            ("==h==", &[("h", "h")]),
+            ("**~~x~~**", &[("x", "bs")]),
+            ("~~**x**~~", &[("x", "bs")]),
+            // escapes, entities and code spans contribute their text, not their markup
+            ("a\\*b", &[("a*b", "")]),
+            ("a&amp;b", &[("a&b", "")]),
+            ("`c`", &[("c", "")]),
+        ];
+        for (markdown, want) in cases {
+            assert_eq!(runs(markdown), expect(want), "{markdown:?}");
+        }
+    }
 }

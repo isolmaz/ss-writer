@@ -869,7 +869,7 @@ fn a_spelling_menu_replaces_the_word_with_the_chosen_suggestion() {
             let view = window.view.borrow();
             Rc::clone(&view.active_tab().unwrap().entry)
         };
-        replace_text(&mut entry.document().borrow_mut(), "x").unwrap();
+        replace_text(&mut entry.document().borrow_mut(), "x");
         let stale = rig
             .controller
             .popup_for(rig.id(), &menu(vec!["tea".to_owned()]))

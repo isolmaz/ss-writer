@@ -582,6 +582,47 @@ mod tests {
         start..end
     }
 
+    fn is_borrowed(text: Cow<'_, str>) -> bool {
+        matches!(text, Cow::Borrowed(_))
+    }
+
+    /// A formatting target that takes `budget` bytes and then refuses every write.
+    struct Refusing {
+        budget: usize,
+        taken: String,
+    }
+
+    impl fmt::Write for Refusing {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            if s.len() > self.budget {
+                return Err(fmt::Error);
+            }
+            self.budget -= s.len();
+            self.taken.push_str(s);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn displaying_a_buffer_reports_a_target_that_refuses_its_text() {
+        use std::fmt::Write as _;
+
+        let buffer = Buffer::from_text("héllo");
+        let mut roomy = Refusing {
+            budget: 100,
+            taken: String::new(),
+        };
+        assert_eq!(write!(roomy, "{buffer}"), Ok(()));
+        assert_eq!(roomy.taken, "héllo");
+
+        let mut full = Refusing {
+            budget: 2,
+            taken: String::new(),
+        };
+        assert_eq!(write!(full, "{buffer}"), Err(fmt::Error));
+        assert_eq!(full.taken, "");
+    }
+
     #[test]
     fn range_predicates_distinguish_open_and_closed_ends() {
         let range = r(2, 5);
@@ -693,7 +734,7 @@ mod tests {
     fn slice_clamps_and_widens_to_char_boundaries() {
         let buffer = Buffer::from_text("héllo");
         assert_eq!(buffer.slice(r(0, 1)), "h");
-        assert!(matches!(buffer.slice(r(0, 1)), Cow::Borrowed(_)));
+        assert!(is_borrowed(buffer.slice(r(0, 1))));
         assert_eq!(buffer.slice(r(2, 4)), "él", "start moves back into é");
         assert_eq!(buffer.slice(r(1, 2)), "é", "end moves forward past é");
         assert_eq!(buffer.slice(r(3, 99)), "llo");
@@ -706,7 +747,7 @@ mod tests {
         let text = "x".repeat(8000) + "é" + &"y".repeat(8000);
         let buffer = Buffer::from_text(&text);
         let whole = buffer.slice(r(0, buffer.len()));
-        assert!(matches!(whole, Cow::Owned(_)));
+        assert!(!is_borrowed(whole.clone()));
         assert_eq!(whole, text);
         let middle = buffer.slice(r(7990, 8020));
         assert_eq!(middle, &text[7990..8020]);

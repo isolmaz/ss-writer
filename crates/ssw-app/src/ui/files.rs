@@ -518,8 +518,12 @@ impl Controller {
         if meta.is_dir() || meta.is_placeholder() {
             return None;
         }
-        let loaded = load_file(env.fs.as_ref(), &path, env.tld.as_deref()).ok()?;
-        matches!(loaded.source, Source::Text).then_some(loaded.text)
+        // The sources of a link update are the index's Markdown files (`.md`, `.markdown`,
+        // `.mdx`, never a folder: checked above) and the open text documents: all of them are
+        // read as text.
+        load_file(env.fs.as_ref(), &path, env.tld.as_deref())
+            .ok()
+            .map(|loaded| loaded.text)
     }
 
     /// Writes one update: an open document takes it as one transaction (it stays unsaved like
@@ -529,9 +533,7 @@ impl Controller {
     fn apply_link_update(&self, root: &Path, update: &LinkUpdate) -> bool {
         let path = absolute(root, &update.path);
         if let Some(entry) = self.docs().find(&path) {
-            // The edits are built from the document's own text: they always apply.
-            return replace_text(&mut entry.document().borrow_mut(), &update.text)
-                .is_ok_and(|changed| changed);
+            return replace_text(&mut entry.document().borrow_mut(), &update.text);
         }
         self.rewrite_closed(&path, update).unwrap_or(false)
     }
@@ -786,10 +788,13 @@ impl Controller {
 
     /// Shows changes on disk in the sidebar of `cell`.
     fn show_changes(cell: &WindowCell, events: &[&FsEvent]) {
-        if let Some(paths) = cell.tree.borrow().as_ref() {
-            for event in events {
-                paths.queue_event((*event).clone());
-            }
+        // Only windows that show a workspace get here: `workspace_root` found their tree.
+        let tree = cell.tree.borrow();
+        let paths = tree
+            .as_ref()
+            .expect("a window showing a workspace has its tree");
+        for event in events {
+            paths.queue_event((*event).clone());
         }
         let mut view = cell.view.borrow_mut();
         if let Some(sidebar) = view.sidebar_mut() {
@@ -885,9 +890,13 @@ impl Controller {
                 }
             },
             move |result| {
-                if let Some(queue) = queues.borrow_mut().roots.get_mut(&done_key) {
-                    queue.running = false;
-                }
+                // The queue of the root exists since the job was queued and is never removed.
+                queues
+                    .borrow_mut()
+                    .roots
+                    .entry(done_key)
+                    .or_default()
+                    .running = false;
                 if matches!(result, Ok(true)) {
                     epoch.set(epoch.get() + 1);
                 }

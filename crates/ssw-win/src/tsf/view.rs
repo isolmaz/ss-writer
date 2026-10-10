@@ -769,6 +769,9 @@ mod tests {
         view.edit_composition(0..0, &units("あい"));
         assert_eq!(view.len(), 6);
         assert_eq!(view.slice(0..6), units("abあいcd"));
+        // A range that ends with the composition takes nothing from the text after it.
+        assert_eq!(view.slice(1..4), units("bあい"));
+        assert_eq!(view.slice(3..5), units("いc"));
         assert_eq!(view.composition_extent(), Some(2..4));
         // The overlay survives a rebuild from unchanged host text.
         view.rebuild("abcd");

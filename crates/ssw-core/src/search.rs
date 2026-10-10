@@ -613,7 +613,8 @@ mod tests {
     fn invalid_regex_is_an_error_everywhere() {
         let q = with("(", false, false, true);
         let err = find_all("x", &q).unwrap_err();
-        assert!(matches!(&err, SearchError::InvalidRegex(m) if !m.is_empty()));
+        let SearchError::InvalidRegex(message) = &err;
+        assert!(message.ends_with("unclosed group"), "{message}");
         assert!(err.to_string().starts_with("invalid regular expression:"));
         assert!(find_next("x", &q, 0).is_err());
         assert!(find_prev("x", &q, 0).is_err());

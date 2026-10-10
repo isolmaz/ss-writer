@@ -21,6 +21,11 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Tests only: lets `ssw_win::fault::arm` make the n-th checked system call of `ssw-win` fail, to
+# reach the error arms of the platform wiring (`ui::platform`).
+fault-injection = ["ssw-win/fault-injection"]
+
 [dependencies]
 ssw-core = { path = "../ssw-core" }
 ssw-io = { path = "../ssw-io" }
@@ -34,15 +39,16 @@ thiserror = "2"
 # call into the OS goes through `ssw-win`.
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
-[build-dependencies]
-embed-manifest = "1.4"
-
 [dev-dependencies]
+# `ssw_win::testing::PrivateDesktop`: the tests that really show and raise windows run on a
+# desktop of their own (the same crate as above, with the test support switched on).
+ssw-win = { path = "../ssw-win", features = ["test-support"] }
 tempfile = "3"
 # Decodes the PNG pages of the dark-theme export tests (the version and features `ssw-render` uses).
 image = { version = "0.25", default-features = false, features = ["png"] }
 # A second connection to the state database that breaks it, for the failed-purge test of
 # `autosave` (the same version and feature as `ssw-io`).
 rusqlite = { version = "0.40", features = ["bundled"] }
-# `TBPFLAG` of the recording taskbar double in `tests/ui_window.rs`.
-windows = { version = "0.62", features = ["Win32_UI_Shell"] }
+# `TBPFLAG` of the recording taskbar double in `tests/ui_window.rs`; the named mutex that keeps
+# the tests of the user's spelling dictionary apart (`ui::platform` tests).
+windows = { version = "0.62", features = ["Win32_UI_Shell", "Win32_System_Threading"] }

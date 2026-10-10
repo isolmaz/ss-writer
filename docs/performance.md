@@ -48,8 +48,25 @@ set), `graphics_attached`, `window_shown`, `first_present`, `first_content_paint
 `folder_open_begin`, `folder_open_returned`, `tree_painted`, `tree_presented`, `index_requested`,
 `index_started`, `index_finished`, `type_begin`, `type_end`.
 
-Per frame: start, `EndDraw` returned (layout and drawing), `Present` returned, and the phase
-(startup, open, scroll, type). Per typed character: time from the `WM_CHAR` message to the return
+Startup order (production, `UiApp::start` with `DeviceStart::Defer`): the device worker is spawned
+first thing in `boot`; the UI thread creates WIC, DirectWrite, the controller and the window while
+it runs. The window is created, gets its Mica / dark-mode attributes and is shown **without** a
+swap chain (`window_created`, `backdrop_applied`, `window_shown`: DWM draws the backdrop of the
+`WS_EX_NOREDIRECTIONBITMAP` window, there is no white fill). When the worker is done it wakes the
+loop; `UiApp::pump` takes the devices (`devices_received`), attaches the swap chains
+(`graphics_attached`) and invalidates the windows, so `first_present` and `first_content_present`
+follow. `window_shown` therefore always precedes `devices_received`; `d3d_device_ready` may fall
+before or after `window_shown`, which is what `window_frame_ms` no longer waits for. Tests that
+draw at once use `UiApp::new` (waits for the devices, the old order).
+
+Per frame: start, the moment the drawing code starts (`ready`: back buffer wrapped, `BeginDraw`
+and clear done), the moment it returned (`recorded`), `EndDraw` returned, `Present` returned, the
+time spent in the layout pass of the view, in the editor's lazy layout (inside the layout pass)
+and in the editor's draw calls, and the phase (startup, open, scroll, type). The scroll scenario
+reports each stage as a median and p95 info metric (`scroll_setup_*`, `scroll_code_*` = layout
+plus draw calls, `scroll_layout_*`, `scroll_editor_layout_*`, `scroll_editor_paint_*`,
+`scroll_enddraw_*`, `scroll_present_*`), so a slow frame is attributed to layout, drawing, the
+GPU flush or `Present` (chrome draw calls are `scroll_code` minus layout and editor paint). Per typed character: time from the `WM_CHAR` message to the return
 of the next `Present`. The JSON format is documented in `crates/ssw-app/src/perf.rs`.
 
 ## Metrics and how they are judged
@@ -106,7 +123,46 @@ For the input-to-photon target as the user sees it (belongs in `docs/manual-test
 
 <!-- perf-results:begin -->
 
-Not measured yet. Run `cargo xtask perf --write-docs`: it replaces everything between the two
-markers of this section with the table of `target/perf/report.md`.
+Runs per scenario: 5. Display refresh: 144.00 Hz. A target passes when the p95 over the runs (or over all samples for `type_latency_ms`) is within its limit.
 
+### startup
+
+| Metric | Target | Median | p95 | n | Verdict |
+|---|---|---:|---:|---:|---|
+| window_frame_ms | <= 150.00 (§14: window frame with Mica < 150 ms) | 305.26 | 318.22 | 5 | FAIL |
+| first_content_frame_ms | <= 370.00 (§14: bounded by device creation (205-370 ms)) | 305.23 | 318.17 | 5 | pass |
+| main_entered_ms | - | 16.27 | 24.80 | 5 | info |
+| startup_done_ms | - | 27.84 | 42.56 | 5 | info |
+| d3d_device_ready_ms | - | 200.65 | 208.41 | 5 | info |
+| window_created_ms | - | 263.72 | 272.60 | 5 | info |
+| backdrop_applied_ms | - | 263.76 | 272.64 | 5 | info |
+| first_present_ms | - | 305.23 | 318.17 | 5 | info |
+
+### open-60k
+
+| Metric | Target | Median | p95 | n | Verdict |
+|---|---|---:|---:|---:|---|
+| open_ms | <= 300.00 (§14: open < 300 ms) | 223.35 | 232.24 | 5 | pass |
+| open_read_ms | - | 1.12 | 1.16 | 5 | info |
+| open_decode_parse_ms | - | 106.48 | 110.28 | 5 | info |
+| open_layout_paint_ms | - | 114.39 | 122.47 | 5 | info |
+| open_present_ms | - | 0.08 | 0.08 | 5 | info |
+| scroll_draw_p95_ms | <= 6.94 (§14: scrolling at refresh rate: draw fits one refresh interval) | 19.14 | 20.87 | 5 | FAIL |
+| scroll_interval_median_ms | <= 7.64 (§14: median frame interval <= 1.1 x refresh interval) | 17.29 | 17.52 | 5 | FAIL |
+| scroll_interval_p95_ms | <= 10.42 (§14: p95 frame interval <= 1.5 x refresh interval) | 19.32 | 21.07 | 5 | FAIL |
+| scroll_frames | - | 2288.00 | 2288.00 | 5 | info |
+
+### folder-10k
+
+| Metric | Target | Median | p95 | n | Verdict |
+|---|---|---:|---:|---:|---|
+| tree_visible_ms | - | 4.52 | 8.60 | 5 | info |
+| index_ms | - | 1653.87 | 1687.31 | 5 | info |
+| index_wait_ms | - | 0.37 | 0.46 | 5 | info |
+
+### type-latency
+
+| Metric | Target | Median | p95 | n | Verdict |
+|---|---|---:|---:|---:|---|
+| type_latency_ms | <= 13.89 (§14: input-to-photon <= 2 frames (proxy: message to Present)) | 5.29 | 8.41 | 600 | pass |
 <!-- perf-results:end -->

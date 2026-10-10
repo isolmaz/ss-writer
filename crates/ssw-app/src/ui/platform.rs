@@ -232,7 +232,7 @@ impl ObjectKey {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Entry {
     Pending,
     Failed,

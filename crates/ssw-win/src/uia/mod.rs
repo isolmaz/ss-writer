@@ -388,6 +388,30 @@ mod tests {
     }
 
     #[test]
+    fn a_vector_is_allocated_for_its_elements_and_filled_in_place() {
+        let array = safe_array(VT_I4.0, 3, &mut |data| {
+            let elements = data.cast::<i32>();
+            for (index, value) in [7, 8, 9].into_iter().enumerate() {
+                // SAFETY: the vector has room for three 32-bit elements and nobody else holds
+                // it yet.
+                unsafe { elements.add(index).write(value) };
+            }
+        })
+        .expect("a vector of three elements");
+        // SAFETY: the array was just created; its data is three initialized 32-bit elements.
+        let (bound, elements) = unsafe {
+            (
+                (*array).rgsabound[0].cElements,
+                std::slice::from_raw_parts((*array).pvData.cast::<i32>(), 3).to_vec(),
+            )
+        };
+        assert_eq!(bound, 3);
+        assert_eq!(elements, [7, 8, 9]);
+        // SAFETY: the array was just created and is destroyed exactly once.
+        unsafe { SafeArrayDestroy(array) }.expect("the array is destroyed");
+    }
+
+    #[test]
     fn an_array_with_more_elements_than_a_safearray_can_hold_is_refused() {
         // Refused before anything is allocated or filled.
         let too_many = u32::MAX as usize + 1;

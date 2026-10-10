@@ -1044,6 +1044,242 @@ mod tests {
         assert_eq!(drawn_texts(&harness, &beyond), ["Zoom"]);
     }
 
+    /// One row of every kind of control (the last with a Browse button beside it).
+    fn every_input_form() -> Form<u8> {
+        let clipboard: crate::widgets::SharedClipboard = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::services::MemoryClipboard::default(),
+        ));
+        let items = ["A", "B"].map(str::to_owned).to_vec();
+        Form::new(vec![
+            Row::new(
+                1u8,
+                "Wrap".to_owned(),
+                None,
+                Input::Toggle(ToggleSwitch::new("Wrap", false)),
+            ),
+            Row::new(
+                2u8,
+                "Font".to_owned(),
+                None,
+                Input::Choice(Box::new(ComboBox::new("Font", items, Some(0)))),
+            ),
+            Row::new(
+                3u8,
+                "Name".to_owned(),
+                Some("Shown under the label".to_owned()),
+                Input::Text(TextBox::new(
+                    "Name",
+                    "alpha",
+                    std::rc::Rc::clone(&clipboard),
+                )),
+            ),
+            Row::new(
+                4u8,
+                "Zoom".to_owned(),
+                None,
+                Input::Slider {
+                    slider: Slider::new("Zoom", 0.0, 5.0, 1.0, 1.0),
+                    labels: Vec::new(),
+                },
+            ),
+            Row::new(
+                5u8,
+                "Run".to_owned(),
+                None,
+                Input::Button(Button::new(ButtonKind::Standard, "Run")),
+            ),
+            Row::new(
+                6u8,
+                "Folder".to_owned(),
+                None,
+                Input::Text(TextBox::new("Folder", "", clipboard)),
+            )
+            .with_accessory(Button::new(ButtonKind::Standard, "Browse")),
+        ])
+    }
+
+    #[test]
+    fn every_kind_of_control_can_be_disabled_and_enabled_with_its_accessory() {
+        let mut form = every_input_form();
+        for key in 1..=6u8 {
+            form.set_enabled(key, false);
+            let disabled = form
+                .rows
+                .iter()
+                .filter(|row| is_disabled(&row.input))
+                .count();
+            assert_eq!(disabled, 1, "only row {key} is disabled");
+            let row = form.rows.iter().find(|row| row.key == key).expect("row");
+            assert!(is_disabled(&row.input));
+            assert!(
+                row.accessory
+                    .as_ref()
+                    .is_none_or(|button| !button.is_enabled())
+            );
+            form.set_enabled(key, true);
+            let row = form.rows.iter().find(|row| row.key == key).expect("row");
+            assert!(!is_disabled(&row.input));
+            assert!(
+                row.accessory
+                    .as_ref()
+                    .is_none_or(|button| button.is_enabled())
+            );
+        }
+    }
+
+    #[test]
+    fn painting_shows_hints_and_messages_and_skips_rows_outside_the_damage() {
+        let mut harness = Harness::new();
+        let mut form = every_input_form();
+        form.set_error(3, Some("Too short".to_owned()));
+        laid_out(&mut harness, &mut form);
+        let texts = drawn_texts(&harness, &form);
+        assert!(texts.iter().any(|text| text == "Shown under the label"));
+        assert!(texts.iter().any(|text| text == "Too short"));
+        assert!(texts.iter().any(|text| text == "Name"));
+        assert_eq!(
+            texts.iter().filter(|text| *text == "Wrap").count(),
+            1,
+            "a toggle draws its own label, the form adds none"
+        );
+
+        let cx = PaintCx::new(
+            WidgetId::allocate(),
+            &harness.theme,
+            1.0,
+            &harness.engine,
+            &harness.focus,
+            &harness.capture,
+            Some(Rect::new(5000.0, 5000.0, 10.0, 10.0)),
+        );
+        let mut canvas = RecordingCanvas::new();
+        form.paint(&cx, &mut canvas);
+        assert_eq!(canvas.ops().count(), 0, "no row is in the damaged area");
+    }
+
+    fn scrolling_form() -> (Harness, Form<u8>, FormScroll) {
+        let mut harness = Harness::new();
+        let mut form = button_form();
+        laid_out(&mut harness, &mut form);
+        let mut scroll = FormScroll::new("Page", Motion::full());
+        {
+            let mut cx = LayoutCx::new(
+                WidgetId::allocate(),
+                &harness.theme,
+                1.0,
+                &harness.engine,
+                &mut harness.focus,
+                &mut harness.requests,
+            );
+            scroll.arrange(&mut cx, Rect::new(0.0, 0.0, 600.0, 400.0), 1000.0);
+        }
+        (harness, form, scroll)
+    }
+
+    fn deliver(
+        harness: &mut Harness,
+        form: &mut Form<u8>,
+        scroll: &mut FormScroll,
+        event: &Event,
+    ) -> EventResult {
+        let mut cx = harness.event_cx(WidgetId::allocate());
+        scroll.event(&mut cx, form, event)
+    }
+
+    #[test]
+    fn a_wheel_the_controls_ignore_scrolls_the_page_and_frames_ease_it() {
+        let (mut harness, mut form, mut scroll) = scrolling_form();
+        let wheel = |position: Point, dy: f32| {
+            Event::Wheel(WheelEvent {
+                delta: Point::new(0.0, dy),
+                precise: false,
+                position,
+                mods: crate::input::Modifiers::NONE,
+            })
+        };
+        let inside = Point::new(100.0, 100.0);
+        let outside = wheel(Point::new(700.0, 100.0), -1.0);
+        assert!(!deliver(&mut harness, &mut form, &mut scroll, &outside).handled);
+        let no_distance = wheel(inside, 0.0);
+        assert!(!deliver(&mut harness, &mut form, &mut scroll, &no_distance).handled);
+
+        harness.requests.take_invalidation();
+        let notch = wheel(inside, -1.0);
+        assert!(deliver(&mut harness, &mut form, &mut scroll, &notch).handled);
+        assert!(!harness.requests.invalidation().is_clean());
+        assert_eq!(scroll.bar.offset(), 0.0, "the easing starts with a frame");
+        assert_eq!(
+            scroll.bar.model().target(),
+            crate::widgets::scroll::WHEEL_STEP
+        );
+
+        harness.requests.take_invalidation();
+        let first = Event::AnimationFrame(harness.now);
+        deliver(&mut harness, &mut form, &mut scroll, &first);
+        assert!(
+            !harness.requests.invalidation().is_clean(),
+            "a moving page repaints its viewport"
+        );
+        let last = Event::AnimationFrame(harness.now + crate::widgets::scroll::SMOOTH_DURATION);
+        deliver(&mut harness, &mut form, &mut scroll, &last);
+        assert_eq!(scroll.bar.offset(), crate::widgets::scroll::WHEEL_STEP);
+
+        // Events that are neither pointer, wheel nor frame go straight to the form.
+        let focus = Event::Focus(crate::input::FocusEvent::Gained);
+        assert!(!deliver(&mut harness, &mut form, &mut scroll, &focus).handled);
+    }
+
+    #[test]
+    fn pointers_reach_the_form_inside_the_viewport_while_captured_and_when_leaving() {
+        use crate::input::PointerButton;
+        let (mut harness, mut form, mut scroll) = scrolling_form();
+        let pointer = |kind, position| {
+            Event::Pointer(PointerEvent::mouse(
+                kind,
+                Some(PointerButton::Left),
+                position,
+            ))
+        };
+        let button = form.rows[0].control_rect.center();
+        let button_id = form.rows[0].input.control().id();
+        let outside = Point::new(900.0, 900.0);
+
+        let stray = pointer(PointerEventKind::Move, outside);
+        assert!(!deliver(&mut harness, &mut form, &mut scroll, &stray).handled);
+        assert_eq!(harness.capture.owner(), None);
+
+        // Pressing the button captures the pointer: it still reaches the form outside the
+        // viewport, and releasing there activates nothing.
+        let down = pointer(PointerEventKind::Down, button);
+        deliver(&mut harness, &mut form, &mut scroll, &down);
+        assert_eq!(harness.capture.owner(), Some(button_id));
+        let away = pointer(PointerEventKind::Move, outside);
+        deliver(&mut harness, &mut form, &mut scroll, &away);
+        let up = pointer(PointerEventKind::Up, outside);
+        deliver(&mut harness, &mut form, &mut scroll, &up);
+        assert_eq!(harness.capture.owner(), None);
+        assert!(form.take_changes().is_empty());
+
+        // A pointer that leaves the window is always passed on.
+        let leave = pointer(PointerEventKind::Leave, outside);
+        deliver(&mut harness, &mut form, &mut scroll, &leave);
+
+        // A click inside the viewport activates the button.
+        let down = pointer(PointerEventKind::Down, button);
+        deliver(&mut harness, &mut form, &mut scroll, &down);
+        let up = pointer(PointerEventKind::Up, button);
+        deliver(&mut harness, &mut form, &mut scroll, &up);
+        assert_eq!(form.take_changes(), vec![(1u8, Change::Pressed)]);
+
+        // The bar answers a click on its track by scrolling a page and repainting.
+        harness.requests.take_invalidation();
+        let track = Point::new(scroll.viewport.right() - BAR_WIDTH / 2.0, 390.0);
+        let page = pointer(PointerEventKind::Down, track);
+        assert!(deliver(&mut harness, &mut form, &mut scroll, &page).handled);
+        assert!(!harness.requests.invalidation().is_clean());
+        assert!(scroll.bar.model().target() > 0.0);
+    }
+
     #[test]
     fn an_animation_frame_while_nothing_eases_repaints_nothing() {
         let mut harness = Harness::new();

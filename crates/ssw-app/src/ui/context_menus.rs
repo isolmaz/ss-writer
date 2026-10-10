@@ -788,22 +788,18 @@ impl Controller {
     fn reveal_new_entry(&self, cell: &Rc<WindowCell>, created: &Path) {
         self.refresh_sidebars();
         let key = cell.tree.borrow().as_ref().map(|paths| paths.key(created));
-        let visible = key.is_some_and(|key| {
-            cell.view
-                .borrow()
-                .sidebar()
-                .is_some_and(|sidebar| sidebar.entry(key).is_some())
+        // The entry is selected where it is visible; a sidebar that does not show it (or no
+        // sidebar at all) leaves `revealed` empty.
+        let revealed = key.filter(|&key| {
+            cell.view.borrow_mut().sidebar_mut().is_some_and(|sidebar| {
+                let shown = sidebar.entry(key).is_some();
+                shown.then(|| sidebar.select_key(key)).is_some()
+            })
         });
-        match key {
-            Some(key) if visible => {
-                let mut view = cell.view.borrow_mut();
-                if let Some(sidebar) = view.sidebar_mut() {
-                    sidebar.select_key(key);
-                }
-                view.request_rename(key);
-            }
-            _ if created.is_file() => self.open_path(cell, created, true),
-            _ => {}
+        match revealed {
+            Some(key) => cell.view.borrow_mut().request_rename(key),
+            None if created.is_file() => self.open_path(cell, created, true),
+            None => {}
         }
     }
 

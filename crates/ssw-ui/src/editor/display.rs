@@ -1344,6 +1344,189 @@ mod tests {
     }
 
     #[test]
+    fn a_caret_maps_through_every_kind_of_segment() {
+        let segment = |src: (usize, usize), disp: (usize, usize), kind| Segment {
+            src: TextRange::new(src.0, src.1),
+            disp: TextRange::new(disp.0, disp.1),
+            kind,
+        };
+        let map = DisplayMap::from_segments(
+            vec![
+                segment((0, 2), (0, 2), SegmentKind::Shown),
+                segment((2, 2), (2, 4), SegmentKind::Composition),
+                segment((2, 4), (4, 4), SegmentKind::Hidden),
+                segment((4, 10), (4, 8), SegmentKind::Atomic),
+                segment((10, 12), (8, 10), SegmentKind::Shown),
+            ],
+            TextRange::new(0, 14),
+            10,
+        );
+        assert_eq!(map.source_to_display(1), 1, "inside the first shown text");
+        assert_eq!(map.source_to_display(2), 2, "its end edge touches too");
+        assert_eq!(
+            map.source_to_display(3),
+            4,
+            "past the composition, inside the hidden marker"
+        );
+        assert_eq!(map.source_to_display(5), 4, "atomic: nearer start");
+        assert_eq!(
+            map.source_to_display(7),
+            4,
+            "atomic: a tie goes to the start"
+        );
+        assert_eq!(map.source_to_display(8), 8, "atomic: nearer end");
+        assert_eq!(map.source_to_display(9), 8, "atomic: nearer end");
+        assert_eq!(map.source_to_display(11), 9, "inside the last shown text");
+        assert_eq!(map.source_to_display(13), 10, "past every segment");
+        assert_eq!(
+            map.source_to_display(99),
+            10,
+            "clamped into the source range"
+        );
+    }
+
+    #[test]
+    fn emphasis_breaks_and_raw_html_are_displayed_in_place() {
+        let tokens = Theme::light(DEFAULT_ACCENT).tokens;
+        let d = display(
+            "*em* soft\nbreak <b>raw</b> hard  \nbreak",
+            None,
+            &NoObjects,
+            None,
+        );
+        assert_eq!(d.text, "em soft\nbreak <b>raw</b> hard\nbreak");
+        let emphasis = d
+            .styles
+            .iter()
+            .find(|s| s.range == (0..2))
+            .expect("emphasis run");
+        assert!(emphasis.style.italic);
+        // The tags of inline HTML are shown dimmed, the text between them is not styled.
+        for tag in [14..17, 20..24] {
+            let run = d
+                .styles
+                .iter()
+                .find(|s| s.range == tag)
+                .expect("dimmed tag");
+            assert_eq!(run.style.color, Some(tokens.marker));
+        }
+        assert!(d.styles.iter().all(|s| s.range != (17..20)));
+    }
+
+    #[test]
+    fn a_decoded_entity_keeps_the_style_of_the_text_around_it() {
+        let d = display("**a &amp; b**", None, &NoObjects, None);
+        assert_eq!(d.text, "a & b");
+        let entity = d
+            .styles
+            .iter()
+            .find(|s| s.range == (2..3))
+            .expect("run of the decoded entity");
+        assert_eq!(entity.style.weight, FontWeight::BOLD);
+        let plain = display("a &amp; b", None, &NoObjects, None);
+        assert!(plain.styles.is_empty(), "plain text needs no style runs");
+    }
+
+    /// Answers formulas with a scene and everything else with a raster image.
+    struct ByKind {
+        math: ObjectInfo,
+        image: ObjectInfo,
+    }
+
+    impl InlineObjectProvider for ByKind {
+        fn object(&self, request: &ObjectRequest<'_>) -> ObjectState {
+            ObjectState::Ready(if request.kind == ObjectKind::Math {
+                self.math
+            } else {
+                self.image
+            })
+        }
+    }
+
+    fn drawn_scenes(canvas: &RecordingCanvas) -> Vec<crate::canvas::SceneId> {
+        canvas
+            .ops()
+            .filter_map(|op| match op {
+                DrawOp::Scene { scene, .. } => Some(*scene),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn drawn_images(canvas: &RecordingCanvas) -> Vec<crate::canvas::ImageId> {
+        canvas
+            .ops()
+            .filter_map(|op| match op {
+                DrawOp::Image { image, .. } => Some(*image),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn underline_widths(canvas: &RecordingCanvas) -> Vec<f32> {
+        canvas
+            .ops()
+            .filter_map(|op| match op {
+                DrawOp::StrokeLine { width, .. } => Some(*width),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn front_decorations_draw_every_placed_object_and_underline_each_composition_segment() {
+        let info = |visual| ObjectInfo {
+            visual,
+            size: Size::new(30.0, 20.0),
+            baseline: 15.0,
+        };
+        let provider = ByKind {
+            math: info(ObjectVisual::Scene(crate::canvas::SceneId(7))),
+            image: info(ObjectVisual::Image(crate::canvas::ImageId(3))),
+        };
+        let comp = Composition {
+            at: 0,
+            text: "ab".into(),
+            caret: 1,
+            attrs: vec![
+                crate::input::ImeAttr {
+                    range: 0..1,
+                    style: ImeAttrStyle::TargetConverted,
+                },
+                crate::input::ImeAttr {
+                    range: 1..2,
+                    style: ImeAttrStyle::Input,
+                },
+            ],
+        };
+        let d = display("$x$ ![i](p.png)", None, &provider, Some(&comp));
+        assert_eq!(d.object_draws.len(), 2);
+        let base = TextStyle::new("Body", 10.0);
+        let engine = MonoTextEngine::new(10.0);
+        let paint = |objects: &[InlineObject]| {
+            let layout = engine.layout(&d.text, &base, &d.styles, objects, 400.0);
+            let mut canvas = RecordingCanvas::new();
+            d.paint_front(layout.as_ref(), &mut canvas, Color::BLACK);
+            canvas
+        };
+
+        let placed = paint(d.objects.as_slice());
+        assert_eq!(drawn_scenes(&placed), [crate::canvas::SceneId(7)]);
+        assert_eq!(drawn_images(&placed), [crate::canvas::ImageId(3)]);
+        assert_eq!(
+            underline_widths(&placed),
+            [2.0, 1.0],
+            "the converted target is drawn thicker than the rest"
+        );
+
+        // A layout that reserved only the formula knows no rectangle for the image.
+        let formula_only = paint(&d.objects[..1]);
+        assert_eq!(drawn_scenes(&formula_only), [crate::canvas::SceneId(7)]);
+        assert!(drawn_images(&formula_only).is_empty());
+        assert_eq!(underline_widths(&formula_only), [2.0, 1.0]);
+    }
+
+    #[test]
     fn nodes_overlapping_text_already_shown_add_nothing() {
         let doc = Document::new("abcdef");
         let block = &doc.ast().blocks[0];

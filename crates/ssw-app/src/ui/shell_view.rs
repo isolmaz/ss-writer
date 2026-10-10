@@ -789,21 +789,15 @@ impl ShellView {
             Pane::CommandRow => Pane::TitleRow,
             pane => pane,
         };
-        self.focus_target = match pane {
-            Pane::TitleRow | Pane::CommandRow => Target::Title,
-            Pane::Sidebar => Target::Sidebar,
-            Pane::Editor => Target::Editor,
-            Pane::Inspector => Target::Inspector,
-            Pane::StatusBar => Target::Status,
+        // No pane stands for the banners, so they never get the focus from here.
+        let (target, id) = match pane {
+            Pane::TitleRow | Pane::CommandRow => (Target::Title, Some(self.titlebar.tabs().id())),
+            Pane::Sidebar => (Target::Sidebar, self.sidebar.as_ref().map(Control::id)),
+            Pane::Editor => (Target::Editor, self.active_tab().map(|tab| tab.editor.id())),
+            Pane::Inspector => (Target::Inspector, Some(self.inspector.id())),
+            Pane::StatusBar => (Target::Status, Some(self.statusbar.id())),
         };
-        let id = match self.focus_target {
-            Target::Title => Some(self.titlebar.tabs().id()),
-            Target::Sidebar => self.sidebar.as_ref().map(Control::id),
-            Target::Banners => Some(self.banners.id()),
-            Target::Editor => self.active_tab().map(|tab| tab.editor.id()),
-            Target::Inspector => Some(self.inspector.id()),
-            Target::Status => Some(self.statusbar.id()),
-        };
+        self.focus_target = target;
         if let Some(id) = id {
             self.focus.focus(id);
         }

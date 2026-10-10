@@ -23,7 +23,6 @@ export-failed-write = The file { $path } could not be written: { $reason }
 export-nothing-title = Nothing to export
 export-nothing-message = Open a document first.
 
-export-reason-empty = The export produced no pages.
 export-reason-busy = The export could not be started. { $reason }
 export-reason-crashed = The exporter stopped unexpectedly.
 export-reason-same-file = Choose a different file: exporting over the document itself would replace it.

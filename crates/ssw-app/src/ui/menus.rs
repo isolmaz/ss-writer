@@ -565,15 +565,17 @@ mod tests {
             &Keymap::default(),
             state,
         );
+        // An item the menu does not list is missing from the result: the comparisons of the
+        // tests fail on it.
         [CommandId::ViewWordWrap, CommandId::ViewRenderAsMarkdown]
-            .map(|command| {
-                let entry = items(&view)
+            .into_iter()
+            .filter_map(|command| {
+                items(&view)
                     .into_iter()
                     .find(|entry| entry.id == menu_id(command))
-                    .unwrap_or_else(|| panic!("the View menu lists {command}"));
-                (entry.label.clone(), entry.enabled, entry.check)
+                    .map(|entry| (entry.label.clone(), entry.enabled, entry.check))
             })
-            .to_vec()
+            .collect()
     }
 
     #[test]

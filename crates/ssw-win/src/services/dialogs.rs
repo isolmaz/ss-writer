@@ -22,7 +22,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Controls::{
     TASKDIALOG_BUTTON, TASKDIALOG_COMMON_BUTTON_FLAGS, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0,
     TD_ERROR_ICON, TD_INFORMATION_ICON, TD_WARNING_ICON, TDCBF_CANCEL_BUTTON, TDCBF_NO_BUTTON,
-    TDCBF_OK_BUTTON, TDCBF_YES_BUTTON, TaskDialogIndirect,
+    TDCBF_OK_BUTTON, TDCBF_YES_BUTTON,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
@@ -154,30 +154,9 @@ pub trait DialogHost {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemDialogHost;
 
-impl DialogHost for SystemDialogHost {
-    fn pick(
-        &mut self,
-        dialog: &IFileDialog,
-        owner: Option<HWND>,
-    ) -> windows::core::Result<Vec<IShellItem>> {
-        // SAFETY: modal dialog shown on the calling thread; `dialog` is a live COM object.
-        let shown = unsafe { dialog.Show(owner) };
-        items_after_show(dialog, shown)
-    }
-
-    fn task_dialog(&mut self, config: &TASKDIALOGCONFIG) -> windows::core::Result<i32> {
-        let mut pressed = 0i32;
-        // SAFETY: the caller keeps the configuration and every string/array it points to alive
-        // for the (modal) call.
-        let shown = unsafe { TaskDialogIndirect(config, Some(&mut pressed), None, None) };
-        // The command id only means something when the dialog was shown.
-        shown.and(Ok(pressed))
-    }
-}
-
 /// What a dialog returns once `Show` ended with `shown`: its items, nothing when the user
 /// cancelled, the error otherwise.
-fn items_after_show(
+pub(crate) fn items_after_show(
     dialog: &IFileDialog,
     shown: windows::core::Result<()>,
 ) -> windows::core::Result<Vec<IShellItem>> {

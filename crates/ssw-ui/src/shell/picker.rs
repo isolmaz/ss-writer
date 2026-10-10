@@ -711,6 +711,15 @@ mod tests {
         assert_eq!(list.selected(), Some(3));
         press(&mut list, vk::PAGE_UP);
         assert_eq!(list.selected(), Some(0));
+        // Up and Down move one row and wrap around the ends.
+        assert_eq!(press(&mut list, vk::DOWN), RowKey::Moved);
+        assert_eq!(list.selected(), Some(1));
+        assert_eq!(press(&mut list, vk::UP), RowKey::Moved);
+        assert_eq!(list.selected(), Some(0));
+        assert_eq!(press(&mut list, vk::UP), RowKey::Moved);
+        assert_eq!((list.selected(), list.first_visible()), (Some(7), 5));
+        assert_eq!(press(&mut list, vk::DOWN), RowKey::Moved);
+        assert_eq!((list.selected(), list.first_visible()), (Some(0), 0));
         assert_eq!(press(&mut list, vk::RETURN), RowKey::Activate(0));
         assert_eq!(press(&mut list, vk::F3), RowKey::Ignored);
         // Modified keys belong to the owner.
@@ -807,6 +816,71 @@ mod tests {
             })
             .collect();
         assert_eq!(glyphs, [glyph::CHEVRON_RIGHT, glyph::CHEVRON_DOWN]);
+    }
+
+    fn text_color(canvas: &RecordingCanvas, wanted: &str) -> Option<crate::geometry::Color> {
+        canvas.ops().find_map(|op| match op {
+            DrawOp::Text { text, color, .. } if text == wanted => Some(*color),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn rows_draw_their_prefix_detail_matches_and_disabled_state() {
+        let harness = Harness::new();
+        let tokens = &harness.theme.tokens;
+        let rows = vec![
+            Row {
+                prefix: "12".to_owned(),
+                label: "alpha".to_owned(),
+                highlights: vec![0..2],
+                detail: "Ctrl+A".to_owned(),
+                ..Row::default()
+            },
+            Row {
+                disabled: true,
+                ..Row::new("beta")
+            },
+        ];
+        let list = list_of(rows, 64.0);
+        let canvas = paint(&harness, &list, None);
+        assert_eq!(text_color(&canvas, "12"), Some(tokens.text_muted));
+        assert_eq!(text_color(&canvas, "Ctrl+A"), Some(tokens.text_muted));
+        assert_eq!(text_color(&canvas, "alpha"), Some(tokens.text));
+        assert_eq!(text_color(&canvas, "beta"), Some(tokens.text_disabled));
+        assert_eq!(text_color(&canvas, "gamma"), None);
+        let matched = tokens.accent.with_alpha(MATCH_OPACITY);
+        assert_eq!(count_fills(&canvas, matched), 1, "one matched stretch");
+    }
+
+    fn scrollbar_thumb(harness: &Harness, list: &RowList) -> Option<Rect> {
+        let scrollbar = harness.theme.tokens.scrollbar;
+        paint(harness, list, None).ops().find_map(|op| match op {
+            DrawOp::FillRoundedRect { rect, color, .. } if *color == scrollbar => Some(*rect),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_list_longer_than_its_view_draws_a_scrollbar_thumb_that_follows_the_scroll() {
+        let harness = Harness::new();
+        assert_eq!(
+            scrollbar_thumb(&harness, &list_of(plain(3), 96.0)),
+            None,
+            "every row fits"
+        );
+        let mut list = list_of(plain(8), 96.0);
+        let top = scrollbar_thumb(&harness, &list).expect("thumb");
+        assert_eq!(top.y, list.bounds().y, "at the top of the track");
+        assert_eq!(top.width, THUMB_WIDTH);
+        assert!(top.height >= THUMB_MIN && top.height < list.bounds().height);
+        assert!(list.scroll_by(5));
+        let bottom = scrollbar_thumb(&harness, &list).expect("thumb");
+        assert!(
+            (bottom.bottom() - list.bounds().bottom()).abs() < 1e-3,
+            "at the bottom of the track"
+        );
+        assert_eq!(bottom.height, top.height);
     }
 
     #[test]

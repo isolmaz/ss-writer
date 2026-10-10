@@ -16,7 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ssw_core::i18n::Localizer;
 use ssw_io::fs::RealFs;
@@ -73,6 +73,16 @@ const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How many recent files the Jump List is asked to show.
 const JUMP_LIST_RECENT: usize = 20;
+
+/// Spelling checks run once no window asked for a repaint (scrolling, typing, animation) for
+/// this long: a check calls into the system and must not delay a frame.
+pub const SPELL_IDLE: Duration = Duration::from_millis(40);
+
+/// The most time one loop turn spends on spelling checks.
+pub const SPELL_BUDGET: Duration = Duration::from_millis(2);
+
+/// How soon the loop wakes again while spelling checks wait.
+pub const SPELL_TURN: Duration = Duration::from_millis(20);
 
 /// Where an off-screen window (`--perf-offscreen`) has its top left corner, in both axes: far
 /// outside every monitor arrangement.
@@ -327,6 +337,8 @@ pub struct UiApp {
     shown_recent: RefCell<Vec<PathBuf>>,
     recent_stale: Cell<bool>,
     frame_interval: Duration,
+    /// When a window last asked for a repaint (the spelling checks wait for a quiet moment).
+    last_repaint: Cell<Instant>,
     final_session: RefCell<Option<Session>>,
     exit: Cell<Option<i32>>,
     // Declared last: every native window is gone before the message window.
@@ -458,6 +470,7 @@ impl UiApp {
             shown_recent: RefCell::new(Vec::new()),
             recent_stale: Cell::new(true),
             frame_interval: ssw_win::services::timers::refresh_interval(),
+            last_repaint: Cell::new(Instant::now()),
             final_session: RefCell::new(None),
             exit: Cell::new(None),
             message_window,
@@ -780,6 +793,7 @@ impl UiApp {
             native.host.set_cursor(cell.cursor.get());
             if repaint || cell.dirty.take() {
                 native.host.invalidate();
+                self.last_repaint.set(Instant::now());
             }
             native.platform.sync(&native.host, repaint);
         }
@@ -936,9 +950,27 @@ impl UiApp {
         let frames = self.deliver_frames();
         self.controller.pump_settings();
         let scrolling = self.sync_windows();
+        self.pump_spell();
         self.sync_settings();
         self.refresh_jump_list();
         frames || scrolling
+    }
+
+    /// Runs the spelling checks the painted blocks wait for, a slice of [`SPELL_BUDGET`] per
+    /// turn, once no window asked for a repaint for [`SPELL_IDLE`] (so a check never delays a
+    /// frame of scrolling or typing), and repaints the windows when a check answered: the
+    /// squiggles change what is drawn, not the layout. Returns whether the windows were asked
+    /// to repaint.
+    pub fn pump_spell(&self) -> bool {
+        if self.last_repaint.get().elapsed() < SPELL_IDLE
+            || !self.controller.pump_spell(SPELL_BUDGET)
+        {
+            return false;
+        }
+        for native in self.windows.borrow().iter() {
+            native.host.invalidate();
+        }
+        true
     }
 
     /// The idle handler of the message loop: how long it may sleep.
@@ -949,6 +981,8 @@ impl UiApp {
         }
         Some(if frames {
             self.frame_interval
+        } else if self.controller.spell_pending() {
+            SPELL_TURN
         } else {
             HOUSEKEEPING_INTERVAL
         })
@@ -1057,9 +1091,7 @@ impl UiApp {
             .as_ref()
             .map(SettingsNative::sync)
             .unwrap_or_default();
-        for event in events {
-            self.controller.push(Request::Settings(event));
-        }
+        self.controller.push_settings(events);
         let gone = self
             .settings
             .borrow()

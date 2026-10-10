@@ -137,6 +137,15 @@ impl Boot {
             Self::Ready(_) => None,
         }
     }
+
+    /// What startup handed to the application; `None` when the process must exit.
+    #[must_use]
+    pub fn started(self) -> Option<Box<Started>> {
+        match self {
+            Self::Ready(started) => Some(started),
+            Self::Exit(_) => None,
+        }
+    }
 }
 
 /// Shows the localized "Windows 11 22H2 required" message and returns the exit code when
@@ -327,10 +336,7 @@ mod tests {
     }
 
     fn ready(boot: Boot) -> Box<Started> {
-        match boot {
-            Boot::Ready(started) => started,
-            Boot::Exit(code) => panic!("exited with {code}"),
-        }
+        boot.started().expect("startup went on")
     }
 
     #[test]
@@ -349,6 +355,7 @@ mod tests {
             outcome.exit_code(),
             Some(ssw_win::window::EXIT_UNSUPPORTED_OS)
         );
+        assert!(outcome.started().is_none(), "nothing runs after the exit");
         let shown = services.dialog_log();
         assert_eq!(shown.len(), 1);
         assert!(shown[0].message.contains("22621"));

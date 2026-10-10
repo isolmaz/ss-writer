@@ -263,17 +263,19 @@ mod tests {
         let events = opened.take_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].path, tmp.path());
-        assert!(matches!(events[0].kind, FsEventKind::Rescan));
+        assert_eq!(format!("{:?}", events[0].kind), "Rescan");
         assert!(opened.take_events().is_empty(), "taken once");
     }
 
     #[test]
     fn a_missing_root_is_an_error_and_a_vanished_folder_lists_empty() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            WorkspaceTree::open(Arc::new(RealFs), &tmp.path().join("missing")),
-            Err(FsError::NotFound(_))
-        ));
+        let missing = tmp.path().join("missing");
+        let error = WorkspaceTree::open(Arc::new(RealFs), &missing).unwrap_err();
+        assert_eq!(
+            format!("{error:?}"),
+            format!("{:?}", FsError::NotFound(missing))
+        );
         std::fs::create_dir(tmp.path().join("gone")).unwrap();
         let mut tree = WorkspaceTree::open(Arc::new(RealFs), tmp.path()).unwrap();
         let top = tree.children(0, &SidebarOptions::default());

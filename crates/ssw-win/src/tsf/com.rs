@@ -733,7 +733,10 @@ mod tests {
 
     #[test]
     fn a_null_allocation_is_out_of_memory_and_a_real_one_passes_through() {
-        let error = allocated(std::ptr::null_mut::<u8>()).expect_err("null is a failed allocation");
+        // One pointer type for both outcomes: `allocated` is generic, and the gate counts the
+        // regions one instantiation covers.
+        let error =
+            allocated(std::ptr::null_mut::<u32>()).expect_err("null is a failed allocation");
         assert_eq!(error.code(), E_OUTOFMEMORY);
         let mut value = 5u32;
         let pointer: *mut u32 = &mut value;

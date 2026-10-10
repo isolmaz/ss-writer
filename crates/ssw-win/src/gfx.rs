@@ -879,6 +879,15 @@ mod tests {
         assert_eq!(error.to_string(), "device thread ended without a result");
     }
 
+    /// What a poll came to: the startup when the worker is still busy, the outcome when it is
+    /// done.
+    fn split(poll: DevicePoll) -> (Option<DeviceStartup>, Option<Result<GfxDevices, WinError>>) {
+        match poll {
+            DevicePoll::Pending(startup) => (Some(startup), None),
+            DevicePoll::Done(outcome) => (None, Some(outcome)),
+        }
+    }
+
     #[test]
     fn polling_a_worker_that_ended_without_a_result_is_an_error() {
         let (sender, receiver) = channel::<Handoff>();
@@ -888,12 +897,10 @@ mod tests {
             worker: std::thread::spawn(|| {}),
             ready: Arc::default(),
         };
-        match startup.poll() {
-            DevicePoll::Done(Err(error)) => {
-                assert_eq!(error.to_string(), "device thread ended without a result");
-            }
-            other => panic!("expected the end of the device thread, got {other:?}"),
-        }
+        let (pending, done) = split(startup.poll());
+        assert!(pending.is_none(), "the end of the device thread is final");
+        let error = done.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "device thread ended without a result");
     }
 
     #[test]
@@ -945,17 +952,18 @@ mod tests {
             let _ = told.send(());
         });
         // The worker is held back: there is nothing to take yet.
-        let startup = match startup.poll() {
-            DevicePoll::Pending(startup) => startup,
-            DevicePoll::Done(_) => panic!("the devices cannot be there before the release"),
-        };
+        let (pending, done) = split(startup.poll());
+        assert!(
+            done.is_none(),
+            "the devices cannot be there before the release"
+        );
+        let startup = pending.unwrap();
         release.send(()).unwrap();
         heard.recv_timeout(Duration::from_secs(60)).unwrap();
         // The hook runs after the hand-over: the devices are waiting.
-        match startup.poll() {
-            DevicePoll::Done(devices) => assert_eq!(devices.unwrap().generation(), 1),
-            DevicePoll::Pending(_) => panic!("the hook runs after the hand-over"),
-        }
+        let (pending, done) = split(startup.poll());
+        assert!(pending.is_none(), "the hook runs after the hand-over");
+        assert_eq!(done.unwrap().unwrap().generation(), 1);
     }
 
     /// Polls `shared` until the worker is done with it.

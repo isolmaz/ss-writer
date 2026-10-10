@@ -2,7 +2,7 @@
 //! documented fallbacks.
 
 use image::{ExtendedColorType, ImageEncoder};
-use ssw_render::scene::{Color, Group, Paint, Rect, Scene, SceneItem};
+use ssw_render::scene::{Color, Group, LineCap, LineJoin, Paint, Rect, Scene, SceneItem};
 use ssw_render::svg_to_scene::svg_to_scene;
 
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -232,6 +232,27 @@ fn patterns_are_drawn_gray_and_hidden_shapes_are_skipped() {
         panic!("fill expected");
     };
     assert_eq!(fill.paint, Paint::Solid(Color::rgb(128, 128, 128)));
+}
+
+#[test]
+fn stroke_ends_and_corners_keep_their_style() {
+    let s = scene(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+            <path d="M1 5H9" fill="none" stroke="#00f" stroke-width="2" stroke-linecap="square"/>
+            <path d="M11 1H19V9" fill="none" stroke="#00f" stroke-width="2" stroke-linejoin="bevel"/></svg>"##,
+    );
+    let styles: Vec<(LineCap, LineJoin)> = all_leaves(&s)
+        .iter()
+        .filter_map(SceneItem::as_stroke)
+        .map(|stroke| (stroke.cap, stroke.join))
+        .collect();
+    assert_eq!(
+        styles,
+        [
+            (LineCap::Square, LineJoin::Miter),
+            (LineCap::Butt, LineJoin::Bevel)
+        ]
+    );
 }
 
 #[test]

@@ -62,11 +62,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_XBUTTONUP, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
+use windows::Win32::UI::WindowsAndMessaging::{POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, PT_TOUCHPAD};
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::canvas::{CanvasAssets, D2dCanvas, TargetResources};
 use crate::chrome::{self, CaptionButton, ChromeState, paint_caption_buttons};
-use crate::com::{OsResultExt, WinError, to_wide};
+use crate::com::{OsResultExt, WinError};
 use crate::dpi::{
     DEFAULT_DPI, dip_to_px, dpi_from_wparam, min_track_size_px, point_px_to_dip, scale_for_dpi,
     size_px_to_dip, top_resize_band_px, window_dpi,
@@ -98,6 +99,15 @@ pub struct OsVersion {
 /// The running Windows version: major 10 with the build from the registry.
 #[must_use]
 pub fn current_os_version() -> OsVersion {
+    OsVersion {
+        major: 10,
+        build: registry_build(w!("CurrentBuildNumber")),
+    }
+}
+
+/// The number the text value `name` of the Windows version key holds; 0 when the value is
+/// missing, too long for a build number or no number.
+fn registry_build(name: PCWSTR) -> u32 {
     let mut buffer = [0u16; 16];
     let mut size = size_of_val(&buffer) as u32;
     // SAFETY: valid key path and a writable buffer of `size` bytes; read-only access.
@@ -105,19 +115,18 @@ pub fn current_os_version() -> OsVersion {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
             w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
-            w!("CurrentBuildNumber"),
+            name,
             RRF_RT_REG_SZ,
             None,
             Some(buffer.as_mut_ptr().cast::<c_void>()),
             Some(&mut size),
         )
     };
-    let build = if status.is_ok() {
+    if status.is_ok() {
         crate::com::from_wide(&buffer).trim().parse().unwrap_or(0)
     } else {
         0
-    };
-    OsVersion { major: 10, build }
+    }
 }
 
 /// Checks that the OS is Windows 11 22H2 or newer. When it is not, `notify` is called (the app
@@ -129,34 +138,6 @@ pub fn check_os_version(version: OsVersion, notify: impl FnOnce()) -> Option<i32
         notify();
         Some(EXIT_UNSUPPORTED_OS)
     }
-}
-
-/// Shows a blocking message box with an OK button.
-pub fn show_message_box(owner: Option<HWND>, title: &str, text: &str) {
-    show_message_box_with(owner, title, text, |owner, title, text| {
-        // SAFETY: both buffers are NUL-terminated and outlive the call.
-        unsafe {
-            windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
-                owner,
-                PCWSTR(text.as_ptr()),
-                PCWSTR(title.as_ptr()),
-                windows::Win32::UI::WindowsAndMessaging::MB_OK
-                    | windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
-            );
-        }
-    });
-}
-
-/// Prepares the NUL-terminated UTF-16 `title` and `text` of a message box and hands them,
-/// with `owner`, to `present`. [`show_message_box`] passes the `MessageBoxW` call; tests pass
-/// a recorder, because a real message box would block on the user's screen.
-pub fn show_message_box_with(
-    owner: Option<HWND>,
-    title: &str,
-    text: &str,
-    present: impl FnOnce(Option<HWND>, &[u16], &[u16]),
-) {
-    present(owner, &to_wide(title), &to_wide(text));
 }
 
 /// Where a point of the client area belongs, as answered by [`WindowHandler::hit_test`].
@@ -1019,9 +1000,7 @@ impl WindowState {
                     };
                     // SAFETY: valid APPBARDATA with its size set.
                     let state = unsafe { SHAppBarMessage(ABM_GETSTATE, &mut bar) } as u32;
-                    if state & ABS_AUTOHIDE != 0 {
-                        params.rgrc[0].bottom -= 1;
-                    }
+                    params.rgrc[0].bottom -= autohide_inset(state);
                 }
                 (Some(LRESULT(0)), After::None)
             }
@@ -1084,11 +1063,11 @@ impl WindowState {
             }
             WM_SETCURSOR => {
                 if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
-                    // SAFETY: loads and sets a stock cursor.
+                    // SAFETY: loads and sets a stock cursor; one that cannot be loaded (the
+                    // stock resources always load) leaves the cursor as it is.
                     unsafe {
-                        if let Ok(cursor) = LoadCursorW(None, cursor_resource(self.cursor)) {
-                            SetCursor(Some(cursor));
-                        }
+                        let _ = LoadCursorW(None, cursor_resource(self.cursor))
+                            .map(|cursor| SetCursor(Some(cursor)));
                     }
                     (Some(LRESULT(1)), After::None)
                 } else {
@@ -1193,42 +1172,7 @@ impl WindowState {
             }
             WM_POINTERDOWN | WM_POINTERUP | WM_POINTERUPDATE | WM_POINTERLEAVE => {
                 let id = (wparam.0 & 0xFFFF) as u32;
-                let mut kind = windows::Win32::UI::WindowsAndMessaging::POINTER_INPUT_TYPE(0);
-                // SAFETY: valid out pointers for a pointer id delivered with this message.
-                if unsafe { GetPointerType(id, &mut kind) }.is_err() {
-                    return (None, After::None);
-                }
-                let pointer_type = match kind {
-                    windows::Win32::UI::WindowsAndMessaging::PT_TOUCH => PointerType::Touch,
-                    windows::Win32::UI::WindowsAndMessaging::PT_PEN => PointerType::Pen,
-                    windows::Win32::UI::WindowsAndMessaging::PT_TOUCHPAD => PointerType::Touchpad,
-                    // The mouse is handled through WM_MOUSE* messages.
-                    _ => return (None, After::None),
-                };
-                let mut info = POINTER_INFO::default();
-                // SAFETY: valid out pointer.
-                if unsafe { GetPointerInfo(id, &mut info) }.is_err() {
-                    return (None, After::None);
-                }
-                let position = self.client_point(info.ptPixelLocation);
-                let button = if info.pointerFlags.0 & POINTER_FLAG_SECONDBUTTON != 0 {
-                    PointerButton::Right
-                } else {
-                    PointerButton::Left
-                };
-                match msg {
-                    WM_POINTERDOWN => {
-                        self.pointer(PointerEventKind::Down, Some(button), position, pointer_type);
-                    }
-                    WM_POINTERUP => {
-                        self.pointer(PointerEventKind::Up, Some(button), position, pointer_type);
-                    }
-                    WM_POINTERUPDATE => {
-                        self.pointer(PointerEventKind::Move, None, position, pointer_type);
-                    }
-                    _ => self.pointer(PointerEventKind::Leave, None, position, pointer_type),
-                }
-                (Some(LRESULT(0)), After::None)
+                self.pointer_message(msg, query_pointer(id))
             }
             WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
                 let is_down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
@@ -1303,8 +1247,66 @@ impl WindowState {
     }
 }
 
+/// What the system knows of the pointer `id` of a `WM_POINTER*` message: its device type and
+/// state; `None` for a pointer it does not know (the message is stale or made up).
+fn query_pointer(id: u32) -> Option<(POINTER_INPUT_TYPE, POINTER_INFO)> {
+    let mut kind = POINTER_INPUT_TYPE(0);
+    let mut info = POINTER_INFO::default();
+    // SAFETY: valid out pointers. Both queries always run (and both fail for an unknown id),
+    // so the answer has no branch only a real pointer could take.
+    let (typed, informed) =
+        unsafe { (GetPointerType(id, &mut kind), GetPointerInfo(id, &mut info)) };
+    (typed.is_ok() & informed.is_ok()).then_some((kind, info))
+}
+
+impl WindowState {
+    /// A `WM_POINTER*` message of the pointer `sample` describes. Only touch, pen and touchpad
+    /// contacts become pointer events (the mouse arrives as `WM_MOUSE*` messages); anything else,
+    /// and a pointer the system does not know, is left to default processing.
+    fn pointer_message(
+        &mut self,
+        msg: u32,
+        sample: Option<(POINTER_INPUT_TYPE, POINTER_INFO)>,
+    ) -> (Option<LRESULT>, After) {
+        let Some((kind, info)) = sample else {
+            return (None, After::None);
+        };
+        let pointer_type = match kind {
+            PT_TOUCH => PointerType::Touch,
+            PT_PEN => PointerType::Pen,
+            PT_TOUCHPAD => PointerType::Touchpad,
+            _ => return (None, After::None),
+        };
+        let position = self.client_point(info.ptPixelLocation);
+        let button = if info.pointerFlags.0 & POINTER_FLAG_SECONDBUTTON != 0 {
+            PointerButton::Right
+        } else {
+            PointerButton::Left
+        };
+        match msg {
+            WM_POINTERDOWN => {
+                self.pointer(PointerEventKind::Down, Some(button), position, pointer_type);
+            }
+            WM_POINTERUP => {
+                self.pointer(PointerEventKind::Up, Some(button), position, pointer_type);
+            }
+            WM_POINTERUPDATE => {
+                self.pointer(PointerEventKind::Move, None, position, pointer_type);
+            }
+            _ => self.pointer(PointerEventKind::Leave, None, position, pointer_type),
+        }
+        (Some(LRESULT(0)), After::None)
+    }
+}
+
 /// Barrel / second-button flag of `POINTER_INFO::pointerFlags`.
 const POINTER_FLAG_SECONDBUTTON: u32 = 0x0000_0020;
+
+/// How many pixels a maximized window leaves free at the bottom of the monitor: one when the
+/// taskbar (`appbar_state` of `ABM_GETSTATE`) hides itself, so that it can still be reached.
+fn autohide_inset(appbar_state: u32) -> i32 {
+    i32::from(appbar_state & ABS_AUTOHIDE != 0)
+}
 
 fn px_to_dip_band(dpi: u32, scale: f32) -> f32 {
     top_resize_band_px(dpi) as f32 / scale
@@ -1775,6 +1777,7 @@ pub fn dip_len_px(info: &WindowInfo, dip: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::com::to_wide;
     use ssw_ui::canvas::DrawOp;
     use ssw_ui::geometry::Rect;
     use ssw_ui::theme::DEFAULT_ACCENT;
@@ -1987,24 +1990,13 @@ mod tests {
         send(&host, WM_MOUSELEAVE, 0, 0);
         let log = log.borrow();
         let events = &log.events;
-        assert!(matches!(
-            events[0],
-            Event::Key(KeyEvent {
-                vk: 0x0D,
-                scan: 0x1C,
-                is_down: true,
-                repeat: false,
-                ..
-            })
-        ));
-        assert!(matches!(
-            events[1],
-            Event::Key(KeyEvent {
-                is_down: false,
-                repeat: false,
-                ..
-            })
-        ));
+        let key_of = |event: &Event| match event {
+            Event::Key(key) => Some((key.vk, key.scan, key.is_down, key.repeat)),
+            _ => None,
+        };
+        assert_eq!(key_of(&events[0]), Some((0x0D, 0x1C, true, false)));
+        assert_eq!(key_of(&events[1]), Some((0x0D, 0x1C, false, false)));
+        assert_eq!(key_of(&events[2]), None, "text is no key");
         assert_eq!(events[2], Event::Text(TextInput("ç".to_owned())));
         assert_eq!(events[3], Event::Text(TextInput("😀".to_owned())));
         assert_eq!(events[4], Event::Focus(FocusEvent::Gained));
@@ -2078,7 +2070,16 @@ mod tests {
         feed(&host, WM_ACTIVATE, usize::from(WA_INACTIVE as u16), 0);
         send(&host, WM_NCACTIVATE, 1, 0);
         send(&host, WM_NCACTIVATE, 0, 0);
+        // The same state again changes nothing.
+        send(&host, WM_NCACTIVATE, 0, 0);
         assert!(!host.info().active);
+        assert_eq!(autohide_inset(0), 0, "a taskbar that stays needs no room");
+        assert_eq!(
+            autohide_inset(ABS_AUTOHIDE),
+            1,
+            "a hiding taskbar keeps a pixel"
+        );
+        assert_eq!(autohide_inset(ABS_AUTOHIDE | 2), 1);
         // A pointer message for a pointer that does not exist is left to default processing.
         let (result, after) = feed(&host, WM_POINTERDOWN, 0xFFFE, 0);
         assert_eq!(result, None);
@@ -2179,10 +2180,30 @@ mod tests {
         let payload = std::panic::catch_unwind(rethrow_pending_panic).unwrap_err();
         assert_eq!(payload_text(&*payload), Some("wake 1"));
         rethrow_pending_panic();
-        assert!(host.wake_handle().wake());
-        // The loop raises a parked panic after the message that caused it.
-        let outcome = std::panic::catch_unwind(|| run_loop(|| Some(Duration::from_millis(50))));
+        // The loop raises a parked panic after the message that caused it: the wake-up is
+        // posted when the loop is idle for the first time.
+        let wake = host.wake_handle();
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            run_loop(|| {
+                assert!(wake.wake());
+                Some(Duration::from_millis(50))
+            })
+        }));
         assert_eq!(payload_text(&*outcome.unwrap_err()), Some("wake 3"));
+        // The handlers of this test that ignore events and painting are told some, too.
+        let info = host.info();
+        let mut bomb = Bomb {
+            wakes: 0,
+            fragile_destroy: false,
+        };
+        bomb.on_event(&info, Event::Timer(ssw_ui::services::TimerId::new(1)));
+        let mut canvas = ssw_ui::canvas::RecordingCanvas::default();
+        bomb.on_paint(&info, &mut canvas);
+        assert!(canvas.recorded().is_empty());
+        let mut answering = Answering;
+        answering.on_event(&info, Event::Timer(ssw_ui::services::TimerId::new(1)));
+        answering.on_paint(&info, &mut canvas);
+        assert!(canvas.recorded().is_empty());
     }
 
     #[test]
@@ -2216,31 +2237,6 @@ mod tests {
         let alive =
             unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(second.hwnd())) };
         assert!(alive.as_bool());
-    }
-
-    #[test]
-    fn message_box_arguments_are_nul_terminated_utf16_and_reach_the_presenter() {
-        // The box itself is never shown here: a real message box would block on the screen.
-        let owner = MessageWindow::new().unwrap();
-        let mut seen = None;
-        show_message_box_with(
-            Some(owner.hwnd()),
-            "Başlık",
-            "Metin 😀",
-            |hwnd, title, text| {
-                seen = Some((hwnd, title.to_vec(), text.to_vec()));
-            },
-        );
-        let (hwnd, title, text) = seen.unwrap();
-        assert_eq!(hwnd, Some(owner.hwnd()));
-        assert_eq!(title, to_wide("Başlık"));
-        assert_eq!(text.last(), Some(&0));
-        assert_eq!(crate::com::from_wide(&text), "Metin 😀");
-        let mut ownerless = false;
-        show_message_box_with(None, "", "", |hwnd, title, text| {
-            ownerless = hwnd.is_none() && title == [0] && text == [0];
-        });
-        assert!(ownerless);
     }
 
     #[test]
@@ -2403,6 +2399,12 @@ mod tests {
             current.build >= MIN_OS_BUILD,
             "tests need Windows 11: {current:?}"
         );
+        assert_eq!(registry_build(w!("CurrentBuildNumber")), current.build);
+        assert_eq!(
+            registry_build(w!("NoSuchBuildValue")),
+            0,
+            "a missing value is build 0"
+        );
     }
 
     #[test]
@@ -2500,11 +2502,15 @@ mod tests {
             1,
             "too slow"
         );
-        // Modifiers.
-        assert_eq!(modifiers_from(|_| false), Modifiers::NONE);
-        let held = modifiers_from(|key| matches!(key, 0x10 | 0x11 | 0x12 | 0x5C));
+        // Modifiers: `modifiers_from` is generic over the key query, so every combination goes
+        // through one closure type (one instantiation sees each key down and up).
+        let pressed = |keys: &[u16]| modifiers_from(|key| keys.contains(&key));
+        assert_eq!(pressed(&[]), Modifiers::NONE);
+        let held = pressed(&[0x10, 0x11, 0x12, 0x5C]);
         assert!(held.shift() && held.ctrl() && held.alt() && held.win());
-        assert!(modifiers_from(|key| key == 0x5B).win());
+        let left_windows = pressed(&[0x5B]);
+        assert!(left_windows.win() && !left_windows.shift());
+        assert_eq!(pressed(&[0x11]), Modifiers::CTRL);
         // Keys.
         let down = key_event(0x41, 0x0030_0001, true, Modifiers::CTRL);
         assert_eq!(
@@ -2580,6 +2586,149 @@ mod tests {
             assert!(!cursor_resource(cursor).is_null());
         }
         let _ = DrawOp::Save;
+    }
+
+    #[test]
+    fn a_registered_timer_ticks_the_handler_and_a_one_shot_timer_is_forgotten() {
+        use ssw_ui::services::TimerId;
+        use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+
+        let (host, log) = host(true, false);
+        let hwnd = host.hwnd();
+        let timers = Rc::clone(&host.state.borrow().timers);
+        let repeating = timers.borrow_mut().register(TimerId::new(900), true);
+        let once = timers.borrow_mut().register(TimerId::new(901), false);
+        // SAFETY: real OS timers of our own window with the ids of the table; the window kills
+        // the one-shot, the test the other.
+        unsafe {
+            let _ = SetTimer(Some(hwnd), repeating, 60_000, None);
+            let _ = SetTimer(Some(hwnd), once, 60_000, None);
+        }
+        let before = log.borrow().events.len();
+        assert_eq!(send(&host, WM_TIMER, repeating, 0), 0);
+        assert_eq!(send(&host, WM_TIMER, once, 0), 0);
+        assert_eq!(
+            log.borrow().events[before..],
+            [
+                Event::Timer(TimerId::new(900)),
+                Event::Timer(TimerId::new(901))
+            ]
+        );
+        assert_eq!(timers.borrow().len(), 1, "a one-shot timer is forgotten");
+        // SAFETY: kills timers of our own window; the one-shot is already gone.
+        unsafe {
+            assert!(KillTimer(Some(hwnd), once).is_err(), "the window killed it");
+            assert!(KillTimer(Some(hwnd), repeating).is_ok());
+        }
+    }
+
+    #[test]
+    fn contacts_become_pointer_events_and_the_mouse_and_unknown_pointers_are_left_alone() {
+        use windows::Win32::UI::Input::Pointer::POINTER_FLAGS;
+        use windows::Win32::UI::WindowsAndMessaging::PT_MOUSE;
+
+        let (host, log) = host(true, false);
+        let message = |msg: u32, kind: POINTER_INPUT_TYPE, flags: u32| {
+            let info = POINTER_INFO {
+                ptPixelLocation: POINT { x: 30, y: 40 },
+                pointerFlags: POINTER_FLAGS(flags),
+                ..Default::default()
+            };
+            let (result, after) = host
+                .state
+                .borrow_mut()
+                .pointer_message(msg, Some((kind, info)));
+            (result.map(|result| result.0), after)
+        };
+        let before = log.borrow().events.len();
+        // The mouse has its own messages; a pointer the system does not know has no type.
+        assert_eq!(message(WM_POINTERDOWN, PT_MOUSE, 0), (None, After::None));
+        let unknown = host
+            .state
+            .borrow_mut()
+            .pointer_message(WM_POINTERDOWN, None);
+        assert_eq!((unknown.0, unknown.1), (None, After::None));
+        assert_eq!(log.borrow().events.len(), before, "no event was made");
+        // A focus event shows that the filter below skips what is no pointer event.
+        feed(&host, WM_SETFOCUS, 0, 0);
+        for (msg, kind, flags) in [
+            (WM_POINTERDOWN, PT_TOUCH, 0),
+            (WM_POINTERUPDATE, PT_TOUCH, 0),
+            (WM_POINTERUP, PT_TOUCH, 0),
+            (WM_POINTERLEAVE, PT_PEN, 0),
+            (WM_POINTERDOWN, PT_PEN, POINTER_FLAG_SECONDBUTTON),
+            (WM_POINTERDOWN, PT_TOUCHPAD, 0),
+        ] {
+            assert_eq!(message(msg, kind, flags), (Some(0), After::None));
+        }
+        let seen: Vec<_> = log.borrow().events[before..]
+            .iter()
+            .filter_map(|event| match event {
+                Event::Pointer(p) => Some((p.kind, p.button, p.pointer_type)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    PointerEventKind::Down,
+                    Some(PointerButton::Left),
+                    PointerType::Touch
+                ),
+                (PointerEventKind::Move, None, PointerType::Touch),
+                (
+                    PointerEventKind::Up,
+                    Some(PointerButton::Left),
+                    PointerType::Touch
+                ),
+                (PointerEventKind::Leave, None, PointerType::Pen),
+                (
+                    PointerEventKind::Down,
+                    Some(PointerButton::Right),
+                    PointerType::Pen
+                ),
+                (
+                    PointerEventKind::Down,
+                    Some(PointerButton::Left),
+                    PointerType::Touchpad
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_caption_buttons_maximize_restore_and_minimize_a_window_of_a_private_desktop() {
+        use crate::testing::PrivateDesktop;
+        use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+
+        fn zoomed(host: &WindowHost) -> bool {
+            // SAFETY: a plain query of a window of this thread.
+            unsafe { IsZoomed(host.hwnd()) }.as_bool()
+        }
+
+        fn iconic(host: &WindowHost) -> bool {
+            // SAFETY: a plain query of a window of this thread.
+            unsafe { IsIconic(host.hwnd()) }.as_bool()
+        }
+
+        // Windows are shown, maximized and minimized only on a desktop of their own.
+        let desktop = PrivateDesktop::create().unwrap();
+        desktop.run(|| {
+            let (host, _log) = host(true, false);
+            host.show_mode(ShowMode::NoActivate);
+            let click = |code: u32| {
+                send(&host, WM_NCLBUTTONDOWN, code as usize, 0);
+                send(&host, WM_NCLBUTTONUP, code as usize, 0);
+            };
+            assert!(!zoomed(&host) && !iconic(&host));
+            click(HTMAXBUTTON);
+            assert!(zoomed(&host), "the maximize button maximizes");
+            click(HTMAXBUTTON);
+            assert!(!zoomed(&host), "and restores a maximized window");
+            click(HTMINBUTTON);
+            assert!(iconic(&host), "the minimize button minimizes");
+        });
     }
 
     /// A handler that implements only what the trait requires.

@@ -506,6 +506,16 @@ mod tests {
     }
 
     #[test]
+    fn kit_combo_idle_animation_frame_repaints_nothing() {
+        let (mut harness, mut combo, _) = setup(Some(0));
+        harness.requests.take_invalidation();
+        harness.frame(&mut combo, 16);
+        assert!(harness.requests.invalidation().is_clean());
+        assert!(!harness.requests.animation_frame_requested());
+        assert!(!combo.is_open());
+    }
+
+    #[test]
     fn kit_combo_measures_to_fit_the_widest_item() {
         let (_, combo, bounds) = setup(None);
         // "Blueberry" is nine glyphs; 72 + 11 + 12 + 22 < the 120 minimum.

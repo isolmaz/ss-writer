@@ -232,6 +232,8 @@ fn opening_a_document_is_timed_step_by_step_and_scrolled_to_its_end() {
             "doc_presented",
             "scroll_begin",
             "scroll_end",
+            "flick_begin",
+            "flick_end",
         ],
     );
     let details = &report["details"];
@@ -241,10 +243,21 @@ fn opening_a_document_is_timed_step_by_step_and_scrolled_to_its_end() {
     let frames = details["scroll_frames"].as_f64().unwrap();
     assert!(frames >= 3.0, "{frames}");
     let phases = report["frames"]["phase"].as_array().unwrap();
-    let scrolled = phases.iter().filter(|p| p.as_u64() == Some(2)).count();
+    let in_phase = |phase: u64| phases.iter().filter(|p| p.as_u64() == Some(phase)).count();
+    let scrolled = in_phase(2);
     assert!(
         scrolled as f64 >= frames,
         "{scrolled} frames of {frames} requests"
+    );
+    // The flick sweep starts from the top after one cold frame of its own, with a small step.
+    assert_eq!(details["flick_step_dip"], 48.0);
+    let flicks = details["flick_frames"].as_f64().unwrap();
+    assert!(flicks >= 1.0, "{flicks}");
+    assert!(in_phase(4) as f64 >= flicks, "{} flicks", in_phase(4));
+    assert!(in_phase(5) >= 1, "the frame that went back to the top");
+    assert!(
+        details["flick_frames"].as_f64().unwrap() > details["scroll_frames"].as_f64().unwrap(),
+        "a small step needs more frames than a large one for the same distance"
     );
 }
 

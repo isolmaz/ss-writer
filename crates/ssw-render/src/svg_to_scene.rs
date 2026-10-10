@@ -484,6 +484,35 @@ mod tests {
     }
 
     #[test]
+    fn text_in_a_clip_path_clips_to_its_outlines() {
+        // usvg keeps `<text>` in a clip path as a text node whose flattened group holds the
+        // glyph outlines; those outlines are the clip.
+        let s = scene(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
+                <defs><clipPath id="c"><text x="20" y="12" font-size="10">I</text></clipPath></defs>
+                <g clip-path="url(#c)"><rect width="40" height="20" fill="#000"/></g></svg>"##,
+        );
+        let group = s.items[0].as_group().expect("clipped group");
+        let clip = group.clip.as_ref().expect("clip path");
+        let b = clip.bounds().expect("outline of the letter");
+        assert!(b.x >= 19.5 && b.right() < 25.0, "{b:?}");
+        assert!(b.y > 2.0 && b.bottom() <= 12.6 && b.height >= 5.0, "{b:?}");
+    }
+
+    #[test]
+    fn patterns_are_drawn_gray_with_the_fill_opacity() {
+        let s = scene(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+                <defs><pattern id="p" width="2" height="2" patternUnits="userSpaceOnUse"><rect width="1" height="1"/></pattern></defs>
+                <rect width="8" height="8" fill="url(#p)" fill-opacity="0.5"/></svg>"##,
+        );
+        let items = leaves(&s);
+        assert_eq!(items.len(), 1);
+        let fill = items[0].as_fill().expect("fill expected");
+        assert_eq!(fill.paint, Paint::Solid(Color::rgba(128, 128, 128, 128)));
+    }
+
+    #[test]
     fn invalid_svg_is_an_error() {
         let err = svg_to_scene(b"not svg").expect_err("invalid");
         assert!(err.to_string().starts_with("invalid SVG"));

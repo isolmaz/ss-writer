@@ -100,8 +100,6 @@ pub struct DiagramJob {
 pub enum ExportFailure {
     /// The renderer or converter failed (its message).
     Convert(String),
-    /// The export produced nothing (no pages).
-    Empty,
     /// The diagram cannot be drawn.
     Diagram,
     /// A file could not be written.
@@ -292,7 +290,7 @@ fn page_path(target: &Path, index: usize, count: usize) -> PathBuf {
 /// Runs the export and returns the files written, the first one being the one to open.
 ///
 /// # Errors
-/// [`ExportFailure`]: a failed conversion, an empty result or a file that cannot be written.
+/// [`ExportFailure`]: a failed conversion or a file that cannot be written.
 pub fn run_export(
     job: &ExportJob,
     fs: &dyn FileSystem,
@@ -339,9 +337,9 @@ pub fn run_export(
                 ),
             }
             .map_err(ExportFailure::convert)?;
-            if pages.is_empty() {
-                return Err(ExportFailure::Empty);
-            }
+            // Typst lays out at least one page for any document (an empty one gets a blank
+            // page: `collect` flushes the staged empty page), and `PageSelection::All` keeps
+            // them all, so `pages` is never empty.
             let mut files = Vec::with_capacity(pages.len());
             for (index, bytes) in pages.iter().enumerate() {
                 let path = page_path(&job.target, index, pages.len());
@@ -364,9 +362,9 @@ pub fn run_export(
                 theme: theme(dark),
                 ..EpubOptions::default()
             };
-            let bytes = export_epub(markdown, &job.title, &assets, &options)
-                .map_err(ExportFailure::convert)?;
-            single(bytes)
+            export_epub(markdown, &job.title, &assets, &options)
+                .map_err(ExportFailure::convert)
+                .and_then(single)
         }
         ExportFormat::Docx | ExportFormat::Odt => {
             let options = word_options(&job.options, &job.title);
@@ -385,14 +383,14 @@ pub fn run_export(
                 image: &mut image,
                 math: &mut math,
             };
-            let bytes = if job.format == ExportFormat::Docx {
+            let exported = if job.format == ExportFormat::Docx {
                 ssw_convert::docx::export_docx(markdown, &options, &mut resources)
-                    .map_err(ExportFailure::convert)?
+                    .map_err(ExportFailure::convert)
             } else {
                 ssw_convert::odt::export_odt(markdown, &options, &mut resources)
-                    .map_err(ExportFailure::convert)?
+                    .map_err(ExportFailure::convert)
             };
-            single(bytes)
+            exported.and_then(single)
         }
         ExportFormat::Rtf => {
             single(ssw_convert::rtf::markdown_to_rtf(markdown, &assets).into_bytes())
@@ -414,10 +412,10 @@ fn export_markdown(
     let plan = markdown_export::plan(&job.markdown, source_dir);
     for (from, relative) in &plan.copies {
         let to = dir.join(relative);
-        if let Some(parent) = to.parent() {
-            fs.create_dir_all(parent)
-                .map_err(|error| ExportFailure::write(parent, error))?;
-        }
+        // Every copy is `attachments/<file name>` below `dir`, so `to` always has a parent.
+        let parent = to.parent().unwrap_or(dir);
+        fs.create_dir_all(parent)
+            .map_err(|error| ExportFailure::write(parent, error))?;
         let bytes = fs.read(from).map_err(ExportFailure::convert)?;
         write(fs, sleeper, &to, &bytes)?;
     }
@@ -447,15 +445,14 @@ fn export_textbundle(
         .target
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("textbundle"));
-    if folder {
-        textbundle::write_dir(&job.target, &plan.markdown, &assets)
-            .map_err(ExportFailure::convert)?;
+    let written = if folder {
+        textbundle::write_dir(&job.target, &plan.markdown, &assets).map_err(ExportFailure::convert)
     } else {
-        let bytes =
-            textbundle::write_pack(&plan.markdown, &assets).map_err(ExportFailure::convert)?;
-        write(fs, sleeper, &job.target, &bytes)?;
-    }
-    Ok(vec![job.target.clone()])
+        textbundle::write_pack(&plan.markdown, &assets)
+            .map_err(ExportFailure::convert)
+            .and_then(|bytes| write(fs, sleeper, &job.target, &bytes))
+    };
+    written.map(|()| vec![job.target.clone()])
 }
 
 /// Draws the diagram and writes it as a picture.
@@ -470,11 +467,12 @@ pub fn run_diagram(
     // A diagram picture goes on white paper (PNG) or into any document (SVG): light colors.
     let svg = mermaid_svg(&job.source, false).ok_or(ExportFailure::Diagram)?;
     let bytes = match job.format {
-        DiagramFormat::Svg => svg.into_bytes(),
+        DiagramFormat::Svg => Ok(svg.into_bytes()),
         DiagramFormat::Png => Exporter::new(None)
             .export_diagram_png(&svg, DIAGRAM_DPI)
-            .map_err(ExportFailure::convert)?,
+            .map_err(ExportFailure::convert),
     };
-    write(fs, sleeper, &job.target, &bytes)?;
-    Ok(vec![job.target.clone()])
+    bytes
+        .and_then(|bytes| write(fs, sleeper, &job.target, &bytes))
+        .map(|()| vec![job.target.clone()])
 }

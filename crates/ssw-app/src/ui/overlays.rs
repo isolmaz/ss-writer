@@ -1011,4 +1011,19 @@ mod tests {
         assert_eq!(limited.len(), 3);
         assert!(limited.windows(2).all(|pair| pair[0] < pair[1]), "sorted");
     }
+
+    #[test]
+    fn hidden_entries_are_listed_on_request_git_never_and_a_missing_root_lists_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".git").join("config"), "x").unwrap();
+        std::fs::write(tmp.path().join(".hidden.md"), "x").unwrap();
+        std::fs::write(tmp.path().join("shown.md"), "x").unwrap();
+        assert_eq!(list_files(tmp.path(), false, 100), ["shown.md"]);
+        assert_eq!(
+            list_files(tmp.path(), true, 100),
+            [".hidden.md", "shown.md"]
+        );
+        assert!(list_files(&tmp.path().join("missing"), false, 100).is_empty());
+    }
 }

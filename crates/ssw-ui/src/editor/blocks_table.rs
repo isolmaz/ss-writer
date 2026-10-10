@@ -440,14 +440,19 @@ impl BlockLayout for GridLayout {
         let tokens = &cx.theme.tokens;
         let frame = Rect::new(0.0, 0.0, self.width, self.height);
         let radii = CornerRadii::uniform(RADIUS);
-        canvas.push_clip_rounded_rect(frame, radii);
-        for row in self.rows.iter().skip(2).step_by(2) {
-            canvas.fill_rect(
-                Rect::new(0.0, row.top, self.width, row.height),
-                tokens.table_zebra.with_alpha(ZEBRA_OPACITY),
-            );
+        // The tinted rows span the whole width and the first one is the third row, so only
+        // the last row can touch a rounded corner (the bottom ones): it is filled with them
+        // rounded instead of clipping every row to the frame, which costs a layer per table.
+        let zebra = tokens.table_zebra.with_alpha(ZEBRA_OPACITY);
+        let last = self.rows.len() - 1;
+        for (index, row) in self.rows.iter().enumerate().skip(2).step_by(2) {
+            let area = Rect::new(0.0, row.top, self.width, row.height);
+            if index == last {
+                canvas.fill_rounded_rect(area, CornerRadii::new(0.0, 0.0, RADIUS, RADIUS), zebra);
+            } else {
+                canvas.fill_rect(area, zebra);
+            }
         }
-        canvas.pop_clip();
         for row in self.rows.iter().skip(1) {
             canvas.stroke_line(
                 Point::new(0.0, row.top),

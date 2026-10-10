@@ -264,7 +264,15 @@ impl LayoutCache {
 pub struct DWriteEngine {
     inner: Rc<EngineInner>,
     cache: Rc<RefCell<LayoutCache>>,
+    formats: Rc<RefCell<HashMap<FormatKey, IDWriteTextFormat>>>,
 }
+
+/// What a layout takes from its text format: family, size, weight, slant and whether word
+/// wrapping is off.
+type FormatKey = (Arc<str>, u32, u16, bool, bool);
+
+/// Most text formats [`DWriteEngine`] keeps; it starts over when the limit is reached.
+const FORMAT_CACHE_LIMIT: usize = 256;
 
 impl DWriteEngine {
     /// An engine whose collection is the system fonts plus the bundled Cascadia Mono.
@@ -329,6 +337,7 @@ impl DWriteEngine {
                     resolved: RefCell::new(HashMap::new()),
                 }),
                 cache: Rc::default(),
+                formats: Rc::default(),
             })
         }
     }
@@ -337,6 +346,45 @@ impl DWriteEngine {
     #[must_use]
     pub fn cached_layouts(&self) -> usize {
         self.cache.borrow().entries.len()
+    }
+
+    /// How many text formats the engine keeps for the layouts it makes.
+    #[must_use]
+    pub fn cached_formats(&self) -> usize {
+        self.formats.borrow().len()
+    }
+
+    /// The format a layout of `base` is made from. A layout copies what it needs from its
+    /// format, so one format serves every layout of the same family, size, weight and slant
+    /// (creating one looks the family up in the font collection). `unlimited` turns word
+    /// wrapping off, which is a property of the format: such formats are kept apart.
+    fn layout_format(
+        &self,
+        base: &TextStyle,
+        unlimited: bool,
+    ) -> Result<IDWriteTextFormat, WinError> {
+        let key = (
+            Arc::clone(&base.family),
+            base.size.to_bits(),
+            base.weight.0,
+            base.italic,
+            unlimited,
+        );
+        if let Some(format) = self.formats.borrow().get(&key) {
+            return Ok(format.clone());
+        }
+        let format = self.text_format(&base.family, base.size, base.weight.0, base.italic)?;
+        if unlimited {
+            // SAFETY: a valid format that no layout was made from yet.
+            check(unsafe { format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP) })
+                .ctx("disable word wrapping")?;
+        }
+        let mut formats = self.formats.borrow_mut();
+        if formats.len() >= FORMAT_CACHE_LIMIT {
+            formats.clear();
+        }
+        formats.insert(key, format.clone());
+        Ok(format)
     }
 
     /// The DirectWrite factory.
@@ -639,14 +687,10 @@ impl DWriteLayout {
         } else {
             max_width.max(0.0)
         };
-        let format = engine.text_format(&base.family, base.size, base.weight.0, base.italic)?;
+        let format = engine.layout_format(base, unlimited)?;
         // SAFETY: all DirectWrite calls receive valid interface pointers, ranges inside the
         // UTF-16 text, and out buffers sized as the API requires.
         unsafe {
-            if unlimited {
-                check(format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP))
-                    .ctx("disable word wrapping")?;
-            }
             let layout = check(engine.factory().CreateTextLayout(
                 &units,
                 &format,
@@ -696,7 +740,12 @@ impl DWriteLayout {
                     .ctx("range strikethrough")?;
             }
 
-            let cluster_starts = cluster_starts(&layout, total)?;
+            // Only inline objects need to know where the clusters start.
+            let cluster_starts = if objects.is_empty() {
+                Vec::new()
+            } else {
+                cluster_starts(&layout, total)?
+            };
             let mut accepted: Vec<AcceptedObject> = Vec::new();
             for object in objects {
                 let Some(at16) = map.byte_to_utf16(object.at) else {
@@ -1816,6 +1865,66 @@ mod tests {
     }
 
     #[test]
+    fn layouts_of_one_style_share_a_format_and_wrapping_keeps_two_apart() {
+        let (_com, engine) = engine();
+        assert_eq!(engine.cached_formats(), 0);
+        let _ = lay(&engine, "one", f32::INFINITY);
+        assert_eq!(engine.cached_formats(), 1);
+        let _ = lay(&engine, "two", f32::INFINITY);
+        assert_eq!(
+            engine.cached_formats(),
+            1,
+            "the same style shares its format"
+        );
+        // Word wrapping belongs to the format: a layout that wraps gets a format of its own,
+        // and neither changes what the other does.
+        let text = "alpha beta gamma delta epsilon";
+        assert_eq!(lay(&engine, text, f32::INFINITY).line_count(), 1);
+        assert!(lay(&engine, text, 90.0).line_count() > 1);
+        assert_eq!(engine.cached_formats(), 2);
+        assert_eq!(lay(&engine, text, f32::INFINITY).line_count(), 1);
+        assert!(lay(&engine, text, 91.0).line_count() > 1);
+        assert_eq!(engine.cached_formats(), 2);
+        // Size, weight, slant and family each make another one.
+        let width = f32::INFINITY;
+        let _ = engine.layout("x", &style(17.0), &[], &[], width);
+        assert_eq!(engine.cached_formats(), 3);
+        let _ = engine.layout(
+            "x",
+            &style(16.0).with_weight(FontWeight::BOLD),
+            &[],
+            &[],
+            width,
+        );
+        assert_eq!(engine.cached_formats(), 4);
+        let _ = engine.layout("x", &style(16.0).with_italic(true), &[], &[], width);
+        assert_eq!(engine.cached_formats(), 5);
+        let _ = engine.layout("x", &TextStyle::new("Cascadia Mono", 16.0), &[], &[], width);
+        assert_eq!(engine.cached_formats(), 6);
+        // A clone of the engine shares them.
+        assert_eq!(engine.clone().cached_formats(), 6);
+    }
+
+    #[test]
+    fn the_formats_start_over_when_too_many_are_kept() {
+        let (_com, engine) = engine();
+        for index in 0..FORMAT_CACHE_LIMIT {
+            let size = 10.0 + index as f32 * 0.01;
+            let _ = engine.layout("x", &style(size), &[], &[], f32::INFINITY);
+        }
+        assert_eq!(engine.cached_formats(), FORMAT_CACHE_LIMIT);
+        let _ = engine.layout("x", &style(30.0), &[], &[], f32::INFINITY);
+        assert_eq!(
+            engine.cached_formats(),
+            1,
+            "the oldest were dropped with the rest"
+        );
+        // A rejected style makes no format: the next request asks again.
+        let _ = engine.layout("x", &style(-1.0), &[], &[], f32::INFINITY);
+        assert_eq!(engine.cached_formats(), 1);
+    }
+
+    #[test]
     fn an_entry_answers_only_the_request_it_was_made_for() {
         let (_com, engine) = engine();
         let layout = engine
@@ -2226,6 +2335,8 @@ mod tests {
             let layout = sweep(
                 |n| {
                     armed(n, || {
+                        // The format is made (and checked) by every run, not kept from one.
+                        engine.formats.borrow_mut().clear();
                         engine.create_layout("abcd", &base, &ranges, &objects, f32::INFINITY)
                     })
                 },

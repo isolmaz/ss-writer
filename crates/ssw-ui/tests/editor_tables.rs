@@ -254,21 +254,34 @@ fn only_the_header_is_bold() {
 }
 
 #[test]
-fn every_second_body_row_is_tinted_inside_the_rounded_clip() {
+fn every_second_body_row_is_tinted_and_the_last_one_follows_the_rounded_corners() {
+    // Five rows: the third is tinted with a plain fill, the fifth (the last) with rounded
+    // bottom corners.
     let lab = Lab::new("| h |\n|---|\n| a |\n| b |\n| c |\n| d |\n");
     let layout = lab.layout();
     let canvas = lab.paint(layout.as_ref());
-    let fills: Vec<_> = canvas
+    let plain: Vec<_> = canvas
         .ops()
         .filter_map(|op| match op {
             DrawOp::FillRect { rect, color } => Some((*rect, *color)),
             _ => None,
         })
         .collect();
-    assert_eq!(fills.len(), 2, "the second and the fourth body row");
-    near(fills[0].0, 0.0, 2.0 * ROW, 56.0, ROW);
-    near(fills[1].0, 0.0, 4.0 * ROW, 56.0, ROW);
-    for (_, color) in &fills {
+    assert_eq!(plain.len(), 1, "the second body row");
+    near(plain[0].0, 0.0, 2.0 * ROW, 56.0, ROW);
+    let rounded: Vec<_> = canvas
+        .ops()
+        .filter_map(|op| match op {
+            DrawOp::FillRoundedRect { rect, radii, color } => Some((*rect, *radii, *color)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rounded.len(), 1, "the fourth and last body row");
+    near(rounded[0].0, 0.0, 4.0 * ROW, 56.0, ROW);
+    let radii = rounded[0].1;
+    assert!(radii.top_left == 0.0 && radii.top_right == 0.0);
+    assert!(radii.bottom_left > 0.0 && radii.bottom_left == radii.bottom_right);
+    for color in [plain[0].1, rounded[0].2] {
         let zebra = lab.theme.tokens.table_zebra;
         assert!(close(color.r, zebra.r) && close(color.b, zebra.b));
         assert!(
@@ -276,17 +289,28 @@ fn every_second_body_row_is_tinted_inside_the_rounded_clip() {
             "translucent, so the selection below shows through"
         );
     }
-    let clipped = canvas
-        .ops()
-        .position(|op| {
-            matches!(op, DrawOp::PushClipRoundedRect { rect, .. } if close(rect.height, 5.0 * ROW))
-        })
-        .expect("the rows are clipped to the rounded border");
-    let first_fill = canvas
-        .ops()
-        .position(|op| matches!(op, DrawOp::FillRect { .. }))
-        .expect("a fill");
-    assert!(clipped < first_fill);
+    assert!(
+        canvas.ops().all(|op| !matches!(
+            op,
+            DrawOp::PushClipRoundedRect { .. } | DrawOp::PushLayer { .. }
+        )),
+        "no clip layer per table"
+    );
+    // With a body row less the last row is not tinted: every tinted row is a plain fill.
+    let even = Lab::new("| h |\n|---|\n| a |\n| b |\n| c |\n");
+    let canvas = even.paint(even.layout().as_ref());
+    assert_eq!(
+        canvas
+            .ops()
+            .filter(|op| matches!(op, DrawOp::FillRect { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        canvas
+            .ops()
+            .all(|op| !matches!(op, DrawOp::FillRoundedRect { .. }))
+    );
 }
 
 #[test]

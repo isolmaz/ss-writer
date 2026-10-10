@@ -20,21 +20,24 @@ use ssw_ui::editor::object::{
     InlineObjectProvider, ObjectKind, ObjectRequest, ObjectState, ObjectVisual,
 };
 use ssw_ui::editor::spell::SpellProvider;
-use ssw_ui::geometry::{Color, Point, Rect};
+use ssw_ui::geometry::{Color, Point, Rect, Size};
 use ssw_ui::input::{
-    Event, ImeEvent, Modifiers, PointerEvent, PointerEventKind, PointerType, WheelEvent,
+    Event, ImeEvent, Modifiers, PointerEvent, PointerEventKind, PointerType, TextInput, WheelEvent,
 };
 use ssw_ui::scroll_physics::Extent;
 use ssw_ui::services::MemoryClipboard;
 use ssw_ui::theme::{DEFAULT_ACCENT, Theme};
 use ssw_ui::widgets::Control;
+use ssw_win::canvas::{CanvasAssets, ImageStore};
 use ssw_win::com::{ComGuard, WinError};
+use ssw_win::dmanip::{ScrollLayout, client_area_animation};
 use ssw_win::dragdrop::{
     AllowedEffects, DragContent, DragEvent, DragKeys, DropHandler, DropKinds, Effect, OleGuard,
 };
-use ssw_win::gfx::Driver;
-use ssw_win::menus::{PopupHost, PopupRequest};
-use ssw_win::spell::{SpellChecker, SpellFactory};
+use ssw_win::dwrite::DWriteEngine;
+use ssw_win::gfx::{DeviceStartup, Driver};
+use ssw_win::menus::{MenuEntry, MenuItem, MenuModel, PopupHost, PopupRequest};
+use ssw_win::spell::SpellFactory;
 use ssw_win::taskbar::{Progress, TaskbarApi, TaskbarFactory};
 use ssw_win::tsf::TextStoreHost;
 use ssw_win::uia::ActionSink;
@@ -50,7 +53,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::{TBPF_NOPROGRESS, TBPF_NORMAL, TBPFLAG};
 use windows::Win32::UI::WindowsAndMessaging::{
-    HMENU, WM_CHAR, WM_GETOBJECT, WM_PAINT, WM_POINTERDOWN,
+    DM_POINTERHITTEST, HMENU, WM_CHAR, WM_GETOBJECT, WM_PAINT, WM_POINTERDOWN, WM_SETTINGCHANGE,
 };
 use windows::core::HSTRING;
 
@@ -68,11 +71,13 @@ use crate::ui::shell_view::ShellAction;
 
 // ----- the harness ----------------------------------------------------------------------------
 
-/// Menus are never shown in these tests.
-struct NoPopups;
+/// Menus are never shown in these tests: every popup is dismissed at once, and what was asked
+/// of the modal call is recorded.
+struct Dismissing(Rc<RefCell<Vec<PopupRequest>>>);
 
-impl PopupHost for NoPopups {
-    fn track(&mut self, _menu: HMENU, _request: &PopupRequest) -> Option<u32> {
+impl PopupHost for Dismissing {
+    fn track(&mut self, _menu: HMENU, request: &PopupRequest) -> Option<u32> {
+        self.0.borrow_mut().push(*request);
         None
     }
 }
@@ -82,6 +87,8 @@ impl PopupHost for NoPopups {
 struct Seams {
     http: Option<Arc<dyn Http>>,
     taskbar: Option<Rc<dyn TaskbarFactory>>,
+    /// Where the popup requests of the window are recorded.
+    popups: Option<Rc<RefCell<Vec<PopupRequest>>>>,
 }
 
 struct Probe<F> {
@@ -101,7 +108,7 @@ impl<F: FnOnce(&UiApp, &Path)> ShellHost for Probe<F> {
                 dialogs: services.dialogs(),
                 shell: services.shell(),
                 clipboard: Rc::new(RefCell::new(MemoryClipboard::default())),
-                popups: Box::new(NoPopups),
+                popups: Box::new(Dismissing(seams.popups.unwrap_or_default())),
             }),
             instance: None,
             jump_list: false,
@@ -164,22 +171,44 @@ fn long_document() -> String {
         .collect()
 }
 
-struct Idle;
-
-impl WindowHandler for Idle {
-    fn on_event(&mut self, _info: &WindowInfo, _event: Event) {}
-    fn on_paint(&mut self, _info: &WindowInfo, _canvas: &mut dyn Canvas) {}
+/// What a spare window handed to its handler.
+#[derive(Default)]
+struct Delivered {
+    events: Vec<Event>,
+    paints: u32,
 }
 
-/// A second hidden window, for platforms that are attached to a window of their own.
-fn spare_window() -> WindowHost {
+struct Idle(Rc<RefCell<Delivered>>);
+
+impl WindowHandler for Idle {
+    fn on_event(&mut self, _info: &WindowInfo, event: Event) {
+        self.0.borrow_mut().events.push(event);
+    }
+
+    fn on_paint(&mut self, _info: &WindowInfo, _canvas: &mut dyn Canvas) {
+        self.0.borrow_mut().paints += 1;
+    }
+}
+
+/// A second hidden window whose handler records into `delivered`.
+fn spare_window_recording(delivered: Rc<RefCell<Delivered>>) -> WindowHost {
     let options = WindowOptions {
         title: "spare".to_owned(),
         rect: Some((-32000, -32000, 800, 600)),
         dark: false,
         no_activate: true,
     };
-    WindowHost::create(&options, Box::new(Idle), Theme::light(DEFAULT_ACCENT)).unwrap()
+    WindowHost::create(
+        &options,
+        Box::new(Idle(delivered)),
+        Theme::light(DEFAULT_ACCENT),
+    )
+    .unwrap()
+}
+
+/// A second hidden window, for platforms that are attached to a window of their own.
+fn spare_window() -> WindowHost {
+    spare_window_recording(Rc::default())
 }
 
 /// A platform over the shared window state that was never attached to a window.
@@ -692,24 +721,37 @@ fn a_window_without_a_document_scrolls_a_range_as_tall_as_its_viewport() {
     });
 }
 
+/// Gives the scroll driver of `platform` a step that ends with `outcome`. Every scenario goes
+/// through this one closure type, so that one instance of the generic `Platform::with_scroll`
+/// takes all of its paths (the closures of its callers are instances of their own).
+fn run_scroll(platform: &Platform, outcome: Result<(), WinError>) -> Option<()> {
+    platform.with_scroll(|_| outcome)
+}
+
+/// Delivers a wheel event whose `deliver` is `deliver`, through one closure type for the same
+/// reason as [`run_scroll`].
+fn wheel_with(platform: &Platform, wheel: &WheelEvent, deliver: &mut dyn FnMut()) {
+    platform.wheel(wheel, deliver);
+}
+
 #[test]
 fn a_scroll_driver_that_cannot_run_is_dropped_and_logged() {
     with_app("hello\n", |_app, platform, _| {
-        assert_eq!(platform.with_scroll(|_| Ok(7)), Some(7));
+        assert_eq!(run_scroll(platform, Ok(())), Some(()));
         {
             let _held = platform.scroll.borrow_mut();
-            assert_eq!(platform.with_scroll(|_| Ok(7)), None);
+            assert_eq!(run_scroll(platform, Ok(())), None);
             assert_eq!(platform.scroll_offset(), None);
         }
         assert!(platform.scroll_offset().is_some());
-        assert_eq!(bare(platform).with_scroll(|_| Ok(7)), None);
+        assert_eq!(run_scroll(&bare(platform), Ok(())), None);
 
-        let failed = platform.with_scroll(|_| Err::<(), WinError>(WinError::Invalid("boom")));
+        let failed = run_scroll(platform, Err(WinError::Invalid("boom")));
         assert_eq!(failed, None);
         assert_eq!(platform.scroll_offset(), None);
         assert!(app_log(platform).contains("touch and touchpad scrolling stopped: boom"));
         // Without a driver nothing runs.
-        assert_eq!(platform.with_scroll(|_| Ok(7)), None);
+        assert_eq!(run_scroll(platform, Ok(())), None);
     });
 }
 
@@ -805,9 +847,11 @@ fn a_wheel_over_a_window_without_a_tab_is_delivered_and_nothing_else() {
         let wheel = wheel_event();
         close_active_tab(platform);
         let mut delivered = false;
-        platform.wheel(&wheel, || delivered = true);
+        wheel_with(platform, &wheel, &mut || delivered = true);
         assert!(delivered);
         assert_eq!(platform.scroll_offset(), Some(0.0));
+        // There is no motion to carry to a window without a document.
+        assert!(!platform.scroll_frame());
     });
 }
 
@@ -819,11 +863,11 @@ fn a_wheel_is_not_undone_while_the_view_is_busy_or_the_editor_is_gone() {
         let wheel = wheel_event();
         // The view is busy when the editor has handled the wheel: nothing is undone.
         let reader = platform.cell.view.borrow();
-        platform.wheel(&wheel, || {});
+        wheel_with(platform, &wheel, &mut || {});
         drop(reader);
         assert_eq!(platform.scroll_offset(), Some(0.0));
         // The editor loses its tab while it handles the wheel.
-        platform.wheel(&wheel, || close_active_tab(platform));
+        wheel_with(platform, &wheel, &mut || close_active_tab(platform));
         assert_eq!(platform.scroll_offset(), Some(0.0));
     });
 }
@@ -883,6 +927,29 @@ fn text_services_are_told_only_what_changed_while_the_view_is_free() {
             assert!(shadow.version > first.unwrap().0);
         }
 
+        // Nothing changed: the shadow stays as it is.
+        let told = platform
+            .shadow
+            .borrow()
+            .as_ref()
+            .map(|s| (s.version, s.selection));
+        platform.notify_text_services();
+        let unchanged = platform
+            .shadow
+            .borrow()
+            .as_ref()
+            .map(|s| (s.version, s.selection));
+        assert_eq!(unchanged, told);
+        // A moved selection alone is noted without a new text version.
+        host.set_selection(Selection { anchor: 1, head: 3 });
+        platform.notify_text_services();
+        {
+            let slot = platform.shadow.borrow();
+            let shadow = slot.as_ref().unwrap();
+            assert_eq!(shadow.selection, Selection { anchor: 1, head: 3 });
+            assert_eq!(Some(shadow.version), told.map(|(version, _)| version));
+        }
+
         // Without a tab there is nothing to follow.
         close_active_tab(platform);
         platform.notify_text_services();
@@ -914,10 +981,7 @@ fn a_synced_window_without_a_tab_or_with_a_busy_view_keeps_what_it_has() {
             let _busy = platform.cell.view.borrow_mut();
             platform.apply_objects(&spare);
         }
-        assert!(matches!(
-            provider.entries.borrow().get(&key),
-            Some(Entry::Failed)
-        ));
+        assert_eq!(provider.entries.borrow().get(&key), Some(&Entry::Failed));
         // Pictures that cannot be decoded (here: no graphics on this window) fail.
         let picture = ObjectKey {
             source: "p".to_owned(),
@@ -929,10 +993,10 @@ fn a_synced_window_without_a_tab_or_with_a_busy_view_keeps_what_it_has() {
             .push(Done::Image(picture.clone(), Some(b"not an image".to_vec())));
         close_active_tab(platform);
         platform.sync(&spare, true);
-        assert!(matches!(
+        assert_eq!(
             provider.entries.borrow().get(&picture),
-            Some(Entry::Failed)
-        ));
+            Some(&Entry::Failed)
+        );
     });
 }
 
@@ -949,7 +1013,11 @@ impl MachineLock {
         let handle = unsafe { CreateMutexW(None, false, &name) }.expect("CreateMutexW");
         // SAFETY: `handle` is the mutex that was just created or opened.
         let outcome = unsafe { WaitForSingleObject(handle, INFINITE) };
-        assert!(outcome == WAIT_OBJECT_0 || outcome == WAIT_ABANDONED);
+        assert!(
+            [WAIT_OBJECT_0, WAIT_ABANDONED].contains(&outcome),
+            "the lock was not acquired: wait result {}",
+            outcome.0
+        );
         Self(handle)
     }
 }
@@ -964,20 +1032,34 @@ impl Drop for MachineLock {
     }
 }
 
+/// The kinds of user dictionary file of a language folder.
+const DICTIONARY_FILE_NAMES: [&str; 3] = ["default.dic", "default.exc", "default.acl"];
+
 /// The user's dictionary files of the folders `neutral` and `languages`, put back on drop.
 struct DictionaryFiles {
+    /// Every file with its content, `None` for a file that did not exist.
     saved: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// Declared after `saved`: released once the files are restored. Tests that can change the
+    /// dictionary files run one at a time across the processes of a parallel run: a snapshot
+    /// taken while another test's changes are in place would "restore" them.
     _exclusive: MachineLock,
 }
 
 impl DictionaryFiles {
-    fn protect(languages: &[&str]) -> Self {
-        let exclusive = MachineLock::acquire("spelling-dictionaries");
+    /// Snapshots the files of the user's spelling folder (`%APPDATA%\Microsoft\Spelling`).
+    fn protect(languages: &[String]) -> Self {
         let appdata = std::env::var_os("APPDATA").expect("APPDATA is set for a user session");
-        let root = Path::new(&appdata).join(r"Microsoft\Spelling");
+        Self::protect_in(&Path::new(&appdata).join(r"Microsoft\Spelling"), languages)
+    }
+
+    /// Snapshots the files of the `neutral` folder and of the folders of `languages` below
+    /// `root`.
+    fn protect_in(root: &Path, languages: &[String]) -> Self {
+        let exclusive = MachineLock::acquire("spelling-dictionaries");
         let mut saved = Vec::new();
-        for folder in std::iter::once("neutral").chain(languages.iter().copied()) {
-            for name in ["default.dic", "default.exc", "default.acl"] {
+        let folders = std::iter::once("neutral").chain(languages.iter().map(String::as_str));
+        for folder in folders {
+            for name in DICTIONARY_FILE_NAMES {
                 let path = root.join(folder).join(name);
                 let content = std::fs::read(&path).ok();
                 saved.push((path, content));
@@ -989,8 +1071,16 @@ impl DictionaryFiles {
         }
     }
 
+    /// True when every file is as it was.
+    fn unchanged(&self) -> bool {
+        self.saved
+            .iter()
+            .all(|(path, content)| std::fs::read(path).ok() == *content)
+    }
+
     fn restore(&self) {
         for (path, content) in &self.saved {
+            // Best effort: a file the service holds open for a moment is retried by `drop`.
             match content {
                 Some(bytes) => {
                     if std::fs::read(path).ok().as_ref() != Some(bytes) {
@@ -1010,30 +1100,30 @@ impl DictionaryFiles {
 
 impl Drop for DictionaryFiles {
     fn drop(&mut self) {
-        // The service may write its files a moment after the call that caused it.
+        // The spell checking service may write its files a moment after the call that caused
+        // it: restore until the files have been unchanged twice in a row (a file that changed
+        // again starts the count anew).
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut stable = 0;
         while stable < 2 && Instant::now() < deadline {
             self.restore();
             std::thread::sleep(Duration::from_millis(150));
-            let unchanged = self
-                .saved
-                .iter()
-                .all(|(path, content)| std::fs::read(path).ok() == *content);
-            stable = if unchanged { stable + 1 } else { 0 };
+            stable = u32::from(self.unchanged()) * (stable + 1);
         }
     }
 }
 
+/// Polls `condition`, a first time after a pause, until it holds or five seconds have passed;
+/// the answer is the last one (the service applies dictionary changes on its own schedule).
 fn eventually(mut condition: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if condition() {
-            return true;
-        }
+    loop {
         std::thread::sleep(Duration::from_millis(50));
+        let holds = condition();
+        if holds | (Instant::now() >= deadline) {
+            return holds;
+        }
     }
-    condition()
 }
 
 fn unique_word() -> String {
@@ -1055,30 +1145,63 @@ fn unique_word() -> String {
 fn the_spell_provider_suggests_ignores_and_adds_words_of_the_windows_checker() {
     let _com = ComGuard::apartment_threaded().unwrap();
     let factory = SpellFactory::new().unwrap();
-    if !factory.is_supported("en-US") {
-        return;
-    }
-    let _files = DictionaryFiles::protect(&["en-US"]);
-    let checker: SpellChecker = factory.checker(&["en-US".to_owned()]).unwrap();
+    // The checker of the OS language, whichever language packs this machine has; a second one
+    // of the same language answers what the adapter is compared with.
+    let checker = factory.checker(&[]).unwrap();
+    let direct = factory.checker(&[]).unwrap();
+    let languages: Vec<String> = checker.languages().map(str::to_owned).collect();
     let spell = WindowsSpell(checker);
+    // Declared last: the files are restored before the checkers are released.
+    let _files = DictionaryFiles::protect(&languages);
 
-    let suggestions = spell.suggestions("speling");
-    assert!(
-        suggestions.iter().any(|word| word == "spelling"),
-        "{suggestions:?}"
-    );
-
+    // A word no dictionary knows is reported over its whole length, not with the full stop.
     let ignored = unique_word();
-    let text = format!("{ignored} stays");
+    let text = format!("{ignored}.");
     assert_eq!(spell.check(&text), [0..ignored.len()]);
+
+    // The suggestions are the ones the checker makes, in its order.
+    let word = unique_word();
+    assert_eq!(spell.suggestions(&word), direct.suggestions(&word).unwrap());
+
+    // An ignored word is accepted for the session.
     spell.ignore(&ignored);
     assert!(eventually(|| spell.check(&text).is_empty()));
 
+    // A word added to the user dictionary is accepted (the guard puts the dictionary back).
     let added = format!("{}x", unique_word());
-    let text = format!("{added} stays");
+    let text = format!("{added}.");
     assert_eq!(spell.check(&text), [0..added.len()]);
     spell.add_to_dictionary(&added);
     assert!(eventually(|| spell.check(&text).is_empty()));
+}
+
+#[test]
+fn the_dictionary_guard_puts_back_changed_and_removed_files_and_removes_new_ones() {
+    let root = tempfile::tempdir().unwrap();
+    let file = |folder: &str, name: &str| root.path().join(folder).join(name);
+    std::fs::create_dir_all(root.path().join("neutral")).unwrap();
+    std::fs::write(file("neutral", "default.dic"), "alpha").unwrap();
+    std::fs::write(file("neutral", "default.acl"), "gamma").unwrap();
+    {
+        let languages = ["xx-XX".to_owned()];
+        let guard = DictionaryFiles::protect_in(root.path(), &languages);
+        assert!(guard.unchanged());
+        // The folder with its files is gone, and files of folders that were not there appear.
+        std::fs::remove_dir_all(root.path().join("neutral")).unwrap();
+        std::fs::create_dir_all(root.path().join("xx-XX")).unwrap();
+        std::fs::write(file("xx-XX", "default.exc"), "delta").unwrap();
+        assert!(!guard.unchanged());
+    }
+    assert_eq!(
+        std::fs::read(file("neutral", "default.dic")).unwrap(),
+        b"alpha"
+    );
+    assert_eq!(
+        std::fs::read(file("neutral", "default.acl")).unwrap(),
+        b"gamma"
+    );
+    assert!(!file("neutral", "default.exc").exists());
+    assert!(!file("xx-XX", "default.exc").exists());
 }
 
 // ----- dropping on the window --------------------------------------------------------------------------------------
@@ -1267,13 +1390,27 @@ fn ready(state: ObjectState) -> ssw_ui::editor::object::ObjectInfo {
 }
 
 #[test]
+#[should_panic(expected = "not ready: Pending")]
+fn an_object_that_is_not_ready_has_no_size_to_look_at() {
+    ready(ObjectState::Pending);
+}
+
+/// What an object is drawn with.
+fn drawn_as(visual: ObjectVisual) -> &'static str {
+    match visual {
+        ObjectVisual::Scene(_) => "scene",
+        ObjectVisual::Image(_) => "image",
+    }
+}
+
+#[test]
 fn math_and_diagrams_are_typeset_in_the_background_and_fitted_to_the_column() {
     with_app("hello\n", |app, platform, _| {
         let provider = provider_of(platform);
         let inline = request(ObjectKind::Math, "x^2", BLACK);
         assert_eq!(provider.object(&inline), ObjectState::Pending);
         let info = ready(settled(app, platform, &inline));
-        assert!(matches!(info.visual, ObjectVisual::Scene(_)));
+        assert_eq!(drawn_as(info.visual), "scene");
         assert!(info.size.width > 0.0 && info.size.height > 0.0);
         assert!(info.baseline > 0.0 && info.baseline <= info.size.height + 0.01);
 
@@ -1328,7 +1465,7 @@ fn local_images_are_read_next_to_the_document_and_sized_by_the_request() {
         std::fs::write(dir.join("bad.png"), b"not an image").unwrap();
         let size = |request: &ObjectRequest<'_>| {
             let info = ready(settled(app, platform, request));
-            assert!(matches!(info.visual, ObjectVisual::Image(_)));
+            assert_eq!(drawn_as(info.visual), "image");
             assert_eq!(info.baseline, info.size.height);
             (info.size.width, info.size.height)
         };
@@ -1572,4 +1709,247 @@ fn every_piece_that_cannot_be_created_is_logged_and_left_out() {
         }
         assert!(scroll_lost && tsf_lost && spell_lost);
     });
+}
+
+// ----- the pump of the scroll driver, with nothing failing -----------------------------------------------
+
+/// Lays the document out and lets a pump turn hand the laid-out range to the driver.
+fn settle_scroll(app: &UiApp, platform: &Platform) {
+    layout_now(platform);
+    app.pump();
+    assert!(!platform.scroll_frame());
+}
+
+#[test]
+fn a_new_layout_reaches_the_driver_and_the_offset_it_clamps_reaches_the_editor() {
+    with_app(&long_document(), |app, platform, _| {
+        settle_scroll(app, platform);
+        let real = scroll_layout(&platform.cell.view.borrow());
+        let driver_layout = || platform.scroll.borrow().as_ref().unwrap().layout;
+
+        // A layout the driver was not given (the window was resized, say) reaches it in the next
+        // turn.
+        platform.scroll.borrow_mut().as_mut().unwrap().layout = ScrollLayout {
+            viewport: Size::new(1.0, 1.0),
+            ..real
+        };
+        assert!(eventually(|| !platform.scroll_frame()));
+        assert_eq!(driver_layout(), real);
+
+        // A driver left past the end of a shorter range is clamped to it, and the editor is
+        // brought to where the driver is.
+        let tall = ScrollLayout {
+            extent: Extent::new(real.extent.viewport, real.extent.content * 4.0),
+            ..real
+        };
+        {
+            let mut slot = platform.scroll.borrow_mut();
+            let scroll = slot.as_mut().unwrap();
+            scroll.driver.set_layout(&tall).unwrap();
+            assert!(scroll.driver.jump_to(tall.extent.max_offset()).unwrap());
+            scroll.layout = tall;
+        }
+        assert_eq!(platform.editor_scroll(), Some(0.0));
+        assert!(eventually(|| !platform.scroll_frame()));
+        assert_eq!(driver_layout(), real);
+        let end = real.extent.max_offset() as f32;
+        let shown = platform.editor_scroll().unwrap();
+        assert!(close(shown, end), "{shown} of {end}");
+
+        // A frame that finds nothing moving ends the pump.
+        platform.scroll.borrow_mut().as_mut().unwrap().more = true;
+        assert!(eventually(|| !platform.scroll_frame()));
+        assert!(!platform.scroll.borrow().as_ref().unwrap().more);
+    });
+}
+
+#[test]
+fn a_wheel_step_is_taken_from_the_editor_and_animated_by_the_driver() {
+    with_app(&long_document(), |app, platform, _| {
+        settle_scroll(app, platform);
+        let wheel = wheel_event();
+
+        // A wheel that moves nothing is not the driver's business.
+        wheel_with(platform, &wheel, &mut || {});
+        assert!(!platform.scroll.borrow().as_ref().unwrap().more);
+        assert_eq!(platform.scroll_offset(), Some(0.0));
+
+        // The editor jumped by a step: it is undone and the driver scrolls instead, frame by
+        // frame, and the editor follows it to where it stops.
+        wheel_with(platform, &wheel, &mut || set_editor_scroll(platform, 60.0));
+        assert_eq!(platform.editor_scroll(), Some(0.0));
+        assert!(eventually(|| !platform.scroll_frame()));
+        let shown = platform.editor_scroll().unwrap();
+        let driver = platform.scroll_offset().unwrap();
+        assert!(shown > 0.0, "{shown}");
+        assert!(
+            (f64::from(shown) - driver).abs() < 0.5,
+            "{shown} / {driver}"
+        );
+    });
+}
+
+#[test]
+fn a_frame_offset_the_editor_already_has_is_not_written_and_one_without_an_editor_is_remembered() {
+    with_app(&long_document(), |app, platform, _| {
+        settle_scroll(app, platform);
+        close_active_tab(platform);
+        let mut slot = platform.scroll.borrow_mut();
+        let scroll = slot.as_mut().unwrap();
+        let mut view = platform.cell.view.borrow_mut();
+        let _ = view.requests_mut().take_invalidation();
+
+        // The offset is the one the editor was given last: nothing is written or repainted.
+        scroll.write(&mut view, f64::from(scroll.written));
+        assert_eq!(scroll.written, 0.0);
+        assert!(view.requests_mut().take_invalidation().is_clean());
+
+        // Without an editor to move the offset is only remembered.
+        scroll.write(&mut view, 80.0);
+        assert_eq!(scroll.written, 80.0);
+    });
+}
+
+#[test]
+fn a_failing_scroll_driver_of_a_platform_without_a_log_is_dropped_silently() {
+    with_app("hello\n", |_app, platform, _| {
+        let loose = bare(platform);
+        *loose.scroll.borrow_mut() = platform.scroll.borrow_mut().take();
+        assert!(loose.scroll_offset().is_some());
+        let failed = run_scroll(&loose, Err(WinError::Invalid("quiet")));
+        assert_eq!(failed, None);
+        assert_eq!(loose.scroll_offset(), None);
+        assert!(!app_log(platform).contains("quiet"));
+    });
+}
+
+// ----- the messages and the tree the platform watches ----------------------------------------------------
+
+#[test]
+fn the_messages_the_platform_watches_are_never_consumed() {
+    let (seams, created, states) = taskbar_seams(false);
+    with_seams("hello\n", seams, |_app, platform, _| {
+        // A pointer id the system does not know.
+        let send = |msg: u32| platform.on_message(msg, WPARAM(0x7777), LPARAM(0));
+
+        // A UI Automation client asks: the tree is published at the first request, later ones
+        // leave it to the syncs.
+        assert!(!platform.uia_active.get());
+        assert!(send(WM_GETOBJECT).is_none());
+        assert!(platform.uia_active.get());
+        let published = platform.uia.borrow().as_ref().unwrap().tree();
+        assert!(published.len() > 1);
+        assert!(send(WM_GETOBJECT).is_none());
+        assert!(Arc::ptr_eq(
+            &published,
+            &platform.uia.borrow().as_ref().unwrap().tree()
+        ));
+
+        // A touch or touchpad contact is looked up in the system: this pointer is not known,
+        // so no contact starts.
+        assert!(send(WM_POINTERDOWN).is_none());
+        assert!(send(DM_POINTERHITTEST).is_none());
+        assert!(
+            !platform
+                .scroll
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .driver
+                .has_contact()
+        );
+
+        // A settings change makes the driver read the scrolling settings again.
+        assert!(send(WM_SETTINGCHANGE).is_none());
+        {
+            let slot = platform.scroll.borrow();
+            let scroll = slot.as_ref().unwrap();
+            assert_eq!(
+                scroll.driver.scroller().animations(),
+                client_area_animation()
+            );
+            assert!(!scroll.more);
+        }
+
+        // The taskbar creating the button anew: the progress is shown again, by the taskbar
+        // object that exists and not while it is in use.
+        let button = platform.button_created;
+        assert!(send(button).is_none());
+        assert_eq!(created.get(), 0, "there is no taskbar object to ask");
+        platform.set_progress(Progress::Normal {
+            completed: 1,
+            total: 4,
+        });
+        assert_eq!(*states.borrow(), [TBPF_NORMAL.0]);
+        assert!(send(button).is_none());
+        assert_eq!(*states.borrow(), [TBPF_NORMAL.0, TBPF_NORMAL.0]);
+        {
+            let _busy = platform.taskbar.borrow_mut();
+            assert!(send(button).is_none());
+        }
+        assert_eq!(states.borrow().len(), 2);
+
+        // Anything else is none of its business.
+        assert!(send(WM_CHAR).is_none());
+    });
+}
+
+#[test]
+fn the_tree_is_published_to_the_bridge_only_while_the_view_is_free() {
+    with_app("hello\n", |_app, platform, _| {
+        let bridge_tree = || platform.uia.borrow().as_ref().unwrap().tree();
+        let before = bridge_tree();
+        // A busy view has no tree to publish.
+        {
+            let _busy = platform.cell.view.borrow_mut();
+            platform.publish_access();
+        }
+        assert!(Arc::ptr_eq(&before, &bridge_tree()));
+        // A platform without a bridge has nobody to tell.
+        bare(platform).publish_access();
+        platform.publish_access();
+        let after = bridge_tree();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(after.len(), platform.access_tree().unwrap().len());
+    });
+}
+
+// ----- the substitutes of the harness ------------------------------------------------------------------
+
+#[test]
+fn a_popup_menu_the_user_dismisses_chooses_nothing_and_belongs_to_its_window() {
+    let shown = Rc::new(RefCell::new(Vec::new()));
+    let seams = Seams {
+        popups: Some(Rc::clone(&shown)),
+        ..Seams::default()
+    };
+    with_seams("hello\n", seams, |app, platform, _| {
+        let model = MenuModel::new(vec![MenuEntry::Item(MenuItem::new(1, "&Copy"))]);
+        let chosen = app.show_popup(platform.cell.id, &model, Point::new(20.0, 30.0));
+        assert_eq!(chosen, None);
+        let requests = shown.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].owner, hwnd_of(app, platform));
+    });
+}
+
+#[test]
+fn a_spare_window_hands_its_text_and_its_paints_to_its_handler() {
+    // COM first: it is torn down last, after the window released its D2D and WIC objects.
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let delivered = Rc::new(RefCell::new(Delivered::default()));
+    let spare = spare_window_recording(Rc::clone(&delivered));
+    send_message(spare.hwnd(), WM_CHAR, usize::from(b'x'), 0);
+    let typed = Event::Text(TextInput("x".to_owned()));
+    assert!(delivered.borrow().events.contains(&typed));
+
+    // Nothing is painted before the window has devices to draw with.
+    send_message(spare.hwnd(), WM_PAINT, 0, 0);
+    assert_eq!(delivered.borrow().paints, 0);
+    let devices = DeviceStartup::spawn().wait().unwrap();
+    let images = ImageStore::new(Wic::new().unwrap());
+    spare.set_assets(CanvasAssets::new(images, DWriteEngine::new().unwrap()));
+    spare.attach_graphics(devices).unwrap();
+    send_message(spare.hwnd(), WM_PAINT, 0, 0);
+    assert!(delivered.borrow().paints >= 1);
 }

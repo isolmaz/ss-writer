@@ -628,6 +628,14 @@ impl Controller {
         self.settings_hub.cell.take();
     }
 
+    /// Queues what the user did in the Settings window, in order, for the loop owner (both the
+    /// window procedure and the housekeeping of assistive actions hand their events over here).
+    pub fn push_settings(&self, events: impl IntoIterator<Item = SettingsEvent>) {
+        for event in events {
+            self.push(Request::Settings(event));
+        }
+    }
+
     /// Carries out something the user did in the Settings window.
     pub fn settings_event(&self, event: SettingsEvent) {
         match event {
@@ -843,6 +851,35 @@ impl Controller {
             .push(Rc::downgrade(check));
     }
 
+    /// Whether the painted blocks of some window wait for a spelling check.
+    #[must_use]
+    pub fn spell_pending(&self) -> bool {
+        self.settings_hub
+            .spells
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|check| check.pending())
+    }
+
+    /// Runs the waiting spelling checks for about `budget` (each window's service gets the
+    /// budget in turn). Returns whether any answered: the editors then repaint to show the
+    /// squiggles.
+    pub fn pump_spell(&self, budget: Duration) -> bool {
+        let checks: Vec<Rc<SpellCheck>> = self
+            .settings_hub
+            .spells
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        let mut answered = 0;
+        for check in checks {
+            answered += check.pump(budget);
+        }
+        answered > 0
+    }
+
     /// The app-wide zoom changed: it is persisted and shown in the Settings window.
     pub(super) fn settings_zoom_changed(&self) {
         self.schedule_settings_save();
@@ -1038,14 +1075,6 @@ struct SettingsGlue {
     access: Rc<SettingsAccess>,
 }
 
-impl SettingsGlue {
-    fn push(&self, events: Vec<SettingsEvent>) {
-        for event in events {
-            self.env.controller.push(Request::Settings(event));
-        }
-    }
-}
-
 impl WindowHandler for SettingsGlue {
     fn hit_test(&self, point: Point, info: &WindowInfo) -> HitRegion {
         default_hit_region(point, info.size_dip().width)
@@ -1057,7 +1086,7 @@ impl WindowHandler for SettingsGlue {
         };
         let events = view.event(&event, &self.env.text);
         drop(view);
-        self.push(events);
+        self.env.controller.push_settings(events);
     }
 
     fn on_paint(&mut self, _info: &WindowInfo, canvas: &mut dyn Canvas) {

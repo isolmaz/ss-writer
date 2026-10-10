@@ -13,7 +13,7 @@
 //!   "refresh_hz": 60.0, "process_age_at_start_ms": 7.9, "qpc_hz": 10000000,
 //!   "details": { "doc_bytes": 3.1e6, ... },          // numbers describing the run
 //!   "marks":   { "window_shown": 91.2, ... },        // ms since process creation
-//!   "phases":  ["startup", "open", "scroll", "type"],
+//!   "phases":  ["startup", "open", "scroll", "type", "flick", "jump"],
 //!   "frames":  { "phase": [0, ...],
 //!                "start_ms": [...],        // the frame began (before the back buffer is wrapped)
 //!                "ready_ms": [...],        // back buffer wrapped, BeginDraw + clear done
@@ -65,6 +65,10 @@ pub const DOC_PRESENTED: &str = "doc_presented";
 pub const SCROLL_BEGIN: &str = "scroll_begin";
 /// The scroll sweep reached the end of the document.
 pub const SCROLL_END: &str = "scroll_end";
+/// The flick sweep (a fast but realistic step per frame, from the top) began.
+pub const FLICK_BEGIN: &str = "flick_begin";
+/// The flick sweep ended.
+pub const FLICK_END: &str = "flick_end";
 /// The scenario asked to open the folder.
 pub const FOLDER_OPEN_BEGIN: &str = "folder_open_begin";
 /// The folder is the sidebar's workspace.
@@ -93,8 +97,13 @@ pub const PHASE_OPEN: u8 = 1;
 pub const PHASE_SCROLL: u8 = 2;
 /// Frames of the typing run.
 pub const PHASE_TYPE: u8 = 3;
+/// Frames of the flick sweep.
+pub const PHASE_FLICK: u8 = 4;
+/// The frame that takes the editor back to the top between the two sweeps (a cold frame that
+/// belongs to neither).
+pub const PHASE_JUMP: u8 = 5;
 /// The names of the phases, indexed by phase number.
-pub const PHASES: [&str; 4] = ["startup", "open", "scroll", "type"];
+pub const PHASES: [&str; 6] = ["startup", "open", "scroll", "type", "flick", "jump"];
 
 /// What a report says about the run besides the recorded data.
 #[derive(Debug, Clone, PartialEq)]
@@ -239,7 +248,7 @@ mod tests {
         assert_eq!(report["marks"]["doc_presented"], 400.0);
         assert_eq!(
             report["phases"],
-            json!(["startup", "open", "scroll", "type"])
+            json!(["startup", "open", "scroll", "type", "flick", "jump"])
         );
         assert_eq!(report["frames"]["phase"], json!([0, 2]));
         assert_eq!(report["frames"]["start_ms"], json!([100.0, 120.0]));
@@ -278,6 +287,8 @@ mod tests {
             (PHASE_OPEN, "open"),
             (PHASE_SCROLL, "scroll"),
             (PHASE_TYPE, "type"),
+            (PHASE_FLICK, "flick"),
+            (PHASE_JUMP, "jump"),
         ] {
             assert_eq!(PHASES[usize::from(phase)], name);
         }

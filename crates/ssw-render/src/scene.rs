@@ -1189,19 +1189,39 @@ mod tests {
         let mut inner = Scene::new(Size::new(10.0, 5.0));
         inner.baseline = Some(4.0);
         let f = inner.add_font(Arc::new(FontData::new(vec![7u8; 3], 0)));
-        inner.push(SceneItem::Group(Group::new(vec![SceneItem::Glyphs(
-            Glyphs {
-                font: f,
-                size: 5.0,
-                glyphs: vec![Glyph {
-                    id: 3,
-                    x: 0.0,
-                    y: 4.0,
-                }],
-                width: 3.0,
+        let mut line = Path::new();
+        line.move_to(0.0, 2.0);
+        line.line_to(10.0, 2.0);
+        // Items without a font reference travel through the remapping unchanged.
+        let font_free = vec![
+            fill(Rect::new(1.0, 1.0, 3.0, 3.0).to_path()),
+            SceneItem::Stroke(Stroke {
+                path: line,
                 paint: solid(),
-            },
-        )])));
+                width: 1.0,
+                cap: LineCap::Butt,
+                join: LineJoin::Miter,
+                dash: None,
+                miter_limit: 4.0,
+            }),
+            SceneItem::Image(Image {
+                data: Arc::new(ImageData::rgba8(1, 1, vec![9, 8, 7, 255])),
+                rect: Rect::new(2.0, 2.0, 4.0, 4.0),
+            }),
+        ];
+        let mut inner_items = font_free.clone();
+        inner_items.push(SceneItem::Glyphs(Glyphs {
+            font: f,
+            size: 5.0,
+            glyphs: vec![Glyph {
+                id: 3,
+                x: 0.0,
+                y: 4.0,
+            }],
+            width: 3.0,
+            paint: solid(),
+        }));
+        inner.push(SceneItem::Group(Group::new(inner_items)));
 
         let mut outer = Scene::new(Size::new(50.0, 50.0));
         let _unused = outer.add_font(Arc::new(FontData::new(vec![1u8], 0)));
@@ -1209,7 +1229,8 @@ mod tests {
         assert_eq!(outer.fonts.len(), 2);
         let g = outer.items[0].as_group().expect("embed must add a group");
         let g2 = g.items[0].as_group().expect("nested group expected");
-        let run = g2.items[0].as_glyphs().expect("glyph run expected");
+        assert_eq!(g2.items[..3], font_free[..]);
+        let run = g2.items[3].as_glyphs().expect("glyph run expected");
         assert_eq!(run.font, FontRef(1));
         assert_eq!(g.transform, Transform::translate(5.0, 5.0));
 

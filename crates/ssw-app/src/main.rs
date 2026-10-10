@@ -20,10 +20,15 @@ use ssw_win::window::current_os_version;
 
 fn main() -> ExitCode {
     let args = Args::parse(std::env::args_os().skip(1));
-    if let Some(problem) = args.perf_problem() {
-        eprintln!("SS Writer cannot start: {problem}");
-        return ExitCode::from(u8::try_from(EXIT_STARTUP_FAILED).unwrap_or(1));
-    }
+    // Refused before anything is created: flags that cannot work together, and a process whose
+    // data locations cannot be determined.
+    let env = match args.startup_environment(args.environment()) {
+        Ok(env) => env,
+        Err(reason) => {
+            eprintln!("SS Writer cannot start: {reason}");
+            return ExitCode::from(u8::try_from(EXIT_STARTUP_FAILED).unwrap_or(1));
+        }
+    };
     if args.test.perf_report.is_some() {
         // Time zero is the creation of the process; the marks start here.
         ssw_win::perf::enable();
@@ -38,13 +43,6 @@ fn main() -> ExitCode {
             dont_save: i18n.text("app-dialog-dont-save"),
         },
     );
-    let env = match args.environment() {
-        Ok(env) => env,
-        Err(error) => {
-            eprintln!("SS Writer cannot start: {error}");
-            return ExitCode::from(u8::try_from(EXIT_STARTUP_FAILED).unwrap_or(1));
-        }
-    };
     let process = ProcessEnv {
         os: current_os_version(),
         env,

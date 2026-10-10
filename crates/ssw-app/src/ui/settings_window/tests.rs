@@ -18,6 +18,7 @@ use ssw_ui::widgets::SharedClipboard;
 use ssw_win::dragdrop::OleGuard;
 use ssw_win::dwrite::DWriteEngine;
 use ssw_win::gfx::Driver;
+use ssw_win::keyboard::ToUnicodeCharProbe;
 use ssw_win::taskbar::SystemTaskbars;
 use ssw_win::window::{OsVersion, WM_WAKE, send_message};
 use windows::Win32::Foundation::HWND;
@@ -58,6 +59,15 @@ fn a_chord_is_named_with_the_system_names_and_modifiers_without_one_are_spelled_
     assert_eq!(
         chord_text_with(chord(0x53, false, false, false, false), some_names),
         "S"
+    );
+}
+
+#[test]
+fn every_modifier_without_a_system_name_is_spelled_in_english() {
+    let only_s = |key: u16| (key == 0x53).then(|| "S".to_owned());
+    assert_eq!(
+        chord_text_with(chord(0x53, true, true, true, false), only_s),
+        "Ctrl+Shift+Alt+S"
     );
 }
 
@@ -104,13 +114,23 @@ fn a_hub_without_a_window_describes_itself_as_closed_and_idle() {
 
 // ----- the harness ----------------------------------------------------------------------------
 
-/// A keyboard layout on which Ctrl+Alt+key never types a character.
-struct NoAltGr;
-
-impl CharProbe for NoAltGr {
-    fn produces_char(&self, _vk: u16, _scan: u16, _shift: bool, _caps: bool) -> bool {
-        false
+/// The application core of a startup that went on.
+fn core_of(outcome: Boot) -> AppCore {
+    match outcome {
+        Boot::Ready(started) => AppCore::new(*started, Arc::new(DeferredWaker::new())),
+        Boot::Exit(code) => panic!("startup exited with {code}"),
     }
+}
+
+#[test]
+#[should_panic(expected = "startup exited with 3")]
+fn a_startup_that_exits_gives_the_tests_no_core() {
+    let _ = core_of(Boot::Exit(3));
+}
+
+/// Takes every request the controller has queued so far.
+fn drain_requests(controller: &Controller) {
+    std::iter::from_fn(|| controller.take_request()).for_each(drop);
 }
 
 /// A startup in a temporary profile with what a Settings window needs: the controller, the
@@ -144,20 +164,17 @@ fn rig() -> Rig {
     };
     let services = ScriptedServices::new();
     let mut dialogs = services.dialogs();
-    let mut core = match boot(&Args::default(), process, &mut *dialogs, None).unwrap() {
-        Boot::Ready(started) => AppCore::new(*started, Arc::new(DeferredWaker::new())),
-        Boot::Exit(code) => panic!("startup exited with {code}"),
-    };
+    let mut core = core_of(boot(&Args::default(), process, &mut *dialogs, None).unwrap());
     let devices = core.wait_devices().unwrap();
     let logger = Arc::clone(&core.logger);
     let clipboard: SharedClipboard = Rc::new(RefCell::new(MemoryClipboard::default()));
     let clock: Rc<dyn Clock> = Rc::new(FakeClock::default());
     let controller = Controller::new(core, services.dialogs(), services.shell(), clipboard, clock);
-    while controller.take_request().is_some() {}
+    drain_requests(&controller);
     let env = Rc::new(WindowEnv {
         controller: Rc::clone(&controller),
         text: DWriteEngine::new().unwrap(),
-        probe: Box::new(NoAltGr),
+        probe: Box::new(ToUnicodeCharProbe::current()),
         mica: Cell::new(true),
         http: Arc::new(WinHttp),
         taskbar: Rc::new(SystemTaskbars),
@@ -183,7 +200,7 @@ fn with_rig(body: impl FnOnce(&Rig)) {
 
 fn open_cell(rig: &Rig) -> Rc<SettingsCell> {
     rig.controller.create_settings(SettingsSetup {
-        probe: Box::new(NoAltGr),
+        probe: Box::new(ToUnicodeCharProbe::current()),
         key_names: Box::new(DisplayKeyNames),
         motion: Motion::reduced(),
         size: WINDOW_SIZE,
@@ -228,7 +245,7 @@ fn control(rig: &Rig, cell: &SettingsCell, section: SettingsSection, field: Fiel
                 )
         })
         .cloned()
-        .unwrap_or_else(|| panic!("no control named {label:?}"))
+        .expect("the page has a control labelled like the field")
 }
 
 /// Gives the language drop-down the keyboard focus.
@@ -342,7 +359,7 @@ fn what_the_user_does_becomes_a_request_and_a_borrowed_view_drops_the_input() {
         let mut fx = glue_of(rig);
         let info = window_info();
         focus_language(rig, &fx.cell);
-        while rig.controller.take_request().is_some() {}
+        drain_requests(&rig.controller);
         let down = || Event::Key(KeyEvent::press(vk::DOWN, Modifiers::NONE));
         let language = |cell: &SettingsCell| {
             cell.view

@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::{Args, PerfScenario};
-use ssw_app::perf::{DOC_OPEN_RETURNED, SCROLL_BEGIN, TYPE_BEGIN};
+use ssw_app::perf::{DOC_OPEN_RETURNED, SCROLL_BEGIN, SCROLL_END, TYPE_BEGIN};
 use ssw_app::startup::ProcessEnv;
 use ssw_app::ui::controller::WindowCell;
 use ssw_app::ui::host::{UiApp, UiOptions, UiServices};
@@ -28,9 +28,10 @@ use ssw_win::dragdrop::OleGuard;
 use ssw_win::gfx::Driver;
 use ssw_win::menus::{PopupHost, PopupRequest};
 use ssw_win::perf::Recorder;
-use ssw_win::window::{current_os_version, send_message};
+use ssw_win::window::{current_os_version, post_message, send_message};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, HMENU, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_PAINT, WM_QUIT,
+    DispatchMessageW, HMENU, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_NULL, WM_PAINT,
+    WM_QUIT,
 };
 
 /// Held for the whole of one run: the recorder and its marks belong to one run at a time.
@@ -556,6 +557,68 @@ fn a_typing_run_fails_without_a_frame_a_window_handle_or_a_window() {
         app.controller().close_window(cell.id);
         assert_eq!(finish(app, &mut driver, recorder, true), EXIT_PERF_FAILED);
         assert_eq!(report_error(tmp.path()), "the application has no window");
+    });
+}
+
+#[test]
+fn a_character_the_full_message_queue_refuses_fails_the_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_app(tmp.path(), |app, args, recorder| {
+        let cell = app.controller().active_window().unwrap();
+        let hwnd = cell.hwnd.get().unwrap();
+        recorder.reset();
+        let mut driver = new_driver(
+            args,
+            Some(PerfScenario::TypeLatency),
+            None,
+            None,
+            Limits::default(),
+        );
+        until_mark(app, &mut driver, recorder, TYPE_BEGIN);
+        // The pause between two characters passes, then the queue of our own window (the
+        // thread's queue holds a limited number of posted messages) is filled up to that limit.
+        std::thread::sleep(Duration::from_millis(60));
+        let mut queued = 0_u32;
+        while post_message(hwnd, WM_NULL, 0, 0) {
+            queued += 1;
+            assert!(queued < 1_000_000, "the message queue never filled up");
+        }
+        assert_eq!(driver.tick(app), Tick::Finished(EXIT_PERF_FAILED));
+        // Dispatching the filler makes room again.
+        dispatch_queued();
+        assert!(
+            post_message(hwnd, WM_NULL, 0, 0),
+            "the queue has room again"
+        );
+        dispatch_queued();
+    });
+    assert_eq!(report_error(tmp.path()), "character 0 could not be posted");
+}
+
+#[test]
+fn a_flick_sweep_whose_tab_was_closed_on_the_way_back_to_the_top_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = long_document(tmp.path(), 40);
+    with_app(tmp.path(), |app, args, recorder| {
+        let cell = app.controller().active_window().unwrap();
+        recorder.reset();
+        let mut driver = new_driver(
+            args,
+            Some(PerfScenario::Open60k),
+            Some(file.as_path()),
+            None,
+            Limits::default(),
+        );
+        // The stress sweep reached the end and sent the editor back to the top ...
+        paint_until_mark(app, &mut driver, recorder, SCROLL_END);
+        // ... but the tab is gone when that frame has been drawn: the flick sweep starts with
+        // no editor to move, and its first frame finds that out.
+        close_tabs(&cell);
+        present(recorder);
+        assert_eq!(driver.tick(app), Tick::Running);
+        present(recorder);
+        assert_eq!(driver.tick(app), Tick::Finished(EXIT_PERF_FAILED));
+        assert_eq!(report_error(tmp.path()), "the window has no editor");
     });
 }
 

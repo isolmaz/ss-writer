@@ -284,6 +284,24 @@ impl Args {
         })
     }
 
+    /// The environment this launch starts with, or why it must not start: the `--perf-*` flags
+    /// that cannot work together ([`Args::perf_problem`]) are refused first, then a process whose
+    /// executable location is unavailable (`environment`, the outcome of
+    /// [`Args::environment`]). Both refusals end the process the same way, so the executable has
+    /// one place that says "cannot start".
+    ///
+    /// # Errors
+    /// The reason, worded for the message the user reads.
+    pub fn startup_environment(
+        &self,
+        environment: Result<Environment, PathsError>,
+    ) -> Result<Environment, String> {
+        match self.perf_problem() {
+            Some(problem) => Err(problem),
+            None => environment.map_err(|error| error.to_string()),
+        }
+    }
+
     /// What is wrong with the `--perf-*` flags, if anything: an unusable value, a scenario or an
     /// off-screen window without `--test-profile` (they change the session the application
     /// stores, which must never be the user's), a scenario without `--perf-report`, a scenario

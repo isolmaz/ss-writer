@@ -56,6 +56,7 @@ pub mod scene_render;
 pub mod services;
 pub mod share;
 pub mod spell;
+mod system_ui;
 pub mod taskbar;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;

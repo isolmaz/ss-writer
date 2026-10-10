@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Duration;
 
 use editor_common::{ADVANCE, COLUMN_LEFT, Harness, TOP, close};
 use ssw_core::command::CommandId;
@@ -98,12 +99,26 @@ impl SpellProvider for Dictionary {
 const SENTENCE: &str = "The quikc brown fox\n";
 const SENTENCE_WORDS: [&str; 5] = ["the", "brown", "fox", "quick", "word"];
 
+/// A budget that no test's queue outlasts.
+const LONG: Duration = Duration::from_secs(60);
+
+/// Paints, lets the service answer what the painted blocks asked for and paints again: the
+/// frame the host draws after its idle turn.
+fn settled(h: &Harness, spell: &SpellCheck) -> RecordingCanvas {
+    h.paint();
+    spell.pump(LONG);
+    h.paint()
+}
+
+/// An editor with the service registered, painted once (the blocks asked for their checks) and
+/// answered; the next paint shows the squiggles.
 fn editor_with(harness: Harness, known: &[&str]) -> (Harness, Rc<Dictionary>, Rc<SpellCheck>) {
     let mut h = harness;
     let provider = Dictionary::new(known);
     let spell = Rc::new(SpellCheck::new(provider.clone()));
     spell::register(h.view.registry_mut(), Rc::clone(&spell));
     h.paint();
+    spell.pump(LONG);
     (h, provider, spell)
 }
 
@@ -307,11 +322,9 @@ fn nothing_the_provider_reports_that_is_not_a_word_of_the_text_is_drawn() {
         fn ignore(&self, _word: &str) {}
     }
     let mut h = Harness::new("a `x` b é\n");
-    spell::register(
-        h.view.registry_mut(),
-        Rc::new(SpellCheck::new(Rc::new(Bogus))),
-    );
-    let canvas = h.paint();
+    let spell = Rc::new(SpellCheck::new(Rc::new(Bogus)));
+    spell::register(h.view.registry_mut(), Rc::clone(&spell));
+    let canvas = settled(&h, &spell);
     let areas = squiggles(&h, &canvas);
     assert_eq!(areas.len(), 1, "only é is a word of the text");
     let line = first_text(&canvas);
@@ -328,16 +341,25 @@ fn nothing_the_provider_reports_that_is_not_a_word_of_the_text_is_drawn() {
 
 #[test]
 fn results_are_cached_per_text_across_layouts_and_edits_elsewhere() {
-    let (mut h, provider, _) = editor("teh first\n\nsecond zzx\n", &["first", "second"]);
+    let (mut h, provider, spell) = editor("teh first\n\nsecond zzx\n", &["first", "second"]);
     assert_eq!(provider.checked().len(), 2);
     for offset in [0, 5, 12, 15] {
         h.set_caret(offset);
         h.paint();
     }
     assert_eq!(provider.checked().len(), 2, "moving the caret asks nothing");
+    assert!(!spell.pending(), "and nothing waits");
     h.set_caret(h.text().len() - 1);
     h.type_text("y");
     h.paint();
+    assert_eq!(
+        provider.checked().len(),
+        2,
+        "painting never calls the provider"
+    );
+    assert!(spell.pending(), "the edited paragraph waits for its check");
+    spell.pump(LONG);
+    assert!(!spell.pending());
     let checked = provider.checked();
     assert_eq!(checked.len(), 3, "only the edited paragraph: {checked:?}");
     assert_eq!(checked[2], "second zzxy");
@@ -351,7 +373,7 @@ fn results_are_cached_per_text_across_layouts_and_edits_elsewhere() {
 #[test]
 fn only_the_blocks_near_the_viewport_are_checked_until_the_document_scrolls() {
     let text: String = (0..300).map(|i| format!("para{i}\n\n")).collect();
-    let (mut h, provider, _) = editor(&text, &[]);
+    let (mut h, provider, spell) = editor(&text, &[]);
     let first = provider.checked().len();
     assert!(
         (1..60).contains(&first),
@@ -365,6 +387,8 @@ fn only_the_blocks_near_the_viewport_are_checked_until_the_document_scrolls() {
     assert!(provider.checked().iter().all(|text| index(text) < 50));
     h.view.set_scroll_y(6000.0);
     h.paint();
+    assert_eq!(provider.checked().len(), first, "painting asks nothing");
+    spell.pump(LONG);
     assert!(provider.checked().len() > first, "scrolling checks more");
     assert!(provider.checked().iter().any(|text| index(text) >= 50));
 }
@@ -407,8 +431,131 @@ fn switching_the_service_off_removes_the_squiggles_without_asking_again_when_it_
     assert_eq!(provider.checked().len(), 1, "the answer was cached");
     spell.clear_cache();
     h.view.invalidate_objects();
-    h.paint();
+    assert!(squiggles(&h, &h.paint()).is_empty(), "no answer yet");
+    assert_eq!(
+        provider.checked().len(),
+        1,
+        "the provider is asked by the pump"
+    );
+    spell.pump(LONG);
     assert_eq!(provider.checked().len(), 2, "asked again after clearing");
+    assert_eq!(squiggles(&h, &h.paint()).len(), 1);
+}
+
+// ----- deferred checks ------------------------------------------------------------------------
+
+#[test]
+fn a_painted_block_asks_for_its_check_and_shows_the_squiggle_once_the_pump_answered() {
+    let mut h = Harness::new(SENTENCE);
+    let provider = Dictionary::new(&SENTENCE_WORDS);
+    let spell = Rc::new(SpellCheck::new(provider.clone()));
+    spell::register(h.view.registry_mut(), Rc::clone(&spell));
+    assert!(!spell.pending());
+    let canvas = h.paint();
+    assert!(
+        squiggles(&h, &canvas).is_empty(),
+        "laying out and painting never wait for the checker"
+    );
+    assert!(provider.checked().is_empty());
+    assert!(spell.pending());
+    assert!(format!("{spell:?}").contains("waiting_texts: 1"));
+    assert_eq!(spell.pump(LONG), 1);
+    assert!(!spell.pending());
+    assert_eq!(squiggles(&h, &h.paint()).len(), 1);
+    assert_eq!(spell.pump(LONG), 0, "nothing waits any more");
+    h.paint();
+    assert!(!spell.pending(), "an answered block does not ask again");
+}
+
+#[test]
+fn a_pump_checks_at_least_one_text_and_stops_when_its_budget_is_spent() {
+    let provider = Dictionary::new(&[]);
+    let spell = SpellCheck::new(provider.clone());
+    for text in ["one", "two", "three"] {
+        spell.request(text);
+    }
+    assert_eq!(
+        spell.pump(Duration::ZERO),
+        1,
+        "one text per call, oldest first"
+    );
+    assert_eq!(provider.checked(), ["one"]);
+    assert_eq!(spell.pump(Duration::ZERO), 1);
+    assert!(spell.pending());
+    assert_eq!(spell.pump(LONG), 1);
+    assert_eq!(provider.checked(), ["one", "two", "three"]);
+    assert_eq!(spell.pump(LONG), 0);
+    assert!(!spell.pending());
+}
+
+#[test]
+fn requests_keep_their_place_and_the_oldest_are_forgotten_when_too_many_wait() {
+    let provider = Dictionary::new(&[]);
+    let spell = SpellCheck::new(provider.clone());
+    spell.request("first");
+    spell.request("second");
+    spell.request("first");
+    assert!(format!("{spell:?}").contains("waiting_texts: 2"));
+    for index in 0..64 {
+        spell.request(&format!("text{index}"));
+    }
+    assert!(format!("{spell:?}").contains("waiting_texts: 64"));
+    assert_eq!(spell.pump(LONG), 64);
+    let checked = provider.checked();
+    assert_eq!(checked.len(), 64);
+    assert_eq!(checked[0], "text0", "first and second were forgotten");
+    assert_eq!(checked[63], "text63");
+}
+
+#[test]
+fn a_text_answered_meanwhile_is_not_asked_again_and_a_service_that_is_off_forgets_its_requests() {
+    let provider = Dictionary::new(&[]);
+    let spell = SpellCheck::new(provider.clone());
+    assert!(spell.cached("asked twice").is_none());
+    spell.request("asked twice");
+    let _ = spell.misspellings("asked twice");
+    assert!(spell.cached("asked twice").is_some());
+    assert_eq!(spell.pump(LONG), 0);
+    assert_eq!(provider.checked().len(), 1);
+
+    spell.request("waits");
+    assert!(spell.pending());
+    spell.set_enabled(false);
+    assert!(!spell.pending(), "a service that is off has nothing to do");
+    assert_eq!(spell.pump(LONG), 0);
+    spell.set_enabled(true);
+    assert!(!spell.pending(), "the request was forgotten");
+    assert_eq!(provider.checked().len(), 1);
+}
+
+#[test]
+fn a_block_whose_request_was_lost_asks_again_the_next_time_it_is_painted() {
+    let mut h = Harness::new(SENTENCE);
+    let provider = Dictionary::new(&SENTENCE_WORDS);
+    let spell = Rc::new(SpellCheck::new(provider.clone()));
+    spell::register(h.view.registry_mut(), Rc::clone(&spell));
+    h.paint();
+    assert!(spell.pending());
+    // The request goes away (the service was switched off and on again).
+    spell.set_enabled(false);
+    spell.pump(Duration::ZERO);
+    spell.set_enabled(true);
+    assert!(!spell.pending());
+    h.paint();
+    assert!(spell.pending(), "the unanswered block asked once more");
+    spell.pump(LONG);
+    assert_eq!(squiggles(&h, &h.paint()).len(), 1);
+    assert_eq!(provider.checked().len(), 1);
+}
+
+#[test]
+fn a_text_known_to_be_clean_is_laid_out_without_asking_again() {
+    let (mut h, provider, spell) = editor("all words known\n", &["all", "words", "known"]);
+    assert_eq!(provider.checked().len(), 1);
+    h.view.invalidate_objects();
+    assert!(squiggles(&h, &h.paint()).is_empty());
+    assert!(!spell.pending());
+    assert_eq!(provider.checked().len(), 1);
 }
 
 // ----- the context menu -----------------------------------------------------------------------
@@ -469,16 +616,16 @@ fn adding_or_ignoring_a_word_removes_its_squiggle() {
     spell.add_to_dictionary("quikc");
     h.view.invalidate_objects();
     assert_eq!(*provider.added.borrow(), ["quikc"]);
-    assert_eq!(squiggles(&h, &h.paint()).len(), 1);
+    assert_eq!(squiggles(&h, &settled(&h, &spell)).len(), 1);
     spell.ignore("fxo");
     h.view.invalidate_objects();
     assert_eq!(*provider.ignored.borrow(), ["fxo"]);
-    assert!(squiggles(&h, &h.paint()).is_empty());
+    assert!(squiggles(&h, &settled(&h, &spell)).is_empty());
 }
 
 #[test]
 fn choosing_a_suggestion_replaces_the_word_as_one_undo_step() {
-    let (mut h, _, _) = editor(SENTENCE, &SENTENCE_WORDS);
+    let (mut h, _, spell) = editor(SENTENCE, &SENTENCE_WORDS);
     assert!(SpellCheck::replace(
         &mut h.view,
         TextRange::new(4, 9),
@@ -486,7 +633,7 @@ fn choosing_a_suggestion_replaces_the_word_as_one_undo_step() {
     ));
     assert_eq!(h.text(), "The quick brown fox\n");
     assert_eq!(h.selection().head, 9, "the caret follows the replacement");
-    assert!(squiggles(&h, &h.paint()).is_empty());
+    assert!(squiggles(&h, &settled(&h, &spell)).is_empty());
     assert!(h.view.execute(CommandId::EditUndo));
     assert_eq!(h.text(), SENTENCE);
     // The document changed under the menu: nothing happens.
@@ -518,7 +665,7 @@ fn a_wrapper_can_be_put_around_any_renderer() {
     h.view
         .registry_mut()
         .register(BlockClass::Paragraph, Rc::new(renderer));
-    let canvas = h.paint();
+    let canvas = settled(&h, &spell);
     assert_eq!(squiggles(&h, &canvas).len(), 1);
 }
 
@@ -531,8 +678,9 @@ fn a_paragraph_without_checkable_text_gets_no_squiggles() {
 
 #[test]
 fn a_checked_paragraph_still_answers_selection_lines_links_cursor_and_description() {
+    // `hrre` is misspelled: the paragraph keeps its wrapper (a clean one is not wrapped).
     let (mut h, _dictionary, _spell) =
-        editor("see [link](http://x.test) here\n", &["see", "link", "here"]);
+        editor("see [link](http://x.test) hrre\n", &["see", "link", "here"]);
     // The selection is drawn through the wrapped layout.
     h.view.set_selection(Selection::new(0, 3));
     let selection_color = h.theme.tokens.selection_bg;

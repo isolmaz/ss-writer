@@ -15,15 +15,14 @@
 //! ordinals 135 and 136; no public API exists) when the system has them.
 
 use ssw_core::keymap::KeyChord;
-use windows::Win32::Foundation::{FreeLibrary, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{FreeLibrary, HWND};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_LWIN, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, DestroyMenu, HMENU, InsertMenuItemW, MENU_ITEM_MASK, MENU_ITEM_STATE,
     MENU_ITEM_TYPE, MENUITEMINFOW, MFS_CHECKED, MFS_DISABLED, MFT_RADIOCHECK, MFT_SEPARATOR,
-    MFT_STRING, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, PostMessageW,
-    SetForegroundWindow, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
-    TrackPopupMenuEx, WM_NULL,
+    MFT_STRING, MIIM_FTYPE, MIIM_ID, MIIM_STATE, MIIM_STRING, MIIM_SUBMENU, TPM_LEFTALIGN,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
@@ -330,27 +329,6 @@ pub trait PopupHost {
 /// `WM_NULL` afterwards, as the documentation prescribes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemPopupHost;
-
-impl PopupHost for SystemPopupHost {
-    fn track(&mut self, menu: HMENU, request: &PopupRequest) -> Option<u32> {
-        // SAFETY: `menu` is a valid menu and `request.owner` a window of this thread. A refused
-        // foreground change only affects how a click outside dismisses the menu.
-        let chosen = unsafe {
-            let _ = SetForegroundWindow(request.owner);
-            let chosen = TrackPopupMenuEx(
-                menu,
-                request.flags,
-                request.x,
-                request.y,
-                request.owner,
-                None,
-            );
-            let _ = PostMessageW(Some(request.owner), WM_NULL, WPARAM(0), LPARAM(0));
-            chosen
-        };
-        u32::try_from(chosen.0).ok().filter(|&id| id != 0)
-    }
-}
 
 /// The flags every popup menu opens with: left/top aligned at the point, either mouse button
 /// selects, the chosen command is returned and no message is posted for it.

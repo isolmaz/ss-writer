@@ -422,6 +422,16 @@ mod tests {
     }
 
     #[test]
+    fn kit_toggle_idle_animation_frame_repaints_nothing() {
+        let (mut harness, mut toggle, _) = setup(true);
+        harness.requests.take_invalidation();
+        harness.frame(&mut toggle, 16);
+        assert!(harness.requests.invalidation().is_clean());
+        assert!(!harness.requests.animation_frame_requested());
+        assert!(toggle.is_on());
+    }
+
+    #[test]
     fn kit_toggle_disabled_paint_and_focus_ring() {
         let (mut harness, mut toggle, bounds) = setup(true);
         harness.focus_widget(&mut toggle);

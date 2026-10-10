@@ -3,11 +3,17 @@
 //!
 //! The checker itself is behind [`SpellProvider`] (the app implements it with the Windows
 //! `ISpellCheckerFactory` of `ssw-win`). [`SpellRenderer`] wraps the renderer of a block class:
-//! while the block is measured (that is, lazily, only for the visible blocks) it extracts the
-//! checkable text of the block, asks the [`SpellCheck`] service for the misspelled ranges and
-//! paints a wavy underline below each of them after the wrapped layout has painted. Results are
-//! cached by the checked text, so scrolling, caret moves and edits elsewhere never call the
-//! provider again for a paragraph that did not change.
+//! while the block is measured it extracts the checkable text of the block, and when the block
+//! is painted it paints a wavy underline below each misspelled word after the wrapped layout
+//! has painted.
+//!
+//! Laying a block out never waits for the checker (a call into the system costs more than
+//! shaping the text): a painted block whose text has no answer yet shows no squiggles and
+//! [`SpellCheck::request`]s one. The host runs [`SpellCheck::pump`] when it has time (a slice of
+//! a couple of milliseconds once nothing scrolls or types) and repaints when it answered, so
+//! only the blocks that were painted are ever checked and scrolling never stalls on the
+//! checker. Answers are cached by the checked text, so scrolling, caret moves and edits
+//! elsewhere never call the provider again for a paragraph that did not change.
 //!
 //! What is checked: the text of the block's text nodes, also inside emphasis, links (the link
 //! text, not the destination), images (the alt text) and wiki links (the alias, not the target).
@@ -21,11 +27,12 @@
 //! [`SpellCheck::replace`], [`SpellCheck::add_to_dictionary`] and [`SpellCheck::ignore`] carry
 //! out the menu entries.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use ssw_core::edit::{Edit, Selection};
 use ssw_core::i18n::Localizer;
@@ -48,6 +55,9 @@ pub const EN_FTL: &str = include_str!("../../../../assets/i18n/en/editor-spell.f
 
 /// Most texts the [`SpellCheck`] cache keeps; it starts over when the limit is reached.
 const CACHE_LIMIT: usize = 2048;
+/// Most texts that wait for their check; the oldest are forgotten (a block that is still on
+/// screen asks again the next time it is painted).
+const QUEUE_LIMIT: usize = 64;
 /// Horizontal distance between the corners of the wave.
 const WAVE_STEP: f32 = 2.0;
 /// Distance of the wave's lower edge from the bottom of the line.
@@ -75,11 +85,13 @@ pub trait SpellProvider {
 }
 
 /// The spelling service shared by the renderers of an editor: the provider, the on/off switch
-/// (setting "Check spelling") and the cache of results.
+/// (setting "Check spelling"), the cache of results and the texts that wait for a check.
 pub struct SpellCheck {
     provider: Rc<dyn SpellProvider>,
     enabled: Cell<bool>,
     cache: RefCell<HashMap<String, Rc<[Range<usize>]>>>,
+    /// Texts of painted blocks without an answer, oldest first.
+    queue: RefCell<Vec<String>>,
 }
 
 impl fmt::Debug for SpellCheck {
@@ -87,6 +99,7 @@ impl fmt::Debug for SpellCheck {
         f.debug_struct("SpellCheck")
             .field("enabled", &self.enabled.get())
             .field("cached_texts", &self.cache.borrow().len())
+            .field("waiting_texts", &self.queue.borrow().len())
             .finish_non_exhaustive()
     }
 }
@@ -99,6 +112,7 @@ impl SpellCheck {
             provider,
             enabled: Cell::new(true),
             cache: RefCell::new(HashMap::new()),
+            queue: RefCell::new(Vec::new()),
         }
     }
 
@@ -117,6 +131,62 @@ impl SpellCheck {
     /// Forgets every cached result (the spelling languages changed).
     pub fn clear_cache(&self) {
         self.cache.borrow_mut().clear();
+    }
+
+    /// The misspelled byte ranges of `text` when they are known; the provider is not asked.
+    #[must_use]
+    pub fn cached(&self, text: &str) -> Option<Rc<[Range<usize>]>> {
+        self.cache.borrow().get(text).cloned()
+    }
+
+    /// Asks for `text` to be checked by a later [`SpellCheck::pump`]; a text that already waits
+    /// keeps its place. When more than a few dozen wait, the oldest requests are forgotten.
+    pub fn request(&self, text: &str) {
+        let mut queue = self.queue.borrow_mut();
+        if queue.iter().any(|waiting| waiting == text) {
+            return;
+        }
+        if queue.len() >= QUEUE_LIMIT {
+            queue.remove(0);
+        }
+        queue.push(text.to_owned());
+    }
+
+    /// Whether texts wait for their check (and the service is on).
+    #[must_use]
+    pub fn pending(&self) -> bool {
+        self.enabled.get() && !self.queue.borrow().is_empty()
+    }
+
+    /// Checks the requested texts, oldest first, until `budget` is spent (at least one text is
+    /// checked per call). Returns how many texts the provider answered: when it is not zero the
+    /// blocks that asked can show their squiggles, which a repaint of the editor does. A service
+    /// that is switched off forgets the requests and answers nothing.
+    pub fn pump(&self, budget: Duration) -> usize {
+        if !self.enabled.get() {
+            self.queue.borrow_mut().clear();
+            return 0;
+        }
+        let started = Instant::now();
+        let mut answered = 0;
+        loop {
+            let next = {
+                let mut queue = self.queue.borrow_mut();
+                (!queue.is_empty()).then(|| queue.remove(0))
+            };
+            let Some(text) = next else {
+                break;
+            };
+            // The text may have been answered meanwhile (a synchronous question).
+            if self.cached(&text).is_none() {
+                let _ = self.misspellings(&text);
+                answered += 1;
+            }
+            if started.elapsed() >= budget {
+                break;
+            }
+        }
+        answered
     }
 
     /// The misspelled byte ranges of `text`: from the cache, or from the provider (and cached).
@@ -163,18 +233,6 @@ impl SpellCheck {
             Selection::caret(range.start + replacement.len()),
         );
         view.apply(tx, false)
-    }
-
-    /// The misspelled words of `block` as source ranges.
-    fn find(&self, buffer: &Buffer, block: &Block) -> Vec<Miss> {
-        let checkable = Checkable::collect(buffer, &block.inlines);
-        if checkable.text.trim().is_empty() {
-            return Vec::new();
-        }
-        self.misspellings(&checkable.text)
-            .iter()
-            .filter_map(|found| checkable.miss(found))
-            .collect()
     }
 }
 
@@ -253,13 +311,23 @@ impl BlockRenderer for SpellRenderer {
         if !self.spell.enabled() {
             return layout;
         }
-        let misses = self.spell.find(cx.buffer, block);
-        if misses.is_empty() {
+        let checkable = Checkable::collect(cx.buffer, &block.inlines);
+        if checkable.text.trim().is_empty() {
+            return layout;
+        }
+        // A text known to be clean needs no wrapper; any other (answered or not) gets one,
+        // which asks for the answer when it is painted.
+        if self
+            .spell
+            .cached(&checkable.text)
+            .is_some_and(|found| found.is_empty())
+        {
             return layout;
         }
         Box::new(SpellLayout {
             inner: layout,
-            misses,
+            checkable,
+            found: OnceCell::new(),
             spell: Rc::clone(&self.spell),
         })
     }
@@ -392,8 +460,34 @@ impl Checkable {
 /// The wrapped layout plus the squiggles.
 struct SpellLayout {
     inner: Box<dyn BlockLayout>,
-    misses: Vec<Miss>,
+    /// The text that is checked and the map back to the document.
+    checkable: Checkable,
+    /// The misspelled words, once the service has answered for the text.
+    found: OnceCell<Vec<Miss>>,
     spell: Rc<SpellCheck>,
+}
+
+impl SpellLayout {
+    /// The misspelled words; none while the text waits for its check (it is requested again
+    /// every time this is asked and the answer is still missing, so a service that started over
+    /// or forgot the request is asked once more).
+    fn misses(&self) -> &[Miss] {
+        if let Some(found) = self.found.get() {
+            return found;
+        }
+        match self.spell.cached(&self.checkable.text) {
+            Some(ranges) => self.found.get_or_init(|| {
+                ranges
+                    .iter()
+                    .filter_map(|range| self.checkable.miss(range))
+                    .collect()
+            }),
+            None => {
+                self.spell.request(&self.checkable.text);
+                &[]
+            }
+        }
+    }
 }
 
 /// A wavy line along the bottom of `rect`.
@@ -420,7 +514,7 @@ impl BlockLayout for SpellLayout {
 
     fn paint(&self, cx: &BlockPaintCx<'_>, canvas: &mut dyn Canvas) {
         self.inner.paint(cx, canvas);
-        for miss in &self.misses {
+        for miss in self.misses() {
             for rect in self.inner.selection_rects(miss.range) {
                 squiggle(canvas, rect, cx.theme.tokens.error);
             }
@@ -456,7 +550,7 @@ impl BlockLayout for SpellLayout {
     }
 
     fn context_menu(&self, point: Point, origin: Point) -> Option<EditorEvent> {
-        for miss in &self.misses {
+        for miss in self.misses() {
             let hit = self
                 .inner
                 .selection_rects(miss.range)

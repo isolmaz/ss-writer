@@ -44,11 +44,19 @@ impl PrivateDesktop {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let name = format!("ssw-test-{}-{nanos}", std::process::id());
+        Self::create_named(&format!("ssw-test-{}-{nanos}", std::process::id()))
+    }
+
+    /// Creates a desktop called `name`.
+    ///
+    /// # Errors
+    /// The desktop cannot be created: the name is one the system refuses, or the session has no
+    /// interactive window station.
+    fn create_named(name: &str) -> Result<Self, WinError> {
         // SAFETY: a valid NUL-terminated name; no device, mode or security attributes.
         let handle = unsafe {
             CreateDesktopW(
-                &HSTRING::from(name.as_str()),
+                &HSTRING::from(name),
                 PCWSTR::null(),
                 None,
                 DESKTOP_CONTROL_FLAGS(0),
@@ -57,7 +65,10 @@ impl PrivateDesktop {
             )
         }
         .ctx("CreateDesktopW")?;
-        Ok(Self { handle, name })
+        Ok(Self {
+            handle,
+            name: name.to_owned(),
+        })
     }
 
     /// The name of the desktop ([`current_desktop_name`] of a thread that runs on it).
@@ -131,7 +142,7 @@ pub fn current_desktop_name() -> String {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    use ssw_ui::canvas::Canvas;
+    use ssw_ui::canvas::{Canvas, RecordingCanvas};
     use ssw_ui::input::Event;
     use ssw_ui::theme::{DEFAULT_ACCENT, Theme};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -227,16 +238,34 @@ mod tests {
         // The calling thread stays where it was.
         assert_eq!(current_desktop_name(), own);
 
-        let panicked = catch_unwind(AssertUnwindSafe(|| {
-            desktop.run(|| -> u32 { panic!("work failed") })
-        }))
-        .unwrap_err();
+        // `run` is generic over the work: one closure type for the work that finishes and the
+        // work that panics, so one instantiation meets both outcomes.
+        let mut outcomes = Vec::new();
+        for fail in [true, false] {
+            outcomes.push(catch_unwind(AssertUnwindSafe(|| {
+                desktop.run(move || -> u32 {
+                    assert!(!fail, "work failed");
+                    7
+                })
+            })));
+        }
+        // The desktop is still usable after a panic.
+        assert_eq!(outcomes.pop().unwrap().unwrap(), 7);
+        let panicked = outcomes.pop().unwrap().unwrap_err();
         assert_eq!(
             panicked.downcast_ref::<&str>().copied(),
             Some("work failed")
         );
-        // The desktop is still usable after a panic.
-        assert_eq!(desktop.run(|| 7), 7);
+    }
+
+    #[test]
+    fn a_desktop_name_the_system_refuses_is_a_creation_error() {
+        // Desktop names may not contain backslashes (they are names inside the window station).
+        let error = PrivateDesktop::create_named(r"ssw-test\nested").unwrap_err();
+        assert!(
+            error.to_string().starts_with("CreateDesktopW failed"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -273,6 +302,11 @@ mod tests {
             host.show();
             assert!(is_visible(&host));
             assert!(!is_zoomed(&host));
+            // The handler that ignores everything is asked to paint into a recording canvas
+            // and draws nothing.
+            let mut canvas = RecordingCanvas::default();
+            Silent.on_paint(&host.info(), &mut canvas);
+            assert!(canvas.recorded().is_empty());
             host.destroy();
         });
     }

@@ -1,0 +1,48 @@
+name: Mutants
+
+# Mutation testing runs on GitHub, never on a developer machine: started by hand (a shard of the
+# workspace per job) and weekly. The report of every shard is kept as an artifact.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 0"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mutants:
+    name: mutants (shard ${{ matrix.shard }}/8)
+    runs-on: windows-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,cargo-nextest
+      - name: Mutants
+        run: cargo xtask mutants -j 2 -- --shard ${{ matrix.shard }}/8 --all-features --timeout 600
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: |
+            target/mutants-report.md
+            target/mutants.out
+          if-no-files-found: ignore

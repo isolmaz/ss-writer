@@ -4,17 +4,15 @@ All notable changes to SS Writer are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- Plain text mode (spec §4.1): View → Word wrap for text files, which wrap long lines at the window edge by default; switched off, every line stays on one row and the view scrolls sideways (Shift+wheel, a horizontal wheel, the caret, UI Automation). View → Render as Markdown shows a text file as live Markdown (headings in the inspector, Markdown paste and copy) without changing how it is saved: file name, encoding, BOM and line endings stay. Both items are checkable, enabled only for plain text files, listed in the command palette and have no default shortcut (assignable in Settings → Shortcuts). Word wrap belongs to the tab and Render as Markdown to the document; neither is stored between sessions.
-
 ## [0.1.0] - 2026-10-10
 
 First release.
 
 ### Added
+
+#### Plain text
+
+- Plain text mode (spec §4.1): View → Word wrap for text files, which wrap long lines at the window edge by default; switched off, every line stays on one row and the view scrolls sideways (Shift+wheel, a horizontal wheel, the caret, UI Automation). View → Render as Markdown shows a text file as live Markdown (headings in the inspector, Markdown paste and copy) without changing how it is saved: file name, encoding, BOM and line endings stay. Both items are checkable, enabled only for plain text files, listed in the command palette and have no default shortcut (assignable in Settings → Shortcuts). Word wrap belongs to the tab and Render as Markdown to the document; neither is stored between sessions.
 
 #### Window and appearance
 
@@ -83,5 +81,8 @@ First release.
 - Weekly update check against the GitHub releases of this repository: notification only, and it can be turned off in Settings > General.
 - Jump List with recent files and folders and New window; touch and pen input, DirectManipulation scrolling, text services (IME, dictation, emoji panel) and UI Automation for every control.
 
-[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.0...HEAD
+### Known issues
+
+- Scrolling very large documents (60 000 lines) at high speed does not yet keep up with a 144 Hz display: in the stress test a frame takes about 16 ms instead of 7 ms. See [docs/performance.md](docs/performance.md#known-issues).
+
 [0.1.0]: https://github.com/isolmaz/ss-writer/releases/tag/v0.1.0

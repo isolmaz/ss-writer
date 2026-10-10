@@ -10,8 +10,9 @@
 //! | scenario       | what it does                                                              |
 //! |----------------|---------------------------------------------------------------------------|
 //! | `startup`      | nothing: the first presented frame ends the run                           |
-//! | `open-60k`     | opens the target file in the running app, then scrolls the editor through |
-//! |                | the whole document by a fixed step per frame                              |
+//! | `open-60k`     | opens the target file in the running app, scrolls the editor through the  |
+//! |                | whole document by a stress step per frame, then flicks from the top by a  |
+//! |                | realistic step per frame ([`FLICK_STEP`], [`FLICK_FRAMES`] frames)        |
 //! | `folder-10k`   | opens the target folder in the sidebar, then builds its workspace index   |
 //! | `type-latency` | types characters into an untitled document and times each to `Present`    |
 //!
@@ -31,10 +32,10 @@ use super::controller::WindowCell;
 use super::host::UiApp;
 use crate::args::{Args, PerfScenario};
 use crate::perf::{
-    DOC_OPEN_BEGIN, DOC_OPEN_RETURNED, DOC_PAINTED, DOC_PRESENTED, FOLDER_OPEN_BEGIN,
-    FOLDER_OPEN_RETURNED, INDEX_FINISHED, INDEX_REQUESTED, PHASE_OPEN, PHASE_SCROLL, PHASE_TYPE,
-    ReportMeta, SCROLL_BEGIN, SCROLL_END, TREE_PAINTED, TREE_PRESENTED, TYPE_BEGIN, TYPE_END,
-    build_report, write_report,
+    DOC_OPEN_BEGIN, DOC_OPEN_RETURNED, DOC_PAINTED, DOC_PRESENTED, FLICK_BEGIN, FLICK_END,
+    FOLDER_OPEN_BEGIN, FOLDER_OPEN_RETURNED, INDEX_FINISHED, INDEX_REQUESTED, PHASE_FLICK,
+    PHASE_JUMP, PHASE_OPEN, PHASE_SCROLL, PHASE_TYPE, ReportMeta, SCROLL_BEGIN, SCROLL_END,
+    TREE_PAINTED, TREE_PRESENTED, TYPE_BEGIN, TYPE_END, build_report, write_report,
 };
 
 /// Process exit code of a scenario that failed (the report says why).
@@ -43,6 +44,13 @@ pub const EXIT_PERF_FAILED: i32 = 9;
 /// DIPs per frame of the scroll sweep unless `--perf-scroll-step` says otherwise: about three
 /// quarters of a viewport, so nearly every frame needs content that was not on screen before.
 pub const DEFAULT_SCROLL_STEP: u32 = 600;
+
+/// DIPs per frame of the flick sweep that follows: a realistic fast flick (about 6 900 DIPs per
+/// second at 144 Hz), a small fraction of the stress step above.
+pub const FLICK_STEP: u32 = 48;
+
+/// Frames of the flick sweep (it ends earlier when the document does).
+pub const FLICK_FRAMES: u32 = 1200;
 
 /// Characters the typing scenario posts.
 pub const TYPED_CHARS: u32 = 120;
@@ -81,6 +89,8 @@ pub struct Limits {
     pub scroll_frames: u32,
     /// A typed character that has no frame after this long failed.
     pub type_timeout: Duration,
+    /// Frames of the flick sweep (it ends earlier when the document does).
+    pub flick_frames: u32,
 }
 
 impl Default for Limits {
@@ -89,8 +99,19 @@ impl Default for Limits {
             timeout: TIMEOUT,
             scroll_frames: MAX_SCROLL_FRAMES,
             type_timeout: TYPE_TIMEOUT,
+            flick_frames: FLICK_FRAMES,
         }
     }
+}
+
+/// The two scroll sweeps of `open-60k`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sweep {
+    /// A step of about three quarters of a viewport per frame, to the end of the document: every
+    /// frame needs content that was not on screen.
+    Stress,
+    /// A realistic fast flick from the top of the document: a few dozen DIPs per frame.
+    Flick,
 }
 
 /// What one tick of the driver decided.
@@ -109,13 +130,17 @@ enum Stage {
     Booting { settled_at: Option<Instant> },
     /// The document is open; waiting for the frame at index `frame`, the first that shows it.
     AwaitDocument { frame: usize },
-    /// Scrolling: `requested` is the offset asked of the editor, `requests` how many were made,
-    /// `seen` the frame count when it was asked.
+    /// Scrolling in `sweep`: `requested` is the offset asked of the editor, `requests` how many
+    /// were made, `seen` the frame count when it was asked.
     Scrolling {
+        sweep: Sweep,
         requested: f32,
         requests: u32,
         seen: usize,
     },
+    /// The editor was sent back to the top for the flick sweep; waiting for the frame after the
+    /// frame count `seen`.
+    AwaitTop { seen: usize },
     /// The folder is open; waiting for the frame at index `frame`, the first that shows it.
     AwaitTree { frame: usize },
     /// The index job runs on its worker.
@@ -352,10 +377,11 @@ impl PerfDriver {
                 self.details.push(("scroll_step_dip", f64::from(self.step)));
                 recorder.set_phase(PHASE_SCROLL);
                 recorder.mark_latest(SCROLL_BEGIN);
-                self.scroll_to(app, &cell, self.step, 1);
+                self.scroll_to(app, &cell, Sweep::Stress, self.step, 1);
                 Ok(false)
             }
             Stage::Scrolling {
+                sweep,
                 requested,
                 requests,
                 seen,
@@ -365,21 +391,50 @@ impl PerfDriver {
                 }
                 let cell = window(app)?;
                 let actual = editor_scroll(&cell)?;
-                if actual + 0.5 < requested {
-                    // The editor clamped the request: the sweep reached the end.
-                    recorder.mark_latest(SCROLL_END);
-                    self.details.push(("scroll_frames", f64::from(requests)));
-                    self.details
-                        .push(("scroll_end_offset_dip", f64::from(actual)));
-                    return Ok(true);
-                }
-                if requests >= self.limits.scroll_frames {
-                    return Err(format!(
+                // The editor clamps a request past the end: the document ended.
+                let ended = actual + 0.5 < requested;
+                match sweep {
+                    Sweep::Stress if ended => {
+                        recorder.mark_latest(SCROLL_END);
+                        self.details.push(("scroll_frames", f64::from(requests)));
+                        self.details
+                            .push(("scroll_end_offset_dip", f64::from(actual)));
+                        // Back to the top for the flick sweep; the cold frame that takes the
+                        // editor there belongs to neither sweep.
+                        recorder.set_phase(PHASE_JUMP);
+                        let seen = recorder.frame_count();
+                        self.set_scroll(app, &cell, 0.0);
+                        self.stage = Stage::AwaitTop { seen };
+                        Ok(false)
+                    }
+                    Sweep::Stress if requests >= self.limits.scroll_frames => Err(format!(
                         "the document did not end within {} frames (offset {actual})",
                         self.limits.scroll_frames
-                    ));
+                    )),
+                    Sweep::Flick if ended || requests >= self.limits.flick_frames => {
+                        recorder.mark_latest(FLICK_END);
+                        self.details.push(("flick_frames", f64::from(requests)));
+                        self.details.push(("flick_step_dip", f64::from(FLICK_STEP)));
+                        Ok(true)
+                    }
+                    sweep => {
+                        let step = match sweep {
+                            Sweep::Stress => self.step,
+                            Sweep::Flick => FLICK_STEP as f32,
+                        };
+                        self.scroll_to(app, &cell, sweep, actual + step, requests + 1);
+                        Ok(false)
+                    }
                 }
-                self.scroll_to(app, &cell, actual + self.step, requests + 1);
+            }
+            Stage::AwaitTop { seen } => {
+                if recorder.frame_count() <= seen {
+                    return Ok(false);
+                }
+                let cell = window(app)?;
+                recorder.set_phase(PHASE_FLICK);
+                recorder.mark_latest(FLICK_BEGIN);
+                self.scroll_to(app, &cell, Sweep::Flick, FLICK_STEP as f32, 1);
                 Ok(false)
             }
             Stage::AwaitTree { frame } => {
@@ -496,9 +551,10 @@ impl PerfDriver {
         Ok(())
     }
 
-    /// Asks the editor of `cell` for the offset `y`, repaints and waits for the frame. Both
-    /// callers just read that editor in the same turn, so there is one.
-    fn scroll_to(&mut self, app: &UiApp, cell: &WindowCell, y: f32, requests: u32) {
+    /// Asks the editor of `cell` for the offset `y` and repaints. A window without an editor
+    /// (its tab was closed since the stage last read it) has nothing to move: the next frame of
+    /// the sweep reports that ([`editor_scroll`]).
+    fn set_scroll(&self, app: &UiApp, cell: &WindowCell, y: f32) {
         {
             let mut view = cell.view.borrow_mut();
             if let Some(editor) = view.active_editor_mut() {
@@ -506,9 +562,16 @@ impl PerfDriver {
             }
             view.requests_mut().invalidate_all();
         }
-        let seen = self.recorder.frame_count();
         poke(app, cell);
+    }
+
+    /// Asks the editor of `cell` for the offset `y` as request number `requests` of `sweep`,
+    /// repaints and waits for the frame.
+    fn scroll_to(&mut self, app: &UiApp, cell: &WindowCell, sweep: Sweep, y: f32, requests: u32) {
+        let seen = self.recorder.frame_count();
+        self.set_scroll(app, cell, y);
         self.stage = Stage::Scrolling {
+            sweep,
             requested: y,
             requests,
             seen,

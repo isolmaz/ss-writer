@@ -645,13 +645,73 @@ mod tests {
     #[test]
     fn a_renderer_that_cannot_start_reports_why() {
         let _com = ComGuard::apartment_threaded().unwrap();
-        // The first system call of the renderer (creating the WIC factory) fails.
-        ssw_win::fault::arm(0);
-        let error = Visuals::new().unwrap_err();
-        ssw_win::fault::disarm();
+        // Every system call of the start fails in turn: the WIC factory first, then the steps
+        // of the DirectWrite engine.
+        let outcomes = ssw_win::fault::sweep(Visuals::new);
         assert!(
-            error.starts_with("cannot start the screenshot renderer: "),
-            "{error}"
+            outcomes.len() > 2,
+            "the start makes several system calls: {}",
+            outcomes.len()
+        );
+        for (call, outcome) in outcomes.iter().enumerate() {
+            let error = outcome.as_ref().unwrap_err();
+            assert!(
+                error.starts_with("cannot start the screenshot renderer: "),
+                "call {call}: {error}"
+            );
+        }
+        let first = outcomes[0].as_ref().unwrap_err();
+        assert!(first.contains("create WIC factory"), "{first}");
+        let last = outcomes.last().unwrap().as_ref().unwrap_err();
+        assert!(
+            !last.contains("WIC"),
+            "the last call belongs to DirectWrite: {last}"
+        );
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn every_system_call_of_a_render_can_fail_and_the_renderer_stays_usable() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let visuals = Visuals::new().unwrap();
+        let geometry = Geometry::new(24, 16, 1.0).unwrap();
+        let mut draw = |canvas: &mut dyn Canvas| {
+            canvas.fill_rect(
+                Rect::new(0.0, 0.0, 12.0, 8.0),
+                Color::from_rgb_u32(0xFF0000),
+            );
+        };
+        // The Direct2D factory, the bitmap and its render target, the scene renderer, the
+        // brush of the drawing, the end of the frame, the copy of the pixels and the PNG
+        // encoder each fail in turn.
+        let outcomes = ssw_win::fault::sweep(|| visuals.render(geometry, Color::WHITE, &mut draw));
+        assert!(
+            outcomes.len() >= 8,
+            "the render makes many system calls: {}",
+            outcomes.len()
+        );
+        for (call, outcome) in outcomes.iter().enumerate() {
+            let error = outcome.as_ref().unwrap_err();
+            assert!(
+                error.starts_with("cannot render the screenshot: "),
+                "call {call}: {error}"
+            );
+        }
+        let first = outcomes[0].as_ref().unwrap_err();
+        assert!(first.contains("create D2D factory"), "{first}");
+        // Nothing of the failed renders is left behind: the next one draws.
+        let png = visuals.render(geometry, Color::WHITE, &mut draw).unwrap();
+        let image = visuals.wic.decode(&png).unwrap();
+        assert_eq!((image.width, image.height), (24, 16));
+        assert_eq!(
+            image.pixel(1, 1),
+            Some([0, 0, 255, 255]),
+            "the red square (BGRA)"
+        );
+        assert_eq!(
+            image.pixel(20, 12),
+            Some([255, 255, 255, 255]),
+            "the background"
         );
     }
 }

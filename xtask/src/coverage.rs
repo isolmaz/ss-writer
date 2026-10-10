@@ -5,8 +5,11 @@ use crate::fsx;
 use crate::run;
 use crate::workspace::Workspace;
 
-/// Files excluded from the report: test sources and xtask itself, nothing else.
-const IGNORE_FILENAME_REGEX: &str = r"(^|[\\/])(tests|xtask)[\\/]";
+/// Files excluded from the report: test sources, xtask itself, vendored third-party code and
+/// `ssw-win/src/system_ui.rs`, the documented exception that only holds the calls putting
+/// system UI on the screen (popup menu, file, task and print dialogs), which no test may make.
+const IGNORE_FILENAME_REGEX: &str =
+    r"(^|[\\/])(tests|xtask|third_party)[\\/]|[\\/]ssw-win[\\/]src[\\/]system_ui\.rs$";
 
 /// Runs every test under instrumentation with all features (the test-only `fault-injection`
 /// features of the platform crates included), writes `lcov.info` (workspace root) and
@@ -69,5 +72,34 @@ pub fn run(workspace: &Workspace) -> Result<(), Error> {
             output.status,
             summary_path.display()
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IGNORE_FILENAME_REGEX;
+    use regex::Regex;
+
+    #[test]
+    fn only_tests_tools_vendored_code_and_the_system_ui_calls_are_left_out() {
+        let ignored = Regex::new(IGNORE_FILENAME_REGEX).unwrap();
+        for path in [
+            r"C:\repo\crates\ssw-ui\tests\editor_spell.rs",
+            r"C:\repo\xtask\src\coverage.rs",
+            r"C:\repo\third_party\mermaid\src\lib.rs",
+            r"C:\repo\crates\ssw-win\src\system_ui.rs",
+            "/repo/crates/ssw-win/src/system_ui.rs",
+        ] {
+            assert!(ignored.is_match(path), "{path}");
+        }
+        for path in [
+            r"C:\repo\crates\ssw-win\src\print.rs",
+            r"C:\repo\crates\ssw-win\src\menus.rs",
+            r"C:\repo\crates\ssw-app\src\ui\system_ui_flows.rs",
+            r"C:\repo\crates\ssw-win\src\system_ui.rs.bak",
+            r"C:\repo\crates\ssw-core\src\markdown\parse\tests.rs",
+        ] {
+            assert!(!ignored.is_match(path), "{path}");
+        }
     }
 }

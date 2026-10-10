@@ -546,7 +546,6 @@ impl Controller {
         let i18n = self.i18n();
         match failure {
             ExportFailure::Convert(message) => message.clone(),
-            ExportFailure::Empty => i18n.text("export-reason-empty"),
             ExportFailure::Diagram => i18n.text("export-mermaid-failed"),
             ExportFailure::Write { path, reason_id } => i18n.format(
                 "export-failed-write",
@@ -668,11 +667,8 @@ impl Controller {
         outcome: Result<Result<Vec<Scene>, ExportFailure>, JobError>,
     ) {
         let pages = match outcome {
-            Ok(Ok(pages)) if !pages.is_empty() => pages,
-            Ok(Ok(_)) => {
-                self.say_print_failed(name, &self.failure_reason(&ExportFailure::Empty));
-                return;
-            }
+            // Typst always lays out at least one page (see `job::run_export`).
+            Ok(Ok(pages)) => pages,
             Ok(Err(failure)) => {
                 self.say_print_failed(name, &self.failure_reason(&failure));
                 return;
@@ -762,7 +758,7 @@ mod tests {
     use crate::app::AppCore;
     use crate::args::Args;
     use crate::startup::{Boot, ProcessEnv, boot};
-    use crate::ui::scripted_services::{DialogRecord, ScriptedServices};
+    use crate::ui::scripted_services::{Answer, DialogKind, DialogRecord, ScriptedServices};
     use crate::workers::DeferredWaker;
 
     /// A controller over a fresh profile below `root` with scripted dialogs.
@@ -782,10 +778,7 @@ mod tests {
             install_crash_handler: false,
         };
         let mut dialogs = ScriptedServices::new().dialogs();
-        let core = match boot(&Args::default(), process, &mut *dialogs, None).unwrap() {
-            Boot::Ready(started) => AppCore::new(*started, Arc::new(DeferredWaker::new())),
-            Boot::Exit(code) => panic!("startup exited with {code}"),
-        };
+        let core = core_of(boot(&Args::default(), process, &mut *dialogs, None).unwrap());
         let clipboard: SharedClipboard = Rc::new(RefCell::new(MemoryClipboard::default()));
         let clock: Rc<dyn Clock> = Rc::new(FakeClock::default());
         let plan = core.plan.clone();
@@ -793,6 +786,115 @@ mod tests {
             Controller::new(core, services.dialogs(), services.shell(), clipboard, clock);
         controller.open_plan(&plan);
         controller
+    }
+
+    /// The application core of a startup that went on.
+    fn core_of(outcome: Boot) -> AppCore {
+        match outcome {
+            Boot::Ready(started) => AppCore::new(*started, Arc::new(DeferredWaker::new())),
+            Boot::Exit(code) => panic!("startup exited with {code}"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "startup exited with 3")]
+    fn a_startup_that_exits_gives_the_tests_no_core() {
+        let _ = core_of(Boot::Exit(3));
+    }
+
+    /// Prints into a list of page counts; fails while `fail` is set.
+    struct Printer {
+        pages: Rc<RefCell<Vec<usize>>>,
+        fail: Rc<Cell<bool>>,
+    }
+
+    impl Printing for Printer {
+        fn print(&mut self, job: PrintJob) -> Result<Option<usize>, ServiceError> {
+            self.pages.borrow_mut().push(job.pages.len());
+            if self.fail.get() {
+                Err(ServiceError::Failed {
+                    service: "print",
+                    message: "the printer is on fire".to_owned(),
+                })
+            } else {
+                Ok(Some(job.pages.len()))
+            }
+        }
+    }
+
+    #[test]
+    fn pages_reach_the_printer_which_is_handed_back_and_its_failure_is_told() {
+        let tmp = tempfile::tempdir().unwrap();
+        let services = ScriptedServices::new();
+        let controller = controller(tmp.path(), &services);
+        let pages = Rc::new(RefCell::new(Vec::new()));
+        let fail = Rc::new(Cell::new(true));
+        controller.set_printing(Box::new(Printer {
+            pages: Rc::clone(&pages),
+            fail: Rc::clone(&fail),
+        }));
+        let scenes = || Ok(Ok(vec![Scene::default(), Scene::default()]));
+        controller.finish_print(None, "notes", scenes());
+        let dialogs = shown(&services);
+        let (title, message) = dialogs.last().unwrap();
+        assert_eq!(title, "Print");
+        assert!(message.contains("could not be printed"), "{message}");
+        assert!(message.contains("the printer is on fire"), "{message}");
+        // The printer is back in its cell: the next print reaches it, and a printed job is silent.
+        fail.set(false);
+        controller.finish_print(None, "notes", scenes());
+        assert_eq!(*pages.borrow(), [2, 2]);
+        assert_eq!(shown(&services).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_write_names_the_file_and_a_finished_export_asks_what_to_do_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let services = ScriptedServices::new();
+        let controller = controller(tmp.path(), &services);
+        controller.report_export(
+            &label(),
+            Ok(Err(ExportFailure::Write {
+                path: PathBuf::from("C:\\out\\notes.pdf"),
+                reason_id: "export-reason-crashed",
+            })),
+        );
+        let dialogs = shown(&services);
+        let (title, message) = dialogs.last().unwrap();
+        assert_eq!(title, "Export failed");
+        assert!(message.contains("notes.pdf"), "{message}");
+        assert!(
+            message.contains("The exporter stopped unexpectedly."),
+            "{message}"
+        );
+
+        let one = vec![PathBuf::from("C:\\out\\notes.pdf")];
+        let many = vec![
+            PathBuf::from("C:\\out\\notes-1.png"),
+            PathBuf::from("C:\\out\\notes-2.png"),
+        ];
+        let before = shown(&services).len();
+        for (files, answer) in [
+            (one.clone(), MessageBoxResult::Yes),
+            (one, MessageBoxResult::No),
+            (many.clone(), MessageBoxResult::Cancel),
+            (many, MessageBoxResult::Yes),
+        ] {
+            services.answer(DialogKind::MessageBox, Answer::Button(answer));
+            controller.report_export(&label(), Ok(Ok(files)));
+        }
+        let dialogs = shown(&services);
+        assert_eq!(dialogs.len(), before + 4);
+        assert!(
+            dialogs[before].1.contains("notes.pdf"),
+            "{:?}",
+            dialogs[before]
+        );
+        assert!(
+            dialogs[before + 2].1.contains("C:\\out"),
+            "{:?}",
+            dialogs[before + 2]
+        );
     }
 
     fn label() -> Label {
@@ -831,10 +933,6 @@ mod tests {
                 "The exporter stopped unexpectedly.",
             ),
             (
-                Ok(Err(ExportFailure::Empty)),
-                "The export produced no pages.",
-            ),
-            (
                 Ok(Err(ExportFailure::Diagram)),
                 "The diagram could not be drawn",
             ),
@@ -863,7 +961,6 @@ mod tests {
         let services = ScriptedServices::new();
         let controller = controller(tmp.path(), &services);
         let outcomes = [
-            (Ok(Ok(Vec::new())), "The export produced no pages."),
             (
                 Ok(Err(ExportFailure::Convert("the layout broke".to_owned()))),
                 "the layout broke",
@@ -891,6 +988,6 @@ mod tests {
                 "Printing is not available in this window.".to_owned()
             )
         );
-        assert_eq!(dialogs.len(), 4);
+        assert_eq!(dialogs.len(), 3);
     }
 }

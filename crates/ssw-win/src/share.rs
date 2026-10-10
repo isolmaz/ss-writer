@@ -288,3 +288,69 @@ impl<U: ShareUi> Drop for Sharer<U> {
         let _ = self.manager.RemoveDataRequested(self.token);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use windows::Win32::Foundation::E_NOTIMPL;
+    use windows::Win32::UI::Shell::IDataTransferManagerInterop_Impl;
+    use windows::core::{GUID, implement};
+
+    use super::*;
+
+    /// An interop object that records the windows it is asked to share from instead of
+    /// showing the system sheet.
+    #[implement(IDataTransferManagerInterop)]
+    struct RecordingInterop {
+        shown: Rc<Cell<usize>>,
+        fail: bool,
+    }
+
+    impl IDataTransferManagerInterop_Impl for RecordingInterop_Impl {
+        fn GetForWindow(
+            &self,
+            _appwindow: HWND,
+            _riid: *const GUID,
+            _datatransfermanager: *mut *mut core::ffi::c_void,
+        ) -> windows::core::Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+
+        fn ShowShareUIForWindow(&self, _appwindow: HWND) -> windows::core::Result<()> {
+            self.shown.set(self.shown.get() + 1);
+            if self.fail {
+                Err(E_FAIL.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn the_system_share_ui_asks_the_interop_for_the_sheet_of_its_window() {
+        for fail in [false, true] {
+            let shown = Rc::new(Cell::new(0));
+            let recorder = RecordingInterop {
+                shown: Rc::clone(&shown),
+                fail,
+            };
+            let interop: IDataTransferManagerInterop = recorder.into();
+            // The manager of a window is not what the sheet needs.
+            // SAFETY: a call into the recording object above, which writes nothing.
+            let manager = unsafe { interop.GetForWindow::<DataTransferManager>(HWND::default()) };
+            assert_eq!(manager.unwrap_err().code(), E_NOTIMPL);
+            let ui = SystemShareUi { interop };
+            let result = ui.show(HWND::default());
+            assert_eq!(result.is_err(), fail);
+            if let Err(error) = result {
+                assert!(
+                    error.to_string().starts_with("ShowShareUIForWindow"),
+                    "{error}"
+                );
+            }
+            assert_eq!(shown.get(), 1);
+        }
+    }
+}

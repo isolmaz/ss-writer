@@ -562,6 +562,9 @@ mod tests {
     fn front_matter_config_requires_closed_block_with_config_object() {
         let config = front_matter_config("\n---\ntitle: T\nconfig:\n  theme: forest\n---\npie\n");
         assert_eq!(config, Some(json!({"theme": "forest"})));
+        // Blank lines and comment-only lines inside the block carry no content.
+        let spaced = front_matter_config("---\nconfig:\n\n  # note\n  theme: forest\n---\npie");
+        assert_eq!(spaced, Some(json!({"theme": "forest"})));
         assert_eq!(front_matter_config("pie\n  \"a\": 1"), None);
         assert_eq!(
             front_matter_config("---\nconfig:\n  theme: forest\npie"),
@@ -779,39 +782,59 @@ mod tests {
         assert_eq!(MermaidTheme::default(), MermaidTheme::Light);
     }
 
+    /// What the job of [`guarded`] does.
+    enum Job {
+        Value(u8),
+        PanicStr,
+        PanicString,
+        PanicOther,
+        Sleep,
+    }
+
+    /// Every test of the guard goes through this one closure, so a single instantiation of
+    /// [`run_guarded`] sees all of its outcomes.
+    fn guarded(
+        builder: thread::Builder,
+        limit: Duration,
+        job: Job,
+    ) -> Result<u8, UnsupportedReason> {
+        run_guarded(builder, limit, move || match job {
+            Job::Value(value) => value,
+            Job::PanicStr => panic!("boom str"),
+            Job::PanicString => panic!("{}", String::from("boom string")),
+            Job::PanicOther => std::panic::panic_any(42_u8),
+            Job::Sleep => {
+                thread::sleep(Duration::from_millis(400));
+                0
+            }
+        })
+    }
+
     #[test]
     fn guard_reports_panics_overruns_and_spawn_failures() {
         let builder = || thread::Builder::new().stack_size(1 << 20);
+        let patient = Duration::from_secs(5);
+        assert_eq!(guarded(builder(), patient, Job::Value(7)), Ok(7));
         assert_eq!(
-            run_guarded(builder(), Duration::from_secs(5), || 7).expect("value"),
-            7
-        );
-        assert_eq!(
-            run_guarded::<()>(builder(), Duration::from_secs(5), || panic!("boom str")),
+            guarded(builder(), patient, Job::PanicStr),
             Err(UnsupportedReason::Crashed("boom str".to_owned()))
         );
         assert_eq!(
-            run_guarded::<()>(builder(), Duration::from_secs(5), || {
-                panic!("{}", String::from("boom string"))
-            }),
+            guarded(builder(), patient, Job::PanicString),
             Err(UnsupportedReason::Crashed("boom string".to_owned()))
         );
         assert_eq!(
-            run_guarded::<()>(builder(), Duration::from_secs(5), || {
-                std::panic::panic_any(42_u8)
-            }),
+            guarded(builder(), patient, Job::PanicOther),
             Err(UnsupportedReason::Crashed("unknown panic".to_owned()))
         );
         let limit = Duration::from_millis(20);
         assert_eq!(
-            run_guarded(builder(), limit, || thread::sleep(Duration::from_millis(
-                400
-            ))),
+            guarded(builder(), limit, Job::Sleep),
             Err(UnsupportedReason::TimedOut(limit))
         );
         // An address space reservation no machine can satisfy.
         let impossible = thread::Builder::new().stack_size(1 << 60);
-        let failed = run_guarded(impossible, Duration::from_secs(5), || ())
+        let failed = guarded(impossible, patient, Job::Value(7))
             .expect_err("no machine has that much address space");
         assert!(
             failed

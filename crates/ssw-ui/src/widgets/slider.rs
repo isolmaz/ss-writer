@@ -683,6 +683,16 @@ mod tests {
     }
 
     #[test]
+    fn kit_slider_idle_animation_frame_repaints_nothing() {
+        let (mut harness, mut slider, _) = placed(50.0);
+        harness.requests.take_invalidation();
+        harness.frame(&mut slider, 16);
+        assert!(harness.requests.invalidation().is_clean());
+        assert!(!harness.requests.animation_frame_requested());
+        assert_eq!(slider.value(), 50.0);
+    }
+
+    #[test]
     fn kit_slider_with_id_and_paint_damage() {
         let id = WidgetId::allocate();
         let mut slider = Slider::new("Volume", 0.0, 100.0, 50.0, 1.0).with_id(id);

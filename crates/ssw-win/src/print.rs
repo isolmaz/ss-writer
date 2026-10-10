@@ -58,7 +58,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::UI::Controls::Dialogs::{
     PD_ALLPAGES, PD_COLLATE, PD_NOCURRENTPAGE, PD_NOSELECTION, PD_PAGENUMS, PD_RESULT_PRINT,
-    PRINTDLGEXW, PRINTPAGERANGE, PrintDlgExW, START_PAGE_GENERAL,
+    PRINTDLGEXW, PRINTPAGERANGE, START_PAGE_GENERAL,
 };
 use windows::Win32::UI::Shell::SHCreateStreamOnFileEx;
 use windows::core::{GUID, HSTRING, Interface, Ref, implement};
@@ -77,7 +77,7 @@ const DIPS_PER_POINT: f32 = 96.0 / 72.0;
 /// Resolution for the parts of a page the printer cannot take as vectors.
 const RASTER_DPI: f32 = 150.0;
 /// Most page ranges the system dialog can return.
-const MAX_RANGES: usize = 16;
+pub(crate) const MAX_RANGES: usize = 16;
 
 /// What a print job draws with: the graphics devices, the image decoder and the canvas assets
 /// (scene renderer, images, text engine).
@@ -458,43 +458,44 @@ pub trait PrintDialogHost {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemPrintDialogHost;
 
-impl PrintDialogHost for SystemPrintDialogHost {
-    fn show(
-        &mut self,
-        owner: HWND,
-        request: &PrintDialogRequest,
-    ) -> Result<Option<PrintSelection>, WinError> {
-        let mut ranges = [PRINTPAGERANGE::default(); MAX_RANGES];
-        ranges[0] = PRINTPAGERANGE {
-            nFromPage: 1,
-            nToPage: request.page_count,
-        };
-        let mut dialog = PRINTDLGEXW {
-            lStructSize: size_of::<PRINTDLGEXW>() as u32,
-            hwndOwner: owner,
-            Flags: PD_ALLPAGES | PD_NOSELECTION | PD_NOCURRENTPAGE,
-            nPageRanges: 1,
-            nMaxPageRanges: MAX_RANGES as u32,
-            lpPageRanges: ranges.as_mut_ptr(),
-            nMinPage: 1,
-            nMaxPage: request.page_count,
-            nCopies: 1,
-            nStartPage: START_PAGE_GENERAL,
-            ..Default::default()
-        };
-        // SAFETY: `dialog` is initialized and points at `ranges`; both outlive the modal call.
-        let shown = unsafe { PrintDlgExW(&mut dialog) };
-        // The dialog allocates the device mode and names even when it fails half way.
-        let names = take_global_words(dialog.hDevNames);
-        free_global(dialog.hDevMode);
-        answer_from_dialog(
-            shown,
-            &dialog,
-            names.as_deref(),
-            &ranges,
-            request.page_count,
-        )
+/// The `PRINTDLGEXW` of `request` for a dialog owned by `owner`: all pages by default, no
+/// selection, no current page, one copy. Its page ranges are `ranges`, whose first entry is set
+/// to the whole document.
+pub(crate) fn dialog_for(
+    owner: HWND,
+    request: &PrintDialogRequest,
+    ranges: &mut [PRINTPAGERANGE; MAX_RANGES],
+) -> PRINTDLGEXW {
+    ranges[0] = PRINTPAGERANGE {
+        nFromPage: 1,
+        nToPage: request.page_count,
+    };
+    PRINTDLGEXW {
+        lStructSize: size_of::<PRINTDLGEXW>() as u32,
+        hwndOwner: owner,
+        Flags: PD_ALLPAGES | PD_NOSELECTION | PD_NOCURRENTPAGE,
+        nPageRanges: 1,
+        nMaxPageRanges: MAX_RANGES as u32,
+        lpPageRanges: ranges.as_mut_ptr(),
+        nMinPage: 1,
+        nMaxPage: request.page_count,
+        nCopies: 1,
+        nStartPage: START_PAGE_GENERAL,
+        ..Default::default()
     }
+}
+
+/// The answer of `dialog` after `PrintDlgExW` returned `shown`. Frees the device blocks the
+/// dialog allocated, which it does even when it fails half way.
+pub(crate) fn finish_dialog(
+    shown: windows::core::Result<()>,
+    dialog: &PRINTDLGEXW,
+    ranges: &[PRINTPAGERANGE; MAX_RANGES],
+    page_count: u32,
+) -> Result<Option<PrintSelection>, WinError> {
+    let names = take_global_words(dialog.hDevNames);
+    free_global(dialog.hDevMode);
+    answer_from_dialog(shown, dialog, names.as_deref(), ranges, page_count)
 }
 
 /// The selection `dialog` holds after `PrintDlgExW` returned `shown`; `names` is its
@@ -820,6 +821,54 @@ mod tests {
                 "show the print dialog failed: {}",
                 windows::core::Error::from(windows::Win32::Foundation::E_FAIL)
             )
+        );
+    }
+
+    #[test]
+    fn the_dialog_offers_every_page_and_its_answer_frees_the_device_blocks() {
+        let mut pages = [PRINTPAGERANGE::default(); MAX_RANGES];
+        let request = PrintDialogRequest { page_count: 7 };
+        let mut dialog = dialog_for(HWND::default(), &request, &mut pages);
+        assert_eq!(dialog.lStructSize as usize, size_of::<PRINTDLGEXW>());
+        assert_eq!(
+            dialog.Flags,
+            PD_ALLPAGES | PD_NOSELECTION | PD_NOCURRENTPAGE
+        );
+        assert_eq!(
+            (dialog.nMinPage, dialog.nMaxPage, dialog.nCopies),
+            (1, 7, 1)
+        );
+        assert_eq!(
+            (dialog.nPageRanges, dialog.nMaxPageRanges),
+            (1, MAX_RANGES as u32)
+        );
+        assert_eq!(dialog.nStartPage, START_PAGE_GENERAL);
+        assert_eq!((pages[0].nFromPage, pages[0].nToPage), (1, 7));
+        assert_eq!(dialog.lpPageRanges, pages.as_mut_ptr());
+
+        // Cancelled without any device block.
+        assert_eq!(finish_dialog(Ok(()), &dialog, &pages, 7).unwrap(), None);
+        // Printed: the printer is read from the names block, both blocks are freed.
+        dialog.dwResultAction = PD_RESULT_PRINT;
+        dialog.hDevNames = global_words(&devnames("Laser"));
+        dialog.hDevMode = global_words(&[0; 8]);
+        let selection = finish_dialog(Ok(()), &dialog, &pages, 7).unwrap().unwrap();
+        assert_eq!(selection.printer, "Laser");
+        assert_eq!(selection.copies, 1);
+        // A failed dialog is reported.
+        let mut failed = dialog;
+        failed.hDevNames = HGLOBAL::default();
+        failed.hDevMode = HGLOBAL::default();
+        let error = finish_dialog(
+            Err(windows::Win32::Foundation::E_FAIL.into()),
+            &failed,
+            &pages,
+            7,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().starts_with("show the print dialog"),
+            "{error}"
         );
     }
 

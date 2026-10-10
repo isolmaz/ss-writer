@@ -221,6 +221,9 @@ pub fn phase_frames(run: &Value, phase: u64) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The phase number of the flick sweep frames (`ssw_app::perf::PHASE_FLICK`).
+const FLICK_PHASE: u64 = 4;
+
 /// One stage of the frames of `phase`, in order: `Span(to, from)` is the time between two
 /// moments of a frame, `Duration(name)` a column that already holds a duration. A frame of a
 /// report that predates the column has no value.
@@ -431,6 +434,65 @@ pub fn metrics_for(scenario: &str, runs: &[Value]) -> Vec<Metric> {
                 ),
             ];
             metrics.extend(stages);
+            // The flick sweep: the same targets for a realistic fast flick (phase 4).
+            let flick = |r: &Value| phase_frames(r, FLICK_PHASE);
+            let flick_intervals =
+                |r: &Value| -> Vec<f64> { flick(r).windows(2).map(|w| w[1].1 - w[0].1).collect() };
+            metrics.extend([
+                metric(
+                    "flick_draw_p95_ms",
+                    per_run(&|r| {
+                        percentile(&flick(r).iter().map(|f| f.0).collect::<Vec<_>>(), 95.0)
+                    }),
+                    limit(
+                        refresh_ms,
+                        "§14: scrolling at refresh rate: draw fits one refresh interval",
+                    ),
+                ),
+                metric(
+                    "flick_interval_median_ms",
+                    per_run(&|r| median(&flick_intervals(r))),
+                    limit(
+                        refresh_ms * 1.1,
+                        "§14: median frame interval <= 1.1 x refresh interval",
+                    ),
+                ),
+                metric(
+                    "flick_interval_p95_ms",
+                    per_run(&|r| percentile(&flick_intervals(r), 95.0)),
+                    limit(
+                        refresh_ms * 1.5,
+                        "§14: p95 frame interval <= 1.5 x refresh interval",
+                    ),
+                ),
+                metric(
+                    "flick_frames",
+                    per_run(&|r| Some(flick(r).len() as f64)),
+                    None,
+                ),
+                metric(
+                    "flick_editor_layout_median_ms",
+                    per_run(&|r| {
+                        median(&phase_stage(
+                            r,
+                            FLICK_PHASE,
+                            Stage::Duration("editor_layout_ms"),
+                        ))
+                    }),
+                    None,
+                ),
+                metric(
+                    "flick_editor_paint_median_ms",
+                    per_run(&|r| {
+                        median(&phase_stage(
+                            r,
+                            FLICK_PHASE,
+                            Stage::Duration("editor_paint_ms"),
+                        ))
+                    }),
+                    None,
+                ),
+            ]);
             metrics
         }
         "folder-10k" => vec![
@@ -819,6 +881,53 @@ mod tests {
             .find(|m| m.name == "scroll_layout_median_ms")
             .unwrap();
         assert!(none.values.is_empty());
+    }
+
+    #[test]
+    fn the_flick_sweep_has_metrics_of_its_own_with_the_targets_of_the_stress_sweep() {
+        // Refresh 100 Hz (10 ms). Stress frames (phase 2) draw in 8 and 9 ms; the flick frames
+        // (phase 4) draw in 2, 3 and 4 ms and are presented 5 ms, then 20 ms apart.
+        let run = json!({
+            "refresh_hz": 100.0,
+            "frames": {
+                "phase": [2, 2, 5, 4, 4, 4],
+                "start_ms": [0.0, 20.0, 40.0, 100.0, 105.0, 110.0],
+                "ready_ms": [0.0, 20.0, 40.0, 100.0, 105.0, 110.0],
+                "recorded_ms": [7.0, 28.0, 60.0, 101.0, 106.0, 111.0],
+                "drawn_ms": [8.0, 29.0, 61.0, 102.0, 108.0, 114.0],
+                "presented_ms": [9.0, 30.0, 62.0, 103.0, 108.0, 128.0],
+                "layout_ms": [0.0, 0.0, 0.0, 1.0, 1.0, 2.0],
+                "editor_layout_ms": [0.0, 0.0, 0.0, 0.5, 1.0, 1.5],
+                "editor_paint_ms": [0.0, 0.0, 0.0, 0.25, 0.5, 0.75]
+            }
+        });
+        let open = metrics_for("open-60k", &[run.clone(), run]);
+        let get = |name: &str| open.iter().find(|m| m.name == name).unwrap().clone();
+        assert_eq!(get("flick_draw_p95_ms").values, [4.0, 4.0]);
+        assert_eq!(get("flick_interval_median_ms").values, [12.5, 12.5]);
+        assert_eq!(get("flick_interval_p95_ms").values, [20.0, 20.0]);
+        assert_eq!(get("flick_frames").values, [3.0, 3.0]);
+        assert_eq!(get("flick_editor_layout_median_ms").values, [1.0, 1.0]);
+        assert_eq!(get("flick_editor_paint_median_ms").values, [0.5, 0.5]);
+        for (name, limit) in [
+            ("flick_draw_p95_ms", 10.0),
+            ("flick_interval_median_ms", 11.0),
+            ("flick_interval_p95_ms", 15.0),
+        ] {
+            let target = get(name).target.unwrap();
+            assert!((target.limit - limit).abs() < 1e-9, "{name}");
+        }
+        assert_eq!(get("flick_draw_p95_ms").verdict(), Verdict::Pass);
+        assert_eq!(get("flick_interval_median_ms").verdict(), Verdict::Fail);
+        // The stress sweep keeps its own frames and targets: the jump frame (phase 5) is in
+        // neither of them.
+        assert_eq!(get("scroll_frames").values, [2.0, 2.0]);
+        assert_eq!(get("scroll_draw_p95_ms").target.unwrap().limit, 10.0);
+        // A report without flick frames contributes no flick values.
+        let none = metrics_for("open-60k", &[json!({ "refresh_hz": 100.0 })]);
+        let flick = none.iter().find(|m| m.name == "flick_draw_p95_ms").unwrap();
+        assert!(flick.values.is_empty());
+        assert_eq!(flick.verdict(), Verdict::Fail);
     }
 
     #[test]

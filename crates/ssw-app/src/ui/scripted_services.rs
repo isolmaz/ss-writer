@@ -508,6 +508,22 @@ mod tests {
     }
 
     #[test]
+    fn a_quiet_shell_records_without_printing() {
+        // The echoing shell above never takes the quiet path of `record`.
+        let services = ScriptedServices::new();
+        let mut shell = services.shell();
+        assert_eq!(shell.open_default_apps_settings(), Ok(()));
+        assert_eq!(shell.open_url("https://example.org/"), Ok(()));
+        assert_eq!(
+            services.shell_log(),
+            vec![
+                ShellRecord::OpenDefaultApps,
+                ShellRecord::OpenUrl("https://example.org/".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn echoing_services_still_answer_and_record() {
         let services = ScriptedServices::echoing();
         let mut dialogs = services.dialogs();

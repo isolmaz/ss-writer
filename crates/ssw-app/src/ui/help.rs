@@ -449,8 +449,10 @@ mod tests {
         // The database's folder is a file: the store cannot be opened (the schedule lives in it).
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, "x").unwrap();
-        let outcome = run_check(false, &blocker.join("state.db"), &WinHttp, 0);
-        assert!(matches!(outcome, Err(UpdateError::Store(_))), "{outcome:?}");
+        let error = run_check(false, &blocker.join("state.db"), &WinHttp, 0).unwrap_err();
+        // The failure of the store, not of the network.
+        let shown = format!("{error:?}");
+        assert!(shown.starts_with("Store("), "{shown}");
     }
 
     #[test]

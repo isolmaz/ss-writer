@@ -18,7 +18,7 @@ file's results section) and, for what a process cannot see about itself, by hand
    | scenario | flags | what happens |
    |---|---|---|
    | `startup` | `--perf-scenario startup` | no document; ends after the first content frame |
-   | `open-60k` | `--perf-scenario open-60k --perf-target <file>` | after the first frame and a 400 ms settle the file is opened in the running app, then the editor is scrolled programmatically through the whole document by a fixed step per frame (`--perf-scroll-step`, default 600 DIP) |
+   | `open-60k` | `--perf-scenario open-60k --perf-target <file>` | after the first frame and a 400 ms settle the file is opened in the running app, then the editor is scrolled programmatically in two sweeps. The **stress sweep** moves through the whole document by a large fixed step per frame (`--perf-scroll-step`, default 600 DIP, about three quarters of a viewport: nearly every frame needs blocks that were not on screen, about 25 per frame in the fixture). The editor then goes back to the top (one cold frame, phase `jump`, counted in neither sweep) and the **flick sweep** moves down by 48 DIP per frame (about 6 900 DIP/s at 144 Hz, a fast but realistic flick) for 1 200 frames or to the end of the document: about one new block per frame, which is what a user's scrolling asks of the editor |
    | `folder-10k` | `--perf-scenario folder-10k --perf-target <folder>` | the folder becomes the sidebar's workspace, then its index is built |
    | `type-latency` | `--perf-scenario type-latency` | 120 characters are *posted* (`PostMessageW`) to the app's own window, one per frame |
 
@@ -44,8 +44,8 @@ Marks (`ssw_win::perf`, `ssw_app::perf`): `main_entered`, `startup_done`, `d3d_d
 (device worker thread), `devices_received`, `window_created`, `backdrop_applied` (Mica attribute
 set), `graphics_attached`, `window_shown`, `first_present`, `first_content_painted`,
 `first_content_present`, `doc_open_begin`, `doc_read`, `doc_decoded`, `doc_parsed`,
-`doc_open_returned`, `doc_painted`, `doc_presented`, `scroll_begin`, `scroll_end`,
-`folder_open_begin`, `folder_open_returned`, `tree_painted`, `tree_presented`, `index_requested`,
+`doc_open_returned`, `doc_painted`, `doc_presented`, `scroll_begin`, `scroll_end`, `flick_begin`,
+`flick_end`, `folder_open_begin`, `folder_open_returned`, `tree_painted`, `tree_presented`, `index_requested`,
 `index_started`, `index_finished`, `type_begin`, `type_end`.
 
 Startup order (production, `UiApp::start` with `DeviceStart::Defer`): the device worker is spawned
@@ -82,12 +82,16 @@ the limit.
 | `scroll_draw_p95_ms` | p95 of draw time (layout + `EndDraw`) of the scroll frames | <= one refresh interval |
 | `scroll_interval_median_ms` | median time between two presented scroll frames | <= 1.1 x refresh interval |
 | `scroll_interval_p95_ms` | p95 of that interval | <= 1.5 x refresh interval |
+| `flick_draw_p95_ms` | the same as `scroll_draw_p95_ms`, over the frames of the flick sweep (48 DIP per frame) | <= one refresh interval |
+| `flick_interval_median_ms` | the same as `scroll_interval_median_ms`, flick sweep | <= 1.1 x refresh interval |
+| `flick_interval_p95_ms` | the same as `scroll_interval_p95_ms`, flick sweep | <= 1.5 x refresh interval |
 | `type_latency_ms` | `WM_CHAR` receipt to `Present` returned | <= 2 frames |
 
 Reported without target: the startup breakdown (`main_entered_ms`, `startup_done_ms`,
 `d3d_device_ready_ms`, `window_created_ms`, `backdrop_applied_ms`, `first_present_ms`), the open
 breakdown (`open_read_ms`, `open_decode_parse_ms`, `open_layout_paint_ms`, `open_present_ms`),
-`scroll_frames`, `tree_visible_ms` (folder open to the sidebar rows presented), `index_ms` (index
+`scroll_frames`, `flick_frames`, `flick_editor_layout_median_ms`, `flick_editor_paint_median_ms`,
+`tree_visible_ms` (folder open to the sidebar rows presented), `index_ms` (index
 job on its worker) and `index_wait_ms` (workspace shown, which is when the app requests its
 index, to job start).
 
@@ -96,8 +100,14 @@ index, to job start).
 - `type_latency_ms` is a **proxy**. It stops at the return of `Present`, not at the photon: the
   compositor, the display pipeline and the panel add their own latency (typically one to two
   refresh intervals more). It also starts at message receipt, not at the key switch.
-- The scroll step is programmatic (`EditorView::set_scroll_y` per frame), not a wheel or touch
-  gesture; DirectManipulation inertia is not exercised.
+- The scroll steps are programmatic (`EditorView::set_scroll_y` per frame), not a wheel or touch
+  gesture; DirectManipulation inertia is not exercised. The 600 DIP stress step is deliberately
+  far beyond any real scrolling and its targets are kept; the flick sweep (48 DIP per frame) is
+  the realistic case.
+- Spell checking runs between frames, never inside one: the editor lays blocks out and paints
+  them without waiting for the checker, and the host runs the checks of the painted blocks in
+  slices of 2 ms once nothing was repainted for 40 ms, then repaints to show the squiggles.
+  Neither sweep includes that work (their frames are always closer together than 40 ms).
 - `Present(1)` pacing of an off-screen window depends on DWM; the draw-time metric does not.
   The refresh rate reported is the primary display's (`DwmGetCompositionTimingInfo`).
 - `window_frame_ms` is the moment the window was shown, not the moment DWM composed the frame.
@@ -123,46 +133,80 @@ For the input-to-photon target as the user sees it (belongs in `docs/manual-test
 
 <!-- perf-results:begin -->
 
-Runs per scenario: 5. Display refresh: 144.00 Hz. A target passes when the p95 over the runs (or over all samples for `type_latency_ms`) is within its limit.
+Measured at commit `a635e70` (before the second scrolling round described below).
+
+Runs per scenario: 3. Display refresh: 144.00 Hz. A target passes when the p95 over the runs (or over all samples for `type_latency_ms`) is within its limit.
 
 ### startup
 
 | Metric | Target | Median | p95 | n | Verdict |
 |---|---|---:|---:|---:|---|
-| window_frame_ms | <= 150.00 (§14: window frame with Mica < 150 ms) | 305.26 | 318.22 | 5 | FAIL |
-| first_content_frame_ms | <= 370.00 (§14: bounded by device creation (205-370 ms)) | 305.23 | 318.17 | 5 | pass |
-| main_entered_ms | - | 16.27 | 24.80 | 5 | info |
-| startup_done_ms | - | 27.84 | 42.56 | 5 | info |
-| d3d_device_ready_ms | - | 200.65 | 208.41 | 5 | info |
-| window_created_ms | - | 263.72 | 272.60 | 5 | info |
-| backdrop_applied_ms | - | 263.76 | 272.64 | 5 | info |
-| first_present_ms | - | 305.23 | 318.17 | 5 | info |
+| window_frame_ms | <= 150.00 (§14: window frame with Mica < 150 ms) | 135.14 | 141.88 | 3 | pass |
+| first_content_frame_ms | <= 370.00 (§14: bounded by device creation (205-370 ms)) | 202.94 | 212.05 | 3 | pass |
+| main_entered_ms | - | 15.87 | 21.22 | 3 | info |
+| startup_done_ms | - | 27.16 | 37.08 | 3 | info |
+| d3d_device_ready_ms | - | 191.19 | 200.81 | 3 | info |
+| window_created_ms | - | 102.78 | 110.51 | 3 | info |
+| backdrop_applied_ms | - | 102.81 | 110.56 | 3 | info |
+| first_present_ms | - | 202.94 | 212.05 | 3 | info |
 
 ### open-60k
 
 | Metric | Target | Median | p95 | n | Verdict |
 |---|---|---:|---:|---:|---|
-| open_ms | <= 300.00 (§14: open < 300 ms) | 223.35 | 232.24 | 5 | pass |
-| open_read_ms | - | 1.12 | 1.16 | 5 | info |
-| open_decode_parse_ms | - | 106.48 | 110.28 | 5 | info |
-| open_layout_paint_ms | - | 114.39 | 122.47 | 5 | info |
-| open_present_ms | - | 0.08 | 0.08 | 5 | info |
-| scroll_draw_p95_ms | <= 6.94 (§14: scrolling at refresh rate: draw fits one refresh interval) | 19.14 | 20.87 | 5 | FAIL |
-| scroll_interval_median_ms | <= 7.64 (§14: median frame interval <= 1.1 x refresh interval) | 17.29 | 17.52 | 5 | FAIL |
-| scroll_interval_p95_ms | <= 10.42 (§14: p95 frame interval <= 1.5 x refresh interval) | 19.32 | 21.07 | 5 | FAIL |
-| scroll_frames | - | 2288.00 | 2288.00 | 5 | info |
+| open_ms | <= 300.00 (§14: open < 300 ms) | 214.10 | 448.54 | 3 | FAIL |
+| open_read_ms | - | 1.13 | 1.20 | 3 | info |
+| open_decode_parse_ms | - | 104.53 | 227.04 | 3 | info |
+| open_layout_paint_ms | - | 106.04 | 217.44 | 3 | info |
+| open_present_ms | - | 0.86 | 1.02 | 3 | info |
+| scroll_draw_p95_ms | <= 6.94 (§14: scrolling at refresh rate: draw fits one refresh interval) | 16.12 | 17.03 | 3 | FAIL |
+| scroll_interval_median_ms | <= 7.64 (§14: median frame interval <= 1.1 x refresh interval) | 14.95 | 14.98 | 3 | FAIL |
+| scroll_interval_p95_ms | <= 10.42 (§14: p95 frame interval <= 1.5 x refresh interval) | 16.24 | 17.18 | 3 | FAIL |
+| scroll_frames | - | 2288.00 | 2288.00 | 3 | info |
+| scroll_setup_median_ms | - | 0.01 | 0.01 | 3 | info |
+| scroll_setup_p95_ms | - | 0.02 | 0.02 | 3 | info |
+| scroll_code_median_ms | - | 14.66 | 14.69 | 3 | info |
+| scroll_code_p95_ms | - | 15.90 | 16.83 | 3 | info |
+| scroll_layout_median_ms | - | 13.46 | 13.46 | 3 | info |
+| scroll_layout_p95_ms | - | 14.66 | 15.36 | 3 | info |
+| scroll_editor_layout_median_ms | - | 13.45 | 13.45 | 3 | info |
+| scroll_editor_layout_p95_ms | - | 14.65 | 15.36 | 3 | info |
+| scroll_editor_paint_median_ms | - | 1.18 | 1.21 | 3 | info |
+| scroll_editor_paint_p95_ms | - | 1.48 | 1.53 | 3 | info |
+| scroll_enddraw_median_ms | - | 0.17 | 0.17 | 3 | info |
+| scroll_enddraw_p95_ms | - | 0.27 | 0.27 | 3 | info |
+| scroll_present_median_ms | - | 0.06 | 0.06 | 3 | info |
+| scroll_present_p95_ms | - | 0.08 | 0.09 | 3 | info |
 
 ### folder-10k
 
 | Metric | Target | Median | p95 | n | Verdict |
 |---|---|---:|---:|---:|---|
-| tree_visible_ms | - | 4.52 | 8.60 | 5 | info |
-| index_ms | - | 1653.87 | 1687.31 | 5 | info |
-| index_wait_ms | - | 0.37 | 0.46 | 5 | info |
+| tree_visible_ms | - | 2.87 | 2.87 | 3 | info |
+| index_ms | - | 1255.80 | 1281.27 | 3 | info |
+| index_wait_ms | - | 0.38 | 0.43 | 3 | info |
 
 ### type-latency
 
 | Metric | Target | Median | p95 | n | Verdict |
 |---|---|---:|---:|---:|---|
-| type_latency_ms | <= 13.89 (§14: input-to-photon <= 2 frames (proxy: message to Present)) | 5.29 | 8.41 | 600 | pass |
+| type_latency_ms | <= 13.89 (§14: input-to-photon <= 2 frames (proxy: message to Present)) | 2.57 | 5.45 | 360 | pass |
 <!-- perf-results:end -->
+
+## Known issues
+
+- **Scrolling a 60 000-line document misses the refresh-rate target in the stress sweep.** At
+  600 DIP per frame (three quarters of a viewport of new content every frame) a frame takes
+  about 16 ms at p95 against a 6.94 ms budget at 144 Hz (19 ms before the layout cache). Nearly
+  all of it is the editor measuring newly visible blocks (`scroll_editor_layout_*`); painting,
+  `EndDraw` and `Present` together stay under 1.5 ms.
+- A second round is in the code but not yet measured: spell checking moved out of block
+  measurement to idle time (at most 2 ms per idle turn), DirectWrite text formats cached by font,
+  cluster metrics skipped for blocks without inline objects, and the per-table clip layer
+  replaced by a rounded fill of the last row. The open-60k scenario also gained a realistic
+  fast-flick sweep (48 DIP per frame) with its own `flick_*` metrics; the stress targets were not
+  relaxed.
+- Next candidates if the stress sweep still misses: lay out table cells lazily, reuse the
+  layouts of blocks that scroll out and back in, and measure blocks ahead of the viewport on idle.
+- `open_ms` had one slow run (448 ms) among three; the other two were 214 ms. Not yet
+  investigated.

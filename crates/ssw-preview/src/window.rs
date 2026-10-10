@@ -386,11 +386,11 @@ impl WindowState {
             WM_GETDLGCODE => (Some(LRESULT(DLGC_WANTARROWS)), After::None),
             WM_SETCURSOR => {
                 if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
-                    // SAFETY: loads and sets a stock cursor.
+                    // SAFETY: loads and sets a stock cursor; one that cannot be loaded (the
+                    // stock resources always load) leaves the cursor as it is.
                     unsafe {
-                        if let Ok(cursor) = LoadCursorW(None, cursor_resource(self.cursor)) {
-                            SetCursor(Some(cursor));
-                        }
+                        let _ = LoadCursorW(None, cursor_resource(self.cursor))
+                            .map(|cursor| SetCursor(Some(cursor)));
                     }
                     (Some(LRESULT(1)), After::None)
                 } else {
@@ -837,12 +837,16 @@ mod tests {
     use ssw_win::com::ComGuard;
     use ssw_win::dwrite::DWriteEngine;
     use ssw_win::theme::{Win32Settings, read_system_theme};
+    use windows::Win32::Foundation::E_NOTIMPL;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::Shell::{IPreviewHandlerFrame_Impl, PREVIEWHANDLERFRAMEINFO};
     #[cfg(feature = "fault-injection")]
     use windows::Win32::UI::WindowsAndMessaging::{GW_CHILD, GetWindow};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassInfoExW, GetCursor, GetParent, HTCAPTION, SendMessageW, SetTimer, WINDOW_EX_STYLE,
         WS_OVERLAPPEDWINDOW,
     };
+    use windows::core::implement;
 
     use super::*;
 
@@ -954,6 +958,45 @@ mod tests {
     /// `x | y << 16` as a mouse message's `lParam`.
     fn pack(x: i32, y: i32) -> isize {
         ((y as u16 as isize) << 16) | (x as u16 as isize)
+    }
+
+    /// A document many panes tall.
+    fn long_document() -> String {
+        (0..80)
+            .map(|i| format!("Paragraph {i} of the long document.\n\n"))
+            .collect()
+    }
+
+    /// Sends `msg` (a wheel message) of `notches` notches (positive: wheel up) at the client
+    /// point (50, 50) of `hwnd`; wheel messages carry screen coordinates.
+    fn wheel(hwnd: HWND, msg: u32, notches: i16) -> isize {
+        let mut point = POINT { x: 50, y: 50 };
+        // SAFETY: converts a point of our own window to screen coordinates.
+        assert!(unsafe { ClientToScreen(hwnd, &mut point) }.as_bool());
+        let delta = (notches * 120) as u16 as usize;
+        send(hwnd, msg, delta << 16, pack(point.x, point.y))
+    }
+
+    /// A host frame that records the key messages it is offered.
+    #[implement(IPreviewHandlerFrame)]
+    struct Frame {
+        keys: Rc<RefCell<Vec<(u32, usize)>>>,
+    }
+
+    #[allow(non_snake_case)]
+    impl IPreviewHandlerFrame_Impl for Frame_Impl {
+        fn GetWindowContext(&self) -> windows::core::Result<PREVIEWHANDLERFRAMEINFO> {
+            Err(E_NOTIMPL.into())
+        }
+
+        fn TranslateAccelerator(&self, pmsg: *const MSG) -> windows::core::Result<()> {
+            // SAFETY: the window passes a valid message.
+            let message = unsafe { *pmsg };
+            self.keys
+                .borrow_mut()
+                .push((message.message, message.wParam.0));
+            Ok(())
+        }
     }
 
     fn class_registered() -> bool {
@@ -1241,10 +1284,7 @@ mod tests {
 
     #[test]
     fn dragging_below_the_pane_scrolls_on_the_autoscroll_timer_until_the_button_is_released() {
-        let text: String = (0..80)
-            .map(|i| format!("Paragraph {i} of the long document.\n\n"))
-            .collect();
-        let rig = rig(&text);
+        let rig = rig(&long_document());
         let hwnd = rig.window.hwnd();
         let timers = Rc::clone(&rig.window.state.borrow().timers);
         send(hwnd, WM_LBUTTONDOWN, 1, pack(30, 40));
@@ -1388,20 +1428,20 @@ mod tests {
         // failure falls into the text layout before the drawing are no device loss; the
         // first one that reaches the drawing is, and the retry on the rebuilt devices meets no
         // failure.
-        let mut rebuilt_by = None;
-        for call in 0..32 {
+        let rebuilt_by = (0..32).find(|&call| {
             ssw_win::fault::arm_with(call, ssw_win::com::D2DERR_RECREATE_TARGET);
             state.paint();
             let reached = ssw_win::fault::tripped();
             ssw_win::fault::disarm();
             assert!(reached, "the frame has a platform call number {call}");
             assert!(!state.painting);
-            if generation(&state) == Some(2) {
-                rebuilt_by = Some(call);
-                break;
-            }
-            assert_eq!(generation(&state), Some(1), "only a lost device is rebuilt");
-        }
+            let devices = generation(&state);
+            assert!(
+                (Some(1)..=Some(2)).contains(&devices),
+                "only a lost device is rebuilt, and only once: {devices:?}"
+            );
+            devices == Some(2)
+        });
         assert!(rebuilt_by.is_some(), "a lost device was never rebuilt");
         let surface = state.graphics.as_ref().unwrap().surface.size_px();
         assert_eq!(
@@ -1445,6 +1485,106 @@ mod tests {
         rig.window.focus();
         // SAFETY: a plain query of the thread's focus window.
         assert_eq!(unsafe { GetFocus() }, hwnd);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_document_and_a_sideways_notch_leaves_the_lines_alone() {
+        let rig = rig(&long_document());
+        let hwnd = rig.window.hwnd();
+        assert_eq!(rig.window.scroll_y(), Some(0.0));
+        assert_eq!(wheel(hwnd, WM_MOUSEWHEEL, -1), 0);
+        let one = rig.window.scroll_y().unwrap();
+        assert!(one > 0.0, "{one}");
+        wheel(hwnd, WM_MOUSEWHEEL, -1);
+        let two = rig.window.scroll_y().unwrap();
+        assert!(two > one, "{two} after {one}");
+        assert_eq!(wheel(hwnd, WM_MOUSEHWHEEL, 1), 0);
+        assert_eq!(
+            rig.window.scroll_y(),
+            Some(two),
+            "a sideways notch does not scroll down"
+        );
+        wheel(hwnd, WM_MOUSEWHEEL, 2);
+        assert!(
+            rig.window.scroll_y().unwrap().abs() < 0.5,
+            "two notches up undo two notches down"
+        );
+    }
+
+    #[test]
+    fn keys_the_pane_does_not_use_go_to_the_hosts_frame_and_the_others_stay_in_the_pane() {
+        let rig = rig("Some text to move through.\n");
+        let hwnd = rig.window.hwnd();
+        let down = |msg| send(hwnd, msg, 0x28, 0);
+        assert_eq!(down(WM_KEYDOWN), 0, "without a frame the key goes nowhere");
+        let keys = Rc::new(RefCell::new(Vec::new()));
+        let frame: IPreviewHandlerFrame = Frame {
+            keys: Rc::clone(&keys),
+        }
+        .into();
+        // SAFETY: a plain call on our own COM object.
+        let context = unsafe { frame.GetWindowContext() };
+        assert_eq!(context.unwrap_err().code(), E_NOTIMPL);
+        rig.window.set_frame(Some(frame));
+        assert_eq!(down(WM_KEYDOWN), 0, "the key is dealt with once forwarded");
+        assert_eq!(
+            *keys.borrow(),
+            [(WM_KEYDOWN, 0x28)],
+            "an unfocused pane passes the key on"
+        );
+        // SAFETY: default processing of a message to our own window.
+        let default = unsafe { DefWindowProcW(hwnd, WM_SYSKEYDOWN, WPARAM(0x28), LPARAM(0)) };
+        assert_eq!(
+            down(WM_SYSKEYDOWN),
+            default.0,
+            "a system key keeps its default processing"
+        );
+        assert_eq!(
+            keys.borrow().len(),
+            2,
+            "and is offered to the frame as well"
+        );
+        assert_eq!(keys.borrow()[1], (WM_SYSKEYDOWN, 0x28));
+        assert_eq!(send(hwnd, WM_SETFOCUS, 0, 0), 0);
+        assert_eq!(down(WM_KEYDOWN), 0);
+        assert_eq!(
+            keys.borrow().len(),
+            2,
+            "a focused pane keeps the arrow keys"
+        );
+        assert_eq!(send(hwnd, WM_KILLFOCUS, 0, 0), 0);
+        assert_eq!(down(WM_KEYDOWN), 0);
+        assert_eq!(
+            keys.borrow().len(),
+            3,
+            "an unfocused pane passes it on again"
+        );
+        rig.window.set_frame(None);
+        assert_eq!(down(WM_KEYDOWN), 0);
+        assert_eq!(keys.borrow().len(), 3, "the replaced frame is not asked");
+    }
+
+    #[test]
+    fn rendering_draws_the_content_at_the_asked_size_and_leaves_the_window_alone() {
+        let rig = rig("# Title\n\nSome text\n");
+        let image = rig.window.render(300, 120, 96).unwrap();
+        assert_eq!((image.width, image.height), (300, 120));
+        assert_eq!(image.bgra.len(), 300 * 120 * 4);
+        let (pixels, _) = image.bgra.as_chunks::<4>();
+        assert!(
+            pixels.iter().any(|pixel| *pixel != pixels[0]),
+            "the heading is drawn on the background"
+        );
+        {
+            let state = rig.window.state.borrow();
+            assert_eq!(state.size_px, (600, 400), "the window keeps its own size");
+            assert_eq!(state.dpi, window_dpi(rig.window.hwnd()));
+        }
+        assert_eq!(
+            rig.window.render(300, 120, 96).unwrap(),
+            image,
+            "a second rendering starts from the same layout"
+        );
     }
 
     #[cfg(feature = "fault-injection")]

@@ -769,6 +769,26 @@ mod tests {
     }
 
     #[test]
+    fn kit_textbox_measure_takes_the_offered_width_or_its_default() {
+        let mut harness = Harness::new();
+        let mut textbox = TextBox::new("Name", "", clipboard());
+        let offered = harness.measure(&mut textbox, crate::geometry::Size::new(120.0, 40.0));
+        assert_eq!(offered, crate::geometry::Size::new(120.0, CONTROL_HEIGHT));
+        let free = harness.measure(&mut textbox, crate::geometry::Size::UNBOUNDED);
+        assert_eq!(
+            free,
+            crate::geometry::Size::new(DEFAULT_WIDTH, CONTROL_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn kit_textbox_without_text_or_placeholder_draws_no_text() {
+        let (mut harness, textbox, _) = setup("");
+        let canvas = harness.paint(&textbox);
+        assert!(canvas.texts().is_empty());
+    }
+
+    #[test]
     fn kit_textbox_typing_replaces_selection_and_strips_line_breaks() {
         let (mut harness, mut textbox, _) = setup("");
         harness.text(&mut textbox, "hello");

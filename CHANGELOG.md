@@ -12,7 +12,7 @@ First release.
 
 #### Plain text
 
-- Plain text mode (spec §4.1): View → Word wrap for text files, which wrap long lines at the window edge by default; switched off, every line stays on one row and the view scrolls sideways (Shift+wheel, a horizontal wheel, the caret, UI Automation). View → Render as Markdown shows a text file as live Markdown (headings in the inspector, Markdown paste and copy) without changing how it is saved: file name, encoding, BOM and line endings stay. Both items are checkable, enabled only for plain text files, listed in the command palette and have no default shortcut (assignable in Settings → Shortcuts). Word wrap belongs to the tab and Render as Markdown to the document; neither is stored between sessions.
+- Plain text mode: View → Word wrap for text files, which wrap long lines at the window edge by default; switched off, every line stays on one row and the view scrolls sideways (Shift+wheel, a horizontal wheel, the caret, UI Automation). View → Render as Markdown shows a text file as live Markdown (headings in the inspector, Markdown paste and copy) without changing how it is saved: file name, encoding, BOM and line endings stay. Both items are checkable, enabled only for plain text files, listed in the command palette and have no default shortcut (assignable in Settings → Shortcuts). Word wrap belongs to the tab and Render as Markdown to the document; neither is stored between sessions.
 
 #### Window and appearance
 

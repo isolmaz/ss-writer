@@ -29,8 +29,13 @@ use thiserror::Error;
 use crate::scene::Scene;
 use crate::svg_to_scene::svg_to_scene;
 
-/// Longest time [`render_mermaid`] waits for a diagram.
-pub const RENDER_LIMIT: Duration = Duration::from_millis(500);
+/// Longest time [`render_mermaid`] waits for a diagram. Unoptimized builds (tests, coverage on
+/// shared CI machines) are many times slower, so they get more time.
+pub const RENDER_LIMIT: Duration = if cfg!(debug_assertions) {
+    Duration::from_secs(10)
+} else {
+    Duration::from_millis(500)
+};
 
 /// Font family of every diagram (a user `fontFamily` overrides it).
 pub const FONT_FAMILY: &str = "\"Segoe UI\", sans-serif";
@@ -101,6 +106,8 @@ pub fn render_mermaid(src: &str, theme: MermaidTheme) -> MermaidOutcome {
 /// Like [`render_mermaid`] with an explicit time limit (export may allow more than an editor
 /// preview).
 pub fn render_mermaid_within(src: &str, theme: MermaidTheme, limit: Duration) -> MermaidOutcome {
+    // The font list is loaded once per process; it does not count against the limit.
+    crate::svg_to_scene::load_system_fonts();
     let src = src.to_owned();
     let builder = thread::Builder::new()
         .name("mermaid".to_owned())

@@ -1,6 +1,6 @@
 # SS Writer
 
-**Markdown & Text Editor** for Windows 11.
+**Markdown & Text Editor** for Windows 11. Website: <https://sswriter.isolmaz.com>
 
 [![CI](https://github.com/isolmaz/ss-writer/actions/workflows/ci.yml/badge.svg)](https://github.com/isolmaz/ss-writer/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/isolmaz/ss-writer)](https://github.com/isolmaz/ss-writer/releases/latest)

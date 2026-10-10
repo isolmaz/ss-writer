@@ -50,6 +50,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      - name: Desktop like Windows 11 (screen, animations, long temp paths)
+        shell: pwsh
+        run: .github/scripts/desktop.ps1
       - name: Tests
         run: cargo nextest run --workspace --all-features --locked
       - name: Doc tests
@@ -66,6 +69,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
+      - name: Desktop like Windows 11 (screen, animations, long temp paths)
+        shell: pwsh
+        run: .github/scripts/desktop.ps1
       - name: Coverage
         run: cargo xtask coverage
       - name: Keep the report

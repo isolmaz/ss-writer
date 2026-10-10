@@ -273,6 +273,12 @@ fn with_several_languages_a_word_is_flagged_only_when_every_language_rejects_it(
     let us = factory.checker(&["en-US".to_owned()]).unwrap();
     let nonsense = unique_word();
     let text = format!("The colour of {nonsense}");
+    // Some installations (Windows Server) report en-GB as supported but check it with the
+    // American word list; there is no second language to combine then.
+    let gb = factory.checker(&["en-GB".to_owned()]).unwrap();
+    if flagged(&gb.check(&text).unwrap(), &text).contains(&"colour") {
+        return;
+    }
     // "colour" is wrong in American English only.
     assert!(flagged(&us.check(&text).unwrap(), &text).contains(&"colour"));
     let words = flagged(&both.check(&text).unwrap(), &text);

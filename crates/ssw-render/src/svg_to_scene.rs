@@ -35,6 +35,13 @@ static SYSTEM_FONTS: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
     Arc::new(db)
 });
 
+/// Loads the system font list now (it is loaded once, on first use). Callers with a time limit
+/// call this before starting the clock: reading every installed font can take longer than the
+/// limit on a busy machine.
+pub fn load_system_fonts() {
+    LazyLock::force(&SYSTEM_FONTS);
+}
+
 fn options() -> usvg::Options<'static> {
     usvg::Options {
         font_family: DEFAULT_FONT_FAMILY.to_owned(),

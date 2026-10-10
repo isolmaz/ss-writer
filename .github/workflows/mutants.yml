@@ -35,6 +35,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants,cargo-nextest
+      - name: Desktop like Windows 11 (screen, animations, long temp paths)
+        shell: pwsh
+        run: .github/scripts/desktop.ps1
       - name: Mutants
         run: cargo xtask mutants -j 2 -- --shard ${{ matrix.shard }}/8 --all-features --timeout 600
       - name: Keep the report

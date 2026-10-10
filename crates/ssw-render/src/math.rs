@@ -13,7 +13,12 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use thiserror::Error;
+use typst::utils::Scalar;
+use typst_layout::{Page, PagedDocument};
+use typst_render::RenderOptions;
+use typst_svg::SvgOptions;
 
+use crate::export::{RasterFormat, encode};
 use crate::fonts::TEXT_FAMILY;
 use crate::frame_to_scene::{BASELINE_MARKER, frame_to_scene};
 use crate::scene::{Color, Scene};
@@ -83,6 +88,34 @@ pub fn render_math(
     shared().render(latex, display, font_size_pt, color)
 }
 
+/// Renders a LaTeX formula to standalone SVG markup (HTML and ePub export), in points, with the
+/// same typesetting as [`render_math`] but no baseline marker. `color` paints every glyph and
+/// rule.
+///
+/// # Errors
+/// The formula is invalid or unsupported, or `font_size_pt` is not in `0..=1000`.
+pub fn render_math_svg(
+    latex: &str,
+    display: bool,
+    font_size_pt: f32,
+    color: Color,
+) -> Result<String, MathError> {
+    shared().render_svg(latex, display, font_size_pt, color)
+}
+
+/// Renders a LaTeX formula to a PNG at [`PNG_PIXELS_PER_PT`] (DOCX and ODT export), black on a
+/// transparent background.
+///
+/// # Errors
+/// The formula is invalid or unsupported, or `font_size_pt` is not in `0..=1000`.
+pub fn render_math_png(
+    latex: &str,
+    display: bool,
+    font_size_pt: f32,
+) -> Result<MathPng, MathError> {
+    shared().render_png(latex, display, font_size_pt, Color::BLACK)
+}
+
 /// The shared renderer behind [`render_math`] and the export formula check.
 fn shared() -> &'static MathRenderer {
     static SHARED: LazyLock<MathRenderer> = LazyLock::new(MathRenderer::new);
@@ -135,12 +168,7 @@ impl MathRenderer {
         font_size_pt: f32,
         color: Color,
     ) -> Result<Scene, MathError> {
-        let size_ok = font_size_pt > 0.0 && font_size_pt <= MAX_FONT_SIZE_PT;
-        if !size_ok {
-            return Err(MathError::new(format!(
-                "invalid font size {font_size_pt} (expected 0 < size <= {MAX_FONT_SIZE_PT})"
-            )));
-        }
+        check_font_size(font_size_pt)?;
         let key = (latex.to_owned(), display, font_size_pt.to_bits(), color);
         if let Some(hit) = lock(&self.cache).get(&key) {
             return hit.clone();
@@ -175,9 +203,105 @@ impl MathRenderer {
             .unwrap_or_default())
     }
 
+    /// See [`render_math_svg`].
+    pub fn render_svg(
+        &self,
+        latex: &str,
+        display: bool,
+        font_size_pt: f32,
+        color: Color,
+    ) -> Result<String, MathError> {
+        let document = self.compile_picture(latex, display, font_size_pt, color)?;
+        // A formula always yields exactly one page; the empty string is never returned.
+        Ok(document
+            .pages()
+            .first()
+            .map(|page| typst_svg::svg(page, &SvgOptions::default()))
+            .unwrap_or_default())
+    }
+
+    /// See [`render_math_png`].
+    pub fn render_png(
+        &self,
+        latex: &str,
+        display: bool,
+        font_size_pt: f32,
+        color: Color,
+    ) -> Result<MathPng, MathError> {
+        let document = self.compile_picture(latex, display, font_size_pt, color)?;
+        // A formula always yields exactly one page; the default picture is never returned.
+        Ok(document.pages().first().map(png_of).unwrap_or_default())
+    }
+
+    /// The one-page document of a formula that is exported as a picture.
+    fn compile_picture(
+        &self,
+        latex: &str,
+        display: bool,
+        font_size_pt: f32,
+        color: Color,
+    ) -> Result<PagedDocument, MathError> {
+        check_font_size(font_size_pt)?;
+        let expression = typst_expression(latex, display)?;
+        let source = picture_source(&expression, font_size_pt, color);
+        self.world
+            .compile(&source)
+            .map_err(|e| MathError::new(e.message))
+    }
+
     #[cfg(test)]
     fn cached_formulas(&self) -> usize {
         lock(&self.cache).len()
+    }
+}
+
+/// Rejects font sizes that are not positive, finite and at most [`MAX_FONT_SIZE_PT`].
+fn check_font_size(font_size_pt: f32) -> Result<(), MathError> {
+    if font_size_pt > 0.0 && font_size_pt <= MAX_FONT_SIZE_PT {
+        Ok(())
+    } else {
+        Err(MathError::new(format!(
+            "invalid font size {font_size_pt} (expected 0 < size <= {MAX_FONT_SIZE_PT})"
+        )))
+    }
+}
+
+/// A formula as PNG file bytes and the size to show it at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MathPng {
+    /// The PNG file.
+    pub png: Vec<u8>,
+    /// Width to display it at, in CSS pixels (96 per inch); the PNG has more pixels than that
+    /// ([`PNG_PIXELS_PER_PT`] per point).
+    pub width_px: u32,
+    /// Height to display it at, in CSS pixels.
+    pub height_px: u32,
+}
+
+/// Pixels per point of the PNG a formula is rendered to (about 288 dpi).
+pub const PNG_PIXELS_PER_PT: f32 = 4.0;
+
+/// The page rendered as a PNG and its display size in CSS pixels.
+fn png_of(page: &Page) -> MathPng {
+    let options = RenderOptions {
+        pixel_per_pt: Scalar::new(f64::from(PNG_PIXELS_PER_PT)),
+        render_bleed: false,
+    };
+    let pixmap = typst_render::render(page, &options);
+    // CSS pixels are 1/96 inch, points 1/72 inch; dividing a multiple of 96 exactly keeps whole
+    // sizes whole.
+    let css = |pixels: u32| {
+        (f64::from(pixels) * 96.0 / 72.0 / f64::from(PNG_PIXELS_PER_PT)).ceil() as u32
+    };
+    MathPng {
+        png: encode(
+            RasterFormat::Png,
+            pixmap.width(),
+            pixmap.height(),
+            pixmap.data(),
+        ),
+        width_px: css(pixmap.width()),
+        height_px: css(pixmap.height()),
     }
 }
 
@@ -209,9 +333,19 @@ fn page_source(expression: &str, display: bool, font_size_pt: f32, color: Color)
     } else {
         format!("#box(width: 0pt, text(fill: rgb(\"#{mr:02x}{mg:02x}{mb:02x}{ma:02x}\"))[x])")
     };
+    page_with_marker(expression, font_size_pt, color, &marker)
+}
+
+/// [`page_source`] for a formula that is shown as a picture (SVG, PNG): there is no baseline
+/// to find, so no marker run that could show up as a faint smudge.
+fn picture_source(expression: &str, font_size_pt: f32, color: Color) -> String {
+    page_with_marker(expression, font_size_pt, color, "")
+}
+
+fn page_with_marker(expression: &str, font_size_pt: f32, color: Color, marker: &str) -> String {
     let Color { r, g, b, a } = color;
     format!(
-        "{import}#set page(width: auto, height: auto, margin: 0pt)\n\
+        "{import}#set page(width: auto, height: auto, margin: 0pt, fill: none)\n\
          #set text(font: {font}, size: {font_size_pt}pt, fill: rgb(\"#{r:02x}{g:02x}{b:02x}{a:02x}\"))\n\
          {marker}#{expression}\n",
         import = typst_import(),
@@ -499,6 +633,67 @@ mod tests {
                 .render("x", false, MAX_FONT_SIZE_PT, Color::BLACK)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn picture_source_has_no_baseline_marker() {
+        let picture = picture_source("EXPR", 12.5, Color::rgba(255, 0, 0, 128));
+        assert!(!picture.contains("#01020304"));
+        assert!(picture.contains("size: 12.5pt, fill: rgb(\"#ff000080\")"));
+        assert!(picture.ends_with("\n#EXPR\n"));
+    }
+
+    #[test]
+    fn formulas_render_as_svg_markup() {
+        let renderer = MathRenderer::new();
+        let svg = renderer
+            .render_svg(r"\frac{a}{b}", true, 12.0, Color::BLACK)
+            .expect("renders");
+        assert!(svg.starts_with("<svg"), "{svg}");
+        assert!(svg.trim_end().ends_with("</svg>"), "{svg}");
+        // The shared renderer behind the free function gives markup as well.
+        assert!(
+            render_math_svg("x^2", false, 14.0, Color::rgb(255, 0, 0))
+                .expect("renders")
+                .starts_with("<svg")
+        );
+        assert!(
+            renderer
+                .render_svg(r"\frac{", false, 12.0, Color::BLACK)
+                .is_err()
+        );
+        assert!(renderer.render_svg("x", false, 0.0, Color::BLACK).is_err());
+    }
+
+    #[test]
+    fn formulas_render_as_png_with_their_css_size() {
+        let renderer = MathRenderer::new();
+        let picture = renderer
+            .render_png("x^2 + y^2", true, 12.0, Color::BLACK)
+            .expect("renders");
+        assert_eq!(
+            &picture.png[..8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        );
+        let decoded = image::load_from_memory(&picture.png)
+            .expect("png")
+            .to_rgba8();
+        // 4 pixels per point is 3 per CSS pixel.
+        assert_eq!(picture.width_px, decoded.width().div_ceil(3));
+        assert_eq!(picture.height_px, decoded.height().div_ceil(3));
+        assert!(picture.width_px > picture.height_px);
+        // Black ink on a transparent background: the edges of the glyphs are antialiased, so
+        // a stroke is black with partial coverage as its alpha (the PNG is not premultiplied),
+        // and the paper between the glyphs is clear.
+        assert!(
+            decoded
+                .pixels()
+                .all(|pixel| pixel.0[3] == 0 || pixel.0[..3] == [0, 0, 0])
+        );
+        assert!(decoded.pixels().any(|pixel| pixel.0[3] >= 128));
+        assert!(decoded.pixels().any(|pixel| pixel.0[3] == 0));
+        assert!(render_math_png("a", false, 12.0).is_ok());
+        assert!(render_math_png(r"\frac{", false, 12.0).is_err());
     }
 
     #[test]

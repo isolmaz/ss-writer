@@ -3164,6 +3164,7 @@ dependencies = [
  "typst-layout",
  "typst-pdf",
  "typst-render",
+ "typst-svg",
  "usvg 0.48.1",
 ]
 

@@ -32,6 +32,12 @@ const DPI_RANGE: RangeInclusive<f32> = 1.0..=600.0;
 /// Points per inch.
 const POINTS_PER_INCH: f64 = 72.0;
 
+/// The virtual file a diagram picture export reads its SVG from.
+const DIAGRAM_PICTURE: &str = "ssw-diagram-0.svg";
+
+/// White space around an exported diagram picture, in points.
+const DIAGRAM_MARGIN_PT: f32 = 8.0;
+
 /// Page setup and styling of an export.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportOptions {
@@ -143,7 +149,7 @@ pub enum ExportError {
 
 /// How [`Exporter::rasterize`] encodes a page.
 #[derive(Clone, Copy)]
-enum RasterFormat {
+pub(crate) enum RasterFormat {
     Png,
     Jpeg { quality: u8 },
 }
@@ -259,6 +265,38 @@ impl Exporter {
         self.rasterize(markdown, options, diagrams, pages, dpi, format)
     }
 
+    /// A picture in SVG markup (a Mermaid diagram) as a PNG file: the page is as large as the
+    /// picture plus a small margin, on white paper, at `dpi` pixels per inch (an SVG user unit
+    /// is one point).
+    pub fn export_diagram_png(&self, svg: &str, dpi: f32) -> Result<Vec<u8>, ExportError> {
+        check_resolution(dpi)?;
+        let _exclusive = lock(&self.gate);
+        self.world
+            .set_virtual_file(DIAGRAM_PICTURE, svg.as_bytes().to_vec())?;
+        let document = self.world.compile(&format!(
+            "#set page(width: auto, height: auto, margin: {DIAGRAM_MARGIN_PT}pt, fill: white)\n\
+             #image(\"{DIAGRAM_PICTURE}\")\n"
+        ))?;
+        let render = RenderOptions {
+            pixel_per_pt: Scalar::new(f64::from(dpi) / POINTS_PER_INCH),
+            render_bleed: false,
+        };
+        // A document with one picture always has exactly one page.
+        Ok(document
+            .pages()
+            .first()
+            .map(|page| {
+                let pixmap = typst_render::render(page, &render);
+                encode(
+                    RasterFormat::Png,
+                    pixmap.width(),
+                    pixmap.height(),
+                    pixmap.data(),
+                )
+            })
+            .unwrap_or_default())
+    }
+
     fn rasterize(
         &self,
         markdown: &str,
@@ -306,7 +344,12 @@ fn page_scene(page: &Page) -> Scene {
 }
 
 /// Encodes premultiplied RGBA8 pixels.
-fn encode(format: RasterFormat, width: u32, height: u32, premultiplied: &[u8]) -> Vec<u8> {
+pub(crate) fn encode(
+    format: RasterFormat,
+    width: u32,
+    height: u32,
+    premultiplied: &[u8],
+) -> Vec<u8> {
     let mut out = Vec::new();
     // The buffer length matches the size and the size is far below the codec limits (pages are
     // at most a few thousand pixels wide), so encoding into memory cannot fail.
@@ -499,6 +542,41 @@ mod tests {
                 .to_string()
                 .contains("bad")
         );
+    }
+
+    #[test]
+    fn a_diagram_becomes_a_png_on_white_paper() {
+        let exporter = Exporter::new(None);
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\" \
+                   viewBox=\"0 0 40 20\"><rect width=\"40\" height=\"20\" fill=\"#ff0000\"/></svg>";
+        let png = exporter.export_diagram_png(svg, 72.0).expect("renders");
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let decoded = image::load_from_memory(&png).expect("png").to_rgba8();
+        let (width, height) = decoded.dimensions();
+        // The picture is wider than tall and has a margin of white paper around it.
+        assert!(width > height && width > 40, "{width}x{height}");
+        assert_eq!(decoded.get_pixel(1, 1).0, [255, 255, 255, 255]);
+        assert_eq!(decoded.get_pixel(width / 2, height / 2).0, [255, 0, 0, 255]);
+        // Twice the resolution, twice the pixels.
+        let double = exporter.export_diagram_png(svg, 144.0).expect("renders");
+        let decoded = image::load_from_memory(&double).expect("png").to_rgba8();
+        let (double_width, double_height) = decoded.dimensions();
+        assert!(
+            double_width.abs_diff(2 * width) <= 1,
+            "{double_width} vs {width}"
+        );
+        assert!(
+            double_height.abs_diff(2 * height) <= 1,
+            "{double_height} vs {height}"
+        );
+        assert!(matches!(
+            exporter.export_diagram_png(svg, 0.0),
+            Err(ExportError::Resolution(_))
+        ));
+        assert!(matches!(
+            exporter.export_diagram_png("not an svg", 72.0),
+            Err(ExportError::Layout(_))
+        ));
     }
 
     #[test]

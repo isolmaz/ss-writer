@@ -1,8 +1,8 @@
 //! Opens the exported DOCX and ODT in a real LibreOffice, headless, and converts them to PDF and
 //! plain text. A file LibreOffice cannot load, or one that loses the body text, fails the test.
 //!
-//! The test runs only when `soffice.exe` is available: set `SSW_SOFFICE` to its path, or keep the
-//! copy at the default location below. Otherwise it prints the reason and returns. LibreOffice
+//! The test runs only when `soffice.exe` is available: set `SSW_SOFFICE` to its path, or install
+//! LibreOffice at its default location. Otherwise it prints the reason and returns. LibreOffice
 //! is started with `--headless`, without a console window and with a throw-away profile; when it
 //! does not finish in time, the process tree this test started is killed and nothing else.
 
@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use ssw_convert::docx::{ExportOptions, MathImage, Resources, export_docx};
 use ssw_convert::odt::export_odt;
 
-const DEFAULT_SOFFICE: &str = "C:/Users/isolm/Desktop/ssw-spikes/e-docx/lo/y/program/soffice.exe";
+/// Where the LibreOffice installer puts `soffice.exe`.
+const DEFAULT_SOFFICE: &str = "C:/Program Files/LibreOffice/program/soffice.exe";
 const TIMEOUT: Duration = Duration::from_secs(240);
 
 const RICH: &str = "\

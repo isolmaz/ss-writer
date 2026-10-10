@@ -30,6 +30,8 @@ missing_debug_implementations = "warn"
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 undocumented_unsafe_blocks = "deny"
+# Lists of byte ranges with one element are normal here (selections, match ranges).
+single_range_in_vec_init = "allow"
 
 [profile.release]
 lto = "fat"

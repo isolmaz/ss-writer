@@ -32,5 +32,8 @@ pub mod text;
 pub mod theme;
 pub mod widget;
 
+pub mod editor;
+pub mod scroll_physics;
+pub mod shell;
 pub mod shortcuts;
 pub mod widgets;

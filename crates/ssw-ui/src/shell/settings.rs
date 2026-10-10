@@ -1,0 +1,893 @@
+//! The Settings window (spec §10): a navigation list of the eight pages and the page beside it.
+//!
+//! [`SettingsWindow`] is the root widget of the separate top-level Settings window. Every option
+//! of `ssw_core::settings` has a control bound two ways to a [`Settings`] value the window owns:
+//! changing a control writes the setting and emits [`SettingsEvent::Changed`]; a value that fails
+//! validation (a number out of range, a malformed color, a file-name template without `{n}`…)
+//! is refused, the setting keeps its previous value and the reason shows under the control.
+//! The Shortcuts page lists every command with its bindings and rebinds by capturing a chord.
+//!
+//! The window never touches the OS. Folder pickers, opening the logs folder and the
+//! confirmation of "reset settings" are [`SettingsEvent`]s the app answers.
+
+pub(crate) mod fields;
+pub(crate) mod form;
+mod shortcuts_page;
+
+use std::fmt;
+use std::rc::Rc;
+
+use ssw_core::command::CommandId;
+use ssw_core::i18n::{Arg, Localizer};
+use ssw_core::keymap::{KeyChord, Keymap, Overrides};
+use ssw_core::settings::{Settings, SettingsSection};
+
+use crate::access::{AccessAction, AccessNode, AccessTree, Role};
+use crate::canvas::{Canvas, Dash};
+use crate::geometry::{Point, Rect, Size};
+use crate::input::{Event, PointerEvent, PointerEventKind, WheelEvent};
+use crate::shortcuts::CharProbe;
+use crate::text::FontWeight;
+use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
+use crate::widgets::anim::Motion;
+use crate::widgets::button::{Button, ButtonKind};
+use crate::widgets::combo::ComboBox;
+use crate::widgets::list::{ListEvent, ListView, SelectionMode};
+use crate::widgets::scroll::{Axis, BAR_WIDTH, ScrollBar};
+use crate::widgets::slider::Slider;
+use crate::widgets::textbox::TextBox;
+use crate::widgets::toggle::ToggleSwitch;
+use crate::widgets::{Control, SharedClipboard, ui_style};
+
+use fields::{FIELDS, FieldDef, FieldKind, FieldValue, display_number, is_enabled};
+use form::{Change, Form, Input, PAD, Row, forward};
+use shortcuts_page::{Edit, Env, ShortcutsPage};
+
+pub use fields::{FieldId, Problem};
+pub use shortcuts_page::{DisplayKeyNames, KeyNames};
+
+/// Width of the navigation column.
+const NAV_WIDTH: f32 = 220.0;
+/// Padding around the navigation list.
+const NAV_PAD: f32 = 8.0;
+/// Height of a navigation row.
+const NAV_ROW: f32 = 40.0;
+/// Height of the page title.
+const HEADER_HEIGHT: f32 = 64.0;
+/// Em size of the page title.
+const TITLE_SIZE: f32 = 20.0;
+/// Size the window asks for when its parent does not constrain it.
+const DEFAULT_SIZE: Size = Size::new(900.0, 640.0);
+
+/// A language the user can pick in General → Language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanguageChoice {
+    /// BCP 47 tag stored in `general.language`.
+    pub tag: String,
+    /// The language's name in that language.
+    pub name: String,
+}
+
+/// What the Settings window needs from the app.
+pub struct SettingsEnv {
+    /// The clipboard of the window's text boxes.
+    pub clipboard: SharedClipboard,
+    /// Asks the keyboard layout whether Ctrl+Alt+key types a character (the AltGr rule).
+    pub char_probe: Box<dyn CharProbe>,
+    /// Names chords for display.
+    pub key_names: Box<dyn KeyNames>,
+    /// The UI languages the app ships.
+    pub languages: Vec<LanguageChoice>,
+    /// The user's motion preference.
+    pub motion: Motion,
+}
+
+impl fmt::Debug for SettingsEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SettingsEnv")
+            .field("languages", &self.languages)
+            .field("motion", &self.motion)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What changed in a [`SettingsEvent::Changed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsChange {
+    /// The value of one option.
+    Field(FieldId),
+    /// The shortcut bindings.
+    Shortcuts,
+}
+
+/// Something the app has to react to; drained with [`SettingsWindow::take_events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsEvent {
+    /// A setting changed: persist [`SettingsWindow::settings`] and apply it.
+    Changed(SettingsChange),
+    /// The Browse button of a folder option was pressed: show a folder picker and answer with
+    /// [`SettingsWindow::set_folder`].
+    BrowseFolder(FieldId),
+    /// Advanced → Open logs folder.
+    OpenLogsFolder,
+    /// Advanced → Reset settings: confirm with the user, then replace the settings with
+    /// [`SettingsWindow::set_settings`].
+    ResetSettings,
+}
+
+/// Identifies a row of a settings page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKey {
+    Field(FieldId),
+    OpenLogs,
+    Reset,
+}
+
+/// The Settings window.
+pub struct SettingsWindow {
+    id: WidgetId,
+    page_id: WidgetId,
+    loc: Rc<Localizer>,
+    env: SettingsEnv,
+    settings: Settings,
+    /// The options of the language drop-down as `(tag, name)`; the first is "system default".
+    language_options: Vec<(String, String)>,
+    nav: ListView,
+    section: SettingsSection,
+    forms: Vec<(SettingsSection, Form<RowKey>)>,
+    shortcuts: ShortcutsPage,
+    scroll: ScrollBar,
+    bounds: Rect,
+    nav_rect: Rect,
+    page_rect: Rect,
+    viewport: Rect,
+    events: Vec<SettingsEvent>,
+    /// The control focus was last revealed for.
+    revealed_focus: Option<WidgetId>,
+    popup_revealed: bool,
+}
+
+impl fmt::Debug for SettingsWindow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SettingsWindow")
+            .field("id", &self.id)
+            .field("section", &self.section)
+            .field("bounds", &self.bounds)
+            .finish_non_exhaustive()
+    }
+}
+
+fn shortcut_env<'a>(loc: &'a Rc<Localizer>, env: &'a SettingsEnv) -> Env<'a> {
+    Env {
+        loc,
+        names: env.key_names.as_ref(),
+        probe: env.char_probe.as_ref(),
+    }
+}
+
+/// The language drop-down: system default, the shipped languages and, when the stored tag is
+/// none of them, the stored tag itself so it is not lost.
+fn language_options(
+    loc: &Localizer,
+    env: &SettingsEnv,
+    settings: &Settings,
+) -> Vec<(String, String)> {
+    let mut options = vec![(String::new(), loc.text("settings-opt-language-system"))];
+    options.extend(
+        env.languages
+            .iter()
+            .map(|language| (language.tag.clone(), language.name.clone())),
+    );
+    if let Some(tag) = &settings.general.language
+        && !options.iter().any(|(known, _)| known == tag)
+    {
+        options.push((tag.clone(), tag.clone()));
+    }
+    options
+}
+
+fn field_row(
+    loc: &Localizer,
+    env: &SettingsEnv,
+    settings: &Settings,
+    languages: &[(String, String)],
+    def: &FieldDef,
+) -> Row<RowKey> {
+    let label = loc.text(def.label);
+    let hint = def.hint.map(|id| loc.text(id));
+    let value = def.read(settings);
+    let motion = env.motion;
+    let text_box = |text: String| {
+        TextBox::new(label.clone(), text, Rc::clone(&env.clipboard)).with_motion(motion)
+    };
+    let input = match def.kind {
+        FieldKind::Toggle => {
+            Input::Toggle(ToggleSwitch::new(label.clone(), value.flag()).with_motion(motion))
+        }
+        FieldKind::Choice(options) => {
+            let items = options.iter().map(|id| loc.text(id)).collect();
+            Input::Choice(
+                ComboBox::new(label.clone(), items, Some(value.index())).with_motion(motion),
+            )
+        }
+        FieldKind::Language => {
+            let items = languages.iter().map(|(_, name)| name.clone()).collect();
+            let index = languages
+                .iter()
+                .position(|(tag, _)| tag == value.text())
+                .unwrap_or(0);
+            Input::Choice(ComboBox::new(label.clone(), items, Some(index)).with_motion(motion))
+        }
+        FieldKind::Text | FieldKind::Folder => Input::Text(text_box(value.text().to_owned())),
+        FieldKind::Number { .. } => Input::Text(text_box(display_number(value.number()))),
+        FieldKind::Percent { max } => {
+            let labels = (0..=i64::from(max))
+                .map(|n| loc.format("settings-percent", &[("value", Arg::Int(n))]))
+                .collect();
+            let slider = Slider::new(label.clone(), 0.0, f64::from(max), value.number(), 1.0)
+                .with_large_step(10.0)
+                .with_motion(motion);
+            Input::Slider { slider, labels }
+        }
+    };
+    let row = Row::new(RowKey::Field(def.id), label.clone(), hint, input);
+    if matches!(def.kind, FieldKind::Folder) {
+        row.with_accessory(
+            Button::new(ButtonKind::Standard, loc.text("settings-browse")).with_motion(motion),
+        )
+    } else {
+        row
+    }
+}
+
+fn action_row(loc: &Localizer, motion: Motion, key: RowKey, id: &str) -> Row<RowKey> {
+    let hint_id = format!("{id}-hint");
+    let hint = loc.has_message(&hint_id).then(|| loc.text(&hint_id));
+    let button =
+        Button::new(ButtonKind::Standard, loc.text(&format!("{id}-button"))).with_motion(motion);
+    Row::new(key, loc.text(id), hint, Input::Button(button))
+}
+
+fn build_form(
+    loc: &Localizer,
+    env: &SettingsEnv,
+    settings: &Settings,
+    languages: &[(String, String)],
+    section: SettingsSection,
+) -> Form<RowKey> {
+    let mut rows: Vec<Row<RowKey>> = FIELDS
+        .iter()
+        .filter(|def| def.section == section)
+        .map(|def| field_row(loc, env, settings, languages, def))
+        .collect();
+    if section == SettingsSection::Advanced {
+        rows.push(action_row(
+            loc,
+            env.motion,
+            RowKey::OpenLogs,
+            "settings-advanced-open-logs",
+        ));
+        rows.push(action_row(
+            loc,
+            env.motion,
+            RowKey::Reset,
+            "settings-advanced-reset",
+        ));
+    }
+    Form::new(rows)
+}
+
+/// Records `chords` as the override of `command`, or drops the override when they are the
+/// command's defaults.
+fn set_override(overrides: &mut Overrides, command: CommandId, chords: Vec<KeyChord>) {
+    let mut wanted = chords.clone();
+    wanted.sort_unstable();
+    let mut defaults: Vec<KeyChord> = Keymap::default_chords(command).collect();
+    defaults.sort_unstable();
+    if wanted == defaults {
+        overrides.remove(command.as_str());
+    } else {
+        overrides.insert(command.as_str().to_owned(), chords);
+    }
+}
+
+impl SettingsWindow {
+    /// A window showing `settings`, with the General page selected.
+    #[must_use]
+    pub fn new(settings: Settings, loc: Rc<Localizer>, env: SettingsEnv) -> Self {
+        let shortcuts = ShortcutsPage::new(
+            &shortcut_env(&loc, &env),
+            settings.keymap(),
+            !settings.shortcuts.is_empty(),
+            env.motion,
+            Rc::clone(&env.clipboard),
+        );
+        let mut window = Self {
+            id: WidgetId::allocate(),
+            page_id: WidgetId::allocate(),
+            nav: Self::build_nav(&loc, env.motion),
+            loc,
+            env,
+            settings,
+            language_options: Vec::new(),
+            section: SettingsSection::General,
+            forms: Vec::new(),
+            shortcuts,
+            scroll: ScrollBar::new(Axis::Vertical, ""),
+            bounds: Rect::ZERO,
+            nav_rect: Rect::ZERO,
+            page_rect: Rect::ZERO,
+            viewport: Rect::ZERO,
+            events: Vec::new(),
+            revealed_focus: None,
+            popup_revealed: false,
+        };
+        window.scroll = ScrollBar::new(Axis::Vertical, window.loc.text("settings-scroll"))
+            .with_motion(window.env.motion);
+        window.rebuild_forms();
+        window.nav.select(0);
+        window
+    }
+
+    fn build_nav(loc: &Localizer, motion: Motion) -> ListView {
+        ListView::new(
+            loc.text("settings-nav"),
+            SettingsSection::ALL
+                .iter()
+                .map(|section| loc.text(section.label_id()))
+                .collect(),
+            SelectionMode::Single,
+        )
+        .with_row_height(NAV_ROW)
+        .with_motion(motion)
+    }
+
+    /// Rebuilds the forms from the settings (the controls start from the stored values).
+    fn rebuild_forms(&mut self) {
+        self.language_options = language_options(&self.loc, &self.env, &self.settings);
+        self.forms = SettingsSection::ALL
+            .iter()
+            .copied()
+            .filter(|section| *section != SettingsSection::Shortcuts)
+            .map(|section| {
+                let form = build_form(
+                    &self.loc,
+                    &self.env,
+                    &self.settings,
+                    &self.language_options,
+                    section,
+                );
+                (section, form)
+            })
+            .collect();
+        self.refresh_enabled();
+    }
+
+    /// Enables the controls that depend on another option (the autosave delay needs autosave,
+    /// the custom accent needs the custom mode, …).
+    fn refresh_enabled(&mut self) {
+        for def in FIELDS {
+            let enabled = is_enabled(def.id, &self.settings);
+            if let Some(form) = self.form_mut(def.section) {
+                form.set_enabled(RowKey::Field(def.id), enabled);
+            }
+        }
+    }
+
+    fn form(&self, section: SettingsSection) -> Option<&Form<RowKey>> {
+        self.forms
+            .iter()
+            .find(|(candidate, _)| *candidate == section)
+            .map(|(_, form)| form)
+    }
+
+    fn form_mut(&mut self, section: SettingsSection) -> Option<&mut Form<RowKey>> {
+        self.forms
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == section)
+            .map(|(_, form)| form)
+    }
+
+    /// The settings as edited so far.
+    #[must_use]
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// Replaces the settings (after a reset or an external edit of `settings.json`); every
+    /// control shows the new values.
+    pub fn set_settings(&mut self, settings: Settings) {
+        self.settings = settings;
+        self.rebuild_forms();
+        let env = shortcut_env(&self.loc, &self.env);
+        self.shortcuts.set_keymap(
+            &env,
+            self.settings.keymap(),
+            !self.settings.shortcuts.is_empty(),
+        );
+    }
+
+    /// Shows every text in the language of `loc` (after the user picked another language).
+    pub fn relocalize(&mut self, loc: Rc<Localizer>) {
+        self.loc = loc;
+        self.nav = Self::build_nav(&self.loc, self.env.motion);
+        self.nav.select(self.section_index());
+        self.scroll = ScrollBar::new(Axis::Vertical, self.loc.text("settings-scroll"))
+            .with_motion(self.env.motion);
+        self.shortcuts = ShortcutsPage::new(
+            &shortcut_env(&self.loc, &self.env),
+            self.settings.keymap(),
+            !self.settings.shortcuts.is_empty(),
+            self.env.motion,
+            Rc::clone(&self.env.clipboard),
+        );
+        self.rebuild_forms();
+    }
+
+    /// The page being shown.
+    #[must_use]
+    pub fn section(&self) -> SettingsSection {
+        self.section
+    }
+
+    fn section_index(&self) -> usize {
+        SettingsSection::ALL
+            .iter()
+            .position(|section| *section == self.section)
+            .unwrap_or(0)
+    }
+
+    /// Shows `section`.
+    pub fn select_section(&mut self, section: SettingsSection) {
+        self.show_section(section);
+        self.nav.select(self.section_index());
+    }
+
+    fn show_section(&mut self, section: SettingsSection) {
+        if section != self.section {
+            self.section = section;
+            self.scroll.model_mut().jump(0.0);
+            self.revealed_focus = None;
+            self.popup_revealed = false;
+        }
+    }
+
+    /// The events since the last call, oldest first.
+    pub fn take_events(&mut self) -> Vec<SettingsEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// The message under the control of `field` while its typed value is refused.
+    #[must_use]
+    pub fn error(&self, field: FieldId) -> Option<&str> {
+        self.form(field.section())
+            .and_then(|form| form.error(RowKey::Field(field)))
+    }
+
+    /// Answers [`SettingsEvent::BrowseFolder`]: stores the chosen folder like a typed value.
+    pub fn set_folder(&mut self, field: FieldId, path: &str) {
+        if let Some(form) = self.form_mut(field.section()) {
+            form.set_text(RowKey::Field(field), path);
+        }
+        self.commit(field, Change::Edited(path.to_owned()));
+    }
+
+    /// True while the Shortcuts page waits for the new chord. The host must then deliver every
+    /// key press to this window, Tab included, and skip its own shortcut routing.
+    #[must_use]
+    pub fn is_capturing_shortcut(&self) -> bool {
+        self.shortcuts.is_capturing()
+    }
+
+    /// The command being rebound.
+    #[must_use]
+    pub fn capturing_command(&self) -> Option<CommandId> {
+        self.shortcuts.capturing_command()
+    }
+
+    /// The Shortcuts page row of `command`: its name, its chords and, when a chord is shared,
+    /// the commands it conflicts with.
+    #[must_use]
+    pub fn shortcut_label(&self, command: CommandId) -> String {
+        self.shortcuts
+            .row_text(&shortcut_env(&self.loc, &self.env), command)
+    }
+
+    /// The status line of the Shortcuts page (the capture prompt, a conflict or AltGr warning).
+    #[must_use]
+    pub fn shortcut_status(&self) -> Option<&str> {
+        self.shortcuts.status_text()
+    }
+
+    /// Writes a change reported by a control into the settings, or shows why it was refused.
+    fn commit(&mut self, field: FieldId, change: Change) {
+        let def = field.def();
+        let value = match change {
+            Change::Toggled(on) => Ok(FieldValue::Bool(on)),
+            Change::Selected(index) => Ok(if matches!(def.kind, FieldKind::Language) {
+                let tag = self
+                    .language_options
+                    .get(index)
+                    .map(|(tag, _)| tag.clone())
+                    .unwrap_or_default();
+                FieldValue::Text(tag)
+            } else {
+                FieldValue::Choice(index)
+            }),
+            Change::Edited(text) => def.parse_input(&text),
+            Change::Slid(number) => Ok(FieldValue::Number(number)),
+            Change::Accessory => {
+                self.events.push(SettingsEvent::BrowseFolder(field));
+                return;
+            }
+            Change::Submitted | Change::Pressed => return,
+        };
+        let outcome = value.and_then(|value| def.write(&mut self.settings, &value));
+        let message = outcome
+            .as_ref()
+            .err()
+            .map(|problem| problem.message(&self.loc));
+        if let Some(form) = self.form_mut(def.section) {
+            form.set_error(RowKey::Field(field), message);
+        }
+        if outcome.is_ok() {
+            self.events
+                .push(SettingsEvent::Changed(SettingsChange::Field(field)));
+            self.refresh_enabled();
+        }
+    }
+
+    /// Applies what the controls reported since the last call.
+    fn harvest(&mut self, cx: &mut EventCx) {
+        let selected = self
+            .nav
+            .take_events()
+            .contains(&ListEvent::SelectionChanged);
+        let section = self
+            .nav
+            .selected_index()
+            .and_then(|index| SettingsSection::ALL.get(index).copied());
+        if selected && let Some(section) = section {
+            self.show_section(section);
+            cx.invalidate_all();
+        }
+        let mut changes = Vec::new();
+        for (_, form) in &mut self.forms {
+            changes.extend(form.take_changes());
+        }
+        for (key, change) in changes {
+            match key {
+                RowKey::OpenLogs => self.events.push(SettingsEvent::OpenLogsFolder),
+                RowKey::Reset => self.events.push(SettingsEvent::ResetSettings),
+                RowKey::Field(field) => self.commit(field, change),
+            }
+        }
+        self.apply_shortcut_edits();
+        self.reveal(cx);
+    }
+
+    fn apply_shortcut_edits(&mut self) {
+        let edits = self.shortcuts.take_edits();
+        if edits.is_empty() {
+            return;
+        }
+        for edit in edits {
+            match edit {
+                Edit::Set(command, chords) => {
+                    set_override(&mut self.settings.shortcuts, command, chords);
+                }
+                Edit::Reset(command) => {
+                    self.settings.shortcuts.remove(command.as_str());
+                }
+                Edit::ResetAll => {
+                    // Ids this version does not know belong to a newer one and are kept.
+                    self.settings
+                        .shortcuts
+                        .retain(|id, _| id.parse::<CommandId>().is_err());
+                }
+            }
+        }
+        let env = shortcut_env(&self.loc, &self.env);
+        self.shortcuts.set_keymap(
+            &env,
+            self.settings.keymap(),
+            !self.settings.shortcuts.is_empty(),
+        );
+        self.events
+            .push(SettingsEvent::Changed(SettingsChange::Shortcuts));
+    }
+
+    /// Scrolls the page so the focused control and an open drop-down are visible, once per
+    /// change of focus or popup (so the user's own scrolling is never undone).
+    fn reveal(&mut self, cx: &mut EventCx) {
+        let Some(form) = self.form(self.section) else {
+            return;
+        };
+        let focused = cx.focus.focused();
+        let focus_row = if focused == self.revealed_focus {
+            None
+        } else {
+            form.focused_row(cx.focus)
+        };
+        let popup = form.open_popup();
+        let reveal_popup = popup.is_some() != self.popup_revealed;
+        self.revealed_focus = focused;
+        self.popup_revealed = popup.is_some();
+        for rect in focus_row.into_iter().chain(popup.filter(|_| reveal_popup)) {
+            let top = rect.top() - self.viewport.y;
+            let bottom = rect.bottom() - self.viewport.y;
+            if self.scroll.model_mut().ensure_visible(top, bottom) {
+                cx.invalidate(self.viewport);
+            }
+        }
+    }
+
+    /// The page's pointer position in content coordinates.
+    fn content_point(&self, position: Point) -> Point {
+        Point::new(position.x, position.y + self.scroll.offset())
+    }
+}
+
+impl Control for SettingsWindow {
+    fn id(&self) -> WidgetId {
+        self.id
+    }
+}
+
+impl Widget for SettingsWindow {
+    fn measure(&mut self, _cx: &mut LayoutCx, available: Size) -> Size {
+        Size::new(
+            if available.width.is_finite() {
+                available.width
+            } else {
+                DEFAULT_SIZE.width
+            },
+            if available.height.is_finite() {
+                available.height
+            } else {
+                DEFAULT_SIZE.height
+            },
+        )
+    }
+
+    fn arrange(&mut self, cx: &mut LayoutCx, bounds: Rect) {
+        self.bounds = bounds;
+        self.nav_rect = Rect::new(
+            bounds.x,
+            bounds.y,
+            NAV_WIDTH.min(bounds.width),
+            bounds.height,
+        );
+        self.page_rect = Rect::new(
+            self.nav_rect.right(),
+            bounds.y,
+            (bounds.width - self.nav_rect.width).max(0.0),
+            bounds.height,
+        );
+        self.viewport = Rect::new(
+            self.page_rect.x,
+            self.page_rect.y + HEADER_HEIGHT,
+            self.page_rect.width,
+            (self.page_rect.height - HEADER_HEIGHT).max(0.0),
+        );
+        let nav_id = self.nav.id();
+        let nav_bounds = Rect::new(
+            self.nav_rect.x + NAV_PAD,
+            self.nav_rect.y + NAV_PAD,
+            (self.nav_rect.width - 2.0 * NAV_PAD).max(0.0),
+            (self.nav_rect.height - 2.0 * NAV_PAD).max(0.0),
+        );
+        self.nav.arrange(&mut cx.for_widget(nav_id), nav_bounds);
+        let viewport = self.viewport;
+        let section = self.section;
+        if section == SettingsSection::Shortcuts {
+            self.shortcuts.arrange(cx, viewport);
+            self.scroll.model_mut().set_extent(viewport.height, 0.0);
+        } else if let Some(form) = self.form_mut(section) {
+            let height = form.layout(cx, viewport);
+            self.scroll.model_mut().set_extent(viewport.height, height);
+        }
+        let scroll_id = self.scroll.id();
+        self.scroll.arrange(
+            &mut cx.for_widget(scroll_id),
+            Rect::new(
+                viewport.right() - BAR_WIDTH,
+                viewport.y,
+                BAR_WIDTH,
+                viewport.height,
+            ),
+        );
+    }
+
+    fn paint(&self, cx: &PaintCx, canvas: &mut dyn Canvas) {
+        if !cx.needs_paint(self.bounds) {
+            return;
+        }
+        let tokens = &cx.theme.tokens;
+        canvas.fill_rect(self.nav_rect, tokens.sidebar_bg);
+        canvas.fill_rect(self.page_rect, tokens.surface);
+        canvas.stroke_line(
+            Point::new(self.nav_rect.right() - 0.5, self.nav_rect.y),
+            Point::new(self.nav_rect.right() - 0.5, self.nav_rect.bottom()),
+            tokens.hairline,
+            1.0,
+            Dash::Solid,
+        );
+        self.nav.paint(&cx.for_widget(self.nav.id()), canvas);
+        let title = cx.text.layout(
+            &self.loc.text(self.section.label_id()),
+            &ui_style(cx.theme, TITLE_SIZE).with_weight(FontWeight::SEMIBOLD),
+            &[],
+            &[],
+            f32::INFINITY,
+        );
+        canvas.draw_text_layout(
+            title.as_ref(),
+            Point::new(
+                self.page_rect.x + PAD,
+                self.page_rect.y + (HEADER_HEIGHT - title.size().height) / 2.0,
+            ),
+            tokens.text,
+        );
+        if self.section == SettingsSection::Shortcuts {
+            self.shortcuts.paint(cx, canvas);
+            return;
+        }
+        if let Some(form) = self.form(self.section) {
+            let offset = self.scroll.offset();
+            canvas.push_clip_rect(self.viewport);
+            canvas.save();
+            canvas.translate(0.0, -offset);
+            let mut page_cx = cx.for_widget(self.id);
+            page_cx.damage = cx.damage.map(|damage| damage.translate(0.0, offset));
+            form.paint(&page_cx, canvas);
+            canvas.restore();
+            canvas.pop_clip();
+        }
+        self.scroll.paint(&cx.for_widget(self.scroll.id()), canvas);
+    }
+
+    fn event(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
+        let capturing = self.shortcuts.is_capturing()
+            && matches!(e, Event::Key(_) | Event::Text(_) | Event::Ime(_));
+        let mut result = if self.section == SettingsSection::Shortcuts {
+            let env = shortcut_env(&self.loc, &self.env);
+            self.shortcuts.event(cx, e, &env)
+        } else {
+            self.route_to_form(cx, e)
+        };
+        if !capturing {
+            result = result.or(forward(&mut self.nav, cx, e));
+        }
+        self.harvest(cx);
+        result
+    }
+
+    fn access(&self, cx: &AccessCx, out: &mut AccessTree) {
+        self.nav.access(&cx.for_widget(self.nav.id()), out);
+        let mut children = if self.section == SettingsSection::Shortcuts {
+            self.shortcuts.access(cx, out)
+        } else if let Some(form) = self.form(self.section) {
+            form.access(
+                cx,
+                out,
+                Point::new(0.0, self.scroll.offset()),
+                self.viewport,
+            )
+        } else {
+            Vec::new()
+        };
+        if self.scroll.model().is_scrollable() && self.section != SettingsSection::Shortcuts {
+            self.scroll.access(&cx.for_widget(self.scroll.id()), out);
+            children.push(self.scroll.id());
+        }
+        out.insert(
+            AccessNode::new(
+                self.page_id,
+                Role::Group,
+                self.loc.text(self.section.label_id()),
+                self.page_rect,
+            )
+            .with_children(children),
+        );
+        out.insert(
+            AccessNode::new(
+                self.id,
+                Role::Window,
+                self.loc.text("settings-title"),
+                self.bounds,
+            )
+            .with_children([self.nav.id(), self.page_id]),
+        );
+    }
+
+    fn perform(&mut self, cx: &mut EventCx, a: &AccessAction) -> bool {
+        let target = cx.id;
+        let mut handled = self.nav.perform_item(&mut cx.for_widget(target), target, a);
+        if !handled && target == self.nav.id() {
+            handled = self.nav.perform(&mut cx.for_widget(target), a);
+        }
+        if !handled {
+            handled = if self.section == SettingsSection::Shortcuts {
+                let env = shortcut_env(&self.loc, &self.env);
+                self.shortcuts.perform(cx, a, &env)
+            } else if target == self.scroll.id() {
+                self.scroll.perform(&mut cx.for_widget(target), a)
+            } else if let Some(form) = self.form_mut(self.section) {
+                form.perform(cx, a)
+            } else {
+                false
+            };
+        }
+        self.harvest(cx);
+        handled
+    }
+}
+
+impl SettingsWindow {
+    /// Routes `e` to the controls of the current page: pointer and wheel positions are
+    /// translated into content coordinates, the scroll bar and the wheel scroll the page.
+    fn route_to_form(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
+        let scroll_id = self.scroll.id();
+        match e {
+            Event::Pointer(pointer) => {
+                let bar = self.scroll.event(&mut cx.for_widget(scroll_id), e);
+                if bar.handled {
+                    return bar;
+                }
+                let popup_open = self
+                    .form(self.section)
+                    .is_some_and(|form| form.open_popup().is_some());
+                let captured = cx
+                    .capture
+                    .owner()
+                    .is_some_and(|owner| owner != self.nav.id() && owner != scroll_id);
+                let inside = self.viewport.contains(pointer.position);
+                let leaving = pointer.kind == PointerEventKind::Leave;
+                if !(inside || captured || popup_open || leaving) {
+                    return EventResult::ignored();
+                }
+                let moved = Event::Pointer(PointerEvent {
+                    position: self.content_point(pointer.position),
+                    ..*pointer
+                });
+                self.form_event(cx, &moved)
+            }
+            Event::Wheel(wheel) => {
+                if !self.viewport.contains(wheel.position) {
+                    return EventResult::ignored();
+                }
+                let moved = Event::Wheel(WheelEvent {
+                    position: self.content_point(wheel.position),
+                    ..*wheel
+                });
+                let inner = self.form_event(cx, &moved);
+                if inner.handled {
+                    return inner;
+                }
+                if self.scroll.wheel(&mut cx.for_widget(scroll_id), wheel) {
+                    self.scroll.take_changed();
+                    cx.invalidate(self.viewport);
+                    EventResult::handled()
+                } else {
+                    EventResult::ignored()
+                }
+            }
+            Event::AnimationFrame(now) => {
+                if self.scroll.animate(&mut cx.for_widget(scroll_id), *now) {
+                    cx.invalidate(self.viewport);
+                }
+                self.form_event(cx, e)
+            }
+            _ => self.form_event(cx, e),
+        }
+    }
+
+    fn form_event(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
+        let section = self.section;
+        match self.form_mut(section) {
+            Some(form) => form.event(cx, e),
+            None => EventResult::ignored(),
+        }
+    }
+}

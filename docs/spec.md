@@ -92,8 +92,8 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 | Quote | `>` | left bar |
 | Callout | `> [!NOTE|TIP|IMPORTANT|WARNING|CAUTION] Optional title` | icon + color + title; click icon to change type |
 | Code block | fenced ```` ``` ````/`~~~` with info string | `code_bg`; hover: language label + Copy button; optional syntax highlighting |
-| Math | `$x$`, `$$…$$` | vector (Typst via MiTeX); errors show source in `error` color; works inside tables |
-| Mermaid | fenced `mermaid`; `.mmd` files | vector diagram below the source while the caret is inside, diagram only otherwise; export PNG/SVG |
+| Math | `$x$`, `$$…$$` | vector (Typst via MiTeX); errors and unsupported commands show the source in `error` color; works inside tables |
+| Mermaid | fenced `mermaid`; `.mmd` files | vector diagram below the source while the caret is inside, diagram only otherwise; export PNG/SVG. Diagram types the renderer cannot draw correctly (`sankey-beta`, `block`) and any render failure show the source as a code block with an "Unsupported diagram" note |
 | Table | GFM pipes, alignment row | rounded border, bold header, zebra rows; in-cell editing (see 3.1) |
 | Image | `![alt](path "title")`, size `![alt|300](p)` / `![alt|300x200](p)` / `<img src width height>` | block if alone in paragraph else inline; resize handles write `|W` |
 | Attachment | link to a local non-image file | chip: shell icon, file name, TYPE pill, `size · date` |
@@ -137,7 +137,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 | `.docx` | ✓ | ✓ | import to Markdown; "Save back to Word" |
 | `.odt` | ✓ | ✓ | same model as docx |
 | `.rtf` | ✓ | ✓ | same model |
-| `.doc` (Word 97–2003) | ✓ | — | import only; save as `.docx` or `.md` |
+| `.doc` (Word 97–2003) | ✓ | — | import only; save as `.docx` or `.md`. Encrypted files and Word 6/95 files are rejected with a message |
 
 - Import reports what could not be represented (merged cells, headers/footers, columns, text boxes, comments, tracked changes, VML shapes, unsupported equations) in a banner with a details list. OMML equations convert to LaTeX for fractions, scripts, radicals, n-ary operators, delimiters, matrices; others become `[equation]` placeholders and are reported.
 
@@ -255,7 +255,7 @@ Stored in `settings.json` (human-editable; unknown keys preserved).
 - Update check: weekly, `https://api.github.com/repos/<owner>/ss-writer/releases/latest`; notification only; can be turned off.
 
 ## 14. Performance targets (measured, not assumed)
-- Cold start to first frame < 150 ms (no document) — measured with ETW.
+- Window frame with Mica backdrop visible < 150 ms from process start; first content frame bounded by Direct3D device creation (205–370 ms measured on the reference machine; created in parallel with startup work) — measured with ETW.
 - Input-to-photon ≤ 2 frames — PresentMon + app ETW markers.
 - 60 000-line document: open < 300 ms, scrolling at display refresh rate.
 - 10 000-file folder: tree visible < 300 ms; index in background.

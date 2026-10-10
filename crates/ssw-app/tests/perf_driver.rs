@@ -16,7 +16,7 @@ use serde_json::Value;
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::{Args, PerfScenario};
 use ssw_app::startup::ProcessEnv;
-use ssw_app::ui::host::{UiApp, UiOptions, UiServices};
+use ssw_app::ui::host::{UiApp, UiOptions, UiServices, UiShell, WinInstance};
 use ssw_app::ui::perf_driver::{EXIT_PERF_FAILED, PerfDriver, TYPED_CHARS, Tick};
 use ssw_app::ui::scripted_services::ScriptedServices;
 use ssw_ui::services::MemoryClipboard;
@@ -59,6 +59,7 @@ impl<F: FnOnce(&UiApp, &Args)> ShellHost for Probe<F> {
             }),
             instance: None,
             jump_list: false,
+            update_check: false,
             http: None,
             taskbar: None,
         };
@@ -172,6 +173,37 @@ fn assert_in_order(report: &Value, names: &[&str]) {
             pair[1]
         );
     }
+}
+
+#[test]
+fn the_shell_drives_a_scenario_from_its_own_loop_and_exits_with_its_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let report = tmp.path().join("out").join("report.json");
+    let mut args = Args::default();
+    args.test.hidden = true;
+    args.test.profile = Some(tmp.path().join("profile"));
+    args.test.perf_report = Some(report.clone());
+    args.test.perf_scenario = Some(PerfScenario::Startup);
+    let process = ProcessEnv {
+        os: current_os_version(),
+        env: args.environment().unwrap(),
+        os_language: "en-US".to_owned(),
+        driver: Driver::Hardware,
+        install_crash_handler: false,
+    };
+    let _run = RECORDER_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    ssw_win::perf::enable();
+    ssw_win::perf::reset();
+    ssw_win::perf::mark(ssw_app::perf::MAIN_ENTERED);
+    // An application id of its own: the user's editor is never involved.
+    let id = format!("SSWriter.Test.perfshell.{}", std::process::id());
+    let mut shell = UiShell::new(Some(WinInstance::with_app_id(id).link()));
+    let mut dialogs = ScriptedServices::new().dialogs();
+    let exit = run(&args, process, &mut *dialogs, None, &mut shell);
+    assert_eq!(exit, 0);
+    let report: Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
+    assert_eq!(report["scenario"], "startup");
+    assert_eq!(report["completed"], true);
 }
 
 #[test]

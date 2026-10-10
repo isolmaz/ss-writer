@@ -82,4 +82,5 @@ jobs:
           path: |
             lcov.info
             target/coverage-summary.txt
+            target/coverage-uncovered.txt
           if-no-files-found: ignore

@@ -4,6 +4,10 @@
 //! `--test-exit-after-start` waits for the graphics device and exits 0; `--test-script` runs the
 //! scripted harness instead of the windows.
 
+// A desktop application: started from Explorer or the Start menu it opens no console window.
+// Standard handles a parent redirects (pipes of tests and tools) are still inherited.
+#![windows_subsystem = "windows"]
+
 use std::process::ExitCode;
 
 use ssw_app::app::{EXIT_STARTUP_FAILED, run};

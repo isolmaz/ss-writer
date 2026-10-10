@@ -14,7 +14,7 @@ use windows::Win32::UI::Shell::{
     SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{HSTRING, PCWSTR, PWSTR, w};
+use windows::core::{HRESULT, HSTRING, PCWSTR, PWSTR, w};
 
 use crate::com::from_wide;
 use crate::services::failed;
@@ -92,8 +92,13 @@ const OPEN_WITH_PROMPT: &str = "OpenWith.exe";
 /// reported as such.
 #[must_use]
 pub fn default_app_for(extension: &str) -> Option<DefaultApp> {
-    let name = query(ASSOCSTR_FRIENDLYAPPNAME, extension)?;
-    let executable = query(ASSOCSTR_EXECUTABLE, extension).map(PathBuf::from);
+    default_app_with(|kind| query(kind, extension))
+}
+
+/// The default app from the association strings `query` answers.
+fn default_app_with(query: impl Fn(ASSOCSTR) -> Option<String>) -> Option<DefaultApp> {
+    let name = query(ASSOCSTR_FRIENDLYAPPNAME)?;
+    let executable = query(ASSOCSTR_EXECUTABLE).map(PathBuf::from);
     if executable.as_deref().is_some_and(is_open_with_prompt) {
         return None;
     }
@@ -123,39 +128,40 @@ fn has_file_name(path: &Path, name: &str) -> bool {
 /// Asks the shell for one string of the association of `extension`.
 fn query(kind: ASSOCSTR, extension: &str) -> Option<String> {
     let association = HSTRING::from(extension);
+    read_string(|out, length| {
+        // SAFETY: `association` is a valid NUL-terminated string; `out` is `None` (the call only
+        // reports the required length, in characters with the terminator) or a buffer of
+        // `*length` characters, the size passed in.
+        unsafe {
+            AssocQueryStringW(
+                ASSOCF_NOTRUNCATE,
+                kind,
+                &association,
+                PCWSTR::null(),
+                out,
+                std::ptr::from_mut(length),
+            )
+        }
+    })
+}
+
+/// The string of a call that reports its length first (`S_FALSE` and the length with the
+/// terminator for a `None` buffer) and fills a buffer of that length second.
+fn read_string(mut call: impl FnMut(Option<PWSTR>, &mut u32) -> HRESULT) -> Option<String> {
     let mut length = 0_u32;
-    // SAFETY: `association` is a valid NUL-terminated string; without an output buffer the call
-    // only reports the required length (in characters, with the terminator).
-    let probe = unsafe {
-        AssocQueryStringW(
-            ASSOCF_NOTRUNCATE,
-            kind,
-            &association,
-            PCWSTR::null(),
-            None,
-            &raw mut length,
-        )
-    };
-    if probe != S_FALSE || length == 0 {
+    if call(None, &mut length) != S_FALSE || length == 0 {
         return None;
     }
     let mut buffer = vec![0_u16; length as usize];
-    // SAFETY: `buffer` holds `length` characters, the size passed in; the strings are valid.
-    let answer = unsafe {
-        AssocQueryStringW(
-            ASSOCF_NOTRUNCATE,
-            kind,
-            &association,
-            PCWSTR::null(),
-            Some(PWSTR(buffer.as_mut_ptr())),
-            &raw mut length,
-        )
-    };
-    answer.is_ok().then(|| from_wide(&buffer))
+    call(Some(PWSTR(buffer.as_mut_ptr())), &mut length)
+        .is_ok()
+        .then(|| from_wide(&buffer))
 }
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::Foundation::{E_FAIL, S_OK};
+
     use super::*;
 
     #[test]
@@ -191,6 +197,78 @@ mod tests {
             r"c:\windows\system32\openwith.EXE"
         )));
         assert!(!is_open_with_prompt(Path::new(r"C:\Windows\notepad.exe")));
+    }
+
+    /// Answers like the shell: the length with the terminator first, then `text`.
+    fn shell_string(text: &str, second: HRESULT) -> impl FnMut(Option<PWSTR>, &mut u32) -> HRESULT {
+        let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+        move |out, length| match out {
+            None => {
+                *length = wide.len() as u32;
+                S_FALSE
+            }
+            Some(buffer) => {
+                assert_eq!(
+                    *length as usize,
+                    wide.len(),
+                    "the buffer has the reported size"
+                );
+                // SAFETY: the buffer holds `*length` characters, as asserted.
+                unsafe { std::ptr::copy_nonoverlapping(wide.as_ptr(), buffer.0, wide.len()) };
+                second
+            }
+        }
+    }
+
+    #[test]
+    fn a_string_is_read_in_two_calls_and_any_other_answer_is_none() {
+        assert_eq!(
+            read_string(shell_string("Notepad", S_OK)).as_deref(),
+            Some("Notepad")
+        );
+        // The second call fails.
+        assert_eq!(read_string(shell_string("Notepad", E_FAIL)), None);
+        // The first call fails, succeeds without asking for a buffer, or reports no length.
+        assert_eq!(read_string(|_, _| E_FAIL), None);
+        assert_eq!(read_string(|_, _| S_OK), None);
+        assert_eq!(read_string(|_, _| S_FALSE), None);
+    }
+
+    #[test]
+    fn the_default_app_needs_a_name_and_the_choose_an_app_prompt_is_none() {
+        let answers = |name: Option<&str>, exe: Option<&str>| {
+            let (name, exe) = (name.map(str::to_owned), exe.map(str::to_owned));
+            move |kind: ASSOCSTR| {
+                if kind == ASSOCSTR_FRIENDLYAPPNAME {
+                    name.clone()
+                } else {
+                    exe.clone()
+                }
+            }
+        };
+        assert_eq!(
+            default_app_with(answers(Some("Notepad"), Some(r"C:\Windows\notepad.exe"))),
+            Some(DefaultApp {
+                name: "Notepad".to_owned(),
+                executable: Some(PathBuf::from(r"C:\Windows\notepad.exe")),
+            })
+        );
+        // A packaged app the shell cannot map to a program file.
+        assert_eq!(
+            default_app_with(answers(Some("Photos"), None)),
+            Some(DefaultApp {
+                name: "Photos".to_owned(),
+                executable: None,
+            })
+        );
+        assert_eq!(
+            default_app_with(answers(
+                Some("Open With"),
+                Some(r"C:\Windows\System32\OpenWith.exe")
+            )),
+            None
+        );
+        assert_eq!(default_app_with(answers(None, Some(r"C:\x.exe"))), None);
     }
 
     #[test]

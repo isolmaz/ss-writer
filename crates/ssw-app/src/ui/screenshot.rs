@@ -648,11 +648,8 @@ mod tests {
         // Every system call of the start fails in turn: the WIC factory first, then the steps
         // of the DirectWrite engine.
         let outcomes = ssw_win::fault::sweep(Visuals::new);
-        assert!(
-            outcomes.len() > 2,
-            "the start makes several system calls: {}",
-            outcomes.len()
-        );
+        let calls = outcomes.len();
+        assert!(calls > 2, "the start makes several system calls: {calls}");
         for (call, outcome) in outcomes.iter().enumerate() {
             let error = outcome.as_ref().unwrap_err();
             assert!(
@@ -685,11 +682,8 @@ mod tests {
         // brush of the drawing, the end of the frame, the copy of the pixels and the PNG
         // encoder each fail in turn.
         let outcomes = ssw_win::fault::sweep(|| visuals.render(geometry, Color::WHITE, &mut draw));
-        assert!(
-            outcomes.len() >= 8,
-            "the render makes many system calls: {}",
-            outcomes.len()
-        );
+        let calls = outcomes.len();
+        assert!(calls >= 8, "the render makes many system calls: {calls}");
         for (call, outcome) in outcomes.iter().enumerate() {
             let error = outcome.as_ref().unwrap_err();
             assert!(

@@ -159,6 +159,14 @@ fn views_and_their_configuration_describe_themselves() {
         let text = format!("{config:?}");
         assert!(text.starts_with("ViewConfig { size:"), "{text}");
         assert!(text.contains("scale: 1.5"), "{text}");
+        // A view without tabs has no plain-text file to wrap or render.
+        let mut empty = ShellView::new(config);
+        assert!(!empty.toggle_word_wrap());
+        assert!(!empty.toggle_render_as_markdown());
+        // An overlay closing while nothing has the focus hands the keyboard to the editor pane.
+        empty.overlays_mut().close_folder_search();
+        rig.paint_view(&mut empty);
+        assert_eq!(empty.focused_pane(), Pane::Editor);
         let window = rig.window();
         let text = format!("{:?}", window.view.borrow());
         assert!(text.starts_with("ShellView { layout:"), "{text}");
@@ -313,6 +321,9 @@ fn the_splitter_follows_the_pointer_while_it_is_dragged() {
             .sidebar
             .expect("a sidebar");
         let edge = Point::new(sidebar.x + sidebar.width, 300.0);
+        // Hovering the edge (the resize cursor) does not start a drag; pressing it does.
+        rig.pointer(PointerEventKind::Move, edge);
+        assert!(window.view.borrow().layout().dragging().is_none());
         rig.pointer(PointerEventKind::Down, edge);
         assert!(window.view.borrow().layout().dragging().is_some());
         rig.pointer(PointerEventKind::Move, Point::new(edge.x + 60.0, 300.0));

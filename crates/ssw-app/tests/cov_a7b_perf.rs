@@ -67,6 +67,7 @@ impl<F: FnOnce(&UiApp, &Args)> ShellHost for Probe<F> {
             }),
             instance: None,
             jump_list: false,
+            update_check: false,
             http: None,
             taskbar: None,
         };

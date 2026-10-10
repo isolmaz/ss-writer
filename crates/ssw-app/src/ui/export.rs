@@ -885,16 +885,9 @@ mod tests {
         }
         let dialogs = shown(&services);
         assert_eq!(dialogs.len(), before + 4);
-        assert!(
-            dialogs[before].1.contains("notes.pdf"),
-            "{:?}",
-            dialogs[before]
-        );
-        assert!(
-            dialogs[before + 2].1.contains("C:\\out"),
-            "{:?}",
-            dialogs[before + 2]
-        );
+        let (one, folder) = (&dialogs[before].1, &dialogs[before + 2].1);
+        assert!(one.contains("notes.pdf"), "{one}");
+        assert!(folder.contains("C:\\out"), "{folder}");
     }
 
     fn label() -> Label {

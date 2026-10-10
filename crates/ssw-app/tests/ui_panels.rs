@@ -1055,6 +1055,57 @@ fn opening_from_the_sidebar_menu_uses_a_tab_or_a_new_window() {
 }
 
 #[test]
+fn a_file_gone_before_it_opens_in_a_new_window_is_reported_there() {
+    with_rig(FILES, |rig| {
+        rig.show_workspace();
+        let (key, _) = rig.entry("other");
+        let popup = rig.sidebar_menu(Some(key));
+        std::fs::remove_file(rig.work.join("other.md")).unwrap();
+        rig.answer(MessageBoxResult::Ok);
+        rig.choose(&popup, "Open in new window");
+        assert_eq!(rig.services.dialog_log().len(), 1);
+        let windows = rig.controller.windows();
+        assert_eq!(windows.len(), 2, "the new window stays, without the file");
+        assert!(windows[1].view.borrow().active_tab().is_none_or(|tab| {
+            !tab.entry
+                .path()
+                .is_some_and(|path| path.ends_with("other.md"))
+        }));
+    });
+}
+
+#[test]
+fn an_open_file_moved_where_its_history_cannot_follow_keeps_its_tab_and_says_so() {
+    use std::os::windows::ffi::OsStringExt;
+
+    with_rig(FILES, |rig| {
+        // Windows allows a folder name with an unpaired surrogate; the history store keys
+        // paths as text and cannot take it.
+        let odd = std::ffi::OsString::from_wide(&[u16::from(b'x'), 0xD800]);
+        std::fs::create_dir(rig.work.join(&odd)).unwrap();
+        rig.open("other.md");
+        rig.show_workspace();
+        let (other, _) = rig.entry("other");
+        let rows = rig.rows();
+        let odd_row = rows.iter().find(|name| name.starts_with('x')).unwrap();
+        let (folder, _) = rig.entry(odd_row);
+        rig.answer(MessageBoxResult::Ok);
+        rig.sidebar_event(SidebarEvent::Dropped {
+            source: other,
+            target_folder: folder,
+            copy: false,
+        });
+        let moved = rig.work.join(&odd).join("other.md");
+        assert!(moved.exists());
+        assert_eq!(rig.services.dialog_log().len(), 1);
+        assert!(
+            rig.active_path()
+                .ends_with(Path::new(&odd).join("other.md"))
+        );
+    });
+}
+
+#[test]
 fn copying_and_revealing_paths_from_the_sidebar_menu() {
     with_rig(FILES, |rig| {
         rig.show_workspace();
@@ -1239,6 +1290,10 @@ fn the_header_menus_collapse_and_expand_every_folder() {
         assert_eq!(expanded(rig), Some(true));
         rig.choose(&popup, "Collapse all");
         assert_eq!(expanded(rig), Some(false));
+        // The workspace closed while the menu was open: nothing is left to fold.
+        rig.window().view.borrow_mut().set_workspace(None);
+        rig.choose(&popup, "Expand all");
+        assert!(rig.window().view.borrow().sidebar().is_none());
     });
 }
 

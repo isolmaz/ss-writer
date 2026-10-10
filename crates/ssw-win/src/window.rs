@@ -2810,6 +2810,50 @@ mod tests {
         assert_eq!(send_message(host.hwnd(), WM_APP + 7, 0, 0), 7);
     }
 
+    /// While it handles `WM_APP + 8`, sends `WM_APP + 7` (which it answers with 7) to its own
+    /// window and keeps what came back.
+    struct Reentrant(Rc<std::cell::Cell<Option<isize>>>);
+
+    impl WindowHandler for Reentrant {
+        fn on_event(&mut self, _info: &WindowInfo, _event: Event) {}
+        fn on_paint(&mut self, _info: &WindowInfo, _canvas: &mut dyn Canvas) {}
+        fn on_message(
+            &mut self,
+            info: &WindowInfo,
+            msg: u32,
+            _wparam: WPARAM,
+            _lparam: LPARAM,
+        ) -> Option<LRESULT> {
+            match msg {
+                m if m == WM_APP + 7 => Some(LRESULT(7)),
+                m if m == WM_APP + 8 => {
+                    self.0.set(Some(send_message(info.hwnd, WM_APP + 7, 0, 0)));
+                    Some(LRESULT(8))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_sent_while_the_handler_runs_takes_the_default_path() {
+        let options = WindowOptions {
+            title: "re-entrant".to_owned(),
+            rect: Some((-32000, -32000, 800, 600)),
+            dark: false,
+            no_activate: true,
+        };
+        let nested = Rc::new(std::cell::Cell::new(None));
+        let handler = Box::new(Reentrant(Rc::clone(&nested)));
+        let host = WindowHost::create(&options, handler, Theme::light(DEFAULT_ACCENT)).unwrap();
+        // Sent on its own, the message reaches the handler.
+        assert_eq!(send_message(host.hwnd(), WM_APP + 7, 0, 0), 7);
+        // Sent while the handler holds the window state, it does not: the default window
+        // procedure answers it (0) instead of a second, aliasing borrow of the state.
+        assert_eq!(send_message(host.hwnd(), WM_APP + 8, 0, 0), 8);
+        assert_eq!(nested.get(), Some(0));
+    }
+
     #[test]
     fn a_wake_handle_made_from_a_window_wakes_it_until_it_is_gone() {
         let (host, log) = host(true, false);

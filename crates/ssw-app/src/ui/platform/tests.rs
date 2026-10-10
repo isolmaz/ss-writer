@@ -112,6 +112,7 @@ impl<F: FnOnce(&UiApp, &Path)> ShellHost for Probe<F> {
             }),
             instance: None,
             jump_list: false,
+            update_check: false,
             http: seams.http,
             taskbar: seams.taskbar,
         };

@@ -60,7 +60,7 @@ pub enum Action {
     /// A sidebar command on an entry (`None`: the workspace root).
     Sidebar {
         /// The command.
-        command: CommandId,
+        command: SidebarCommand,
         /// The entry the menu was opened on.
         target: Option<NodeKey>,
     },
@@ -96,6 +96,59 @@ pub enum Action {
     },
     /// Write the active document with these line endings from now on.
     LineEnding(LineEnding),
+}
+
+/// What an item of a sidebar menu does to its entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarCommand {
+    /// Open the file in a tab of the window.
+    Open,
+    /// Open the file in a tab (the same as Open: a file has one tab).
+    OpenInNewTab,
+    /// Open the file in a new window.
+    OpenInNewWindow,
+    /// Start renaming the entry in place.
+    Rename,
+    /// Copy the entry next to itself.
+    Duplicate,
+    /// Move the entry to the Recycle Bin.
+    Delete,
+    /// Show the entry in File Explorer.
+    RevealInExplorer,
+    /// Copy the full path.
+    CopyPath,
+    /// Copy the path relative to the workspace root.
+    CopyRelativePath,
+    /// Create a file in the folder (or next to the file).
+    NewFile,
+    /// Create a folder in the folder (or next to the file).
+    NewFolder,
+    /// Collapse every folder.
+    CollapseAll,
+    /// Expand every folder.
+    ExpandAll,
+}
+
+impl SidebarCommand {
+    /// The command the item shows (its label, shortcut and menu id).
+    #[must_use]
+    pub fn id(self) -> CommandId {
+        match self {
+            Self::Open => C::SidebarOpen,
+            Self::OpenInNewTab => C::SidebarOpenInNewTab,
+            Self::OpenInNewWindow => C::SidebarOpenInNewWindow,
+            Self::Rename => C::SidebarRename,
+            Self::Duplicate => C::SidebarDuplicate,
+            Self::Delete => C::SidebarDelete,
+            Self::RevealInExplorer => C::SidebarRevealInExplorer,
+            Self::CopyPath => C::SidebarCopyPath,
+            Self::CopyRelativePath => C::SidebarCopyRelativePath,
+            Self::NewFile => C::SidebarNewFile,
+            Self::NewFolder => C::SidebarNewFolder,
+            Self::CollapseAll => C::SidebarCollapseAll,
+            Self::ExpandAll => C::SidebarExpandAll,
+        }
+    }
 }
 
 /// A popup menu to show: the model, where, and what each item does.
@@ -152,6 +205,11 @@ impl<'a> Builder<'a> {
     }
 
     /// An item for `command` (label and shortcut from Fluent and the keymap).
+    /// The sidebar command `command` on the entry `target`.
+    fn sidebar(&mut self, command: SidebarCommand, target: Option<NodeKey>) {
+        self.command(command.id(), true, Action::Sidebar { command, target });
+    }
+
     fn command(&mut self, command: CommandId, enabled: bool, action: Action) {
         let id = menu_id(command);
         let mut item = MenuItem::new(id, self.i18n.text(command.label_id()));
@@ -251,40 +309,28 @@ pub fn sidebar_menu(
     i18n: &Localizer,
     keymap: &Keymap,
 ) -> Popup {
+    use SidebarCommand as S;
     let mut builder = Builder::new(i18n, keymap);
-    let item = |command| Action::Sidebar { command, target };
     if target.is_some() {
         if !folder {
-            builder.command(C::SidebarOpen, true, item(C::SidebarOpen));
-            builder.command(C::SidebarOpenInNewTab, true, item(C::SidebarOpenInNewTab));
-            builder.command(
-                C::SidebarOpenInNewWindow,
-                true,
-                item(C::SidebarOpenInNewWindow),
-            );
+            for command in [S::Open, S::OpenInNewTab, S::OpenInNewWindow] {
+                builder.sidebar(command, target);
+            }
             builder.separator();
         }
-        builder.command(C::SidebarRename, true, item(C::SidebarRename));
-        builder.command(C::SidebarDuplicate, true, item(C::SidebarDuplicate));
-        builder.command(C::SidebarDelete, true, item(C::SidebarDelete));
+        for command in [S::Rename, S::Duplicate, S::Delete] {
+            builder.sidebar(command, target);
+        }
         builder.separator();
     }
-    builder.command(
-        C::SidebarRevealInExplorer,
-        true,
-        item(C::SidebarRevealInExplorer),
-    );
-    builder.command(C::SidebarCopyPath, true, item(C::SidebarCopyPath));
+    builder.sidebar(S::RevealInExplorer, target);
+    builder.sidebar(S::CopyPath, target);
     if target.is_some() {
-        builder.command(
-            C::SidebarCopyRelativePath,
-            true,
-            item(C::SidebarCopyRelativePath),
-        );
+        builder.sidebar(S::CopyRelativePath, target);
     }
     builder.separator();
-    builder.command(C::SidebarNewFile, true, item(C::SidebarNewFile));
-    builder.command(C::SidebarNewFolder, true, item(C::SidebarNewFolder));
+    builder.sidebar(S::NewFile, target);
+    builder.sidebar(S::NewFolder, target);
     builder.finish(at)
 }
 
@@ -292,16 +338,12 @@ pub fn sidebar_menu(
 #[must_use]
 pub fn header_menu(menu: HeaderMenu, anchor: Point, i18n: &Localizer, keymap: &Keymap) -> Popup {
     let mut builder = Builder::new(i18n, keymap);
-    let item = |command| Action::Sidebar {
-        command,
-        target: None,
+    let commands = match menu {
+        HeaderMenu::New => [SidebarCommand::NewFile, SidebarCommand::NewFolder],
+        HeaderMenu::Options => [SidebarCommand::CollapseAll, SidebarCommand::ExpandAll],
     };
-    let commands: &[CommandId] = match menu {
-        HeaderMenu::New => &[C::SidebarNewFile, C::SidebarNewFolder],
-        HeaderMenu::Options => &[C::SidebarCollapseAll, C::SidebarExpandAll],
-    };
-    for &command in commands {
-        builder.command(command, true, item(command));
+    for command in commands {
+        builder.sidebar(command, None);
     }
     builder.finish(anchor)
 }
@@ -685,7 +727,7 @@ impl Controller {
                 None
             }
             SidebarEvent::DeleteRequested(key) => {
-                self.sidebar_command(cell, C::SidebarDelete, Some(key));
+                self.sidebar_command(cell, SidebarCommand::Delete, Some(key));
                 None
             }
             SidebarEvent::Dropped {
@@ -712,7 +754,13 @@ impl Controller {
     }
 
     /// Runs the sidebar command `command` on the entry `target` (`None`: the root).
-    fn sidebar_command(&self, cell: &Rc<WindowCell>, command: CommandId, target: Option<NodeKey>) {
+    fn sidebar_command(
+        &self,
+        cell: &Rc<WindowCell>,
+        command: SidebarCommand,
+        target: Option<NodeKey>,
+    ) {
+        use SidebarCommand as S;
         let key = target.unwrap_or(0);
         let Some(path) = Self::tree_path(cell, key) else {
             return;
@@ -725,8 +773,8 @@ impl Controller {
             .map_or(target.is_none(), SidebarEntry::is_folder);
         let fs = self.docs().env().fs.clone();
         match command {
-            C::SidebarOpen | C::SidebarOpenInNewTab => self.open_path(cell, &path, true),
-            C::SidebarOpenInNewWindow => {
+            S::Open | S::OpenInNewTab => self.open_path(cell, &path, true),
+            S::OpenInNewWindow => {
                 let (size, scale) = {
                     let view = cell.view.borrow();
                     (view.layout().size(), view.layout().scale())
@@ -738,28 +786,28 @@ impl Controller {
                 self.set_active_window(fresh.id);
                 self.refresh(&fresh);
             }
-            C::SidebarRename => cell.view.borrow_mut().request_rename(key),
-            C::SidebarDuplicate => match fileops::duplicate(fs.as_ref(), &path) {
+            S::Rename => cell.view.borrow_mut().request_rename(key),
+            S::Duplicate => match fileops::duplicate(fs.as_ref(), &path) {
                 Ok(_) => self.refresh_sidebars(),
                 Err(error) => self.report_file_op(&error),
             },
-            C::SidebarDelete => self.delete_entry(cell, &path),
-            C::SidebarRevealInExplorer => {
+            S::Delete => self.delete_entry(cell, &path),
+            S::RevealInExplorer => {
                 let _ = self.shell.borrow_mut().reveal_in_explorer(&path);
             }
-            C::SidebarCopyPath => self.copy_text(path.to_string_lossy().into_owned()),
-            C::SidebarCopyRelativePath => {
+            S::CopyPath => self.copy_text(path.to_string_lossy().into_owned()),
+            S::CopyRelativePath => {
                 let root = Self::tree_path(cell, 0).unwrap_or_default();
                 let relative = path.strip_prefix(&root).unwrap_or(&path);
                 self.copy_text(relative.to_string_lossy().into_owned());
             }
-            C::SidebarNewFile | C::SidebarNewFolder => {
+            S::NewFile | S::NewFolder => {
                 let dir = if folder {
                     path
                 } else {
                     path.parent().map(Path::to_path_buf).unwrap_or_default()
                 };
-                let created = if command == C::SidebarNewFile {
+                let created = if command == S::NewFile {
                     fileops::new_untitled_file(fs.as_ref(), &dir, "md")
                 } else {
                     let base = self.i18n().text("panels-new-folder-name");
@@ -770,16 +818,15 @@ impl Controller {
                     Err(error) => self.report_file_op(&error),
                 }
             }
-            C::SidebarCollapseAll | C::SidebarExpandAll => {
+            S::CollapseAll | S::ExpandAll => {
                 if let Some(sidebar) = cell.view.borrow_mut().sidebar_mut() {
-                    if command == C::SidebarCollapseAll {
+                    if command == S::CollapseAll {
                         sidebar.collapse_all();
                     } else {
                         sidebar.expand_all();
                     }
                 }
             }
-            _ => {}
         }
     }
 

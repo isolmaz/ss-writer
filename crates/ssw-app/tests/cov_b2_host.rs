@@ -26,14 +26,18 @@ use ssw_ui::geometry::Point;
 use ssw_ui::services::{MemoryClipboard, MessageBoxResult};
 use ssw_ui::shell::settings::SettingsEvent;
 use ssw_ui::shell::titlebar::{MenuKind, TitleEvent};
+use ssw_ui::theme::{DEFAULT_ACCENT, Theme, ThemeMode};
 use ssw_win::com::WinError;
 use ssw_win::dragdrop::OleGuard;
 use ssw_win::gfx::{DeviceStartup, Driver};
 use ssw_win::jumplist::JumpList;
 use ssw_win::menus::{MenuModel, PopupHost, PopupRequest};
 use ssw_win::taskbar::Progress;
+use ssw_win::theme::SystemTheme;
 use ssw_win::window::current_os_version;
-use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, HMENU};
+use ssw_win::window::send_message;
+use windows::Win32::Foundation::RECT;
+use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, GetClientRect, HMENU, WM_MOUSEMOVE};
 
 /// A popup host that "chooses" `choice` at once.
 struct Popups(Option<u32>);
@@ -75,14 +79,20 @@ fn process(args: &Args) -> ProcessEnv {
 /// Starts the application over a temporary profile (autosave off: edits stay unsaved) with
 /// `files` as its launch and hands the core to `body`, which stands in for the shell.
 fn start(files: &[PathBuf], tmp: &Path, body: impl FnOnce(AppCore, &Args) -> i32) -> i32 {
+    start_with(r#"{"general":{"autosave":false}}"#, files, tmp, body)
+}
+
+/// [`start`] with `settings` as the `settings.json` of the profile.
+fn start_with(
+    settings: &str,
+    files: &[PathBuf],
+    tmp: &Path,
+    body: impl FnOnce(AppCore, &Args) -> i32,
+) -> i32 {
     let args = test_args(tmp, files);
     let roaming = tmp.join("profile").join("roaming").join("SS Writer");
     std::fs::create_dir_all(&roaming).unwrap();
-    std::fs::write(
-        roaming.join("settings.json"),
-        r#"{"general":{"autosave":false}}"#,
-    )
-    .unwrap();
+    std::fs::write(roaming.join("settings.json"), settings).unwrap();
     let mut dialogs = ScriptedServices::new().dialogs();
     run(
         &args,
@@ -104,6 +114,7 @@ fn options(services: &ScriptedServices, choice: Option<u32>) -> UiOptions {
         }),
         instance: None,
         jump_list: false,
+        update_check: false,
         http: None,
         taskbar: None,
     }
@@ -279,18 +290,210 @@ fn an_up_to_date_jump_list_is_not_written_again() {
         app.controller().open_file(&cell, &other).unwrap();
         app.pump();
 
-        // A request makes the list stale again, but the recent files are the same.
-        app.controller()
-            .push(Request::Command(cell.id, CommandId::ViewZoomIn));
-        app.pump();
-        let log = app.controller().core().borrow().paths.logs_dir();
-        let text = std::fs::read_to_string(log.join("ssw.log")).unwrap();
+        // The next request writes the list with the file opened since; the one after makes
+        // it stale again, but the recent files are the same.
+        for _ in 0..2 {
+            app.controller()
+                .push(Request::Command(cell.id, CommandId::ViewZoomIn));
+            app.pump();
+        }
+        let text = log_text(&app);
         assert!(!text.contains("cannot update the Jump List"), "{text}");
 
         // Nothing stays behind in the shell.
         JumpList::new(id.clone(), exe.clone(), "Recent", "New window")
             .delete()
             .unwrap();
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+/// The text of the application log so far.
+fn log_text(app: &UiApp) -> String {
+    let dir = app.controller().core().borrow().paths.logs_dir();
+    std::fs::read_to_string(dir.join("ssw.log")).unwrap_or_default()
+}
+
+#[test]
+fn a_turn_while_a_modal_loop_holds_the_view_leaves_that_window_for_the_next_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "a");
+    let services = ScriptedServices::new();
+    let code = start(&[file], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let app = UiApp::new(core, options(&services, None)).unwrap();
+        app.pump();
+        let cell = app.controller().windows()[0].clone();
+        cell.dirty.set(true);
+        {
+            // A popup menu or dialog opened from the view runs its own loop with the view
+            // borrowed; a turn of ours in it must not touch the view.
+            let _held = cell.view.borrow_mut();
+            app.pump();
+            assert!(cell.dirty.get(), "the busy window waits for the next turn");
+        }
+        app.pump();
+        assert!(
+            !cell.dirty.get(),
+            "the repaint was asked for once the view was free"
+        );
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_turn_that_delivers_animation_frames_sleeps_for_one_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "a");
+    let services = ScriptedServices::new();
+    let code = start(&[file], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let app = UiApp::new(core, options(&services, None)).unwrap();
+        app.pump();
+        let hwnd = app.hwnd(app.controller().windows()[0].id).unwrap();
+        let mut client = RECT::default();
+        // SAFETY: reads the client rectangle of a window of this thread into a local.
+        unsafe { GetClientRect(hwnd, &mut client) }.unwrap();
+        // The pointer comes over the close button: its hover fades in, a frame at a time.
+        let (x, y) = (client.right - 20, 12);
+        send_message(hwnd, WM_MOUSEMOVE, 0, ((y as isize) << 16) | x as isize);
+        let frame = ssw_win::services::timers::refresh_interval();
+        let waits: Vec<Option<std::time::Duration>> = (0..10).map(|_| app.idle()).collect();
+        assert!(waits.contains(&Some(frame)), "{waits:?} against {frame:?}");
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_theme_change_reaches_the_settings_window_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "a");
+    let services = ScriptedServices::new();
+    let code = start(&[file], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let app = UiApp::new(core, options(&services, None)).unwrap();
+        app.pump();
+        app.controller().push(Request::OpenSettings);
+        app.pump();
+        assert!(app.settings_hwnd().is_some());
+        // The system turns dark; the app follows the system by default.
+        app.controller().set_system_theme(SystemTheme {
+            theme: Theme::dark(DEFAULT_ACCENT),
+            dark: true,
+            high_contrast: false,
+            transparency_effects: false,
+            client_animations: true,
+            accent: DEFAULT_ACCENT,
+        });
+        app.pump();
+        assert_eq!(app.controller().theme().mode, ThemeMode::Dark);
+        assert!(app.settings_hwnd().is_some());
+        assert_eq!(
+            app.controller().take_theme_change(),
+            None,
+            "taken by the turn"
+        );
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn the_startup_update_check_respects_the_setting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "a");
+    let services = ScriptedServices::new();
+    let settings = r#"{"general":{"autosave":false,"check_for_updates":false}}"#;
+    let code = start_with(settings, &[file], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let mut app_options = options(&services, None);
+        app_options.update_check = true;
+        let app = UiApp::new(core, app_options).unwrap();
+        app.pump();
+        // Switched off: nothing was asked of the network, so nothing is offered.
+        assert!(app.controller().available_update().is_none());
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn an_autosave_that_fails_during_a_turn_is_reported_to_the_user() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "locked.md", "start\n");
+    let services = ScriptedServices::new();
+    let settings = r#"{"general":{"autosave":true,"autosave_delay_ms":200}}"#;
+    let code = start_with(
+        settings,
+        std::slice::from_ref(&file),
+        tmp.path(),
+        |core, _| {
+            let _ole = OleGuard::initialize().unwrap();
+            let app = UiApp::new(core, options(&services, None)).unwrap();
+            app.pump();
+            let entry = app.controller().docs().find(&file).unwrap();
+            {
+                let mut document = entry.document().borrow_mut();
+                let end = document.buffer().len();
+                let edit = Transaction::single(
+                    Edit::insert(end, "more"),
+                    Selection::caret(end),
+                    Selection::caret(end + 4),
+                );
+                document.apply(edit).unwrap();
+            }
+            app.pump();
+            // Another program holds the file without sharing it when the autosave is due.
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&file)
+                .unwrap();
+            services.answer(DialogKind::MessageBox, Answer::Button(MessageBoxResult::Ok));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while services.dialog_log().is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no report of the failed autosave"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                app.pump();
+            }
+            drop(lock);
+            let shown = services.dialog_log();
+            assert_eq!(shown[0].kind, DialogKind::MessageBox);
+            0
+        },
+    );
+    assert_eq!(code, 0);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_menu_that_cannot_be_built_is_logged_and_chooses_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "a");
+    let services = ScriptedServices::new();
+    let code = start(&[file], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        // The host would choose the first command of any menu it is shown.
+        let app = UiApp::new(core, options(&services, Some(1))).unwrap();
+        app.pump();
+        let id = app.controller().windows()[0].id;
+        // The first system call of showing the menu (`CreatePopupMenu`) fails.
+        ssw_win::fault::arm(0);
+        let chosen = app.show_popup(id, &MenuModel::default(), Point::new(4.0, 4.0));
+        let reached = ssw_win::fault::tripped();
+        ssw_win::fault::disarm();
+        assert!(reached);
+        assert_eq!(chosen, None);
+        let text = log_text(&app);
+        assert!(text.contains("cannot show the menu"), "{text}");
         0
     });
     assert_eq!(code, 0);

@@ -83,6 +83,7 @@ fn options(hidden: bool, instance: Option<InstanceLink>, jump_list: bool) -> UiO
         }),
         instance,
         jump_list,
+        update_check: false,
         http: None,
         taskbar: None,
     }

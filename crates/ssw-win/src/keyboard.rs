@@ -185,15 +185,9 @@ pub fn key_name(vk: u16, scan: u16) -> Result<String, KeyboardError> {
 mod tests {
     use super::*;
 
-    /// The handle of Turkish Q (language 0x041F, layout 0x041F): `HKL` `0x041F041F`.
-    const TURKISH_Q_HKL: usize = 0x041F_041F;
-    const VK_Q: u16 = 0x51;
-    const VK_I: u16 = 0x49;
-    const VK_7: u16 = 0x37;
+    const VK_A: u16 = 0x41;
+    const SCAN_A: u16 = 0x1E;
     const VK_F5: u16 = 0x74;
-    const SCAN_Q_POSITION: u16 = 0x10;
-    const SCAN_I_POSITION: u16 = 0x17;
-    const SCAN_7: u16 = 0x08;
 
     #[test]
     fn the_session_layouts_are_the_users_and_probing_one_changes_nothing() {
@@ -211,58 +205,25 @@ mod tests {
     }
 
     #[test]
-    fn uia_keyboard_turkish_q_altgr_layer_types_text() {
-        let active_before = current_layout();
-        // The user's own Turkish Q layout, when the session has it (it is only probed).
-        for hkl in session_layouts()
-            .into_iter()
-            .filter(|hkl| hkl.0 as usize == TURKISH_Q_HKL)
-        {
-            let probe = ToUnicodeCharProbe::for_layout(hkl);
-            // Function keys type nothing, whatever the layout, even with AltGr.
-            assert!(!probe.produces_char(VK_F5, 0x3F, false, false));
-            // AltGr+Q is '@' and AltGr+7 is '{' on the Turkish Q layout.
-            assert_eq!(
-                probe
-                    .char_for(VK_Q, SCAN_Q_POSITION, false, false, true)
-                    .as_deref(),
-                Some("@")
-            );
-            assert_eq!(
-                probe.char_for(VK_7, SCAN_7, false, false, true).as_deref(),
-                Some("{")
-            );
-            assert!(probe.produces_char(VK_Q, SCAN_Q_POSITION, false, false));
-            assert!(probe.produces_char(VK_7, SCAN_7, false, false));
-            // Without AltGr the same keys type their plain letters; Turkish I is dotless.
-            assert_eq!(
-                probe
-                    .char_for(VK_Q, SCAN_Q_POSITION, false, false, false)
-                    .as_deref(),
-                Some("q")
-            );
-            assert_eq!(
-                probe
-                    .char_for(VK_I, SCAN_I_POSITION, false, false, false)
-                    .as_deref(),
-                Some("\u{131}")
-            );
-            assert_eq!(
-                probe
-                    .char_for(VK_I, SCAN_I_POSITION, true, false, false)
-                    .as_deref(),
-                Some("I")
-            );
-            // Caps Lock upper-cases without Shift.
-            assert_eq!(
-                probe
-                    .char_for(VK_Q, SCAN_Q_POSITION, false, true, false)
-                    .as_deref(),
-                Some("Q")
-            );
-        }
-        // Probing never changes the user's active layout.
-        assert_eq!(current_layout(), active_before);
+    fn shift_or_caps_lock_upper_cases_a_letter_and_both_together_cancel_out() {
+        // The key A types a Latin letter on every layout these tests run with (the user's
+        // Turkish Q layout is probed in tests/integ_keyboard.rs, when the session has it).
+        let probe = ToUnicodeCharProbe::current();
+        let letter = probe.char_for(VK_A, SCAN_A, false, false, false).unwrap();
+        let upper = letter.to_uppercase();
+        assert_eq!(
+            probe.char_for(VK_A, SCAN_A, true, false, false),
+            Some(upper.clone())
+        );
+        assert_eq!(
+            probe.char_for(VK_A, SCAN_A, false, true, false),
+            Some(upper)
+        );
+        // Shift with Caps Lock cancels out.
+        assert_eq!(
+            probe.char_for(VK_A, SCAN_A, true, true, false),
+            Some(letter)
+        );
     }
 
     #[test]

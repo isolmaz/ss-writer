@@ -140,6 +140,8 @@ pub struct UiOptions {
     pub instance: Option<InstanceLink>,
     /// Keep the taskbar Jump List in step with the recent files (production).
     pub jump_list: bool,
+    /// Start the weekly update check the settings allow (production).
+    pub update_check: bool,
     /// The network to load remote images with instead of WinHTTP (tests).
     pub http: Option<Arc<dyn Http>>,
     /// The taskbar object of each window instead of the real taskbar (tests).
@@ -476,6 +478,10 @@ impl UiApp {
             message_window,
         };
         app.controller.open_plan(&plan);
+        if options.update_check {
+            // Weekly, setting-gated, notification only (spec §13).
+            app.controller.start_update_check();
+        }
         Ok(app)
     }
 
@@ -1174,6 +1180,8 @@ impl ShellHost for UiShell {
             services: None,
             instance: self.instance.take(),
             jump_list: !args.test.any(),
+            // Never in test runs.
+            update_check: !args.test.any(),
             http: None,
             taskbar: None,
         };
@@ -1191,10 +1199,6 @@ impl ShellHost for UiShell {
             }
         };
         app.set_offscreen(args.test.perf_offscreen);
-        if !args.test.any() {
-            // Weekly, setting-gated, notification only (spec §13); never in test runs.
-            app.controller().start_update_check();
-        }
         let mut driver = super::perf_driver::PerfDriver::new(args);
         let code = ssw_win::window::run_loop(|| {
             let wait = app.idle();

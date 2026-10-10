@@ -31,3 +31,6 @@ pub mod services;
 pub mod text;
 pub mod theme;
 pub mod widget;
+
+pub mod shortcuts;
+pub mod widgets;

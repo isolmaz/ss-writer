@@ -78,7 +78,7 @@ cargo test --workspace --all-features
 cargo xtask docs-check --strict
 ```
 
-and the coverage gate below is still at 100 %. CI (`.github/workflows/ci.yml`) runs format, clippy, tests under `cargo nextest`, doc tests, the docs check and the coverage gate on `windows-latest`; the tag-triggered release workflow builds the installer and the portable zip.
+and the coverage gate below is still at 100 %. CI (`.github/workflows/ci.yml`) runs format, clippy, tests under `cargo nextest`, doc tests, the docs check and the coverage gate on `windows-latest` for every push and pull request; mutation testing (`.github/workflows/mutants.yml`) runs there too, by hand or weekly, in eight shards; the tag-triggered release workflow builds the installer and the portable zip. The full suite, the coverage gate and mutation testing are meant to run on GitHub: locally, run the tests of the crate you changed (`cargo nextest run -p <crate> --all-features`). A test that hangs is stopped after three minutes (`.config/nextest.toml`).
 
 Workspace lints are strict: `clippy::all` is denied, `clippy::undocumented_unsafe_blocks` is denied, `unsafe_op_in_unsafe_fn` is denied and every public type implements `Debug`. Rustfmt uses `max_width = 100`; files use LF line endings (`.gitattributes`).
 

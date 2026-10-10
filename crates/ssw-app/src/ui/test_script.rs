@@ -694,16 +694,7 @@ fn parse_line(line: &str) -> Parsed<Vec<Op>> {
         }),
         "screenshot" => Op::Screenshot(parse_shot(name, rest, WINDOW_SHOT)?),
         "screenshot-settings" => Op::ScreenshotSettings(parse_shot(name, rest, SETTINGS_SHOT)?),
-        "settings-page" => {
-            // docs-check: not a message id
-            let page = one(name, rest)?;
-            Op::SettingsPage(
-                SettingsSection::ALL
-                    .into_iter()
-                    .find(|section| section.key() == page)
-                    .ok_or_else(|| format!("unknown settings page `{page}`"))?,
-            )
-        }
+        "settings-page" => Op::SettingsPage(settings_page(name, rest)?), // docs-check: not a message id
         "quit" => {
             no_args(name, rest)?;
             Op::Quit
@@ -711,6 +702,15 @@ fn parse_line(line: &str) -> Parsed<Vec<Op>> {
         other => return Err(format!("unknown step `{other}`")),
     };
     Ok(vec![op])
+}
+
+/// The Settings page a `settings-page` step names.
+fn settings_page(name: &str, rest: &str) -> Result<SettingsSection, String> {
+    let page = one(name, rest)?;
+    SettingsSection::ALL
+        .into_iter()
+        .find(|section| section.key() == page)
+        .ok_or_else(|| format!("unknown settings page `{page}`"))
 }
 
 /// The keyboard layout of the harness has no AltGr: Ctrl+Alt+key is always a shortcut.
@@ -1955,13 +1955,13 @@ quit
             ("key", "key takes 1 argument(s), found 0"),
             ("select 1 b", "select needs a number, found `b`"),
             ("select-text", "select-text needs text"),
-            ("clipboard-text", "clipboard-text needs text"),
+            ("clipboard-text", "clipboard-text needs text"), // docs-check: not a message id
             (
-                "clipboard-html",
+                "clipboard-html", // docs-check: not a message id
                 "clipboard-html takes 1 argument(s), found 0",
             ),
             (
-                "clipboard-image",
+                "clipboard-image", // docs-check: not a message id
                 "clipboard-image takes 1 argument(s), found 0",
             ),
             ("paste now", "paste takes no arguments"),

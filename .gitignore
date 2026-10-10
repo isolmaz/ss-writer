@@ -4,3 +4,5 @@
 /lcov.info
 /dist
 /.briefs
+/.tmp*
+/third_party/*/target

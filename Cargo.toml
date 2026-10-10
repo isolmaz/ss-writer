@@ -11,6 +11,9 @@ members = [
     "crates/ssw-preview",
     "xtask",
 ]
+# Vendored upstream code is a path dependency, not a workspace member: it keeps its own
+# lints and test suite (see third_party/mermaid-rs-renderer/FIXES.md).
+exclude = ["third_party/mermaid-rs-renderer"]
 
 [workspace.package]
 version = "0.1.0"

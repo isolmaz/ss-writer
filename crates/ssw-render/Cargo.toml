@@ -21,5 +21,7 @@ typst-pdf = "=0.15.1"
 typst-render = "=0.15.1"
 mitex = "0.2.4"
 usvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
-mermaid-rs-renderer = { version = "0.3.1", default-features = false }
+mermaid-rs-renderer = { version = "0.3.1", path = "../../third_party/mermaid-rs-renderer" }
 comemo = "0.5"
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

@@ -379,7 +379,9 @@ impl Converter<'_> {
         let range_end = span(&children, start)
             .end
             .max(markers.iter().map(|m| m.end).max().unwrap_or(start))
-            .max(callout.as_ref().map_or(0, |c| c.1.end));
+            .max(callout.as_ref().map_or(0, |(_, tag, title)| {
+                title.map_or(tag.end, |title| title.end)
+            }));
         let range = TextRange::new(start, range_end);
         if let Some((kind, tag, title)) = callout {
             markers.push(tag);

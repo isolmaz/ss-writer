@@ -24,6 +24,7 @@
 pub mod ast;
 pub mod definitions;
 mod entities;
+pub mod incremental;
 mod parse;
 mod unicode_punct;
 

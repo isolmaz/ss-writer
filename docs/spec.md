@@ -107,7 +107,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 | Escapes, hard breaks | `\*`, two spaces/backslash at EOL | CommonMark |
 
 ### 3.1 Tables
-- Rendered grid; caret inside a cell edits that cell's source text. Tab/Shift+Tab next/previous cell (Tab in last cell adds a row). Enter moves down.
+- Rendered grid; caret inside a cell edits that cell's source text. Tab/Shift+Tab next/previous cell (Tab in last cell adds a row). Enter moves down (in the last row it adds a row).
 - Cell context menu: insert row above/below, column left/right, delete row/column, align left/center/right, Copy table as Markdown/CSV/HTML, Edit as raw Markdown.
 - On leaving the table, pipes are re-aligned (setting "Format tables on exit", default on).
 - Tables the cell model cannot represent (escaped `|`, `|` inside inline code spanning cells) open in raw mode automatically.

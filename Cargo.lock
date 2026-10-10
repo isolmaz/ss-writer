@@ -1894,8 +1894,6 @@ dependencies = [
 [[package]]
 name = "mermaid-rs-renderer"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb5b469222ce6b9896edf0a969cf68464f5a028ef394fd6643f00bd943df117"
 dependencies = [
  "anyhow",
  "fontdb 0.23.0",
@@ -2024,6 +2022,16 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nucleo-matcher"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf33f538733d1a5a3494b836ba913207f14d9d4a1d3cd67030c5061bdd2cac85"
+dependencies = [
+ "memchr",
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "num-bigint"
@@ -3094,7 +3102,9 @@ name = "ssw-core"
 version = "0.1.0"
 dependencies = [
  "fluent-bundle",
+ "nucleo-matcher",
  "proptest",
+ "regex",
  "ropey",
  "serde",
  "serde_json",
@@ -3102,6 +3112,7 @@ dependencies = [
  "thiserror",
  "unic-langid",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -3116,6 +3127,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "parking_lot",
  "regex",
  "rusqlite",
  "serde",
@@ -3136,8 +3148,10 @@ name = "ssw-render"
 version = "0.1.0"
 dependencies = [
  "comemo",
+ "image",
  "mermaid-rs-renderer",
  "mitex",
+ "serde_json",
  "ssw-core",
  "thiserror",
  "typst",

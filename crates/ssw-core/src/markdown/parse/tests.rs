@@ -510,6 +510,32 @@ fn callout_tag_title_and_body() {
 }
 
 #[test]
+fn callout_range_covers_the_tag_line_and_its_title() {
+    for (src, range) in [
+        // Title and no body: the range reaches the end of the title.
+        ("> [!NOTE] My title", "> [!NOTE] My title"),
+        ("> [!NOTE] My title\n\nafter", "> [!NOTE] My title"),
+        // No title: the range ends at the tag.
+        ("> [!TIP]", "> [!TIP]"),
+        // With a body: up to the end of the last child.
+        ("> [!NOTE] My title\n> body", "> [!NOTE] My title\n> body"),
+        // Nested in a list item.
+        ("- a\n\n  > [!WARNING] t", "> [!WARNING] t"),
+    ] {
+        let doc = parse_document(src);
+        let callout = doc
+            .iter_blocks()
+            .find(|b| matches!(b.kind, BlockKind::Callout { .. }))
+            .unwrap_or_else(|| panic!("no callout in {src:?}"));
+        assert_eq!(at(src, callout.range), range, "{src:?}");
+        assert!(callout.range.contains_range(callout.content));
+    }
+    let src = "> [!NOTE] My title";
+    let b = only_block(src);
+    assert_eq!(at(src, b.content), "");
+}
+
+#[test]
 fn page_break_and_thematic_break() {
     let src = "<!-- pagebreak -->\n\n***\n";
     let doc = parse_document(src);

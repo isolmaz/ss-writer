@@ -821,6 +821,12 @@ fn the_watcher_reports_create_modify_rename_and_delete() {
     std::fs::write(&a, "one").unwrap();
     let created = wait_for(&receiver, "create", |e| same(&e.path, &a));
     assert_eq!(created.kind, FsEventKind::Created);
+    // The callback runs after the batch reaches the channel, so it may still be on its way
+    // when the event is in hand.
+    let deadline = Instant::now() + WAIT;
+    while woken.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(woken.load(Ordering::SeqCst) >= 1, "the wake callback ran");
 
     std::fs::write(&a, "one and more").unwrap();

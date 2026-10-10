@@ -180,7 +180,9 @@ fn the_shell_drives_a_scenario_from_its_own_loop_and_exits_with_its_code() {
     let tmp = tempfile::tempdir().unwrap();
     let report = tmp.path().join("out").join("report.json");
     let mut args = Args::default();
-    args.test.hidden = true;
+    // A hidden window is never painted by the system: the window is shown, off-screen and
+    // without activation, on a desktop of its own.
+    args.test.perf_offscreen = true;
     args.test.profile = Some(tmp.path().join("profile"));
     args.test.perf_report = Some(report.clone());
     args.test.perf_scenario = Some(PerfScenario::Startup);
@@ -192,14 +194,17 @@ fn the_shell_drives_a_scenario_from_its_own_loop_and_exits_with_its_code() {
         install_crash_handler: false,
     };
     let _run = RECORDER_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    ssw_win::perf::enable();
-    ssw_win::perf::reset();
-    ssw_win::perf::mark(ssw_app::perf::MAIN_ENTERED);
-    // An application id of its own: the user's editor is never involved.
-    let id = format!("SSWriter.Test.perfshell.{}", std::process::id());
-    let mut shell = UiShell::new(Some(WinInstance::with_app_id(id).link()));
-    let mut dialogs = ScriptedServices::new().dialogs();
-    let exit = run(&args, process, &mut *dialogs, None, &mut shell);
+    let desktop = ssw_win::testing::PrivateDesktop::create().unwrap();
+    let exit = desktop.run(move || {
+        ssw_win::perf::enable();
+        ssw_win::perf::reset();
+        ssw_win::perf::mark(ssw_app::perf::MAIN_ENTERED);
+        // An application id of its own: the user's editor is never involved.
+        let id = format!("SSWriter.Test.perfshell.{}", std::process::id());
+        let mut shell = UiShell::new(Some(WinInstance::with_app_id(id).link()));
+        let mut dialogs = ScriptedServices::new().dialogs();
+        run(&args, process, &mut *dialogs, None, &mut shell)
+    });
     assert_eq!(exit, 0);
     let report: Value = serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(report["scenario"], "startup");

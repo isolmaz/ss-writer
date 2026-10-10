@@ -35,9 +35,7 @@ use ssw_win::menus::{MenuModel, PopupHost, PopupRequest};
 use ssw_win::taskbar::Progress;
 use ssw_win::theme::SystemTheme;
 use ssw_win::window::current_os_version;
-use ssw_win::window::send_message;
-use windows::Win32::Foundation::RECT;
-use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, GetClientRect, HMENU, WM_MOUSEMOVE};
+use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, HMENU};
 
 /// A popup host that "chooses" `choice` at once.
 struct Popups(Option<u32>);
@@ -316,34 +314,6 @@ fn log_text(app: &UiApp) -> String {
 }
 
 #[test]
-fn a_turn_while_a_modal_loop_holds_the_view_leaves_that_window_for_the_next_turn() {
-    let tmp = tempfile::tempdir().unwrap();
-    let file = note(tmp.path(), "a.md", "a");
-    let services = ScriptedServices::new();
-    let code = start(&[file], tmp.path(), |core, _| {
-        let _ole = OleGuard::initialize().unwrap();
-        let app = UiApp::new(core, options(&services, None)).unwrap();
-        app.pump();
-        let cell = app.controller().windows()[0].clone();
-        cell.dirty.set(true);
-        {
-            // A popup menu or dialog opened from the view runs its own loop with the view
-            // borrowed; a turn of ours in it must not touch the view.
-            let _held = cell.view.borrow_mut();
-            app.pump();
-            assert!(cell.dirty.get(), "the busy window waits for the next turn");
-        }
-        app.pump();
-        assert!(
-            !cell.dirty.get(),
-            "the repaint was asked for once the view was free"
-        );
-        0
-    });
-    assert_eq!(code, 0);
-}
-
-#[test]
 fn a_turn_that_delivers_animation_frames_sleeps_for_one_refresh() {
     let tmp = tempfile::tempdir().unwrap();
     let file = note(tmp.path(), "a.md", "a");
@@ -352,13 +322,12 @@ fn a_turn_that_delivers_animation_frames_sleeps_for_one_refresh() {
         let _ole = OleGuard::initialize().unwrap();
         let app = UiApp::new(core, options(&services, None)).unwrap();
         app.pump();
-        let hwnd = app.hwnd(app.controller().windows()[0].id).unwrap();
-        let mut client = RECT::default();
-        // SAFETY: reads the client rectangle of a window of this thread into a local.
-        unsafe { GetClientRect(hwnd, &mut client) }.unwrap();
-        // The pointer comes over the close button: its hover fades in, a frame at a time.
-        let (x, y) = (client.right - 20, 12);
-        send_message(hwnd, WM_MOUSEMOVE, 0, ((y as isize) << 16) | x as isize);
+        // A widget of the window asks for an animation frame (a fade, an eased scroll).
+        app.controller().windows()[0]
+            .view
+            .borrow_mut()
+            .requests_mut()
+            .request_animation_frame();
         let frame = ssw_win::services::timers::refresh_interval();
         let waits: Vec<Option<std::time::Duration>> = (0..10).map(|_| app.idle()).collect();
         assert!(waits.contains(&Some(frame)), "{waits:?} against {frame:?}");

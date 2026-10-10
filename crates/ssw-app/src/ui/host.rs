@@ -784,9 +784,8 @@ impl UiApp {
             // Before the invalidation is read: scrolling invalidates the editor.
             scrolling |= native.platform.scroll_frame();
             let (repaint, cursor) = {
-                let Ok(mut view) = cell.view.try_borrow_mut() else {
-                    continue;
-                };
+                // The loop owner's turn never runs inside a handler of the view.
+                let mut view = cell.view.borrow_mut();
                 let requests = view.requests_mut();
                 let repaint = !requests.take_invalidation().is_clean();
                 let cursor = requests.take_cursor();

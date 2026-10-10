@@ -30,6 +30,10 @@ jobs:
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A red run still saves its cache: without it every failing run recompiles the
+          # whole dependency graph (28 of the coverage job's 35 minutes went there).
+          cache-on-failure: true
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -47,6 +51,10 @@ jobs:
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A red run still saves its cache: without it every failing run recompiles the
+          # whole dependency graph (28 of the coverage job's 35 minutes went there).
+          cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -66,6 +74,10 @@ jobs:
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          # A red run still saves its cache: without it every failing run recompiles the
+          # whole dependency graph (28 of the coverage job's 35 minutes went there).
+          cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov,cargo-nextest

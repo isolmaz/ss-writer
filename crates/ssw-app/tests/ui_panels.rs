@@ -404,6 +404,16 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// The names in `dir`, for failure messages.
+fn names_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![format!("<{} cannot be listed>", dir.display())];
+    };
+    entries
+        .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+        .collect()
+}
+
 // ===== the inspector ===========================================================================
 
 const DOC: &[u8] = b"# Alpha\n\nfirst words\n\n## Beta\n\nsecond words\n\n# Gamma\n\nthird\n";
@@ -1076,31 +1086,33 @@ fn a_file_gone_before_it_opens_in_a_new_window_is_reported_there() {
 
 #[test]
 fn an_open_file_moved_where_its_history_cannot_follow_keeps_its_tab_and_says_so() {
-    use std::os::windows::ffi::OsStringExt;
-
     with_rig(FILES, |rig| {
-        // Windows allows a folder name with an unpaired surrogate; the history store keys
-        // paths as text and cannot take it.
-        let odd = std::ffi::OsString::from_wide(&[u16::from(b'x'), 0xD800]);
-        std::fs::create_dir(rig.work.join(&odd)).unwrap();
         rig.open("other.md");
         rig.show_workspace();
         let (other, _) = rig.entry("other");
-        let rows = rig.rows();
-        let odd_row = rows.iter().find(|name| name.starts_with('x')).unwrap();
-        let (folder, _) = rig.entry(odd_row);
+        let (folder, _) = rig.entry("sub");
+        // The version history cannot follow the file: its table is gone (a damaged database).
+        let database = rig.controller.core().borrow().paths.state_db();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch("DROP TABLE history_snapshots;")
+            .unwrap();
         rig.answer(MessageBoxResult::Ok);
         rig.sidebar_event(SidebarEvent::Dropped {
             source: other,
             target_folder: folder,
             copy: false,
         });
-        let moved = rig.work.join(&odd).join("other.md");
-        assert!(moved.exists());
+        let target = rig.work.join("sub");
+        assert!(
+            target.join("other.md").exists(),
+            "the folder holds {:?}",
+            names_in(&target)
+        );
         assert_eq!(rig.services.dialog_log().len(), 1);
         assert!(
             rig.active_path()
-                .ends_with(Path::new(&odd).join("other.md"))
+                .ends_with(Path::new("sub").join("other.md"))
         );
     });
 }

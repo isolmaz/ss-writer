@@ -303,12 +303,12 @@ impl ExportDialog {
     /// Chooses `format` in the list.
     pub fn select_format(&mut self, format: ExportFormat) {
         self.format = format;
-        if let Some(index) = FORMATS
+        // `FORMATS` lists every format.
+        let index = FORMATS
             .iter()
             .position(|(candidate, _)| *candidate == format)
-        {
-            self.formats.select(index);
-        }
+            .unwrap_or_default();
+        self.formats.select(index);
     }
 
     /// True while the dialog is shown.
@@ -363,14 +363,13 @@ impl ExportDialog {
     /// Applies what the controls reported.
     fn harvest(&mut self, cx: &mut EventCx) {
         let list_events = self.formats.take_events();
-        if let Some(format) = self
+        // The list always has a row selected: the constructor selects one and a click or a key
+        // only moves the selection.
+        self.format = self
             .formats
             .selected_index()
             .and_then(|index| FORMATS.get(index))
-            .map(|(format, _)| *format)
-        {
-            self.format = format;
-        }
+            .map_or(self.format, |(format, _)| *format);
         let activated = list_events
             .iter()
             .any(|event| matches!(event, ListEvent::Activated(_)));
@@ -378,9 +377,10 @@ impl ExportDialog {
         for (key, change) in self.form.take_changes() {
             match (key, change) {
                 (OptionKey::PageSize, Change::Selected(index)) => {
-                    if let Some((size, _)) = PAGE_SIZES.get(index) {
-                        self.options.page_size = *size;
-                    }
+                    // The combo box lists exactly `PAGE_SIZES`.
+                    self.options.page_size = PAGE_SIZES
+                        .get(index)
+                        .map_or(self.options.page_size, |(size, _)| *size);
                 }
                 (OptionKey::Margin, Change::Edited(text)) => {
                     let outcome = self.parse(FieldId::ExportMargin, OptionKey::Margin, &text);

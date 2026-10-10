@@ -2128,7 +2128,7 @@ mod tests {
         harness.hover(&mut inspector, row.center());
         let fills = hover_fills(&mut harness, &inspector);
         assert_eq!(fills.len(), 1);
-        assert!(row.contains_rect(fills[0]), "{:?} in {row:?}", fills[0]);
+        assert!(row.contains_rect(fills[0]));
     }
 
     #[test]
@@ -2195,11 +2195,7 @@ mod tests {
         harness.hover(&mut inspector, second.center());
         let fills = hover_fills(&mut harness, &inspector);
         assert_eq!(fills.len(), 1);
-        assert!(
-            second.contains_rect(fills[0]),
-            "{:?} in {second:?}",
-            fills[0]
-        );
+        assert!(second.contains_rect(fills[0]));
     }
 
     #[test]
@@ -2236,7 +2232,7 @@ mod tests {
                 .collect()
         };
         let top = described(&harness, &inspector);
-        assert!(!top.is_empty() && top.len() < 20, "{} described", top.len());
+        assert!(!top.is_empty() && top.len() < 20);
         assert_eq!(top[0], "Heading 0");
         let max = inspector.bar.model().max_offset();
         inspector.bar.model_mut().jump(max);
@@ -2288,5 +2284,140 @@ mod tests {
         );
         harness.run_animations(&mut inspector);
         assert_eq!(inspector.scroll_offset(), inspector.bar.model().target());
+    }
+
+    #[test]
+    fn showing_the_tab_already_open_keeps_the_scroll_position_and_the_hover() {
+        let (mut harness, mut inspector) = long_outline(Motion::reduced());
+        let max = inspector.bar.model().max_offset();
+        inspector.bar.model_mut().jump(max);
+        harness.arrange(&mut inspector, Rect::new(800.0, 80.0, 280.0, 400.0));
+        assert_eq!(inspector.scroll_offset(), max);
+        assert!(max > 0.0);
+        let last = inspector.item_rect(59).center();
+        harness.hover(&mut inspector, last);
+        assert_eq!(hover_fills(&mut harness, &inspector).len(), 1);
+        inspector.set_tab(InspectorTab::Contents);
+        assert_eq!(inspector.scroll_offset(), max);
+        assert_eq!(hover_fills(&mut harness, &inspector).len(), 1);
+        // Another tab starts at the top and forgets the hover.
+        inspector.set_tab(InspectorTab::Info);
+        assert_eq!(inspector.scroll_offset(), 0.0);
+        assert!(hover_fills(&mut harness, &inspector).is_empty());
+    }
+
+    #[test]
+    fn a_caret_before_the_first_heading_has_no_current_row_and_the_keys_wait_for_a_cursor() {
+        let (mut harness, mut inspector) = setup();
+        inspector.set_toc(&toc_of("intro\n\n# A\n## B\n"));
+        inspector.set_caret(0);
+        assert_eq!(inspector.current_heading(), None);
+        assert_eq!(inspector.current_row(), None);
+        let selected = harness
+            .tree(&inspector)
+            .nodes()
+            .iter()
+            .filter(|n| n.role == Role::TreeItem && n.state.selected)
+            .count();
+        assert_eq!(selected, 0);
+        focus_list(&mut harness, &inspector);
+        // Right, Left and Return are taken but have no row to act on.
+        for key in [vk::RIGHT, vk::LEFT, vk::RETURN] {
+            assert!(harness.key(&mut inspector, key).handled);
+            assert_eq!(inspector.cursor, None);
+        }
+        assert!(inspector.take_events().is_empty());
+        assert_eq!(inspector.visible_headings(), vec![0, 1]);
+        // Down starts at the first row.
+        harness.key(&mut inspector, vk::DOWN);
+        assert_eq!(inspector.cursor, Some(0));
+    }
+
+    #[test]
+    fn a_heading_filtered_out_with_no_parent_leaves_no_current_row() {
+        let (mut harness, mut inspector) = setup();
+        // "### A" is the first heading: nothing above it can stand in once the filter hides it.
+        let toc = toc_of("### A\n# B\n");
+        inspector.set_toc(&toc);
+        inspector.set_level_filter(1);
+        inspector.set_caret(0);
+        assert_eq!(inspector.current_heading(), Some(0));
+        assert_eq!(inspector.visible_headings(), vec![1]);
+        assert_eq!(inspector.current_row(), None);
+        focus_list(&mut harness, &inspector);
+        assert!(harness.key(&mut inspector, vk::LEFT).handled);
+        assert_eq!(inspector.cursor, None);
+        // The caret in the visible heading selects its own row.
+        inspector.set_caret(toc.entries()[1].range.start);
+        assert_eq!(inspector.current_row(), Some(0));
+    }
+
+    #[test]
+    fn a_press_in_the_list_below_the_last_row_hits_nothing() {
+        let (mut harness, mut inspector) = setup();
+        let below = Point::new(900.0, inspector.item_rect(6).y + 4.0);
+        assert!(inspector.list_rect().contains(below));
+        assert!(!harness.click(&mut inspector, below).handled);
+        assert!(inspector.take_events().is_empty());
+        harness.hover(&mut inspector, below);
+        assert!(hover_fills(&mut harness, &inspector).is_empty());
+    }
+
+    #[test]
+    fn return_in_the_info_tab_needs_a_chosen_backlink() {
+        let (mut harness, mut inspector) = setup();
+        fill_info(&mut inspector);
+        inspector.set_tab(InspectorTab::Info);
+        harness.arrange(&mut inspector, Rect::new(800.0, 80.0, 280.0, 400.0));
+        focus_list(&mut harness, &inspector);
+        assert!(harness.key(&mut inspector, vk::RETURN).handled);
+        assert!(inspector.take_events().is_empty());
+        assert_eq!(inspector.link_cursor, None);
+    }
+
+    #[test]
+    fn the_keyboard_row_is_the_focused_node_only_while_the_list_has_focus() {
+        let (mut harness, mut inspector) = setup();
+        let focused = |harness: &Harness, inspector: &Inspector| -> Vec<String> {
+            harness
+                .tree(inspector)
+                .nodes()
+                .iter()
+                .filter(|n| n.role == Role::TreeItem && n.state.focused)
+                .map(|n| n.name.clone())
+                .collect()
+        };
+        focus_list(&mut harness, &inspector);
+        assert!(
+            focused(&harness, &inspector).is_empty(),
+            "no row chosen yet"
+        );
+        harness.key(&mut inspector, vk::DOWN);
+        assert_eq!(focused(&harness, &inspector), vec!["Setup"]);
+        harness.focus.focus(inspector.contents_tab_id);
+        assert!(focused(&harness, &inspector).is_empty());
+    }
+
+    #[test]
+    fn missing_file_and_backlink_data_are_described_as_plain_text_in_the_info_tab() {
+        let (mut harness, mut inspector) = setup();
+        inspector.set_file(None);
+        inspector.set_backlinks(&[], &localizer());
+        inspector.set_tab(InspectorTab::Info);
+        harness.arrange(&mut inspector, Rect::new(800.0, 80.0, 280.0, 400.0));
+        let tree = harness.tree(&inspector);
+        let rows: Vec<_> = tree
+            .children(inspector.list_id)
+            .map(|n| (n.role, n.name.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Role::Text, "File"),
+                (Role::Text, "No file"),
+                (Role::Text, "Backlinks (0)"),
+                (Role::Text, "No backlinks"),
+            ]
+        );
     }
 }

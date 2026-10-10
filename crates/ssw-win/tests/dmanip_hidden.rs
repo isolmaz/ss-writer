@@ -328,6 +328,10 @@ fn the_viewport_follows_the_geometry_in_pixels() {
     let _com = ComGuard::apartment_threaded().expect("STA");
     let window = HiddenWindow::new();
     let mut dm = rig(&window, DmConfig::default(), 1.5);
+    // The debug form names the window, the scale and the zoom, not the COM objects.
+    let debug = format!("{dm:?}");
+    assert!(debug.starts_with("DirectManipulation { hwnd: "), "{debug}");
+    assert!(debug.ends_with(", scale: 1.5, zoom: 1.0, .. }"), "{debug}");
     let rect = |right, bottom| RECT {
         left: 0,
         top: 0,
@@ -355,6 +359,9 @@ fn invalid_requests_are_rejected_before_they_reach_the_viewport() {
         let error =
             DirectManipulation::new(window.0, config, viewport(), Size::new(400.0, 3000.0), 1.0)
                 .unwrap_err();
+        assert!(matches!(error, WinError::Invalid(_)), "{error:?}");
+        // The driver reports the viewport's refusal as its own.
+        let error = ScrollDriver::new(window.0, config, &layout(3000.0)).unwrap_err();
         assert!(matches!(error, WinError::Invalid(_)), "{error:?}");
     }
     let dm = rig(&window, DmConfig::default(), 1.0);
@@ -733,4 +740,259 @@ fn settings_and_activation_pass_through() {
     driver.deactivate().unwrap();
     assert!(!driver.has_contact());
     driver.activate().unwrap();
+}
+
+#[test]
+fn a_contact_the_viewport_accepted_is_tracked_until_the_system_says_it_is_gone() {
+    let _com = ComGuard::apartment_threaded().expect("STA");
+    let window = HiddenWindow::new();
+    let mut driver = ScrollDriver::new(window.0, DmConfig::default(), &layout(3000.0)).unwrap();
+    // No pointer is injected: the closure stands in for the viewport accepting a touch pointer.
+    let mut handed = Vec::new();
+    driver
+        .start_contact_with(0x7777, |dm, id| {
+            handed.push(id);
+            assert!(!dm.status().unwrap().is_moving());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(handed, [0x7777]);
+    assert!(driver.has_contact());
+    // A viewport that refuses another pointer leaves the tracked contact alone.
+    let refused = driver.start_contact_with(0x8888, |_, _| Err(WinError::Invalid("refused")));
+    assert!(refused.is_err());
+    assert!(driver.has_contact());
+    // The system does not know pointer 0x7777 (it never was one): the contact is over by the
+    // next frame, which then has nothing left to do.
+    let frame = driver.frame(Duration::ZERO).unwrap();
+    assert!(!driver.has_contact());
+    assert!(!frame.more);
+}
+
+/// The operation an error reports as failed ("stop the viewport" for "stop the viewport failed:
+/// ...").
+#[cfg(feature = "fault-injection")]
+fn reported<T>(outcome: Result<T, WinError>) -> Option<String> {
+    outcome.err().map(|error| {
+        error
+            .to_string()
+            .split(" failed: ")
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    })
+}
+
+/// What a sweep reports when each of `steps` fails in turn.
+#[cfg(feature = "fault-injection")]
+fn failing(steps: &[&str]) -> Vec<Option<String>> {
+    steps.iter().map(|step| Some((*step).to_owned())).collect()
+}
+
+/// Runs `operation` on a fresh driver whose checked call 0, 1, 2, ... fails, one run each,
+/// until a run does not reach the failing call; returns what the runs that were hit made of it.
+/// `setup` brings every fresh driver to the state under test before the failure is armed (a
+/// failure of the operation may change that state, so no run reuses a driver).
+#[cfg(feature = "fault-injection")]
+fn sweep_driver<T>(
+    window: &HiddenWindow,
+    setup: impl Fn(&mut ScrollDriver),
+    mut operation: impl FnMut(&mut ScrollDriver) -> T,
+) -> Vec<T> {
+    let mut outcomes = Vec::new();
+    for call in 0.. {
+        let mut driver = ScrollDriver::new(window.0, DmConfig::default(), &layout(3000.0))
+            .expect("the driver is created");
+        setup(&mut driver);
+        ssw_win::fault::arm(call);
+        let outcome = operation(&mut driver);
+        let hit = ssw_win::fault::tripped();
+        ssw_win::fault::disarm();
+        if !hit {
+            break;
+        }
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn every_failing_step_of_creating_a_viewport_is_reported_by_the_step_that_failed() {
+    let _com = ComGuard::apartment_threaded().expect("STA");
+    let mut steps = vec![
+        "create the DirectManipulation manager",
+        "get the DirectManipulation update manager",
+        "create the DirectManipulation viewport",
+        "configure the DirectManipulation viewport",
+        "select manual updates",
+        "add the viewport event handler",
+        "set the viewport rectangle",
+        "activate DirectManipulation for the window",
+        "enable the DirectManipulation viewport",
+        "get the primary content",
+        "set the content rectangle",
+    ];
+    // Every run has a window of its own: a viewport that failed half way leaves its window as
+    // it was.
+    let create = |config: DmConfig| {
+        ssw_win::fault::sweep(|| {
+            let window = HiddenWindow::new();
+            reported(DirectManipulation::new(
+                window.0,
+                config,
+                viewport(),
+                Size::new(400.0, 3000.0),
+                1.0,
+            ))
+        })
+    };
+    assert_eq!(create(DmConfig::default()), failing(&steps));
+    // Pinch zoom adds the zoom limits.
+    steps.extend([
+        "get the primary content for zoom limits",
+        "set the zoom limits",
+    ]);
+    let zoomed = DmConfig {
+        zoom: Some(ZoomRange { min: 0.5, max: 4.0 }),
+    };
+    assert_eq!(create(zoomed), failing(&steps));
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn every_failing_call_of_a_viewport_is_reported_by_the_step_that_failed() {
+    use ssw_win::fault::sweep;
+
+    let _com = ComGuard::apartment_threaded().expect("STA");
+    let window = HiddenWindow::new();
+    let mut dm = rig(&window, DmConfig::default(), 1.0);
+    let mut recorder = Recorder::default();
+    let content = Size::new(400.0, 3000.0);
+
+    assert_eq!(
+        sweep(|| reported(dm.set_geometry(viewport(), content, 1.0))),
+        failing(&["set the viewport rectangle", "set the content rectangle"])
+    );
+    assert_eq!(
+        sweep(|| reported(dm.viewport_rect())),
+        failing(&["get the viewport rectangle"])
+    );
+    assert_eq!(
+        sweep(|| reported(dm.content_rect())),
+        failing(&["get the content rectangle"])
+    );
+    assert_eq!(
+        sweep(|| reported(dm.status())),
+        failing(&["get the viewport status"])
+    );
+    assert_eq!(
+        sweep(|| reported(dm.content_transform())),
+        failing(&["get the content transform"])
+    );
+    // The system does not know this pointer: it is the failure of the last run, which the
+    // injected ones are compared to.
+    assert_eq!(
+        sweep(|| reported(dm.set_contact(0x7777))),
+        failing(&["set the manipulation contact"])
+    );
+    assert_eq!(
+        sweep(|| reported(dm.update(&mut recorder))),
+        failing(&["update DirectManipulation", "get the viewport status"])
+    );
+    let moving = ["get the viewport rectangle", "move the content"];
+    assert_eq!(sweep(|| reported(dm.sync_to(100.0, 1.0))), failing(&moving));
+    assert_eq!(
+        sweep(|| reported(dm.animate_to(100.0, 1.0))),
+        failing(&moving)
+    );
+    assert_eq!(
+        sweep(|| reported(dm.activate())),
+        failing(&["activate DirectManipulation"])
+    );
+    assert_eq!(
+        sweep(|| reported(dm.deactivate())),
+        failing(&["deactivate DirectManipulation"])
+    );
+    assert_eq!(
+        sweep(|| reported(dm.stop())),
+        failing(&["stop the viewport"])
+    );
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn every_failing_step_of_the_driver_is_reported_and_leaves_no_contact() {
+    let _com = ComGuard::apartment_threaded().expect("STA");
+    let window = HiddenWindow::new();
+    let status = "get the viewport status";
+    let rectangle = "get the viewport rectangle";
+    let moved = "move the content";
+    let update = "update DirectManipulation";
+
+    // A new layout: the manipulation is looked at first, then both rectangles are set.
+    assert_eq!(
+        sweep_driver(
+            &window,
+            |_| {},
+            |driver| reported(driver.set_layout(&layout(1000.0)))
+        ),
+        failing(&[
+            status,
+            "set the viewport rectangle",
+            "set the content rectangle"
+        ])
+    );
+
+    // After a scroll that did not come from DirectManipulation its transform is re-seated
+    // (moved and updated) before a move of its own or before a contact is handed over.
+    let jumped = |driver: &mut ScrollDriver| {
+        driver.jump_to(700.0).unwrap();
+        assert!(driver.is_stale());
+    };
+    assert_eq!(
+        sweep_driver(&window, jumped, |driver| reported(
+            driver.animate_to(800.0, 1.0)
+        )),
+        failing(&[status, rectangle, moved, update, status, rectangle, moved])
+    );
+    assert_eq!(
+        sweep_driver(&window, jumped, |driver| {
+            let outcome = reported(driver.start_contact(0x7777));
+            assert!(!driver.has_contact());
+            outcome
+        }),
+        failing(&[
+            rectangle,
+            moved,
+            update,
+            status,
+            "set the manipulation contact"
+        ])
+    );
+
+    // The first frames after an animation was started update the viewport.
+    assert_eq!(
+        sweep_driver(
+            &window,
+            |driver| driver.animate_to(800.0, 1.0).unwrap(),
+            |driver| reported(driver.frame(Duration::ZERO))
+        ),
+        failing(&[status, update, status])
+    );
+
+    // A manipulation that is moving is stopped and its position adopted before the scroller
+    // moves on its own.
+    assert_eq!(
+        sweep_driver(
+            &window,
+            |driver| {
+                driver.animate_to(2500.0, 1.0).unwrap();
+                run_frames(driver, "movement", |frame| frame.offset > 300.0);
+                assert!(driver.manipulation().status().unwrap().is_moving());
+            },
+            |driver| reported(driver.jump_to(100.0))
+        ),
+        failing(&[status, "stop the viewport", "get the content transform"])
+    );
 }

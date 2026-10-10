@@ -298,7 +298,10 @@ pub(super) mod tests {
             let _ = Stylesheet::parse(&good[..n], 0, n as u32);
         }
         // an STD too short for its header or name yields an empty slot; a name or UPX past the STD is tolerated
-        assert!(parse_std(&[1, 0], 10).is_none());
+        assert!(parse_std(&[], 10).is_none(), "no sti word");
+        assert!(parse_std(&[1], 10).is_none(), "half an sti word");
+        assert!(parse_std(&[1, 0], 10).is_none(), "no stk/base word");
+        assert!(parse_std(&[1, 0, 1, 0], 10).is_none(), "no cupx word");
         assert!(parse_std(&[0u8; 10], 10).is_none());
         let mut std = vec![0u8; 10];
         std[4] = 0x02; // two UPXs claimed

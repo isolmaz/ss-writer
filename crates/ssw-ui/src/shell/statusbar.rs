@@ -231,9 +231,8 @@ impl StatusBar {
     }
 
     fn set_text(&mut self, kind: StatusSegment, text: String) {
-        if let Some(segment) = self.segments.iter_mut().find(|s| s.kind == kind) {
-            segment.text = text;
-        }
+        // `segments` follows `StatusSegment::ALL`, so a kind's discriminant is its slot.
+        self.segments[kind as usize].text = text;
     }
 
     /// The text of `kind`; empty when the segment is not shown.

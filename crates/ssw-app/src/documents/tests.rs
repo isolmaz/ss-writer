@@ -246,6 +246,7 @@ fn saving_back_to_word_snapshots_first_and_round_trips_the_edit() {
         entry.source(),
         Source::Converted(ConvertedFormat::Docx)
     ));
+    assert!(entry.can_save_back());
     type_at_end(&entry, "\nTyped by the test.\n");
     assert!(matches!(f.docs.save(&entry), Err(DocError::NeedsSaveAs)));
     f.docs.save_back(&entry).unwrap();
@@ -273,6 +274,11 @@ fn saving_back_to_word_snapshots_first_and_round_trips_the_edit() {
         &std::fs::read(fixture_file("doc/simple-list.doc")).unwrap(),
     );
     let old = f.docs.open(&doc).unwrap();
+    // Neither the import-only .doc nor a text file nor an untitled buffer can be written back.
+    assert!(!old.can_save_back());
+    let plain = f.docs.open(&f.write("plain.md", b"text\n")).unwrap();
+    assert!(!plain.can_save_back());
+    assert!(!f.docs.new_untitled().can_save_back());
     assert!(matches!(
         f.docs.save_back(&old),
         Err(DocError::Unsupported(_))
@@ -301,7 +307,23 @@ fn an_untitled_buffer_becomes_a_file_with_save_as() {
     assert_eq!(second.title(&i18n), "Untitled 2");
     assert!(first.is_untitled() && !first.is_dirty());
     assert!(matches!(f.docs.save(&first), Err(DocError::Untitled)));
+    assert!(first.is_pristine_untitled());
+    // A restored buffer counts as unsaved even when it is empty; a file is no scratch buffer.
+    assert!(
+        !f.docs
+            .restore_untitled("restored", "")
+            .is_pristine_untitled()
+    );
+    let file = f.docs.open(&f.write("file.md", b"x\n")).unwrap();
+    assert!(!file.is_pristine_untitled());
     type_at_end(&first, "# Draft\n");
+    assert!(!first.is_pristine_untitled(), "it has text now");
+    // Typing and undoing leaves an empty buffer that is not the one nobody touched.
+    let scratch = f.docs.new_untitled();
+    type_at_end(&scratch, "x");
+    assert!(scratch.document().borrow_mut().undo().unwrap());
+    assert!(scratch.document().borrow().buffer().is_empty());
+    assert!(!scratch.is_pristine_untitled());
     let id = first.untitled_id().unwrap();
     f.store.borrow().untitled_put(&id, "# Draft\n", 5).unwrap();
 

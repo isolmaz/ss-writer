@@ -404,17 +404,21 @@ impl View {
         }
     }
 
+    /// ACP where the composition `comp` of this view starts.
+    fn start_of(&self, comp: &Composition) -> usize {
+        self.byte_to_host_units(comp.host_at)
+    }
+
     /// ACP where the composition string starts, if composing.
     pub(super) fn composition_start(&self) -> Option<usize> {
-        self.comp
-            .as_ref()
-            .map(|comp| self.byte_to_host_units(comp.host_at))
+        self.comp.as_ref().map(|comp| self.start_of(comp))
     }
 
     /// ACP range of the composition string, if composing.
     pub(super) fn composition_extent(&self) -> Option<Range<usize>> {
-        let start = self.composition_start()?;
-        Some(start..start + self.comp.as_ref()?.units.len())
+        let comp = self.comp.as_ref()?;
+        let start = self.start_of(comp);
+        Some(start..start + comp.units.len())
     }
 
     /// ACP of the host byte offset `byte`. A position at the composition's insertion point maps
@@ -604,7 +608,7 @@ impl View {
     /// The `ImeEvent::Update` for the current composition string, caret and attributes.
     pub(super) fn update_event(&self) -> Option<ImeEvent> {
         let comp = self.comp.as_ref()?;
-        let start = self.composition_start()?;
+        let start = self.start_of(comp);
         let text = String::from_utf16_lossy(&comp.units);
         let map = Utf16Map::new(&text);
         let caret = comp.selection.head().clamp(start, start + comp.units.len()) - start;
@@ -617,14 +621,30 @@ impl View {
 
     /// Takes the pending `ImeEvent::Update`, if the composition changed since the last one.
     pub(super) fn take_update(&mut self) -> Option<ImeEvent> {
-        if !self.comp.as_ref()?.dirty {
+        let comp = self.comp.as_mut()?;
+        if !comp.dirty {
             return None;
         }
-        let event = self.update_event();
+        comp.dirty = false;
+        self.update_event()
+    }
+
+    /// The composition string, caret or attributes changed: the host hears of it with the next
+    /// update. Without a composition there is nothing to tell.
+    pub(super) fn mark_composition_dirty(&mut self) {
         if let Some(comp) = self.comp.as_mut() {
-            comp.dirty = false;
+            comp.dirty = true;
         }
-        event
+    }
+
+    /// The composition was ended and started again over a moved extent: the new one inherits
+    /// `selection`, TSF's selection of the old one, and the host is told about it. Without a
+    /// new composition (the host refused it) or without the old selection nothing changes.
+    pub(super) fn resume_composition(&mut self, selection: Option<AcpSelection>) {
+        if let (Some(comp), Some(selection)) = (self.comp.as_mut(), selection) {
+            comp.selection = selection;
+            comp.dirty = true;
+        }
     }
 }
 
@@ -1154,5 +1174,51 @@ mod tests {
         assert!(view.take_update().is_none());
         view.set_attrs(&[(0..1, ImeAttrStyle::Converted)]);
         assert!(view.composition().is_none());
+    }
+
+    #[test]
+    fn marking_a_composition_dirty_schedules_one_update_and_needs_a_composition() {
+        let mut view = view("ab");
+        // Nothing to mark: no composition appears and no update is pending.
+        view.mark_composition_dirty();
+        assert!(view.composition().is_none());
+        assert!(view.take_update().is_none());
+        begin(&mut view, 1, 1);
+        assert!(view.take_update().is_none(), "a fresh composition is clean");
+        view.mark_composition_dirty();
+        assert!(view.composition().expect("composing").dirty);
+        assert!(view.take_update().is_some());
+        assert!(view.take_update().is_none(), "the update is delivered once");
+    }
+
+    #[test]
+    fn a_restarted_composition_inherits_the_selection_only_when_there_is_one_to_inherit() {
+        let mut view = view("abcd");
+        let old = AcpSelection {
+            start: 3,
+            end: 4,
+            backward: true,
+        };
+        // The host refused the new composition: nothing to give the selection to.
+        view.resume_composition(Some(old));
+        assert!(view.composition().is_none());
+        begin(&mut view, 1, 2);
+        // The old composition had no selection to hand over.
+        view.resume_composition(None);
+        let comp = view.composition().expect("composing");
+        assert_eq!(
+            comp.selection,
+            AcpSelection {
+                start: 1,
+                end: 2,
+                backward: false
+            }
+        );
+        assert!(!comp.dirty);
+        // With one, the new composition takes it over and the host is told.
+        view.resume_composition(Some(old));
+        let comp = view.composition().expect("composing");
+        assert_eq!(comp.selection, old);
+        assert!(comp.dirty);
     }
 }

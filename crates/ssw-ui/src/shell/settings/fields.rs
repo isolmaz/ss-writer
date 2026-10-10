@@ -670,4 +670,18 @@ mod tests {
         assert_eq!(FieldValue::Number(2.5).number(), 2.5);
         assert_eq!(FieldValue::Text("2.5".into()).number(), 0.0);
     }
+
+    #[test]
+    fn a_choice_that_names_no_option_leaves_the_setting_as_it_was() {
+        let mut settings = Settings::default();
+        let def = FieldId::AttachmentLocation.def();
+        assert_eq!(def.write(&mut settings, &FieldValue::Choice(2)), Ok(()));
+        assert_eq!(def.read(&settings), FieldValue::Choice(2));
+        // Past the last option, and a value of another kind: nothing is selected.
+        assert_eq!(def.write(&mut settings, &FieldValue::Choice(99)), Ok(()));
+        assert_eq!(def.read(&settings), FieldValue::Choice(2));
+        let text = FieldValue::Text("2".into());
+        assert_eq!(def.write(&mut settings, &text), Ok(()));
+        assert_eq!(def.read(&settings), FieldValue::Choice(2));
+    }
 }

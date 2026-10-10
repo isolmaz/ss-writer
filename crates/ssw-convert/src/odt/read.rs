@@ -488,13 +488,14 @@ impl<'a, 'p> Converter<'a, 'p> {
         while matches!(blocks.last(), Some(Block::PageBreak)) {
             blocks.pop();
         }
-        let mut markdown = md::blocks_to_string(&blocks);
-        if !self.notes.is_empty() {
-            if !markdown.is_empty() {
-                markdown.push_str("\n\n");
-            }
-            markdown.push_str(self.notes.concat().trim_end());
-        }
+        // The footnote definitions follow the body after a blank line.
+        let body = md::blocks_to_string(&blocks);
+        let notes = self.notes.concat();
+        let mut markdown = [body.as_str(), notes.trim_end()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         if !markdown.is_empty() {
             markdown.push('\n');
         }
@@ -1302,6 +1303,14 @@ mod tests {
         bytes
     }
 
+    /// Start of the message of every [`ImportError::Corrupt`].
+    const CORRUPT: &str = "the document is corrupt: ";
+
+    /// The message of the error of an import that must fail.
+    fn failure(result: Result<ImportResult, ImportError>) -> String {
+        result.unwrap_err().to_string()
+    }
+
     fn parse(xml: &str) -> Element {
         xml::parse(xml.as_bytes()).unwrap()
     }
@@ -1330,10 +1339,8 @@ mod tests {
                 })
             );
         }
-        assert!(matches!(
-            import_odt(b"PK\x03\x04junk", "x"),
-            Err(ImportError::Corrupt(_))
-        ));
+        let message = failure(import_odt(b"PK\x03\x04junk", "x"));
+        assert!(message.starts_with(CORRUPT), "{message}");
     }
 
     #[test]
@@ -1362,10 +1369,12 @@ mod tests {
                 Err(wrong_zip(detected))
             );
         }
-        assert!(matches!(
+        assert_eq!(
             import_odt(&zip(&[("a", b"")]), "x"),
-            Err(ImportError::Corrupt(_))
-        ));
+            Err(ImportError::Corrupt(
+                "the package has no content.xml".into()
+            ))
+        );
     }
 
     #[test]
@@ -1412,22 +1421,31 @@ mod tests {
     #[test]
     fn unusable_content_parts_are_corrupt_or_another_document_type() {
         let corrupt = [
-            "<a",
-            "<root/>",
-            "<office:document-content/>",
-            "<office:document-content><office:body/></office:document-content>",
+            ("<a", "content.xml: "),
+            ("<root/>", "content.xml is not an OpenDocument content part"),
+            (
+                "<office:document-content/>",
+                "content.xml has no document body",
+            ),
+            (
+                "<office:document-content><office:body/></office:document-content>",
+                "content.xml has no text document body",
+            ),
         ];
-        for xml in corrupt {
+        for (xml, reason) in corrupt {
             let bytes = zip(&[("mimetype", MIME), ("content.xml", xml.as_bytes())]);
+            let message = failure(import_odt(&bytes, "x"));
             assert!(
-                matches!(import_odt(&bytes, "x"), Err(ImportError::Corrupt(_))),
-                "{xml}"
+                message.starts_with(&format!("{CORRUPT}{reason}")),
+                "{xml}: {message}"
             );
         }
-        assert!(matches!(
+        assert_eq!(
             import_odt(&zip(&[("mimetype", MIME)]), "x"),
-            Err(ImportError::Corrupt(_))
-        ));
+            Err(ImportError::Corrupt(
+                "the package has no content.xml".into()
+            ))
+        );
         let body = |inner: &str| {
             format!(
                 "<office:document-content><office:body>{inner}</office:body></office:document-content>"
@@ -1492,9 +1510,9 @@ mod tests {
             b"<manifest:manifest/>",
             b"<office:document-content",
         ] {
-            let result = import_odt(&damage(intact.clone(), needle), "x");
+            let message = failure(import_odt(&damage(intact.clone(), needle), "x"));
             let label = String::from_utf8_lossy(needle);
-            assert!(matches!(result, Err(ImportError::Corrupt(_))), "{label}");
+            assert!(message.starts_with(CORRUPT), "{label}: {message}");
         }
         let result = import_odt(&damage(intact, b"<office:document-styles/>"), "x").unwrap();
         assert_eq!(losses_of(&result), [(LossKind::CorruptParts, 1)]);
@@ -1511,10 +1529,13 @@ mod tests {
         ]);
         let mut package = Package::open(&bytes).unwrap();
         package.exhaust_budget((MIME.len() + xml.len() + styles.len() - 1) as u64);
-        assert!(matches!(
+        assert_eq!(
             import_package(&mut package, "x"),
-            Err(ImportError::TooLarge(_))
-        ));
+            Err(ImportError::TooLarge(format!(
+                "more than {} bytes uncompressed",
+                crate::odt::package::MAX_TOTAL
+            )))
+        );
     }
 
     #[test]
@@ -2485,7 +2506,7 @@ mod tests {
             ("title alt, jpeg by magic, twice", r##"<text:p><draw:frame svg:width="1cm"><draw:image xlink:href="Pictures/b.dat"/><svg:title>The  title</svg:title></draw:frame><draw:frame><draw:image xlink:href="Pictures/b.dat"/></draw:frame><draw:frame><draw:image xlink:href="./Pictures/c.jpeg"/></draw:frame></text:p>"##, &[("Pictures/b.dat", b"\xff\xd8\xff\xe0abcd"), ("Pictures/c.jpeg", b"plain bytes")], "![The title|38](doc_assets/image-1.jpg)![](doc_assets/image-1.jpg)![](doc_assets/image-2.jpg)\n", &[], 2),
             ("unnamed ext", r##"<text:p><draw:frame><draw:image xlink:href="Pictures/x.dat"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/noext"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/x.toolongext"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/y.p-g"/></draw:frame></text:p>"##, &[("Pictures/x.dat", b"plain bytes"), ("Pictures/noext", b"plain bytes"), ("Pictures/x.toolongext", b"plain bytes"), ("Pictures/y.p-g", b"plain bytes")], "![](doc_assets/image-1.dat)![](doc_assets/image-2.bin)![](doc_assets/image-3.bin)![](doc_assets/image-4.bin)\n", &[], 4),
             ("emf", r##"<text:p><draw:frame svg:width="100pt"><draw:image xlink:href="Pictures/e.emf"/></draw:frame></text:p>"##, &[("Pictures/e.emf", b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00 EMF")], "![|133](doc_assets/image-1.emf)\n", &[(LossKind::UnsupportedImages, 1)], 1),
-            ("missing and external", r##"<text:p><draw:frame><draw:image xlink:href="Pictures/none.png"/></draw:frame> <draw:frame svg:width="50px"><draw:image xlink:href="http://e.com/x.png"/><svg:desc>ext</svg:desc></draw:frame> <draw:frame><draw:image xlink:href="../up/x.png"/></draw:frame> <draw:frame><draw:image xlink:href="/abs/x.png"/></draw:frame> <draw:frame><draw:image xlink:href=""/></draw:frame></text:p>"##, &[], "![ext|50](http://e.com/x.png) ![](../up/x.png) ![](/abs/x.png)\n", &[(LossKind::CorruptParts, 2)], 0),
+            ("missing and external", r##"<text:p><draw:frame><draw:image xlink:href="Pictures/none.png"/></draw:frame> <draw:frame svg:width="50px"><draw:image xlink:href="http://e.com/x.png"/><svg:desc>ext</svg:desc></draw:frame> <draw:frame><draw:image xlink:href="../up/x.png"/></draw:frame> <draw:frame><draw:image xlink:href="/abs/x.png"/></draw:frame> <draw:frame><draw:image xlink:href=""/></draw:frame><draw:frame><draw:image xlink:href="Pictures/gone%20too.png"/></draw:frame></text:p>"##, &[], "![ext|50](http://e.com/x.png) ![](../up/x.png) ![](/abs/x.png)\n", &[(LossKind::CorruptParts, 3)], 0),
             ("percent", r##"<text:p><draw:frame><draw:image xlink:href="Pictures/a%20b.png"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/a%20b.png"/></draw:frame></text:p>"##, &[("Pictures/a b.png", b"\x89PNG\x0d\x0a\x1a\x0a1234")], "![](doc_assets/image-1.png)![](doc_assets/image-1.png)\n", &[], 1),
             ("binary", r##"<text:p><draw:frame><draw:image><office:binary-data>iVBO
  Rw0K</office:binary-data></draw:image></draw:frame><draw:frame><draw:image><office:binary-data>!!!notbase64</office:binary-data></draw:image></draw:frame><draw:frame><draw:image><office:binary-data>iVBO Rw0K</office:binary-data></draw:image></draw:frame></text:p>"##, &[], "![](doc_assets/image-1.png)![](doc_assets/image-2.png)\n", &[(LossKind::CorruptParts, 1)], 2),

@@ -1189,3 +1189,77 @@ fn resizing_an_img_tag_handles_unquoted_values_foreign_attributes_and_self_closi
         assert_eq!(h.text(), format!("a\n\n{expected}\n"), "{tag}");
     }
 }
+
+#[test]
+fn resizing_an_img_tag_whose_alt_text_mimics_an_attribute_appends_the_real_width() {
+    let ready_image = ready(ObjectVisual::Image(ImageId(3)), 400.0, 100.0);
+    let mut h = harness(
+        "a\n\n<img src=\"p.png\" alt=\"a width='5\">\n",
+        image_provider(ready_image),
+    );
+    drag_handle(&mut h, -100.0);
+    assert_eq!(
+        h.text(),
+        "a\n\n<img src=\"p.png\" alt=\"a width='5\" width=\"252\">\n"
+    );
+}
+
+#[test]
+fn a_code_block_without_a_language_hovers_with_only_the_copy_button() {
+    let mut h = harness("a\n\n```\nlet x = 1;\n```\n", plain());
+    let code_box = fills(&h.paint(), h.theme.tokens.code_bg)[0];
+    h.pointer(
+        PointerEventKind::Move,
+        code_box.center(),
+        0,
+        Modifiers::NONE,
+    );
+    let canvas = h.paint();
+    assert_eq!(canvas.texts(), ["a", "let x = 1;", "Copy"]);
+}
+
+#[test]
+fn a_math_scene_has_the_text_cursor_and_no_context_menu() {
+    let mut h = harness(
+        "a\n\n$$\nx^2\n$$\n",
+        Provider {
+            math: ready(ObjectVisual::Scene(SceneId(9)), 100.0, 40.0),
+            ..plain()
+        },
+    );
+    let scene = scene_rects(&h.paint(), SceneId(9))[0];
+    h.requests.take_cursor();
+    h.pointer(PointerEventKind::Move, scene.center(), 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+
+    h.events();
+    let right = h.event(Event::Pointer(PointerEvent::mouse(
+        PointerEventKind::Down,
+        Some(PointerButton::Right),
+        scene.center(),
+    )));
+    assert!(!right.handled, "a formula offers no context menu");
+    let events = h.events();
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, EditorEvent::Media(_))),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn an_unterminated_math_block_reveals_only_its_opening_delimiter() {
+    let mut h = harness(
+        "a\n\n$$\nx^2",
+        Provider {
+            math: ready(ObjectVisual::Scene(SceneId(9)), 100.0, 40.0),
+            ..plain()
+        },
+    );
+    assert_eq!(h.paint().texts(), ["a"]);
+    h.set_caret(5);
+    let canvas = h.paint();
+    assert_eq!(canvas.texts(), ["a", "$$\nx^2"]);
+    assert_eq!(scene_rects(&canvas, SceneId(9)).len(), 1);
+}

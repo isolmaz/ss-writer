@@ -8,9 +8,11 @@
 
 use std::path::Path;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 
-use crate::store::{Store, StoreError, UnixSeconds, key_of, path_key, path_text};
+use crate::store::{
+    Store, StoreError, UnixSeconds, key_of, path_key, path_text, query_optional, query_rows,
+};
 
 /// Minimum time between periodic snapshots of an edited document.
 pub const SNAPSHOT_INTERVAL_SECS: i64 = 5 * 60;
@@ -132,31 +134,28 @@ impl Store {
         let text = path_text(path)?;
         let key = key_of(text);
         let hash = blake3::hash(content.as_bytes());
-        let tx = self.conn.transaction()?;
-        let newest: Option<(i64, Vec<u8>)> = tx
-            .query_row(
+        self.in_transaction(|tx| {
+            let newest: Option<(i64, Vec<u8>)> = query_optional(
+                tx,
                 "SELECT id, hash FROM history_snapshots WHERE key = ?1 ORDER BY id DESC LIMIT 1",
                 [&key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((id, newest_hash)) = newest
-            && newest_hash.as_slice() == hash.as_bytes()
-        {
-            return Ok(SnapshotOutcome::Unchanged(id));
-        }
-        tx.execute(
-            "INSERT OR IGNORE INTO history_blobs (hash, content) VALUES (?1, ?2)",
-            params![hash.as_bytes(), content.as_bytes()],
-        )?;
-        tx.execute(
-            "INSERT INTO history_snapshots (key, path, created_at, reason, hash)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![key, text, now, reason.code(), hash.as_bytes()],
-        )?;
-        let id = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(SnapshotOutcome::Created(id))
+            )?;
+            if let Some((id, newest_hash)) = newest
+                && newest_hash.as_slice() == hash.as_bytes()
+            {
+                return Ok(SnapshotOutcome::Unchanged(id));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO history_blobs (hash, content) VALUES (?1, ?2)",
+                params![hash.as_bytes(), content.as_bytes()],
+            )?;
+            tx.execute(
+                "INSERT INTO history_snapshots (key, path, created_at, reason, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![key, text, now, reason.code(), hash.as_bytes()],
+            )?;
+            Ok(SnapshotOutcome::Created(tx.last_insert_rowid()))
+        })
     }
 
     /// Time of the newest snapshot of `path`, for [`should_snapshot`].
@@ -180,16 +179,13 @@ impl Store {
     /// [`StoreError::NonUnicodePath`], [`StoreError::InvalidData`] (unknown reason code) or
     /// [`StoreError::Sqlite`].
     pub fn history_list(&self, path: &Path) -> Result<Vec<SnapshotInfo>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let rows: Vec<(i64, i64, i64, i64)> = query_rows(
+            &self.conn,
             "SELECT s.id, s.created_at, s.reason, length(b.content)
              FROM history_snapshots s JOIN history_blobs b ON b.hash = s.hash
              WHERE s.key = ?1 ORDER BY s.created_at DESC, s.id DESC",
+            [path_key(path)?],
         )?;
-        let rows = stmt
-            .query_map([path_key(path)?], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<Result<Vec<(i64, i64, i64, i64)>, _>>()?;
         rows.into_iter()
             .map(|(id, created_at, reason, size)| info_from(id, created_at, reason, size))
             .collect()
@@ -201,16 +197,13 @@ impl Store {
     /// [`StoreError::InvalidData`] (unknown reason code or text that is not UTF-8) or
     /// [`StoreError::Sqlite`].
     pub fn history_load(&self, id: i64) -> Result<Option<Snapshot>, StoreError> {
-        let row: Option<(i64, i64, i64, Vec<u8>)> = self
-            .conn
-            .query_row(
-                "SELECT s.id, s.created_at, s.reason, b.content
-                 FROM history_snapshots s JOIN history_blobs b ON b.hash = s.hash
-                 WHERE s.id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
+        let row: Option<(i64, i64, i64, Vec<u8>)> = query_optional(
+            &self.conn,
+            "SELECT s.id, s.created_at, s.reason, b.content
+             FROM history_snapshots s JOIN history_blobs b ON b.hash = s.hash
+             WHERE s.id = ?1",
+            [id],
+        )?;
         let Some((id, created_at, reason, bytes)) = row else {
             return Ok(None);
         };
@@ -255,17 +248,17 @@ impl Store {
             return Ok(0);
         }
         let cutoff = now.saturating_sub(i64::from(retention_days) * SECONDS_PER_DAY);
-        let tx = self.conn.transaction()?;
-        let deleted = tx.execute(
-            "DELETE FROM history_snapshots WHERE created_at < ?1",
-            [cutoff],
-        )?;
-        tx.execute(
-            "DELETE FROM history_blobs WHERE hash NOT IN (SELECT hash FROM history_snapshots)",
-            [],
-        )?;
-        tx.commit()?;
-        Ok(deleted)
+        self.in_transaction(|tx| {
+            let deleted = tx.execute(
+                "DELETE FROM history_snapshots WHERE created_at < ?1",
+                [cutoff],
+            )?;
+            tx.execute(
+                "DELETE FROM history_blobs WHERE hash NOT IN (SELECT hash FROM history_snapshots)",
+                [],
+            )?;
+            Ok(deleted)
+        })
     }
 
     /// Make the history of `from` the history of `to` (the file was renamed or moved).

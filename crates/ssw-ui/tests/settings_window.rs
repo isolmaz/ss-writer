@@ -544,6 +544,17 @@ fn dependent_controls_follow_their_switch() {
     );
     assert_eq!(window.settings().attachments.custom_folder, "D:\\Pics");
     assert_eq!(window.error(FieldId::CustomFolder), None);
+    // Characters Windows forbids in a path are refused; the folder keeps its value.
+    host.perform(
+        &mut window,
+        node.id,
+        AccessAction::SetValue("D:\\Pi|cs".into()),
+    );
+    assert_eq!(
+        window.error(FieldId::CustomFolder),
+        Some("Windows does not allow < > \" | ? * in a path.")
+    );
+    assert_eq!(window.settings().attachments.custom_folder, "D:\\Pics");
 
     // Spell-check languages need spell check.
     let (mut window, mut host) = open(Settings::default(), SettingsSection::Editor);
@@ -584,6 +595,20 @@ fn folder_rows_ask_the_app_to_browse() {
         Some("C:\\Docs")
     );
     assert!(window.error(FieldId::DefaultFolder).is_some());
+}
+
+#[test]
+fn the_general_page_has_a_default_apps_button_that_asks_the_app_to_open_settings() {
+    let (mut window, mut host) = open(Settings::default(), SettingsSection::General);
+    let button = host.node(&window, Role::Button, "Default apps…");
+    assert_eq!(
+        host.control(&window, "Default apps…").description,
+        "Opens Windows Settings, where you choose the app that opens Markdown and text files."
+    );
+    assert!(host.perform(&mut window, button.id, AccessAction::Invoke));
+    assert_eq!(window.take_events(), vec![SettingsEvent::OpenDefaultApps]);
+    // No setting changed: the button only asks the app to open the system page.
+    assert_eq!(window.settings(), &Settings::default());
 }
 
 #[test]

@@ -1047,6 +1047,12 @@ mod tests {
         assert_eq!(rects.len(), 2);
         assert_rect_close(rects[0], Rect::new(10.0, 0.0, 20.0, 12.0));
         assert_rect_close(rects[1], Rect::new(0.0, 12.0, 20.0, 12.0));
+        // A range running past the end of the text stops after the last break: the empty last
+        // line has nothing to highlight.
+        let to_the_end = l.range_rects(1..100);
+        assert_eq!(to_the_end.len(), 2);
+        assert_rect_close(to_the_end[0], Rect::new(10.0, 0.0, 20.0, 12.0));
+        assert_rect_close(to_the_end[1], Rect::new(0.0, 12.0, 30.0, 12.0));
         // An empty line in the middle is selectable through its break.
         let blank = layout("a\n\nb", f32::INFINITY);
         assert_eq!(blank.line_count(), 3);

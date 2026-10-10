@@ -629,6 +629,17 @@ mod tests {
     }
 
     #[test]
+    fn unknown_elements_of_style_groups_and_styles_are_skipped() {
+        let s = styles(
+            r#"<office:automatic-styles><style:default-style style:family="paragraph"/><style:style style:name="B" style:family="text"><style:map style:condition="x"/><style:text-properties fo:font-weight="bold"/></style:style><style:style style:name="Tbl" style:family="table"><style:table-properties fo:break-before="page"/></style:style></office:automatic-styles>"#,
+            None,
+        );
+        assert_eq!(s.text("B").bold, Some(true));
+        assert!(s.table(Some("Tbl")).break_before);
+        assert!(!s.table(None).break_before);
+    }
+
+    #[test]
     fn reads_character_properties() {
         let p = props(
             r##"fo:font-weight="bold" fo:font-style="oblique" style:text-underline-style="solid" style:text-line-through-style="solid" fo:background-color="#ffff00" fo:color="#ff0000" style:text-position="super 58%" text:display="none" style:font-name="Plain""##,
@@ -735,6 +746,7 @@ mod tests {
             ("#fff", None),
             ("ffff00", None),
             ("#gg0000", None),
+            ("#ffgg00", None),
             ("#ff00é", None),
             ("#fé000", None),
         ];

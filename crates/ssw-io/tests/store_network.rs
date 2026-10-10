@@ -2085,3 +2085,170 @@ fn images_download_and_cache_over_real_http() {
         "{error:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Database failures of the image cache and of the update record
+// ---------------------------------------------------------------------------------------------
+
+/// Runs `sql` on a second connection to the database of `c`.
+fn tamper(c: &Cache, sql: &str) {
+    Connection::open(&c.db).unwrap().execute_batch(sql).unwrap();
+}
+
+/// The statement that makes every `event` (`INSERT`, `UPDATE`, `DELETE`) on `table` abort.
+fn abort_on(event: &str, table: &str) -> String {
+    format!(
+        "CREATE TRIGGER abort_{event} BEFORE {event} ON {table}
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+    )
+}
+
+fn shown(len: usize) -> RemoteImage {
+    RemoteImage {
+        mime: "image/png".to_owned(),
+        bytes: image(len, 1),
+        from_cache: false,
+    }
+}
+
+/// The message of the database error `result` failed with.
+fn database_error<T: std::fmt::Debug>(result: Result<T, ImageError>) -> String {
+    match result.unwrap_err() {
+        ImageError::Store(StoreError::Sqlite(error)) => error.to_string(),
+        other => panic!("not a database error: {other:?}"),
+    }
+}
+
+#[test]
+fn cache_lookups_report_database_failures() {
+    let url = "https://img.example.com/a.png";
+    let http = ScriptedHttp::new();
+
+    // The metadata table is gone: lookups and loads fail before anything is downloaded.
+    let c = cache(CACHE_LIMIT_BYTES);
+    tamper(&c, "DROP TABLE image_cache");
+    let text = database_error(c.images.lookup(&c.store, url, 1));
+    assert!(text.contains("no such table"), "{text}");
+    let text = database_error(c.images.load(&c.store, &http, url, false, 1));
+    assert!(text.contains("no such table"), "{text}");
+    assert!(http.requests().is_empty());
+
+    // A hit whose last-access time cannot be recorded.
+    let c = cache(CACHE_LIMIT_BYTES);
+    c.images.insert(&c.store, url, &shown(10), 1).unwrap();
+    tamper(&c, &abort_on("UPDATE", "image_cache"));
+    let text = database_error(c.images.lookup(&c.store, url, 2));
+    assert!(text.contains("injected failure"), "{text}");
+
+    // A damaged entry (its file is gone) that cannot be dropped.
+    let c = cache(CACHE_LIMIT_BYTES);
+    c.images.insert(&c.store, url, &shown(10), 1).unwrap();
+    std::fs::remove_file(c.dir.join(cache_key(url))).unwrap();
+    tamper(&c, &abort_on("DELETE", "image_cache"));
+    let text = database_error(c.images.lookup(&c.store, url, 2));
+    assert!(text.contains("injected failure"), "{text}");
+    assert_eq!(rows(&c.db), 1);
+}
+
+#[test]
+fn cache_inserts_report_database_failures() {
+    let url = "https://img.example.com/a.png";
+    let http = ScriptedHttp::new();
+    let raw_entry = |key: &str, size: &str| {
+        format!(
+            "INSERT INTO image_cache (key, url, mime, size, last_access)
+             VALUES ({key}, 'u', 'image/png', {size}, 1)"
+        )
+    };
+
+    // The new entry cannot be recorded.
+    let c = cache(CACHE_LIMIT_BYTES);
+    tamper(&c, &abort_on("INSERT", "image_cache"));
+    let text = database_error(c.images.insert(&c.store, url, &shown(10), 1));
+    assert!(text.contains("injected failure"), "{text}");
+
+    // The cache size cannot be added up: an entry has a size that is not a whole number.
+    let c = cache(CACHE_LIMIT_BYTES);
+    tamper(&c, &raw_entry("'odd'", "1.5"));
+    let text = database_error(c.images.insert(&c.store, url, &shown(10), 2));
+    assert!(text.contains("Invalid column type"), "{text}");
+
+    // The entries cannot be listed for eviction: an entry has a key that is not text.
+    let c = cache(10);
+    tamper(&c, &raw_entry("x'6b6579'", "1000"));
+    let text = database_error(c.images.insert(&c.store, url, &shown(10), 2));
+    assert!(text.contains("Invalid column type"), "{text}");
+
+    // An evicted entry cannot be deleted from the table.
+    let (a, b) = (url, "https://img.example.com/b.png");
+    let c = cache(150);
+    serve_image(&http, a, &image(100, 1));
+    serve_image(&http, b, &image(100, 2));
+    loaded(c.images.load(&c.store, &http, a, false, 1));
+    tamper(&c, &abort_on("DELETE", "image_cache"));
+    let text = database_error(c.images.load(&c.store, &http, b, false, 2));
+    assert!(text.contains("injected failure"), "{text}");
+}
+
+#[test]
+fn invalid_urls_and_failed_requests_fail_a_download_and_an_insert() {
+    let url = "https://img.example.com/a.png";
+    let c = cache(CACHE_LIMIT_BYTES);
+    let http = ScriptedHttp::new();
+    assert!(matches!(
+        c.images.download(&http, "not a url", false),
+        Err(ImageError::Net(NetError::InvalidUrl(_)))
+    ));
+    http.respond(
+        url,
+        &head("404 Not Found", &[("Content-Type", "image/png")]),
+        b"",
+    );
+    assert!(matches!(
+        c.images.download(&http, url, false),
+        Err(ImageError::Net(NetError::HttpStatus(404)))
+    ));
+    assert!(matches!(
+        c.images.insert(&c.store, "not a url", &shown(1), 1),
+        Err(ImageError::Net(NetError::InvalidUrl(_)))
+    ));
+}
+
+#[test]
+fn the_update_record_reports_database_failures() {
+    let http = ScriptedHttp::new();
+    let current = version("0.1.0");
+
+    // The record is unreadable: the check stops before it asks the feed.
+    let (tmp, store) = store();
+    Connection::open(tmp.path().join("state.db"))
+        .unwrap()
+        .execute_batch("DROP TABLE kv")
+        .unwrap();
+    assert!(matches!(last_check(&store), Err(StoreError::Sqlite(_))));
+    let error = check_for_updates(&store, &http, RELEASES_URL, &current, true, NOW).unwrap_err();
+    assert!(
+        matches!(&error, UpdateError::Store(StoreError::Sqlite(_))),
+        "{error:?}"
+    );
+    assert!(http.requests().is_empty());
+
+    // The answer cannot be recorded: the check fails and the next start asks again.
+    let (tmp, store) = crate::store();
+    Connection::open(tmp.path().join("state.db"))
+        .unwrap()
+        .execute_batch(&abort_on("INSERT", "kv"))
+        .unwrap();
+    http.respond(
+        RELEASES_URL,
+        &json_head(),
+        release_json("v0.2.0", PAGE).as_bytes(),
+    );
+    let error = check_for_updates(&store, &http, RELEASES_URL, &current, true, NOW).unwrap_err();
+    assert!(
+        matches!(&error, UpdateError::Store(StoreError::Sqlite(_))),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("injected failure"), "{error}");
+    assert_eq!(last_check(&store).unwrap(), None);
+}

@@ -19,6 +19,7 @@ use ssw_ui::access::{AccessNode, AccessTree, ToggleState};
 use ssw_ui::widget::WidgetId;
 
 use super::{Shared, UiaError};
+use crate::fault::check;
 
 /// A property whose change is reported to UIA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +190,9 @@ pub(crate) fn raise(shared: &Arc<Shared>, changes: &[UiaChange]) -> Result<(), U
             UiaChange::FocusChanged(id) => {
                 let provider = shared.provider(*id);
                 // SAFETY: `provider` is a live provider created by this bridge.
-                unsafe { UiaRaiseAutomationEvent(&provider, UIA_AutomationFocusChangedEventId) }?;
+                check(unsafe {
+                    UiaRaiseAutomationEvent(&provider, UIA_AutomationFocusChangedEventId)
+                })?;
             }
             UiaChange::PropertyChanged {
                 id,
@@ -199,33 +202,33 @@ pub(crate) fn raise(shared: &Arc<Shared>, changes: &[UiaChange]) -> Result<(), U
             } => {
                 let provider = shared.provider(*id);
                 // SAFETY: `provider` is live and both VARIANTs outlive the call.
-                unsafe {
+                check(unsafe {
                     UiaRaiseAutomationPropertyChangedEvent(
                         &provider,
                         property.id(),
                         &old.variant(),
                         &new.variant(),
                     )
-                }?;
+                })?;
             }
             UiaChange::StructureChanged(id) => {
                 let provider = shared.provider(*id);
                 // SAFETY: a null runtime id with length 0 is allowed for this change type.
-                unsafe {
+                check(unsafe {
                     UiaRaiseStructureChangedEvent(
                         &provider,
                         StructureChangeType_ChildrenInvalidated,
                         ptr::null_mut(),
                         0,
                     )
-                }?;
+                })?;
             }
             UiaChange::TextSelectionChanged(id) => {
                 let provider = shared.provider(*id);
                 // SAFETY: `provider` is a live provider created by this bridge.
-                unsafe {
+                check(unsafe {
                     UiaRaiseAutomationEvent(&provider, UIA_Text_TextSelectionChangedEventId)
-                }?;
+                })?;
             }
         }
     }

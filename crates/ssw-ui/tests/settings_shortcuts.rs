@@ -432,3 +432,41 @@ fn pointer_movement_does_not_end_a_capture() {
     assert!(window.is_capturing_shortcut());
     assert_eq!(window.capturing_command(), Some(CommandId::FormatBold));
 }
+
+#[test]
+fn a_command_sharing_several_chords_with_another_names_it_once() {
+    let mut settings = Settings::default();
+    let both = vec![
+        chord(key::J, true, false, false),
+        chord(key::J, true, true, false),
+    ];
+    settings
+        .shortcuts
+        .insert("format.bold".to_owned(), both.clone());
+    settings.shortcuts.insert("format.italic".to_owned(), both);
+    let (window, _) = open(settings);
+    assert_eq!(
+        window.shortcut_label(CommandId::FormatBold),
+        "Bold — Ctrl+J, Ctrl+Shift+J — conflicts with Italic"
+    );
+    assert_eq!(
+        window.shortcut_label(CommandId::FormatItalic),
+        "Italic — Ctrl+J, Ctrl+Shift+J — conflicts with Bold"
+    );
+    assert_eq!(window.settings().keymap().conflicts().len(), 2);
+}
+
+#[test]
+fn adding_a_chord_the_command_already_has_leaves_it_bound_once() {
+    let (mut window, mut host) = open(Settings::default());
+    select(&mut window, &mut host, "bold", "Bold — Ctrl+B");
+    press_button(&mut window, &mut host, "Add another");
+    host.key(&mut window, key::B, Modifiers::CTRL);
+    assert!(!window.is_capturing_shortcut());
+    assert_eq!(window.shortcut_status(), Some("Bold: Ctrl+B"));
+    assert_eq!(
+        window.shortcut_label(CommandId::FormatBold),
+        "Bold — Ctrl+B"
+    );
+    assert!(window.settings().shortcuts.is_empty());
+}

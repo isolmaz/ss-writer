@@ -547,7 +547,6 @@ fn split_inlines(inlines: Vec<Inl>) -> Vec<Piece> {
 // ---------------------------------------------------------------------------------------------
 
 /// Everything the converter needs besides the document body.
-#[derive(Default)]
 struct Setup {
     rels: Relationships,
     /// Name of the main document part; relationship targets are relative to it.
@@ -681,13 +680,11 @@ impl<'m> Converter<'m> {
                 self.columns(sect);
             }
         }
-        let mut markdown = render_blocks(&blocks);
-        if !self.note_defs.is_empty() {
-            if !markdown.is_empty() {
-                markdown.push_str("\n\n");
-            }
-            markdown.push_str(&self.note_defs.join("\n\n"));
-        }
+        let mut markdown = [render_blocks(&blocks), self.note_defs.join("\n\n")]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
         if !markdown.is_empty() {
             markdown.push('\n');
         }
@@ -1750,6 +1747,10 @@ mod tests {
         let doc =
             parse_xml(format!("<w:document {NS}><w:body>{body}</w:body></w:document>").as_bytes())
                 .unwrap();
+        convert_document(f, &doc)
+    }
+
+    fn convert_document(f: &Fixture, doc: &Element) -> ImportResult {
         let styles = Styles::parse(
             &parse_xml(format!("<w:styles {NS}>{}</w:styles>", f.styles).as_bytes()).unwrap(),
         );
@@ -1787,7 +1788,7 @@ mod tests {
                 .find(|(n, _)| *n == name)
                 .map(|(_, bytes)| bytes.clone())
         };
-        Converter::new(setup, &mut lookup).run(&doc)
+        Converter::new(setup, &mut lookup).run(doc)
     }
 
     fn md(body: &str) -> String {
@@ -1865,6 +1866,11 @@ mod tests {
             (
                 r("snake_case a &amp; b &amp;amp; &amp;#35; &amp;x; &lt; 3"),
                 "snake_case a & b \\&amp; \\&#35; \\&x; < 3\n",
+            ),
+            // `&#x…;` and `&#X…;` are character references, `&#a` is not.
+            (
+                r("&amp;#x41; &amp;#X1f; &amp;#a"),
+                "\\&#x41; \\&#X1f; &#a\n",
             ),
         ];
         for (body, want) in cases {
@@ -1954,19 +1960,27 @@ mod tests {
 
     #[test]
     fn loss_accounting_for_run_and_paragraph_properties() {
+        let aligned = |jc: &str, text: &str| {
+            format!("<w:p><w:pPr><w:jc w:val=\"{jc}\"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>")
+        };
         let body = format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             p(&rp("<w:vertAlign w:val=\"superscript\"/>", "x")),
             p(&rp("<w:color w:val=\"FF0000\"/>", "y")),
-            "<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:t>c</w:t></w:r></w:p>",
-            "<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr></w:p>"
+            aligned("center", "c"),
+            "<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr></w:p>",
+            aligned("right", "r"),
+            aligned("end", "e"),
+            aligned("left", "l"),
+            aligned("both", "b")
         );
         let result = convert_with(&Fixture::default(), &body);
-        assert_eq!(result.markdown, "x\n\ny\n\nc\n");
+        assert_eq!(result.markdown, "x\n\ny\n\nc\n\nr\n\ne\n\nl\n\nb\n");
+        // only centered, right-aligned and end-aligned text with content counts
         assert_eq!(
             kinds(&result),
             [
-                (LossKind::Alignment, 1),
+                (LossKind::Alignment, 3),
                 (LossKind::FontsAndColors, 1),
                 (LossKind::SubSuperscript, 1)
             ]
@@ -2066,6 +2080,27 @@ mod tests {
     }
 
     #[test]
+    fn list_items_continue_after_hard_breaks_and_may_skip_a_level() {
+        let fixture = Fixture {
+            numbering: r#"<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl><w:lvl w:ilvl="1"><w:numFmt w:val="bullet"/></w:lvl><w:lvl w:ilvl="2"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum>
+<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#,
+            ..Fixture::default()
+        };
+        let item = |lvl: u8, runs: &str| {
+            format!(
+                "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"{lvl}\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>{runs}</w:p>"
+            )
+        };
+        let broken = format!("{}<w:r><w:br/></w:r>{}", r("a"), r("b"));
+        let body = format!("{}{}", item(0, &broken), item(2, &r("c")));
+        // a second line is indented under the item text; a skipped level is two columns wide
+        assert_eq!(
+            convert_with(&fixture, &body).markdown,
+            "- a\\\n  b\n    - c\n"
+        );
+    }
+
+    #[test]
     fn hyperlinks_anchors_and_fields() {
         let fixture = Fixture {
             styles: r#"<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>"#,
@@ -2074,7 +2109,7 @@ mod tests {
         };
         let body = format!(
             "{}{}{}{}{}{}{}{}{}",
-            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:bookmarkStart w:id=\"1\" w:name=\"_Toc1\"/><w:r><w:t>My Title</w:t></w:r></w:p>",
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:bookmarkStart w:id=\"1\" w:name=\"_Toc1\"/><w:bookmarkStart w:id=\"9\"/><w:r><w:t>My Title</w:t></w:r></w:p>",
             "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:bookmarkStart w:id=\"2\" w:name=\"_Toc2\"/><w:r><w:t>My Title</w:t></w:r></w:p>",
             "<w:p><w:hyperlink r:id=\"rId5\"><w:r><w:rPr><w:u w:val=\"single\"/></w:rPr><w:t>site</w:t></w:r></w:hyperlink><w:hyperlink r:id=\"rId5\" w:anchor=\"frag\"><w:r><w:t>both</w:t></w:r></w:hyperlink></w:p>",
             "<w:p><w:hyperlink w:anchor=\"_Toc2\"><w:r><w:t>jump</w:t></w:r></w:hyperlink><w:hyperlink w:anchor=\"nope\"><w:r><w:t>dangling</w:t></w:r></w:hyperlink></w:p>",
@@ -2108,7 +2143,7 @@ mod tests {
                 "<w:ins><w:r><w:t>inserted</w:t></w:r></w:ins>",
                 "<w:del><w:r><w:delText>gone</w:delText></w:r></w:del>",
                 "<w:moveFrom><w:r><w:t>moved</w:t></w:r></w:moveFrom><w:moveTo><w:r><w:rPr><w:rPrChange/></w:rPr><w:t>here</w:t></w:r></w:moveTo>",
-                "<w:smartTag><w:r><w:t>S</w:t></w:r></w:smartTag><w:sdt><w:sdtContent><w:r><w:t>T</w:t></w:r></w:sdtContent></w:sdt><w:proofErr/>"
+                "<w:smartTag><w:r><w:t>S</w:t></w:r></w:smartTag><w:sdt><w:sdtContent><w:r><w:t>T</w:t></w:r></w:sdtContent></w:sdt><w:sdt/><w:proofErr/>"
             )),
             "<w:ins><w:p><w:r><w:t>block ins</w:t></w:r></w:p></w:ins><w:del><w:p><w:r><w:t>block del</w:t></w:r></w:p></w:del>"
         );
@@ -2170,7 +2205,8 @@ mod tests {
             footnotes: r#"<w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>
 <w:footnote w:id="1"><w:p><w:r><w:footnoteRef/></w:r><w:r><w:t xml:space="preserve"> First </w:t></w:r></w:p><w:p><w:r><w:t>Second para</w:t></w:r></w:p></w:footnote>
 <w:endnote w:id="2"><w:p><w:r><w:t>An end note</w:t></w:r></w:p></w:endnote>
-<w:footnote w:id="3"/>"#,
+<w:footnote w:id="3"/>
+<w:footnote><w:p><w:r><w:t>without an id</w:t></w:r></w:p></w:footnote>"#,
             ..Fixture::default()
         };
         let body = format!(
@@ -2280,7 +2316,7 @@ mod tests {
         };
         let txbx = "<w:txbxContent><w:p><w:r><w:t>boxed</w:t></w:r></w:p></w:txbxContent>";
         let body = format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}",
             p(&format!(
                 "{}<w:r><mc:AlternateContent><mc:Choice><w:drawing><wp:anchor><a:graphic>{txbx}</a:graphic></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape><v:textbox>{txbx}</v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r>",
                 r("host")
@@ -2288,6 +2324,8 @@ mod tests {
             p(
                 "<w:r><w:pict><v:shape><v:imagedata r:id=\"rId1\" o:title=\"vml\"/></v:shape></w:pict></w:r>"
             ),
+            // a picture whose relationship does not exist is dropped and reported
+            p("<w:r><w:pict><v:shape><v:imagedata r:id=\"rId9\"/></v:shape></w:pict></w:r>"),
             p(
                 "<w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData/></a:graphic></wp:inline></w:drawing></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>"
             ),
@@ -2304,7 +2342,11 @@ mod tests {
         );
         assert_eq!(
             kinds(&result),
-            [(LossKind::TextBoxes, 2), (LossKind::VectorShapes, 2)]
+            [
+                (LossKind::TextBoxes, 2),
+                (LossKind::VectorShapes, 2),
+                (LossKind::CorruptParts, 1)
+            ]
         );
     }
 
@@ -2384,7 +2426,7 @@ mod tests {
     #[test]
     fn alternate_content_inside_paragraphs_and_ruby_without_a_base() {
         let body = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             p(
                 "<mc:AlternateContent><mc:Choice Requires=\"w14\"><w:r><w:t>chosen</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>fallback</w:t></w:r></mc:Fallback></mc:AlternateContent>"
             ),
@@ -2393,9 +2435,65 @@ mod tests {
             ),
             p(
                 "<w:r><w:ruby><w:rt><w:r><w:t>guide</w:t></w:r></w:rt></w:ruby><w:t>tail</w:t></w:r>"
+            ),
+            p(
+                "<w:r><w:t xml:space=\"preserve\">before </w:t><mc:AlternateContent/><w:t>after</w:t></w:r>"
             )
         );
-        assert_eq!(md(&body), "chosen\n\nonly fallback\n\ntail\n");
+        assert_eq!(
+            md(&body),
+            "chosen\n\nonly fallback\n\ntail\n\nbefore after\n"
+        );
+    }
+
+    #[test]
+    fn fields_without_an_instruction_or_a_result_leave_only_their_text() {
+        let fld = |kind: &str| format!("<w:r><w:fldChar w:fldCharType=\"{kind}\"/></w:r>");
+        let instr = |text: &str| format!("<w:r><w:instrText>{text}</w:instrText></w:r>");
+        let body = format!(
+            "{}{}",
+            // an empty instruction names no field: the result text stays and nothing is lost
+            p(&format!(
+                "{}{}{}{}",
+                fld("begin"),
+                fld("separate"),
+                r("result"),
+                fld("end")
+            )),
+            // a link field without result text leaves nothing behind
+            p(&format!(
+                "{}{}{}{}",
+                fld("begin"),
+                instr(" HYPERLINK \"https://x.org\" "),
+                fld("separate"),
+                fld("end")
+            ))
+        );
+        let result = convert_with(&Fixture::default(), &body);
+        assert_eq!(result.markdown, "result\n");
+        assert!(result.losses.is_empty());
+    }
+
+    #[test]
+    fn instruction_text_only_counts_while_a_field_is_in_its_instruction() {
+        let field = |first: &str, second: &str| {
+            format!(
+                "<w:p><w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText>{first}</w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:instrText>{second}</w:instrText><w:t>label</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:p>"
+            )
+        };
+        let body = format!(
+            "{}{}",
+            // no field is open: the instruction is dropped, the text stays
+            p(
+                "<w:r><w:instrText> HYPERLINK \"https://x.org\" </w:instrText><w:t>plain</w:t></w:r>"
+            ),
+            // the result part of a field ignores a later instruction
+            field(
+                " HYPERLINK \"https://y.org\" ",
+                " HYPERLINK \"https://z.org\" "
+            )
+        );
+        assert_eq!(md(&body), "plain\n\n[label](https://y.org)\n");
     }
 
     #[test]
@@ -2405,10 +2503,23 @@ mod tests {
     }
 
     #[test]
+    fn cell_text_is_collected_through_insertions_moves_and_empty_paragraphs() {
+        let para = |text: &str| format!("<w:p><w:r><w:t>{text}</w:t></w:r></w:p>");
+        let body = format!(
+            "<w:tbl><w:tr><w:tc><w:p/><w:ins>{}</w:ins><w:moveTo>{}</w:moveTo><w:sdtContent>{}</w:sdtContent></w:tc></w:tr></w:tbl>",
+            para("inserted"),
+            para("moved"),
+            para("bare")
+        );
+        let result = convert_with(&Fixture::default(), &body);
+        assert_eq!(result.markdown, "| inserted moved bare |\n| --- |\n");
+        assert_eq!(kinds(&result), [(LossKind::MultiParagraphCells, 1)]);
+    }
+
+    #[test]
     fn a_document_without_a_body_is_empty() {
         let document = parse_xml(format!("<w:document {NS}/>").as_bytes()).unwrap();
-        let mut media = |_: &str| -> Option<Vec<u8>> { None };
-        let result = Converter::new(Setup::default(), &mut media).run(&document);
+        let result = convert_document(&Fixture::default(), &document);
         assert_eq!(result.markdown, "");
         assert!(result.losses.is_empty());
     }
@@ -2447,6 +2558,7 @@ mod tests {
         assert_eq!(escape_line_start("####### x"), "####### x");
         assert_eq!(escape_line_start("+x"), "+x");
         assert_eq!(escape_line_start("1.x"), "1.x");
+        assert_eq!(escape_line_start("2024 report"), "2024 report");
         assert_eq!(
             render_blocks(&[Block::Math("x".into()), Block::Para("a".into())]),
             "$$\nx\n$$\n\na"
@@ -2465,6 +2577,8 @@ mod tests {
 
     #[test]
     fn rejects_files_that_are_not_docx() {
+        use std::io::Write;
+
         assert_eq!(
             import_docx(b"{\\rtf1 hi}", "x").unwrap_err(),
             ImportError::WrongFormat {
@@ -2479,10 +2593,21 @@ mod tests {
                 detected: "an unknown file type"
             }
         );
-        assert!(matches!(
-            import_docx(b"PK\x03\x04junk", "x"),
-            Err(ImportError::Corrupt(_))
-        ));
+        let truncated = import_docx(b"PK\x03\x04junk", "x").unwrap_err().to_string();
+        assert!(
+            truncated.starts_with("the document is corrupt: not a valid ZIP package: "),
+            "{truncated}"
+        );
+        // a password-protected package is an OLE file wrapping an `EncryptedPackage` stream
+        let mut compound = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+        let mut stream = compound.create_stream("/EncryptedPackage").unwrap();
+        stream.write_all(b"data").unwrap();
+        drop(stream);
+        compound.flush().unwrap();
+        assert_eq!(
+            import_docx(&compound.into_inner().into_inner(), "x").unwrap_err(),
+            ImportError::Encrypted
+        );
         let odt = zip(&[("mimetype", "application/vnd.oasis.opendocument.text")]);
         assert_eq!(
             import_docx(&odt, "x").unwrap_err(),
@@ -2508,15 +2633,15 @@ mod tests {
             }
         );
         let empty = zip(&[("readme.txt", "hi")]);
-        assert!(matches!(
-            import_docx(&empty, "x"),
-            Err(ImportError::Corrupt(_))
-        ));
+        assert_eq!(
+            import_docx(&empty, "x").unwrap_err(),
+            ImportError::Corrupt("the package has no main document part".to_string())
+        );
         let not_xml = zip(&[("word/document.xml", "   ")]);
-        assert!(matches!(
-            import_docx(&not_xml, "x"),
-            Err(ImportError::Corrupt(_))
-        ));
+        assert_eq!(
+            import_docx(&not_xml, "x").unwrap_err(),
+            ImportError::Corrupt("the main document part is empty or not XML".to_string())
+        );
     }
 
     #[test]
@@ -2577,10 +2702,11 @@ mod tests {
             .map(|i| format!("f{i}.txt"))
             .collect();
         let parts: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "")).collect();
-        assert!(matches!(
-            import_docx(&zip(&parts), "x"),
-            Err(ImportError::TooLarge(_))
-        ));
+        let limit = crate::ooxml::MAX_ENTRIES;
+        assert_eq!(
+            import_docx(&zip(&parts), "x").unwrap_err(),
+            ImportError::TooLarge(format!("{} entries (limit {limit})", limit + 1))
+        );
     }
 
     /// A ZIP of stored parts in which the first byte of `damaged` (the full content of one part)

@@ -7,6 +7,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rusqlite::Connection;
 use ssw_io::index::{IndexChange, IndexOptions, IndexStats, IndexedHeading, MAX_PARSE_BYTES};
 use ssw_io::store::{Store, StoreError};
 use tempfile::{TempDir, tempdir};
@@ -373,6 +374,71 @@ fn markdown_link_destinations_are_resolved_like_a_reader_would() {
     assert_eq!(count("ref-target.md"), 1);
     assert_eq!(count("outside.md"), 0);
     assert_eq!(count("x.md"), 0);
+}
+
+/// How many link rows the index holds.
+fn link_rows(fx: &Fixture) -> i64 {
+    Connection::open(fx._tmp.path().join("state.db"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM index_links", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn escapes_schemes_and_unusual_targets_are_resolved_like_a_reader_would() {
+    let links = "\
+[lower](caf%c3%a9.md) [upper](CAF%C3%A9.md) [bare](100%.md) [short](a%2) [bad](b%zz.md)
+
+[plus](git+ssh:foo.md) [dash](my-app:foo.md) [dot](a.b:foo.md) [under](a_b:foo.md)
+
+[here](.) [root](/) [none](LICENSE) [dotfile](.env)
+";
+    let mut fx = workspace(&[("links.md", links)]);
+    run(&mut fx.store, &fx.root, &IndexOptions::default());
+    let at = |rel: &str| path_of(&fx.root, rel);
+    let count = |rel: &str| fx.store.index_links_to(&fx.root, &at(rel)).unwrap().len();
+
+    // Escapes decode in either case of the hex digits; a `%` that starts no escape stays.
+    assert_eq!(count("café.md"), 2);
+    assert_eq!(count("100%.md"), 1);
+    assert_eq!(count("a%2"), 1);
+    assert_eq!(count("b%zz.md"), 1);
+    // `+`, `-` and `.` belong to a scheme (these are not files), `_` does not.
+    assert_eq!(count("foo.md"), 0);
+    assert_eq!(count("a_b:foo.md"), 1);
+    // Targets without an extension, and dot-files, match under their whole name.
+    assert_eq!(count("LICENSE"), 1);
+    assert_eq!(count(".env"), 1);
+    // `.` and `/` point at no file, so they are not stored at all.
+    assert_eq!(link_rows(&fx), 8);
+}
+
+#[test]
+fn reference_links_autolinks_and_html_images_are_not_file_links() {
+    let src = "\
+[text][ref] [ref] ![alt][ref] <https://example.com/a.md> www.example.com/b.md x <img src=\"pics/h.png\" alt=\"h\"> y
+
+[ref]: target.md
+";
+    let mut fx = workspace(&[("note.md", src)]);
+    run(&mut fx.store, &fx.root, &IndexOptions::default());
+    let at = |rel: &str| path_of(&fx.root, rel);
+    // Only the definition names a file; the links that use it, the autolinks and the HTML
+    // image do not.
+    assert_eq!(
+        fx.store
+            .index_links_to(&fx.root, &at("target.md"))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        fx.store
+            .index_links_to(&fx.root, &at("pics/h.png"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(link_rows(&fx), 1);
 }
 
 #[test]

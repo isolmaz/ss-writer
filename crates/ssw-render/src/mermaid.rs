@@ -167,10 +167,14 @@ fn render_unguarded(src: &str, theme: MermaidTheme) -> Result<(Scene, String), U
     apply_config(&mut palette, &mut layout_config, &config);
 
     let layout = compute_layout(&parsed.graph, &palette, &layout_config);
-    let svg = render_svg(&layout, &palette, &layout_config);
-    let scene =
-        svg_to_scene(svg.as_bytes()).map_err(|err| UnsupportedReason::Svg(err.to_string()))?;
-    Ok((scene, svg))
+    scene_from_svg(render_svg(&layout, &palette, &layout_config))
+}
+
+/// The scene of the renderer's SVG, and the SVG itself.
+fn scene_from_svg(svg: String) -> Result<(Scene, String), UnsupportedReason> {
+    svg_to_scene(svg.as_bytes())
+        .map(|scene| (scene, svg))
+        .map_err(|err| UnsupportedReason::Svg(err.to_string()))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -741,6 +745,20 @@ mod tests {
         assert_eq!(layout.node_spacing, 1.0);
         apply_config(&mut theme, &mut layout, &Value::Null);
         assert_eq!(layout.node_spacing, 1.0);
+
+        // A flowchart block that names only one of the two spacings leaves the other alone.
+        apply_config(
+            &mut theme,
+            &mut layout,
+            &json!({"flowchart": {"nodeSpacing": 80}}),
+        );
+        apply_config(
+            &mut theme,
+            &mut layout,
+            &json!({"flowchart": {"rankSpacing": 120}}),
+        );
+        assert_eq!(layout.node_spacing, 80.0);
+        assert_eq!(layout.rank_spacing, 120.0);
     }
 
     #[test]
@@ -793,10 +811,31 @@ mod tests {
         );
         // An address space reservation no machine can satisfy.
         let impossible = thread::Builder::new().stack_size(1 << 60);
-        assert!(matches!(
-            run_guarded(impossible, Duration::from_secs(5), || ()),
-            Err(UnsupportedReason::Worker(_))
-        ));
+        let failed = run_guarded(impossible, Duration::from_secs(5), || ())
+            .expect_err("no machine has that much address space");
+        assert!(
+            failed
+                .to_string()
+                .starts_with("cannot start the diagram renderer: "),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn rendered_svg_that_usvg_rejects_is_unusable() {
+        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"5\">\
+                   <rect width=\"10\" height=\"5\"/></svg>";
+        let (scene, kept) = scene_from_svg(svg.to_owned()).expect("valid svg");
+        assert_eq!(kept, svg);
+        assert_eq!((scene.size.width, scene.size.height), (10.0, 5.0));
+
+        let reason = scene_from_svg("<svg".to_owned()).expect_err("truncated svg");
+        assert!(
+            reason
+                .to_string()
+                .starts_with("the rendered SVG is unusable: invalid SVG: "),
+            "{reason}"
+        );
     }
 
     #[test]

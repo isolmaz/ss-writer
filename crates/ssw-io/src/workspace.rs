@@ -10,7 +10,7 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
     FOLDERID_Documents, KF_FLAG_DEFAULT, SHGetKnownFolderPath, StrCmpLogicalW,
 };
-use windows::core::PCWSTR;
+use windows::core::{GUID, PCWSTR};
 
 use crate::fileops::{NameStyle, free_name};
 use crate::fs::{Attributes, DirEntry, FileMeta, FileSystem, FileTime, FsError, wide, win};
@@ -509,10 +509,15 @@ pub fn untitled_name(fs: &dyn FileSystem, dir: &Path, ext: &str) -> Result<Strin
 /// # Errors
 /// The shell error when the known folder cannot be resolved.
 pub fn known_documents_dir() -> Result<PathBuf, FsError> {
-    // SAFETY: `FOLDERID_Documents` is a valid GUID; no token means the current user.
+    known_folder(&FOLDERID_Documents, "Documents")
+}
+
+/// The folder `id` of the current user; `name` is what an error reports as the path.
+fn known_folder(id: &GUID, name: &str) -> Result<PathBuf, FsError> {
+    // SAFETY: `id` points to a GUID; no token means the current user.
     let pointer = win(
-        unsafe { SHGetKnownFolderPath(&FOLDERID_Documents, KF_FLAG_DEFAULT, None) },
-        Path::new("Documents"),
+        unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) },
+        Path::new(name),
     )?;
     // SAFETY: on success the shell returns a NUL-terminated string that we own and free below.
     let text = String::from_utf16_lossy(unsafe { pointer.as_wide() });
@@ -536,5 +541,20 @@ pub fn ensure_default_folder(
     match fs.write_new(&folder.join(WELCOME_FILE_NAME), welcome.as_bytes()) {
         Ok(()) | Err(FsError::AlreadyExists(_)) => Ok(folder),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_known_folder_is_a_path_and_an_unknown_one_an_error_naming_it() {
+        let documents = known_folder(&FOLDERID_Documents, "Documents").unwrap();
+        assert!(documents.is_absolute());
+
+        let unknown = GUID::from_u128(0x6a1e_70c0_3b1a_4a35_8a7f_0d3e_5d83_a001);
+        let error = known_folder(&unknown, "Nowhere").unwrap_err();
+        assert_eq!(error.path(), Path::new("Nowhere"));
     }
 }

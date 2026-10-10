@@ -953,4 +953,121 @@ mod tests {
         assert!(scroll.event(&mut cx, &mut form, &wheel).handled);
         assert_eq!(scroll.bar.offset(), 0.0);
     }
+
+    fn text_and_button_form() -> Form<u8> {
+        let clipboard: crate::widgets::SharedClipboard = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::services::MemoryClipboard::default(),
+        ));
+        Form::new(vec![
+            Row::new(
+                1u8,
+                "Action".to_owned(),
+                None,
+                Input::Button(Button::new(ButtonKind::Standard, "Run")),
+            ),
+            Row::new(
+                2u8,
+                "Name".to_owned(),
+                None,
+                Input::Text(TextBox::new("Name", "alpha", clipboard)),
+            ),
+        ])
+    }
+
+    fn text_of(form: &Form<u8>, key: u8) -> Option<String> {
+        form.rows
+            .iter()
+            .find(|row| row.key == key)
+            .and_then(|row| match &row.input {
+                Input::Text(text_box) => Some(text_box.text().to_owned()),
+                _ => None,
+            })
+    }
+
+    #[test]
+    fn a_message_or_text_for_a_row_that_does_not_exist_or_has_no_text_box_is_dropped() {
+        let mut form = text_and_button_form();
+        form.set_error(99, Some("Nobody home".to_owned()));
+        assert!(!form.has_error());
+        assert_eq!(form.error(99), None);
+        form.set_text(99, "ghost");
+        form.set_text(1, "on a button");
+        assert_eq!(text_of(&form, 2).as_deref(), Some("alpha"));
+        assert_eq!(text_of(&form, 1), None);
+
+        form.set_error(2, Some("Too short".to_owned()));
+        form.set_text(2, "beta");
+        assert!(form.has_error());
+        assert_eq!(form.error(2), Some("Too short"));
+        assert_eq!(text_of(&form, 2).as_deref(), Some("beta"));
+        form.set_error(2, None);
+        assert!(!form.has_error());
+    }
+
+    fn captioned_slider(value: f64) -> Form<u8> {
+        let labels = ["Off", "Low", "High"].map(str::to_owned).to_vec();
+        Form::new(vec![Row::new(
+            1u8,
+            "Zoom".to_owned(),
+            None,
+            Input::Slider {
+                slider: Slider::new("Zoom", 0.0, 5.0, value, 1.0),
+                labels,
+            },
+        )])
+    }
+
+    fn drawn_texts(harness: &Harness, form: &Form<u8>) -> Vec<String> {
+        let cx = PaintCx::new(
+            WidgetId::allocate(),
+            &harness.theme,
+            1.0,
+            &harness.engine,
+            &harness.focus,
+            &harness.capture,
+            None,
+        );
+        let mut canvas = RecordingCanvas::new();
+        form.paint(&cx, &mut canvas);
+        canvas.texts().into_iter().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn a_slider_shows_the_caption_of_its_value_and_none_beyond_the_last_caption() {
+        let mut harness = Harness::new();
+        let mut form = captioned_slider(1.0);
+        laid_out(&mut harness, &mut form);
+        assert_eq!(drawn_texts(&harness, &form), ["Zoom", "Low"]);
+
+        let mut beyond = captioned_slider(4.0);
+        laid_out(&mut harness, &mut beyond);
+        assert_eq!(drawn_texts(&harness, &beyond), ["Zoom"]);
+    }
+
+    #[test]
+    fn an_animation_frame_while_nothing_eases_repaints_nothing() {
+        let mut harness = Harness::new();
+        let mut form = button_form();
+        laid_out(&mut harness, &mut form);
+        let mut scroll = FormScroll::new("Page", Motion::full());
+        {
+            let mut cx = LayoutCx::new(
+                WidgetId::allocate(),
+                &harness.theme,
+                1.0,
+                &harness.engine,
+                &mut harness.focus,
+                &mut harness.requests,
+            );
+            scroll.arrange(&mut cx, Rect::new(0.0, 0.0, 600.0, 400.0), 1000.0);
+        }
+        harness.requests.take_invalidation();
+        let frame = Event::AnimationFrame(harness.now);
+        let mut cx = harness.event_cx(WidgetId::allocate());
+        let result = scroll.event(&mut cx, &mut form, &frame);
+        assert!(!result.handled);
+        assert!(harness.requests.invalidation().is_clean());
+        assert!(!harness.requests.animation_frame_requested());
+        assert_eq!(scroll.bar.offset(), 0.0);
+    }
 }

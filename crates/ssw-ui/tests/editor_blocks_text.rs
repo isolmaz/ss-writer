@@ -369,6 +369,22 @@ fn a_task_item_with_the_caret_shows_its_source_and_still_reports_the_checkbox() 
 }
 
 #[test]
+fn only_task_items_report_a_checkbox() {
+    let f = Fixture::new("- plain\n- [ ] task\n");
+    let layout = f.measure(0, &[]);
+    let (body, line) = (f.body(), f.line());
+    let box_center = Point::new(1.5 * body - 0.4 * body - 0.95 * body / 2.0, line / 2.0);
+    assert!(
+        layout.task_box_at(box_center).is_none(),
+        "a bullet is not a checkbox"
+    );
+    let task = layout
+        .task_box_at(Point::new(box_center.x, box_center.y + line))
+        .expect("the task's checkbox");
+    assert_eq!(task.offset, 10, "the `[ ]` of the second item");
+}
+
+#[test]
 fn list_markers_show_their_source_while_the_caret_is_in_the_item() {
     let f = Fixture::new("para\n\n- a\n- b\n");
     let hidden = f.painted(1, &[0]);
@@ -602,6 +618,26 @@ fn blank_quote_lines_are_rows_the_caret_can_sit_on() {
     assert!(close(caret.x, indent + ADVANCE) && close(caret.y, line));
     assert_eq!(layout.hit_test(Point::new(indent + 30.0, line + 5.0)), 5);
     assert_eq!(layout.line_range(5), TextRange::new(4, 5));
+}
+
+#[test]
+fn a_blank_quote_line_after_the_last_child_is_a_separator_row() {
+    let f = Fixture::new("> a\n>\n");
+    let (line, spacing) = (f.line(), f.config.spacing_px());
+    assert!(close(f.measure(0, &[]).height(), line + spacing));
+    assert!(close(f.measure(0, &[4]).height(), 2.0 * line));
+}
+
+#[test]
+fn a_selection_marks_the_line_break_of_a_blank_quote_line_only_when_it_includes_it() {
+    let f = Fixture::new("> a\n>\n> b\n");
+    let layout = f.measure(0, &[]);
+    // `2..5` ends at the blank line's own break (offset 5), `2..6` takes it along.
+    let short = layout.selection_rects(TextRange::new(2, 5));
+    let through = layout.selection_rects(TextRange::new(2, 6));
+    assert_eq!(through.len(), short.len() + 1);
+    let mark = through[through.len() - 1];
+    assert!(close(mark.width, 6.0) && close(mark.y, f.line()));
 }
 
 #[test]
@@ -892,6 +928,21 @@ fn a_page_break_is_a_labelled_dashed_hairline() {
     let shown = f.painted(1, &[4]);
     assert_eq!(shown.texts(), ["<!-- pagebreak -->"]);
     assert!(lines(&shown).is_empty());
+}
+
+#[test]
+fn a_page_break_label_wider_than_the_column_leaves_no_room_for_hairlines() {
+    let label = "W".repeat(60);
+    let strings = BlockStrings {
+        page_break: label.clone(),
+        ..BlockStrings::default()
+    };
+    let mut f = Fixture::new("a\n\n<!-- pagebreak -->\n\nb\n");
+    f.registry = BlockRegistry::with_defaults();
+    blocks_text::register_with(&mut f.registry, strings);
+    let canvas = f.painted(1, &[]);
+    assert_eq!(canvas.texts(), [label.as_str()]);
+    assert!(lines(&canvas).is_empty());
 }
 
 #[test]

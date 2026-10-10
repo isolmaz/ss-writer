@@ -242,13 +242,13 @@ pub fn export_to_folder(
     }
     let plan = plan(src, source_dir);
     std::fs::create_dir_all(target_dir)?;
+    if !plan.copies.is_empty() {
+        // Every copy is `attachments/<file name>`, so one folder serves them all.
+        std::fs::create_dir_all(target_dir.join(ATTACHMENTS_DIR))?;
+    }
     let mut attachments = Vec::with_capacity(plan.copies.len());
     for (from, rel) in &plan.copies {
-        let to = target_dir.join(rel);
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(from, &to)?;
+        std::fs::copy(from, target_dir.join(rel))?;
         attachments.push(rel.clone());
     }
     let markdown_path = target_dir.join(file_name);
@@ -333,6 +333,19 @@ mod tests {
     }
 
     #[test]
+    fn reference_links_are_rewritten_at_their_definition_only() {
+        let tmp = source_tree();
+        let md = "[r][ref] [short] <https://x.y/> www.x.y\n\n[ref]: report.pdf\n[short]: img/c.png";
+        let plan = plan(md, tmp.path());
+        assert_eq!(
+            plan.markdown,
+            "[r][ref] [short] <https://x.y/> www.x.y\n\n[ref]: attachments/report.pdf\n[short]: attachments/c.png"
+        );
+        let rels: Vec<&str> = plan.copies.iter().map(|(_, rel)| rel.as_str()).collect();
+        assert_eq!(rels, ["attachments/report.pdf", "attachments/c.png"]);
+    }
+
+    #[test]
     fn absolute_paths_are_copied_too() {
         let tmp = source_tree();
         let abs = tmp.path().join("report.pdf");
@@ -362,6 +375,58 @@ mod tests {
             "![a](attachments/c.png) ![m](nope.png)"
         );
         assert_eq!(std::fs::read(out.join("attachments/c.png")).unwrap(), b"C1");
+    }
+
+    #[test]
+    fn a_document_without_attachments_gets_no_attachments_folder() {
+        let tmp = source_tree();
+        let target = tempfile::tempdir().unwrap();
+        let report =
+            export_to_folder("[web](https://x.y)", tmp.path(), target.path(), "d.md").unwrap();
+        assert!(report.attachments.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(target.path().join("d.md")).unwrap(),
+            "[web](https://x.y)"
+        );
+        assert!(!target.path().join(ATTACHMENTS_DIR).exists());
+    }
+
+    #[test]
+    fn export_failures_surface_as_io_errors_and_stop_the_export() {
+        let tmp = source_tree();
+        let md = "![a](img/c.png)";
+        let io_error = |target: &Path| {
+            export_to_folder(md, tmp.path(), target, "doc.md")
+                .unwrap_err()
+                .to_string()
+        };
+
+        // The target folder is a file.
+        let target = tempfile::tempdir().unwrap();
+        let file = target.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(io_error(&file).starts_with("i/o error: "));
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+
+        // The attachments folder is a file.
+        let blocked = target.path().join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join(ATTACHMENTS_DIR), b"y").unwrap();
+        assert!(io_error(&blocked).starts_with("i/o error: "));
+        assert!(!blocked.join("doc.md").exists());
+
+        // The copy's destination is a folder.
+        let occupied = target.path().join("occupied");
+        std::fs::create_dir_all(occupied.join("attachments/c.png")).unwrap();
+        assert!(io_error(&occupied).starts_with("i/o error: "));
+        assert!(occupied.join("attachments/c.png").is_dir());
+        assert!(!occupied.join("doc.md").exists());
+
+        // The document's own file name is taken by a folder.
+        let taken = target.path().join("taken");
+        std::fs::create_dir_all(taken.join("doc.md")).unwrap();
+        assert!(io_error(&taken).starts_with("i/o error: "));
+        assert!(taken.join("doc.md").is_dir());
     }
 
     #[test]

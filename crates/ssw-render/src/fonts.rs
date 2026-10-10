@@ -171,12 +171,15 @@ mod tests {
         assert_eq!(set.len(), 5);
         assert!(!set.is_empty());
         for family in [TEXT_FAMILY, MATH_FAMILY, MONO_FAMILY] {
-            let index = set
+            let font = set
                 .book()
                 .select(&family.to_lowercase(), regular())
-                .unwrap_or_else(|| panic!("{family} missing"));
-            let font = set.font(index).expect("face loads");
-            assert_eq!(font.info().family.to_lowercase(), family.to_lowercase());
+                .and_then(|index| set.font(index));
+            assert_eq!(
+                font.map(|font| font.info().family.to_lowercase()),
+                Some(family.to_lowercase()),
+                "{family}"
+            );
         }
         assert!(set.font(99).is_none());
         assert!(format!("{set:?}").contains("5"));
@@ -211,16 +214,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ssw-render-fonts-err-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let mut set = FontSet::bundled();
-        let missing = set
-            .add_file(&dir.join("nope.ttf"))
-            .expect_err("missing file");
-        assert!(matches!(missing, FontError::Read { .. }));
-        assert!(missing.to_string().contains("nope.ttf"));
+        let nope = dir.join("nope.ttf");
+        let missing = set.add_file(&nope).expect_err("missing file");
+        assert!(
+            missing
+                .to_string()
+                .starts_with(&format!("cannot read font file {}: ", nope.display())),
+            "{missing}"
+        );
+        let cause = std::error::Error::source(&missing).expect("the I/O error is the source");
+        assert_eq!(
+            cause
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::NotFound)
+        );
         let junk = dir.join("junk.ttf");
         std::fs::write(&junk, b"not a font").expect("write");
         let err = set.add_file(&junk).expect_err("not a font");
-        assert!(matches!(err, FontError::NoFaces { .. }));
-        assert!(err.to_string().contains("junk.ttf"));
+        assert_eq!(
+            err.to_string(),
+            format!("{} contains no usable font face", junk.display())
+        );
+        assert!(std::error::Error::source(&err).is_none());
         assert_eq!(set.len(), 5);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

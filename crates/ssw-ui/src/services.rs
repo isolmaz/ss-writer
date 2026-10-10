@@ -404,6 +404,12 @@ pub trait Shell {
     /// # Errors
     /// Fails when the item cannot be recycled.
     fn recycle(&mut self, path: &Path) -> Result<(), ServiceError>;
+    /// Opens the Windows Settings page where the user picks the default app per file type
+    /// (spec §12).
+    ///
+    /// # Errors
+    /// Fails when the shell cannot open the page.
+    fn open_default_apps_settings(&mut self) -> Result<(), ServiceError>;
 }
 
 #[cfg(test)]

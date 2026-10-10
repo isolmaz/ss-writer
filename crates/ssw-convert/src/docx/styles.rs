@@ -223,7 +223,8 @@ fn heading_level_from_name(name: &str) -> Option<u8> {
     if digits.len() != 1 || !HEADING_PREFIXES.contains(&prefix.trim()) {
         return None;
     }
-    let level: u8 = digits.parse().ok()?;
+    // `digits` is exactly one ASCII digit
+    let level = digits.as_bytes()[0] - b'0';
     (1..=9).contains(&level).then_some(level.min(6))
 }
 

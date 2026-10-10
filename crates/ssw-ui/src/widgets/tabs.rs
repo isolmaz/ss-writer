@@ -332,6 +332,12 @@ impl TabStrip {
         if forwarded.handled {
             return forwarded;
         }
+        if event.kind == PointerEventKind::Move
+            && let Some(drag) = self.drag
+        {
+            self.drag_to(cx, drag, event.position);
+            return EventResult::handled();
+        }
         let tab = self.tab_at(event.position);
         match (event.kind, event.button) {
             (PointerEventKind::Down, Some(PointerButton::Left)) => {
@@ -372,10 +378,6 @@ impl TabStrip {
                 }
                 None => EventResult::ignored(),
             },
-            (PointerEventKind::Move, _) if self.drag.is_some() => {
-                self.drag_to(cx, event.position);
-                EventResult::handled()
-            }
             (PointerEventKind::Up, Some(PointerButton::Left)) if self.drag.is_some() => {
                 self.drag = None;
                 cx.release_pointer();
@@ -403,8 +405,8 @@ impl TabStrip {
         EventResult::handled()
     }
 
-    fn drag_to(&mut self, cx: &mut EventCx, position: Point) {
-        let Some(mut drag) = self.drag else { return };
+    /// Continues the tab drag `drag` (the current `self.drag`) to `position`.
+    fn drag_to(&mut self, cx: &mut EventCx, mut drag: Drag, position: Point) {
         if drag.index >= self.tabs.len() {
             // The dragged tab was closed meanwhile.
             self.drag = None;
@@ -922,8 +924,12 @@ mod tests {
             start: Point::new(100.0, 20.0),
             torn: false,
         });
-        let mut cx = harness.event_cx(strip.id());
-        strip.drag_to(&mut cx, Point::new(450.0, 20.0));
+        harness.pointer(
+            &mut strip,
+            PointerEventKind::Move,
+            None,
+            Point::new(450.0, 20.0),
+        );
         assert_eq!(strip.active(), 0);
         strip.drag = Some(Drag {
             index: 2,
@@ -931,8 +937,43 @@ mod tests {
             start: Point::new(100.0, 20.0),
             torn: false,
         });
-        strip.drag_to(&mut cx, Point::new(150.0, 20.0));
+        harness.pointer(
+            &mut strip,
+            PointerEventKind::Move,
+            None,
+            Point::new(150.0, 20.0),
+        );
         assert_eq!(strip.active(), 1);
+        // Reordering two tabs on the same side of the active one leaves it where it is.
+        let (mut harness, mut strip) = self::strip(4, 800.0);
+        let width = strip.tab_width();
+        strip.drag = Some(Drag {
+            index: 1,
+            grab: 0.0,
+            start: Point::new(width, 20.0),
+            torn: false,
+        });
+        harness.pointer(
+            &mut strip,
+            PointerEventKind::Move,
+            None,
+            Point::new(2.0 * width, 20.0),
+        );
+        assert_eq!((strip.key_at(2), strip.active()), (Some(11), 0));
+        strip.set_active(3);
+        strip.drag = Some(Drag {
+            index: 2,
+            grab: 0.0,
+            start: Point::new(2.0 * width, 20.0),
+            torn: false,
+        });
+        harness.pointer(
+            &mut strip,
+            PointerEventKind::Move,
+            None,
+            Point::new(0.0, 20.0),
+        );
+        assert_eq!((strip.key_at(0), strip.active()), (Some(11), 3));
     }
 
     #[test]
@@ -997,6 +1038,11 @@ mod tests {
             smooth.add_tab(key, "t");
         }
         harness.arrange(&mut smooth, Rect::new(0.0, 0.0, 700.0, 40.0));
+        assert!(
+            !harness.send(&mut smooth, wheel(1.0, false, over)).handled,
+            "a notch back from the start has nowhere to ease to"
+        );
+        assert_eq!(smooth.scroll_offset(), 0.0);
         assert!(harness.send(&mut smooth, wheel(-1.0, false, over)).handled);
         assert!(harness.requests.animation_frame_requested());
         harness.run_animations(&mut smooth);
@@ -1043,6 +1089,12 @@ mod tests {
     fn kit_tabs_paint_active_hover_dirty_dot_and_close() {
         let (mut harness, mut strip) = strip(3, 700.0);
         let tokens = harness.theme.tokens;
+        let close_glyphs = |canvas: &crate::canvas::RecordingCanvas| {
+            canvas
+                .ops()
+                .filter(|op| matches!(op, DrawOp::Icon { glyph: g, .. } if *g == glyph::CLOSE))
+                .count()
+        };
         strip.set_dirty(1, true);
         strip.set_dirty(2, true);
         let canvas = harness.paint(&strip);
@@ -1062,20 +1114,20 @@ mod tests {
             })
             .count();
         assert_eq!(dots, 2);
-        let closes = canvas
-            .ops()
-            .filter(|op| matches!(op, DrawOp::Icon { glyph: g, .. } if *g == glyph::CLOSE))
-            .count();
-        assert_eq!(closes, 1, "only the clean active tab shows a close glyph");
+        assert_eq!(
+            close_glyphs(&canvas),
+            1,
+            "only the clean active tab shows a close glyph"
+        );
+        // A dirty active tab shows its dot too until it is hovered.
+        strip.set_dirty(0, true);
+        assert_eq!(close_glyphs(&harness.paint(&strip)), 0);
+        strip.set_dirty(0, false);
         // Hovering a dirty tab turns the dot into a close button with a hover fill.
         let close = strip.close_rect(1).center();
         harness.hover(&mut strip, close);
         let canvas = harness.paint(&strip);
-        let closes = canvas
-            .ops()
-            .filter(|op| matches!(op, DrawOp::Icon { glyph: g, .. } if *g == glyph::CLOSE))
-            .count();
-        assert_eq!(closes, 2);
+        assert_eq!(close_glyphs(&canvas), 2);
         assert!(canvas.ops().filter(|op| matches!(op, DrawOp::FillRoundedRect { color, .. } if *color == tokens.hover_bg)).count() >= 2);
         // Hover without being over the close glyph has the tab fill only.
         let middle = strip.tab_rect(1).center();

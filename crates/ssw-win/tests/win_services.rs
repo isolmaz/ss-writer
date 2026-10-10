@@ -799,6 +799,23 @@ fn shell(fail: bool) -> (WindowsShell<ScriptedShell>, Executed, Revealed) {
 }
 
 #[test]
+fn the_default_apps_page_is_opened_through_the_host_and_a_failing_host_is_reported() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let (mut shell, executed, _) = shell(false);
+    shell.open_default_apps_settings().unwrap();
+    let calls = executed.borrow().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "open");
+    assert_eq!(calls[0].1, "ms-settings:defaultapps");
+    assert_ne!(calls[0].2 & SEE_MASK_NOASYNC, 0);
+    let (mut failing, _, _) = self::shell(true);
+    assert!(failed(
+        &failing.open_default_apps_settings().unwrap_err(),
+        "assoc"
+    ));
+}
+
+#[test]
 fn shell_requests_are_validated_before_the_os_call() {
     let _com = ComGuard::apartment_threaded().unwrap();
     let (mut shell, executed, _) = shell(false);

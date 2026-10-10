@@ -24,8 +24,8 @@ use ssw_win::com::ComGuard;
 use ssw_win::dpi;
 use ssw_win::tsf::{TextServices, TextStore, TextStoreHost};
 use windows::Win32::Foundation::{
-    CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_POINTER, E_UNEXPECTED, HWND, POINT,
-    RECT,
+    CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_POINTER, E_UNEXPECTED,
+    HWND, POINT, RECT,
 };
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Com::{
@@ -2307,6 +2307,125 @@ fn direct_the_input_scope_rejects_null_out_pointers() {
 }
 
 #[test]
+fn direct_query_insert_skips_the_out_pointers_tsf_leaves_null() {
+    let d = Direct::new("abcd");
+    let (mut start, mut end) = (-1i32, -1i32);
+    com!(
+        d.proxy
+            .0
+            .QueryInsert(1, 3, 2, &mut start, std::ptr::null_mut())
+    )
+    .expect("QueryInsert");
+    assert_eq!((start, end), (1, -1));
+    com!(
+        d.proxy
+            .0
+            .QueryInsert(1, 3, 2, std::ptr::null_mut(), &mut end)
+    )
+    .expect("QueryInsert");
+    assert_eq!((start, end), (1, 3));
+}
+
+#[test]
+fn direct_a_sink_without_the_sink_interface_and_no_sink_at_all_are_refused() {
+    let d = Direct::new("abc");
+    // The store is a COM object all right, but no ITextStoreACPSink.
+    let foreign: IUnknown = d.proxy.0.cast().expect("IUnknown");
+    assert_eq!(
+        code(com!(d.proxy.0.AdviseSink(
+            &ITextStoreACPSink::IID,
+            &foreign,
+            TS_AS_TEXT_CHANGE
+        ))),
+        E_NOINTERFACE
+    );
+    assert_eq!(
+        code(com!(d.proxy.0.UnadviseSink(None::<&IUnknown>))),
+        E_POINTER
+    );
+    // Both refusals left the advised sink alone: it still hears the host.
+    d.host.edit(0..0, "Z");
+    assert_eq!(
+        d.take_events(),
+        vec![
+            "text 0:0->1".to_owned(),
+            "sel".to_owned(),
+            "layout 1".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn direct_reading_runs_only_or_an_empty_range_returns_no_characters_and_no_run() {
+    let d = Direct::new("abc");
+    let (p, log) = (d.proxy.clone(), d.log.clone());
+    d.locked_ok(READ_SYNC, move |_| {
+        let mut log = log.borrow_mut();
+        // A buffer without capacity asks for runs only: no characters, no run, and the position
+        // a read would go on at.
+        log.push(format!("no buffer {:?}", p.text(1, -1, 0).ok()));
+        // An empty range has no characters, so no run either, however much room there is.
+        log.push(format!("empty {:?}", p.text(2, 2, 8).ok()));
+        log.push(format!("filled {:?}", p.text(1, 3, 8).ok()));
+    });
+    assert_eq!(
+        d.logged(),
+        vec![
+            "no buffer Some((\"\", 1, 0))".to_owned(),
+            "empty Some((\"\", 2, 0))".to_owned(),
+            "filled Some((\"bc\", 3, 1))".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn direct_inserting_text_that_is_no_utf16_or_over_a_selection_across_the_composition_fails() {
+    let d = Direct::new("abcd");
+    d.host.move_caret(Selection::new(1, 3));
+    let sink = d.composition_sink();
+    assert!(
+        com!(sink.OnStartComposition(None::<&ITfCompositionView>))
+            .expect("start")
+            .as_bool()
+    );
+    let (p, log) = (d.proxy.clone(), d.log.clone());
+    d.locked_ok(RW_SYNC, move |_| {
+        let mut log = log.borrow_mut();
+        let (mut start, mut end) = (0i32, 0i32);
+        let mut change = TS_TEXTCHANGE::default();
+        // A lone surrogate is no text.
+        log.push(format!(
+            "lone {:x}",
+            code(com!(p.0.InsertTextAtSelection(
+                0,
+                &[0xD800],
+                &mut start,
+                &mut end,
+                &mut change
+            )))
+            .0
+        ));
+        // The selection reaches from the host text into the composition: there is no one place
+        // to put the text.
+        log.push(format!("select {:?}", p.set_selection(0, 2, false).is_ok()));
+        log.push(format!("straddle {:x}", code(p.insert(0, "x")).0));
+        // The failed insertions changed nothing.
+        log.push(format!("text {:?}", p.text(0, -1, 100).map(|t| t.0).ok()));
+    });
+    assert_eq!(
+        d.logged(),
+        vec![
+            format!("lone {:x}", E_INVALIDARG.0),
+            "select true".to_owned(),
+            format!("straddle {:x}", TS_E_INVALIDPOS.0),
+            "text Some(\"abcd\")".to_owned(),
+        ]
+    );
+    com!(sink.OnEndComposition(None::<&ITfCompositionView>)).expect("end");
+    assert_eq!(d.host.doc(), "abcd");
+}
+
+#[test]
 fn direct_a_backward_composition_selection_is_a_reversed_host_selection_after_the_commit() {
     let d = Direct::new("abcd");
     d.host.move_caret(Selection::caret(2));
@@ -2597,4 +2716,149 @@ fn tsf_attribute_managers_that_cannot_be_created_leave_the_default_attributes() 
         tip.end(&t);
         assert_eq!(t.host.doc(), "aかb");
     }
+}
+
+// ---- failing system calls ----------------------------------------------------------------------
+
+/// The call an error message names: "create window" for "create window failed: ...".
+#[cfg(feature = "fault-injection")]
+fn failed_call(message: &str) -> &str {
+    message.split(" failed: ").next().unwrap_or_default()
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn tsf_every_failing_call_of_the_activation_is_reported_by_its_step_and_leaves_nothing_behind() {
+    let _com = ComGuard::apartment_threaded().expect("COM initializes");
+    let window = HiddenWindow::new();
+    let host = TestHost::new("abc");
+    // Eight checked calls set TSF up and one takes it down: the ninth failure is the
+    // teardown's, which the activation survives.
+    let outcomes = ssw_win::fault::sweep(|| {
+        TextServices::new(window.0, host.clone())
+            .map(drop)
+            .map_err(|error| error.to_string())
+    });
+    let steps: Vec<Option<&str>> = outcomes
+        .iter()
+        .map(|outcome| outcome.as_ref().err().map(|message| failed_call(message)))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            Some("CoCreateInstance(TF_ThreadMgr)"),
+            Some("ITfThreadMgr::Activate"),
+            Some("QueryInterface(IUnknown)"),
+            Some("ITfThreadMgr::CreateDocumentMgr"),
+            Some("ITfDocumentMgr::CreateContext"),
+            Some("QueryInterface(ITfSource)"),
+            Some("ITfSource::AdviseSink(ITfTextEditSink)"),
+            Some("ITfDocumentMgr::Push"),
+            None,
+        ]
+    );
+    // The failures left TSF usable: the next activation goes through and works.
+    let services = TextServices::new(window.0, host.clone()).expect("TSF activates again");
+    services.set_focus();
+    assert!(!services.store().is_composing());
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn tsf_a_failing_composition_services_query_leaves_the_composition_running() {
+    let t = Tsf::new("ab");
+    let tip = Tip::new();
+    t.host.move_caret(Selection::caret(2));
+    tip.start(&t, (2, 2), "x");
+    ssw_win::fault::arm(0);
+    let failed = t.services.terminate_composition();
+    assert!(ssw_win::fault::tripped());
+    ssw_win::fault::disarm();
+    let message = failed.expect_err("the query fails").to_string();
+    assert_eq!(
+        failed_call(&message),
+        "QueryInterface(ITfContextOwnerCompositionServices)"
+    );
+    // Nothing was asked of the text service: the composition goes on and ends as usual.
+    assert!(t.services.store().is_composing());
+    assert_eq!(tip.terminated.get(), 0);
+    t.services
+        .terminate_composition()
+        .expect("TerminateComposition");
+    assert_eq!(tip.terminated.get(), 1);
+    assert_eq!(t.host.doc(), "abx");
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn tsf_failing_calls_while_reading_a_composition_degrade_its_attributes_not_the_composition() {
+    let _com = ComGuard::apartment_threaded().expect("COM initializes");
+    let known = [
+        (
+            GUID::from_u128(0x7a1c0002_5e5b_4f0c_9d3e_000000000001),
+            TF_ATTR_TARGET_CONVERTED,
+        ),
+        (
+            GUID::from_u128(0x7a1c0002_5e5b_4f0c_9d3e_000000000002),
+            TF_ATTR_CONVERTED,
+        ),
+    ];
+    // Each call of the composition's start and its attribute read fails once, in turn; the run
+    // that fails nothing is the last.
+    let mut outcomes = Vec::new();
+    for call in 0.. {
+        // The order of the passing display attribute test: TSF is activated first, then the
+        // fake manager takes the place of the system's.
+        let t = Tsf::new("");
+        let _manager =
+            RegisteredClass::new(CLSID_TF_DisplayAttributeMgr, Some(Rc::new(known.to_vec())));
+        let categories: ITfCategoryMgr = com!(CoCreateInstance(
+            &CLSID_TF_CategoryMgr,
+            None::<&IUnknown>,
+            CLSCTX_INPROC_SERVER
+        ))
+        .expect("the category manager");
+        let atoms: Vec<u32> = known
+            .iter()
+            .map(|(guid, _)| com!(categories.RegisterGUID(guid)).expect("a GUID atom"))
+            .collect();
+        let tip = Tip::new();
+        ssw_win::fault::arm(call);
+        tip.start_styled(&t, (0, 0), "ab", &atoms);
+        let hit = ssw_win::fault::tripped();
+        ssw_win::fault::disarm();
+        outcomes.push(last_attributes(&t.host.events_now()));
+        tip.end(&t);
+        assert_eq!(
+            t.host.doc(),
+            "ab",
+            "call {call}: the composition commits whatever failed"
+        );
+        if !hit {
+            break;
+        }
+    }
+    let styled = vec![
+        (0..1, ImeAttrStyle::TargetConverted),
+        (1..2, ImeAttrStyle::Converted),
+    ];
+    assert_eq!(outcomes.last(), Some(&styled), "no failure, full styling");
+    // Whatever failed, the host got attributes covering the whole string without gaps.
+    for attrs in &outcomes {
+        assert_eq!(attrs.first().map(|(range, _)| range.start), Some(0));
+        assert_eq!(attrs.last().map(|(range, _)| range.end), Some(2));
+        assert!(
+            attrs
+                .windows(2)
+                .all(|pair| pair[0].0.end == pair[1].0.start),
+            "{attrs:?}"
+        );
+    }
+    // A property that cannot be read leaves the default style; a run that cannot be read only
+    // costs that run its style.
+    assert!(outcomes.contains(&vec![(0..2, ImeAttrStyle::Input)]));
+    assert!(outcomes.contains(&vec![
+        (0..1, ImeAttrStyle::TargetConverted),
+        (1..2, ImeAttrStyle::Input)
+    ]));
 }

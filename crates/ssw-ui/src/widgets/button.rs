@@ -514,7 +514,7 @@ mod tests {
                     DrawOp::Text { color, .. } => Some(*color),
                     _ => None,
                 })
-                .unwrap_or_else(|| panic!("no text"))
+                .expect("the button draws its label")
         };
         assert_eq!(text_color(&mut harness, &button), tokens.hover_text);
         harness.pointer(

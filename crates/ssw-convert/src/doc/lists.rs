@@ -59,7 +59,8 @@ impl Lists {
                 table.len()
             };
             let b = slice(table, start, stop.saturating_sub(start).max(lst.1 as usize))?;
-            let c_lst = u16_at(b, 0)? as usize;
+            // `b` holds at least `lst.1 >= 2` bytes
+            let c_lst = usize::from(u16::from_le_bytes([b[0], b[1]]));
             let mut o = 2usize;
             let mut heads = Vec::new();
             for _ in 0..c_lst {
@@ -97,10 +98,17 @@ impl Lists {
         }
         if lfo.1 >= 4 {
             let b = slice(table, lfo.0 as usize, lfo.1 as usize)?;
-            let n = u32_at(b, 0)? as usize;
-            for i in 0..n.min((b.len() - 4) / 16) {
-                out.lfo_lsid.push(u32_at(b, 4 + i * 16)?);
-            }
+            // `b` holds at least `lfo.1 >= 4` bytes: the count, then one 16-byte LFO per entry
+            // (only the whole ones that are there are read)
+            let n = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
+            out.lfo_lsid.extend(
+                b[4..]
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .take(n)
+                    .map(|entry| u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]])),
+            );
         }
         Ok(out)
     }

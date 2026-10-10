@@ -156,6 +156,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 
 ### 4.4 New & untitled
 - `Ctrl+N` in a workspace creates `Untitled.md` (`Untitled 2.md`…) in the selected folder and starts inline rename. Without a workspace: unsaved buffer kept in the session (backed up every 30 s) until saved.
+- Opening a file (dialog, command line, Explorer drop, Jump List, Quick Open, sidebar) while the active tab is an unused untitled buffer (never edited, empty, no undo history) replaces that tab instead of adding a new one; an untitled tab with text, or with edits that were undone or deleted again, stays.
 - Setting "Sync file name with first heading" (default off).
 
 ### 4.5 Version history

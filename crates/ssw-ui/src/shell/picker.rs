@@ -50,6 +50,8 @@ pub struct Row {
     pub expanded: Option<bool>,
     /// The accessible name when it differs from `prefix label detail`.
     pub name: Option<String>,
+    /// Drawn in the disabled text color and described as disabled; its owner refuses to run it.
+    pub disabled: bool,
 }
 
 impl Row {
@@ -474,6 +476,11 @@ impl RowList {
         } else {
             FontWeight::NORMAL
         };
+        let (text_color, muted_color) = if row.disabled {
+            (tokens.text_disabled, tokens.text_disabled)
+        } else {
+            (tokens.text, tokens.text_muted)
+        };
         let mut left = rect.x + INSET;
         if let Some(expanded) = row.expanded {
             let glyph = if expanded {
@@ -492,20 +499,14 @@ impl RowList {
         }
         if !row.prefix.is_empty() {
             let prefix = layout(&row.prefix, FontWeight::NORMAL);
-            draw_left_centered(canvas, prefix.as_ref(), left, rect, tokens.text_muted);
+            draw_left_centered(canvas, prefix.as_ref(), left, rect, muted_color);
             left += prefix.size().width + GAP;
         }
         let mut right = rect.right() - INSET;
         if !row.detail.is_empty() {
             let detail = layout(&row.detail, FontWeight::NORMAL);
             let width = detail.size().width;
-            draw_left_centered(
-                canvas,
-                detail.as_ref(),
-                right - width,
-                rect,
-                tokens.text_muted,
-            );
+            draw_left_centered(canvas, detail.as_ref(), right - width, rect, muted_color);
             right -= width + GAP;
         }
         let label = layout(&row.label, weight);
@@ -521,7 +522,7 @@ impl RowList {
                 );
             }
         }
-        canvas.draw_text_layout(label.as_ref(), Point::new(left, top), tokens.text);
+        canvas.draw_text_layout(label.as_ref(), Point::new(left, top), text_color);
         canvas.pop_clip();
     }
 
@@ -538,9 +539,10 @@ impl RowList {
             );
             node.state.selected = self.selected == Some(index);
             node.state.expanded = row.expanded;
+            node.state.disabled = row.disabled;
             node.patterns.selection_item = row.selectable();
             node.patterns.expand_collapse = row.expanded.is_some();
-            node.patterns.invoke = !row.header;
+            node.patterns.invoke = !row.header && !row.disabled;
             out.insert(node);
         }
         let state = AccessState {
@@ -673,6 +675,28 @@ mod tests {
         assert!(!empty.step(1));
         assert_eq!(press(&mut empty, vk::HOME), RowKey::Moved);
         assert_eq!(empty.selected(), None);
+    }
+
+    #[test]
+    fn updating_rows_keeps_the_scroll_and_the_selection_only_where_they_still_exist() {
+        let mut list = list_of(plain(8), 96.0);
+        press(&mut list, vk::END);
+        assert_eq!((list.selected(), list.first_visible()), (Some(7), 5));
+        // A longer list keeps both where they were.
+        list.update_rows(plain(10));
+        assert_eq!((list.selected(), list.first_visible()), (Some(7), 5));
+        // A shorter list has no row 7: the selection falls back to the first selectable row.
+        list.update_rows(plain(4));
+        assert_eq!((list.selected(), list.first_visible()), (Some(0), 0));
+        // A row that is no longer selectable cannot keep the selection either.
+        assert!(list.select(2));
+        list.update_rows(vec![
+            Row::new("a"),
+            Row::new("b"),
+            header("Two"),
+            Row::new("c"),
+        ]);
+        assert_eq!(list.selected(), Some(0));
     }
 
     #[test]

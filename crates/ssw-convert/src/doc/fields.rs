@@ -122,7 +122,12 @@ mod tests {
 
     #[test]
     fn classifies_instructions() {
-        let cases: [(&str, FieldKind); 14] = [
+        let cases: [(&str, FieldKind); 15] = [
+            // a switch without an argument, and a second target that is ignored
+            (
+                "HYPERLINK \\h \"http://x.org\" \"http://y.org\"",
+                FieldKind::Hyperlink("http://x.org".into()),
+            ),
             (
                 " HYPERLINK \"http://example.com/a b\" ",
                 FieldKind::Hyperlink("http://example.com/a%20b".into()),

@@ -38,7 +38,7 @@ use crate::widgets::{CONTROL_HEIGHT, Control, ICON_SIZE, SharedClipboard, glyph,
 
 use super::find::{CHIP_SIZE, ToggleChip};
 use super::palette::ShortcutLabels;
-use super::picker::{Row, RowClick, RowKey, RowList, RowOutcome, highlight_ranges};
+use super::picker::{Row, RowClick, RowList, RowOutcome, highlight_ranges};
 
 /// Padding inside a popup.
 const PAD: f32 = 4.0;
@@ -1659,9 +1659,9 @@ impl Widget for WikilinkCompletion {
         match e {
             Event::Key(key) if key.is_down && key.mods.is_empty() => match key.vk {
                 vk::UP | vk::DOWN | vk::PAGE_UP | vk::PAGE_DOWN => {
-                    if self.list.key(key) == RowKey::Moved {
-                        cx.invalidate(self.bounds);
-                    }
+                    // The guard admits unmodified keys only, and those always answer `Moved`.
+                    self.list.key(key);
+                    cx.invalidate(self.bounds);
                     EventResult::handled()
                 }
                 vk::RETURN | vk::TAB => {

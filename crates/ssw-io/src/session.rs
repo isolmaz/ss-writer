@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{OptionalExtension, params};
 
-use crate::store::{Store, StoreError, UnixSeconds, key_of, path_key, path_text};
+use crate::store::{
+    Store, StoreError, UnixSeconds, key_of, path_key, path_text, query_optional, query_rows,
+};
 
 /// How many recent files (and, separately, recent folders) are remembered.
 pub const RECENT_LIMIT: usize = 20;
@@ -100,50 +102,50 @@ impl Store {
     /// [`StoreError::NonUnicodePath`] for a path that is not valid Unicode and
     /// [`StoreError::Sqlite`] on database failure; nothing is changed in either case.
     pub fn save_session(&mut self, session: &Session) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM session_windows", [])?;
-        for (w, window) in session.windows.iter().enumerate() {
-            let p = window.placement;
-            tx.execute(
-                "INSERT INTO session_windows (id, x, y, width, height, maximized, active)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    w as i64,
-                    p.x,
-                    p.y,
-                    p.width,
-                    p.height,
-                    p.maximized,
-                    session.active_window == Some(w)
-                ],
-            )?;
-            for (t, tab) in window.tabs.iter().enumerate() {
-                let (path, untitled) = match &tab.document {
-                    TabDocument::File(path) => (Some(path_text(path)?), None),
-                    TabDocument::Untitled(id) => (None, Some(id.as_str())),
-                };
-                let workspace = tab.workspace.as_deref().map(path_text).transpose()?;
+        self.in_transaction(|tx| {
+            tx.execute("DELETE FROM session_windows", [])?;
+            for (w, window) in session.windows.iter().enumerate() {
+                let p = window.placement;
                 tx.execute(
-                    "INSERT INTO session_tabs (window_id, position, path, untitled_id, workspace, active)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO session_windows (id, x, y, width, height, maximized, active)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         w as i64,
-                        t as i64,
-                        path,
-                        untitled,
-                        workspace,
-                        window.active_tab == Some(t)
+                        p.x,
+                        p.y,
+                        p.width,
+                        p.height,
+                        p.maximized,
+                        session.active_window == Some(w)
                     ],
                 )?;
+                for (t, tab) in window.tabs.iter().enumerate() {
+                    let (path, untitled) = match &tab.document {
+                        TabDocument::File(path) => (Some(path_text(path)?), None),
+                        TabDocument::Untitled(id) => (None, Some(id.as_str())),
+                    };
+                    let workspace = tab.workspace.as_deref().map(path_text).transpose()?;
+                    tx.execute(
+                        "INSERT INTO session_tabs (window_id, position, path, untitled_id, workspace, active)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            w as i64,
+                            t as i64,
+                            path,
+                            untitled,
+                            workspace,
+                            window.active_tab == Some(t)
+                        ],
+                    )?;
+                }
             }
-        }
-        tx.execute(
-            "DELETE FROM untitled_buffers WHERE id NOT IN
-             (SELECT untitled_id FROM session_tabs WHERE untitled_id IS NOT NULL)",
-            [],
-        )?;
-        tx.commit()?;
-        Ok(())
+            tx.execute(
+                "DELETE FROM untitled_buffers WHERE id NOT IN
+                 (SELECT untitled_id FROM session_tabs WHERE untitled_id IS NOT NULL)",
+                [],
+            )?;
+            Ok(())
+        })
     }
 
     /// The stored session (empty when none was saved).
@@ -152,44 +154,43 @@ impl Store {
     /// [`StoreError::InvalidData`] for a tab row without a document and
     /// [`StoreError::Sqlite`] on database failure.
     pub fn load_session(&self) -> Result<Session, StoreError> {
-        let mut windows = self.conn.prepare(
+        let windows: Vec<(i64, i32, i32, i32, i32, bool, bool)> = query_rows(
+            &self.conn,
             "SELECT id, x, y, width, height, maximized, active
              FROM session_windows ORDER BY id",
-        )?;
-        let mut tabs = self.conn.prepare(
-            "SELECT path, untitled_id, workspace, active
-             FROM session_tabs WHERE window_id = ?1 ORDER BY position",
+            [],
         )?;
         let mut session = Session::default();
-        let mut window_rows = windows.query([])?;
-        while let Some(row) = window_rows.next()? {
-            let window_id: i64 = row.get(0)?;
-            let placement = WindowPlacement {
-                x: row.get(1)?,
-                y: row.get(2)?,
-                width: row.get(3)?,
-                height: row.get(4)?,
-                maximized: row.get(5)?,
-            };
-            if row.get::<_, bool>(6)? && session.active_window.is_none() {
+        for (window_id, x, y, width, height, maximized, active) in windows {
+            if active && session.active_window.is_none() {
                 session.active_window = Some(session.windows.len());
             }
             let mut window = SessionWindow {
-                placement,
+                placement: WindowPlacement {
+                    x,
+                    y,
+                    width,
+                    height,
+                    maximized,
+                },
                 tabs: Vec::new(),
                 active_tab: None,
             };
-            let mut tab_rows = tabs.query([window_id])?;
-            while let Some(tab_row) = tab_rows.next()? {
-                let path: Option<String> = tab_row.get(0)?;
-                let untitled: Option<String> = tab_row.get(1)?;
-                let workspace: Option<String> = tab_row.get(2)?;
+            // (path, untitled_id, workspace, active)
+            type TabRow = (Option<String>, Option<String>, Option<String>, bool);
+            let tabs: Vec<TabRow> = query_rows(
+                &self.conn,
+                "SELECT path, untitled_id, workspace, active
+                 FROM session_tabs WHERE window_id = ?1 ORDER BY position",
+                [window_id],
+            )?;
+            for (path, untitled, workspace, active) in tabs {
                 let document = match (path, untitled) {
                     (Some(path), _) => TabDocument::File(PathBuf::from(path)),
                     (None, Some(id)) => TabDocument::Untitled(id),
                     (None, None) => return Err(StoreError::InvalidData("tab without document")),
                 };
-                if tab_row.get::<_, bool>(3)? && window.active_tab.is_none() {
+                if active && window.active_tab.is_none() {
                     window.active_tab = Some(window.tabs.len());
                 }
                 window.tabs.push(SessionTab {
@@ -215,22 +216,22 @@ impl Store {
     ) -> Result<(), StoreError> {
         let text = path_text(path)?;
         let key = key_of(text);
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "DELETE FROM recent_items WHERE kind = ?1 AND key = ?2",
-            params![kind.code(), key],
-        )?;
-        tx.execute(
-            "INSERT INTO recent_items (kind, key, path, opened_at) VALUES (?1, ?2, ?3, ?4)",
-            params![kind.code(), key, text, now],
-        )?;
-        tx.execute(
-            "DELETE FROM recent_items WHERE kind = ?1 AND seq NOT IN
-             (SELECT seq FROM recent_items WHERE kind = ?1 ORDER BY seq DESC LIMIT ?2)",
-            params![kind.code(), RECENT_LIMIT as i64],
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.in_transaction(|tx| {
+            tx.execute(
+                "DELETE FROM recent_items WHERE kind = ?1 AND key = ?2",
+                params![kind.code(), key],
+            )?;
+            tx.execute(
+                "INSERT INTO recent_items (kind, key, path, opened_at) VALUES (?1, ?2, ?3, ?4)",
+                params![kind.code(), key, text, now],
+            )?;
+            tx.execute(
+                "DELETE FROM recent_items WHERE kind = ?1 AND seq NOT IN
+                 (SELECT seq FROM recent_items WHERE kind = ?1 ORDER BY seq DESC LIMIT ?2)",
+                params![kind.code(), RECENT_LIMIT as i64],
+            )?;
+            Ok(())
+        })
     }
 
     /// Recent items of `kind`, most recent first.
@@ -238,18 +239,18 @@ impl Store {
     /// # Errors
     /// [`StoreError::Sqlite`] on database failure.
     pub fn recent_items(&self, kind: RecentKind) -> Result<Vec<RecentItem>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let rows: Vec<(String, UnixSeconds)> = query_rows(
+            &self.conn,
             "SELECT path, opened_at FROM recent_items WHERE kind = ?1 ORDER BY seq DESC",
+            [kind.code()],
         )?;
-        let items = stmt
-            .query_map([kind.code()], |row| {
-                Ok(RecentItem {
-                    path: PathBuf::from(row.get::<_, String>(0)?),
-                    opened_at: row.get(1)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(items)
+        Ok(rows
+            .into_iter()
+            .map(|(path, opened_at)| RecentItem {
+                path: PathBuf::from(path),
+                opened_at,
+            })
+            .collect())
     }
 
     /// Forget one recent item (for example because the file no longer exists).
@@ -321,21 +322,11 @@ impl Store {
     /// [`StoreError::NonUnicodePath`], [`StoreError::Json`] (stored folds are not a JSON array of
     /// offsets) or [`StoreError::Sqlite`].
     pub fn view_state(&self, path: &Path) -> Result<Option<ViewState>, StoreError> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT caret, scroll_anchor, scroll_delta, folds FROM file_view_state WHERE key = ?1",
-                [path_key(path)?],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, f64>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let row: Option<(i64, i64, f64, String)> = query_optional(
+            &self.conn,
+            "SELECT caret, scroll_anchor, scroll_delta, folds FROM file_view_state WHERE key = ?1",
+            [path_key(path)?],
+        )?;
         row.map(|(caret, scroll_anchor, scroll_delta, folds)| {
             Ok::<_, StoreError>(ViewState {
                 caret: caret as usize,

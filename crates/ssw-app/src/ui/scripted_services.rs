@@ -97,6 +97,8 @@ pub enum ShellRecord {
     Reveal(PathBuf),
     /// Move an item to the Recycle Bin (the item is removed from disk).
     Recycle(PathBuf),
+    /// Open the Settings page for default apps (nothing is opened).
+    OpenDefaultApps,
 }
 
 #[derive(Debug, Default)]
@@ -303,6 +305,11 @@ impl Shell for ScriptedShell {
 
     fn reveal_in_explorer(&mut self, path: &Path) -> Result<(), ServiceError> {
         self.record(ShellRecord::Reveal(path.to_path_buf()));
+        Ok(())
+    }
+
+    fn open_default_apps_settings(&mut self) -> Result<(), ServiceError> {
+        self.record(ShellRecord::OpenDefaultApps);
         Ok(())
     }
 

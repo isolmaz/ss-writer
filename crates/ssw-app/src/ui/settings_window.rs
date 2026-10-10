@@ -627,6 +627,10 @@ impl Controller {
         match event {
             SettingsEvent::Changed(_) => self.settings_changed(),
             SettingsEvent::BrowseFolder(field) => self.browse_folder(field),
+            SettingsEvent::OpenDefaultApps => {
+                // The page opening is the whole effect; a refusal has nobody to tell.
+                let _ = self.shell.borrow_mut().open_default_apps_settings();
+            }
             SettingsEvent::OpenLogsFolder => self.open_logs_folder(),
             SettingsEvent::OpenSettingsFile => self.open_settings_file(),
             SettingsEvent::ResetSettings => self.reset_settings(),

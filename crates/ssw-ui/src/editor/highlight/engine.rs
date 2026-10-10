@@ -794,8 +794,8 @@ fn toml_key_end(text: &str) -> Option<usize> {
     let mut len = 0;
     let mut rest = text;
     loop {
-        let part = if let Some(inner) = rest.strip_prefix('"').or_else(|| rest.strip_prefix('\'')) {
-            inner.find(rest.chars().next()?)? + 2
+        let part = if let Some(quote @ ('"' | '\'')) = rest.chars().next() {
+            rest[1..].find(quote)? + 2
         } else {
             rest.find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
                 .unwrap_or(rest.len())

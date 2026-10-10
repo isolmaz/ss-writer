@@ -107,7 +107,9 @@ fn finish(
                 .borrow()
                 .active_tab()
                 .and_then(|tab| tab.workspace.clone());
-            cell.view.borrow_mut().add_tab(entry, workspace);
+            cell.view
+                .borrow_mut()
+                .open_tab(entry, workspace, controller.docs());
             controller.refresh(&cell);
         }
         Err(error) => controller.report(&error),

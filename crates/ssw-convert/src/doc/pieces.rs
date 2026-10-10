@@ -3,7 +3,7 @@
 
 use encoding_rs::Encoding;
 
-use super::fib::{Result, corrupt, slice, u8_at, u16_at, u32_at};
+use super::fib::{Result, corrupt, slice, u16_at, u32_at};
 
 /// Placeholder written at the trail-byte position of a double-byte character in an 8-bit
 /// piece (every byte is its own CP); the converter skips it.
@@ -52,12 +52,13 @@ impl Pieces {
         };
         // RgPrc: clxt = 1, cbGrpprl: u16, grpprl
         let mut prcs: Vec<&[u8]> = Vec::new();
-        while off < end && u8_at(table, off)? == 0x01 {
+        // (`off < end <= table.len()`: the byte at `off` exists)
+        while off < end && table[off] == 0x01 {
             let cb = u16_at(table, off + 1)? as usize;
             prcs.push(slice(table, off + 3, cb)?);
             off += 3 + cb;
         }
-        if off >= end || u8_at(table, off)? != 0x02 {
+        if off >= end || table[off] != 0x02 {
             return corrupt("CLX has no Pcdt");
         }
         let lcb_plc = u32_at(table, off + 1)? as usize;
@@ -66,15 +67,21 @@ impl Pieces {
         if lcb_plc < 4 {
             return corrupt("PlcPcd too small");
         }
+        // n + 1 CPs, then n Pcds: `plc` holds at least 4 + 12 * n bytes
         let n = (lcb_plc - 4) / 12;
+        let (cps, pcds) = plc.split_at((n + 1) * 4);
+        let cps: Vec<u32> = cps
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|cp| u32::from_le_bytes([cp[0], cp[1], cp[2], cp[3]]))
+            .collect();
         let mut pieces = Vec::with_capacity(n);
-        for i in 0..n {
-            let cp0 = u32_at(plc, i * 4)?;
-            let cp1 = u32_at(plc, (i + 1) * 4)?;
-            let pcd = (n + 1) * 4 + i * 8;
+        for (i, pcd) in pcds.as_chunks::<8>().0.iter().take(n).enumerate() {
+            let (cp0, cp1) = (cps[i], cps[i + 1]);
             // Pcd: flags(2), FcCompressed(4), prm(2)
-            let fcc = u32_at(plc, pcd + 2)?;
-            let prm = u16_at(plc, pcd + 6)?;
+            let fcc = u32::from_le_bytes([pcd[2], pcd[3], pcd[4], pcd[5]]);
+            let prm = u16::from_le_bytes([pcd[6], pcd[7]]);
             let compressed = fcc & 0x4000_0000 != 0;
             let fc = fcc & 0x3FFF_FFFF;
             let fc = if compressed { fc / 2 } else { fc };
@@ -352,6 +359,7 @@ pub(super) mod tests {
         let mut long_prc = vec![1u8, 0xFF, 0xFF];
         long_prc.extend_from_slice(&good);
         assert!(parse(&long_prc).is_err(), "RgPrc entry beyond table");
+        assert!(parse(&[1u8]).is_err(), "RgPrc size cut off");
         let mut truncated = good;
         truncated[1..5].copy_from_slice(&1000u32.to_le_bytes());
         assert!(parse(&truncated).is_err(), "PlcPcd beyond table");
@@ -438,6 +446,10 @@ pub(super) mod tests {
         out.clear();
         p.fc_range_to_cp(100, 110, &mut out);
         assert_eq!(out, vec![(0, 10, 0), (14, 20, 2)]);
+        out.clear();
+        // piece 2 already ended before the range starts: only piece 0 covers it
+        p.fc_range_to_cp(107, 108, &mut out);
+        assert_eq!(out, vec![(7, 8, 0)]);
         out.clear();
         p.fc_range_to_cp(5, 5, &mut out);
         p.fc_range_to_cp(0, 50, &mut out);

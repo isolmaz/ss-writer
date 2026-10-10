@@ -138,6 +138,15 @@ fn escape_and_a_press_outside_close_without_moving() {
 }
 
 #[test]
+fn a_key_the_box_does_not_use_leaves_the_overlay_open_and_untaken() {
+    let (mut host, mut goto, doc) = setup("a\nbb", 2);
+    assert!(!host.key(&mut goto, vk::F3).handled);
+    assert!(goto.is_visible());
+    assert!(goto.take_events().is_empty());
+    assert_eq!(caret(&doc), 2);
+}
+
+#[test]
 fn the_access_tree_has_the_box_and_the_hint() {
     let (mut host, mut goto, _doc) = setup("a\nbb\nccc", 0);
     let tree = host.tree(&goto);
@@ -159,6 +168,8 @@ fn the_access_tree_has_the_box_and_the_hint() {
     let mut cx = host.cx(goto.id());
     assert!(goto.perform_child(&mut cx, input_id, &AccessAction::SetValue("x".into())));
     assert!(!goto.perform_child(&mut cx, WidgetId::allocate(), &AccessAction::Focus));
+    // An action the box refuses is refused by the overlay.
+    assert!(!goto.perform_child(&mut cx, input_id, &AccessAction::Invoke));
     assert!(goto.is_invalid());
     let tree = host.tree(&goto);
     assert_eq!(

@@ -442,6 +442,8 @@ fn rows_are_activated_by_index_and_unknown_rows_do_nothing() {
     show_results(&mut host, &mut panel);
     assert!(!panel.activate_row(99));
     assert!(panel.take_events().is_empty());
+    panel.toggle_file(99);
+    assert!(!panel.is_collapsed(0) && !panel.is_collapsed(1));
     // A header collapses its file; the match of the next file moves up to row 2.
     assert!(panel.activate_row(0));
     assert!(panel.is_collapsed(0));

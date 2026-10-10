@@ -744,10 +744,13 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
             return None;
         }
         // Any number of 0xFF fill bytes may precede the marker code.
-        while *bytes.get(at + 1)? == 0xFF {
+        let marker = loop {
+            let code = *bytes.get(at + 1)?;
+            if code != 0xFF {
+                break code;
+            }
             at += 1;
-        }
-        let marker = *bytes.get(at + 1)?;
+        };
         match marker {
             // Standalone markers carry no length.
             0x01 | 0xD0..=0xD8 => at += 2,
@@ -755,9 +758,13 @@ fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
             0xD9 | 0xDA => return None,
             // Start-of-frame markers (not DHT, JPG, DAC).
             0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => {
-                return Some((be16(bytes, at + 7)?, be16(bytes, at + 5)?));
+                // length(2), precision(1), height(2), width(2)
+                let height = be16(bytes, at + 5)?;
+                let width = be16(bytes, at + 7)?;
+                return Some((width, height));
             }
-            _ => at += 2 + usize::try_from(be16(bytes, at + 2)?).ok()?,
+            // a 16-bit segment length always fits in `usize`
+            _ => at += 2 + be16(bytes, at + 2)? as usize,
         }
     }
 }
@@ -1010,7 +1017,8 @@ mod tests {
             b"<a/><b>",
         ] {
             let (root, damaged) = parse_xml_salvage(input).unwrap();
-            assert!(damaged, "{}", String::from_utf8_lossy(input));
+            let shown = String::from_utf8_lossy(input);
+            assert!(damaged, "{shown}");
             assert_eq!(root.name, "a");
         }
         assert!(parse_xml_salvage(b"").is_none());
@@ -1069,16 +1077,19 @@ mod tests {
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
         bytes.extend_from_slice(b"<a><b/></a>");
         assert!(parse_xml(&bytes).unwrap().child(Ns::None, "b").is_some());
-        assert!(matches!(
-            parse_xml(b"<a><b></a>"),
-            Err(XmlError::Malformed(_))
-        ));
-        assert!(matches!(parse_xml(b"<a>"), Err(XmlError::Malformed(_))));
-        assert!(matches!(parse_xml(b"</a>"), Err(XmlError::Malformed(_))));
-        assert!(matches!(
+        assert_eq!(
+            parse_xml(b"<a>"),
+            Err(XmlError::Malformed("unclosed element".into()))
+        );
+        assert_eq!(
             parse_xml(b"<a/><b/>"),
-            Err(XmlError::Malformed(_))
-        ));
+            Err(XmlError::Malformed("multiple root elements".into()))
+        );
+        // a mismatched and an unmatched end tag are reported by the XML reader itself
+        for input in [&b"<a><b></a>"[..], b"</a>"] {
+            let error = parse_xml(input).unwrap_err().to_string();
+            assert!(error.starts_with("malformed XML: "), "{error}");
+        }
         assert_eq!(parse_xml(b"   "), Err(XmlError::Empty));
     }
 
@@ -1262,10 +1273,8 @@ mod tests {
         w.add("bad.xml", b"<a><b></a>");
         let bytes = w.finish().unwrap();
         let mut p = Package::open(&bytes).unwrap();
-        assert!(matches!(
-            p.read_xml("bad.xml"),
-            Err(PackageError::Xml(XmlError::Malformed(_)))
-        ));
+        let error = p.read_xml("bad.xml").err().unwrap().to_string();
+        assert!(error.starts_with("malformed XML: "), "{error}");
     }
 
     fn ole_with_stream(name: &str) -> Vec<u8> {
@@ -1367,11 +1376,19 @@ mod tests {
     fn image_info_rejects_unknown_truncated_and_empty_images() {
         let mut no_ihdr = png(1, 1);
         no_ihdr[12] = b'X';
-        let cases: [(&str, Vec<u8>); 12] = [
+        let cases: [(&str, Vec<u8>); 17] = [
             ("empty", vec![]),
             ("text", b"hello world".to_vec()),
             ("png without IHDR", no_ihdr),
+            ("png truncated in the width", png(1, 1)[..18].to_vec()),
             ("png truncated", png(1, 1)[..20].to_vec()),
+            ("jpeg without markers", jpeg(&[])),
+            ("jpeg cut after the marker prefix", jpeg(&[0xFF])),
+            ("jpeg cut after a standalone marker", jpeg(&[0xFF, 0xD0])),
+            (
+                "jpeg frame cut in the height",
+                jpeg(&[0xFF, 0xC0, 0, 11, 8, 0]),
+            ),
             ("png zero width", png(0, 4)),
             ("png zero height", png(4, 0)),
             ("gif truncated", b"GIF89a\x01".to_vec()),
@@ -1411,10 +1428,12 @@ mod tests {
         let without = build(None);
         assert_eq!(Package::open(&without).unwrap().main_part().unwrap(), None);
         let broken = build(Some("<Relationships>"));
-        assert!(matches!(
+        assert_eq!(
             Package::open(&broken).unwrap().main_part(),
-            Err(PackageError::Xml(_))
-        ));
+            Err(PackageError::Xml(XmlError::Malformed(
+                "unclosed element".into()
+            )))
+        );
         let mut only_external = RelationshipsBuilder::new();
         only_external.add(rel::OFFICE_DOCUMENT, "https://x.test/d", true);
         let external = build(Some(&only_external.to_xml()));
@@ -1423,19 +1442,60 @@ mod tests {
 
     #[test]
     fn open_rejects_non_zip_and_too_many_entries() {
-        assert!(matches!(
-            Package::open(b"definitely not a zip"),
-            Err(PackageError::Corrupt(_))
-        ));
+        let error = Package::open(b"definitely not a zip").err().unwrap();
+        let text = error.to_string();
+        assert!(text.starts_with("not a valid ZIP package: "), "{text}");
         let mut w = PackageWriter::new();
         for i in 0..=MAX_ENTRIES {
             w.add(&format!("f{i}.txt"), b"");
         }
         let bytes = w.finish().unwrap();
-        assert!(matches!(
-            Package::open(&bytes),
-            Err(PackageError::TooLarge(_))
-        ));
+        assert_eq!(
+            Package::open(&bytes).err(),
+            Some(PackageError::TooLarge(format!(
+                "{} entries (limit {MAX_ENTRIES})",
+                MAX_ENTRIES + 1
+            )))
+        );
+    }
+
+    #[test]
+    fn entries_that_cannot_be_read_are_reported_as_corrupt() {
+        // the signature of the entry's local header is gone: `open` reads every header
+        let mut w = PackageWriter::new();
+        w.add("a.txt", b"abc");
+        let bytes = w.finish().unwrap();
+        let mut no_header = bytes.clone();
+        no_header[..4].copy_from_slice(b"JUNK");
+        assert_eq!(
+            Package::open(&no_header).err(),
+            Some(PackageError::Corrupt(
+                "invalid Zip archive: Invalid local file header".into()
+            ))
+        );
+
+        // an entry flagged as encrypted opens, but its content cannot be read (no password)
+        let encrypted = |name: &str, data: &[u8]| {
+            let mut w = PackageWriter::new();
+            w.add(name, data);
+            let mut bytes = w.finish().unwrap();
+            // general purpose flag (bit 0 = encrypted) of the central directory entry
+            let entry = bytes
+                .windows(4)
+                .rposition(|signature| signature == b"PK\x01\x02")
+                .unwrap();
+            bytes[entry + 8] |= 1;
+            bytes
+        };
+        let locked = PackageError::Corrupt(
+            "unsupported Zip archive: Password required to decrypt file".into(),
+        );
+        let bytes = encrypted("a.xml", b"<a/>");
+        let mut package = Package::open(&bytes).unwrap();
+        assert_eq!(package.read_part("a.xml"), Err(locked.clone()));
+        assert_eq!(package.read_xml("a.xml"), Err(locked.clone()));
+        let bytes = encrypted("_rels/.rels", b"<Relationships/>");
+        assert_eq!(Package::open(&bytes).unwrap().main_part(), Err(locked));
     }
 
     #[test]
@@ -1451,19 +1511,16 @@ mod tests {
             .rposition(|signature| signature == b"PK\x01\x02")
             .unwrap();
         declared[entry + 24..entry + 28].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
-        assert!(matches!(
-            Package::open(&declared),
-            Err(PackageError::TooLarge(_))
+        let too_large = PackageError::TooLarge(format!(
+            "more than {MAX_TOTAL_UNCOMPRESSED} bytes uncompressed"
         ));
+        assert_eq!(Package::open(&declared).err(), Some(too_large.clone()));
 
         // the length that is really decompressed counts, whatever the declared sizes say
         let mut package = Package::open(&bytes).unwrap();
         assert_eq!(package.read_part("a.txt").unwrap(), Some(b"abc".to_vec()));
         package.read_total = MAX_TOTAL_UNCOMPRESSED - 2;
-        assert!(matches!(
-            package.read_part("a.txt"),
-            Err(PackageError::TooLarge(_))
-        ));
+        assert_eq!(package.read_part("a.txt"), Err(too_large));
         package.read_total = MAX_TOTAL_UNCOMPRESSED - 3;
         assert_eq!(package.read_part("a.txt").unwrap(), Some(b"abc".to_vec()));
         assert_eq!(package.read_total, MAX_TOTAL_UNCOMPRESSED);
@@ -1476,5 +1533,12 @@ mod tests {
         // `&#0;` is not a legal character: the reference is dropped, the text around it stays
         let root = parse_xml(b"<a>x&#0;y&amp;</a>").unwrap();
         assert_eq!(root.text(), "xy&");
+    }
+
+    #[test]
+    fn unknown_entities_are_dropped_from_text_and_kept_in_attributes() {
+        let root = parse_xml(b"<a v=\"x&bogus;y\">p&bogus;q</a>").unwrap();
+        assert_eq!(root.text(), "pq");
+        assert_eq!(root.attr("v"), Some("x&bogus;y"));
     }
 }

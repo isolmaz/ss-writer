@@ -128,6 +128,7 @@ impl WindowGlue {
             ("window-menu-key-edit", MenuKind::Edit),
             ("window-menu-key-format", MenuKind::Format),
             ("window-menu-key-view", MenuKind::View),
+            ("window-menu-key-window", MenuKind::Window),
             ("help-menu-key", MenuKind::Help),
         ]
         .into_iter()

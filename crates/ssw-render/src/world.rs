@@ -475,6 +475,41 @@ mod tests {
         std::fs::remove_dir_all(&outer).expect("cleanup");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn reserved_device_names_and_drive_prefixes_are_denied() {
+        let root = temp_dir("reserved");
+        let world = TypstWorld::new(Some(&root));
+        for name in ["NUL", "con.txt", "C:data.txt"] {
+            assert!(!world.file_available(name), "{name}");
+            let id = project_id(name).expect("a valid virtual path");
+            assert_eq!(
+                World::file(&world, id).expect_err("denied"),
+                FileError::AccessDenied,
+                "{name}"
+            );
+        }
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn unreadable_project_entries_report_why() {
+        let root = temp_dir("unreadable");
+        std::fs::create_dir_all(root.join("folder")).expect("folder");
+        let world = TypstWorld::new(Some(&root));
+        // A directory is inside the root but cannot be read as a file.
+        let folder = project_id("folder").expect("path");
+        let err = World::file(&world, folder).expect_err("a directory has no bytes");
+        assert!(err.to_string().starts_with("failed to load file"), "{err}");
+        // A source that does not exist.
+        let missing = project_id("missing.typ").expect("path");
+        assert_eq!(
+            World::source(&world, missing).expect_err("no such file"),
+            FileError::NotFound(world.root().expect("root").join("missing.typ"))
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn invalid_utf8_sources_are_rejected() {
         let world = TypstWorld::new(None);

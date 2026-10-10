@@ -430,9 +430,10 @@ impl Conv<'_> {
                     }
                     // inside a field instruction (any ancestor): collect, never render
                     _ if self.fields.iter().any(|f| !f.in_result) => {
-                        if let Some(f) = self.fields.iter_mut().find(|f| !f.in_result) {
-                            f.instr.push(c);
-                        }
+                        let open = self.fields.iter_mut().find(|f| !f.in_result);
+                        open.expect("the guard found an open instruction")
+                            .instr
+                            .push(c);
                     }
                     _ if self.hidden_in_field() => {}
                     _ if eff.vanish => self.counts.hidden += 1,
@@ -652,9 +653,7 @@ impl Conv<'_> {
 
         if depth > 0 {
             if !text_empty {
-                if let Some((_, m)) = &marker {
-                    text = format!("{} {text}", if m == "-" { "\u{2022}" } else { m });
-                }
+                text = cell_item_text(marker.as_ref(), text);
                 self.tables.push_paragraph(depth, text);
                 self.tables.align_cell(depth, jc_align(pi.pap.jc));
             }
@@ -765,6 +764,15 @@ fn flush(inl: &mut Vec<Inline>, pending: &mut Vec<u16>, fmt: Fmt) {
     pending.clear();
 }
 
+/// Table cells cannot hold Markdown list syntax, so the marker of a list paragraph inside a
+/// cell becomes a text prefix (a bullet for `-`).
+fn cell_item_text(marker: Option<&(u8, String)>, text: String) -> String {
+    match marker {
+        None => text,
+        Some((_, m)) => format!("{} {text}", if m == "-" { "\u{2022}" } else { m }),
+    }
+}
+
 fn push_break(blocks: &mut Vec<Block>) {
     if !matches!(blocks.last(), Some(Block::PageBreak) | None) {
         blocks.push(Block::PageBreak);
@@ -847,6 +855,63 @@ mod tests {
         }
         cf.flush().unwrap();
         cf.into_inner().into_inner()
+    }
+
+    /// A compound file whose text is `main` followed by the footnote and the endnote story. Each
+    /// note argument is `(story text, reference CPs in the main story, CP at which each note
+    /// text starts - relative to its story - with the end CP last)`. The style and list tables
+    /// lie beyond the end of the table stream (two corrupt parts).
+    fn notes_doc(
+        main: &[u8],
+        ftn: (&[u8], &[u32], &[u32]),
+        edn: (&[u8], &[u32], &[u32]),
+    ) -> Vec<u8> {
+        let main_len = main.len() as u32;
+        let text = [main, ftn.0, edn.0].concat();
+        // PlcfndRef: n CPs, the end CP, n 2-byte FRDs; PlcfndTxt: only CPs
+        let ref_plc = |refs: &[u32]| -> Vec<u8> {
+            refs.iter()
+                .copied()
+                .chain([main_len])
+                .flat_map(u32::to_le_bytes)
+                .chain(vec![0u8; refs.len() * 2])
+                .collect()
+        };
+        let txt_plc =
+            |cps: &[u32]| -> Vec<u8> { cps.iter().copied().flat_map(u32::to_le_bytes).collect() };
+        // one 8-bit piece whose text starts at byte 1024 of the WordDocument stream
+        let clx = pieces::tests::clx(&[], &[(0, text.len() as u32, 0x4000_0000 | (1024 * 2), 0)]);
+        let mut table = clx.clone();
+        let mut pairs = vec![(0u32, 0u32); IDX_PLF_LFO + 1];
+        pairs[IDX_CLX] = (0, clx.len() as u32);
+        for (ref_index, txt_index, (_, refs, cps)) in [
+            (IDX_PLCFFND_REF, IDX_PLCFFND_TXT, ftn),
+            (IDX_PLCFEND_REF, IDX_PLCFEND_TXT, edn),
+        ] {
+            let (refs, cps) = (ref_plc(refs), txt_plc(cps));
+            pairs[ref_index] = (table.len() as u32, refs.len() as u32);
+            table.extend_from_slice(&refs);
+            pairs[txt_index] = (table.len() as u32, cps.len() as u32);
+            table.extend_from_slice(&cps);
+        }
+        pairs[IDX_STSHF] = (100_000, 4);
+        pairs[IDX_PLF_LST] = (100_000, 10);
+        let mut word = fib::tests::fib_bytes(0xA5EC, 0x00C1, 0, 14, 22, &pairs);
+        // FibRgLw97 starts at byte 64: ccpText, ccpFtn, ccpHdd, reserved, ccpAtn, ccpEdn, ...
+        for (at, ccp) in [
+            (76, main_len),
+            (80, ftn.0.len() as u32),
+            (84, 0),
+            (92, 0),
+            (96, edn.0.len() as u32),
+            (100, 0),
+            (104, 0),
+        ] {
+            word[at..at + 4].copy_from_slice(&ccp.to_le_bytes());
+        }
+        word.resize(1024, 0);
+        word.extend_from_slice(&text);
+        ole(&word, &table)
     }
 
     #[test]
@@ -948,9 +1013,14 @@ mod tests {
             ftn_ref: HashMap::new(),
             edn_ref: HashMap::new(),
         };
+        convert_story(&doc, assets_dir, Sub::Main)
+    }
+
+    /// Runs the whole text of `doc` through the paragraph walker as story `sub`.
+    fn convert_story(doc: &Doc, assets_dir: &str, sub: Sub) -> ImportResult {
         let mut res = ImportResult::default();
         let mut cv = Conv {
-            d: &doc,
+            d: doc,
             assets_dir,
             res: &mut res,
             counts: Counts::default(),
@@ -959,11 +1029,11 @@ mod tests {
             tables: Tables::default(),
             table_loss: TableLoss::default(),
             serial: 0,
-            sub: Sub::Main,
+            sub,
             pending_break: false,
             images: 0,
         };
-        let blocks = cv.render_range(0, doc.text.len() as u32, Sub::Main);
+        let blocks = cv.render_range(0, doc.text.len() as u32, sub);
         let markdown = md::blocks_to_string(&blocks);
         cv.finish();
         res.markdown = markdown;
@@ -1013,11 +1083,11 @@ mod tests {
         assert_eq!(losses(&res), vec![(LossKind::SymbolFontCharacters, 6)]);
     }
 
-    /// PICFAndOfficeArtData holding one PNG BLIP (instance 0x6E0, one UID) with `payload`.
-    fn png_picture(payload: &[u8]) -> Vec<u8> {
+    /// PICFAndOfficeArtData holding one BLIP record (`ty`, `inst`, one UID) with `payload`.
+    fn picture_record(ty: u16, inst: u16, payload: &[u8]) -> Vec<u8> {
         let mut blip = Vec::new();
-        blip.extend_from_slice(&(0x6E0u16 << 4).to_le_bytes());
-        blip.extend_from_slice(&0xF01Eu16.to_le_bytes());
+        blip.extend_from_slice(&(inst << 4).to_le_bytes());
+        blip.extend_from_slice(&ty.to_le_bytes());
         blip.extend_from_slice(&((16 + 1 + payload.len()) as u32).to_le_bytes());
         blip.extend_from_slice(&[0; 17]);
         blip.extend_from_slice(payload);
@@ -1052,7 +1122,7 @@ mod tests {
                 vec![],
                 vec![run(0, 1, pic.clone())],
                 Lists::default(),
-                png_picture(&payload),
+                picture_record(0xF01E, 0x6E0, &payload),
                 dir,
             );
             assert_eq!(res.markdown, format!("![image-1]({path})"));
@@ -1064,6 +1134,35 @@ mod tests {
                 }]
             );
             assert!(res.losses.is_empty());
+        }
+
+        // a picture mark without a stored location has nothing to extract
+        let no_location = sprm(CFSPEC, &[1]);
+        let res = convert_plain("a\u{1}b\r", vec![run(1, 2, no_location)]);
+        assert_eq!(res.markdown, "ab");
+        assert!(res.losses.is_empty() && res.assets.is_empty());
+    }
+
+    #[test]
+    fn pictures_that_cannot_be_converted_are_omitted_and_reported() {
+        let pic = [sprm(CFSPEC, &[1]), sprm(CPICLOCATION, &[0; 4])].concat();
+        // an EMF record (vector format) and a DIB record whose bytes are not a bitmap
+        let cases = [
+            picture_record(0xF01A, 0x3D4, &[1, 2, 3]),
+            picture_record(0xF01F, 0x7A8, &[1, 2, 3]),
+        ];
+        for data in cases {
+            let res = convert(
+                "\u{1}\r",
+                vec![],
+                vec![run(0, 1, pic.clone())],
+                Lists::default(),
+                data,
+                "pics",
+            );
+            assert_eq!(res.markdown, "*[image omitted]*");
+            assert!(res.assets.is_empty());
+            assert_eq!(losses(&res), vec![(LossKind::UnsupportedImages, 1)]);
         }
     }
 
@@ -1108,5 +1207,139 @@ mod tests {
             "| \u{2022} a | 5. b | c |\n| --- | --- | --- |"
         );
         assert!(res.losses.is_empty());
+    }
+
+    #[test]
+    fn control_characters_and_field_kinds_in_a_paragraph() {
+        let table = [
+            // floating object anchor, tab, annotation mark, note mark without a note
+            ("a\u{8}b\r", "ab"),
+            ("a\tb\r", "a b"),
+            ("a\u{5}b\r", "ab"),
+            ("a\u{2}b\r", "ab"),
+            ("a\u{c}b\r", "ab\n\n<!-- pagebreak -->"),
+            // a break before any content, or right after another break, adds nothing
+            ("\u{c}\r", ""),
+            ("a\u{c}\r\u{c}\r", "a\n\n<!-- pagebreak -->"),
+            // a picture mark without the special-character flag is not a picture
+            ("a\u{1}b\r", "ab"),
+            // a field end without a field, and a hyperlink whose result is empty
+            ("a\u{15}b\r", "ab"),
+            ("\u{13} HYPERLINK \"http://x.org\" \u{14}\u{15}\r", ""),
+            (
+                "\u{13} HYPERLINK \"http://x.org\" \u{14}link\u{15} \u{13} DATE \u{14}today\u{15}\r",
+                "[link](http://x.org) today",
+            ),
+        ];
+        for (text, expected) in table {
+            assert_eq!(convert_plain(text, vec![]).markdown, expected, "{text:?}");
+        }
+        assert_eq!(
+            losses(&convert_plain("a\u{8}b\r", vec![])),
+            vec![(LossKind::VectorShapes, 1)]
+        );
+        // hidden text (sprmCFVanish) is dropped and counted
+        let hidden = convert_plain("a b\r", vec![run(1, 2, sprm(0x083C, &[1]))]);
+        assert_eq!(hidden.markdown, "ab");
+        assert_eq!(losses(&hidden), vec![(LossKind::HiddenText, 1)]);
+    }
+
+    #[test]
+    fn note_marks_are_labelled_by_kind_and_only_in_the_main_story() {
+        // a footnote mark at CP 1, an endnote mark at CP 3, and a mark with no note at CP 5
+        let doc = Doc {
+            text: "a\u{2}b\u{2}c\u{2}d\r".encode_utf16().collect(),
+            paps: vec![],
+            chps: vec![],
+            styles: Stylesheet::default(),
+            lists: Lists::default(),
+            data: vec![],
+            ftn_ref: HashMap::from([(1, 1)]),
+            edn_ref: HashMap::from([(3, 2)]),
+        };
+        assert_eq!(convert_story(&doc, "", Sub::Main).markdown, "a[^1]b[^e2]cd");
+        // inside a note itself the marks are dropped
+        for sub in [Sub::Footnote, Sub::Endnote] {
+            assert_eq!(convert_story(&doc, "", sub).markdown, "abcd");
+        }
+    }
+
+    #[test]
+    fn notes_and_main_text_are_joined_only_when_both_exist() {
+        // (main story, footnote story + reference CPs + text CPs, endnote story likewise)
+        type Story<'a> = (&'a [u8], &'a [u32], &'a [u32]);
+        let none: Story<'_> = (b"", &[], &[]);
+        let cases: [(&[u8], Story<'_>, Story<'_>, &str); 4] = [
+            // no notes at all
+            (b"Plain\r", none, none, "Plain\n"),
+            // nothing at all
+            (b"\r", none, none, ""),
+            // notes of both kinds around a mark that has no note
+            (
+                b"A\x02B\x02C\x02\r",
+                (b"Foot\r", &[1], &[0, 5]),
+                (b"End\r", &[3], &[0, 4]),
+                "A[^1]B[^e1]C\n\n[^1]: Foot\n[^e1]: End\n",
+            ),
+            // an empty main story: the definition stands alone
+            (b"\r", (b"Note\r", &[0], &[0, 5]), none, "[^1]: Note\n"),
+        ];
+        for (main, ftn, edn, want) in cases {
+            let res = import(&notes_doc(main, ftn, edn), "assets").unwrap();
+            let label = String::from_utf8_lossy(main);
+            assert_eq!(res.markdown, want, "{label:?}");
+            // the style and list tables of the document lie outside the table stream
+            assert_eq!(losses(&res), vec![(LossKind::CorruptParts, 2)]);
+        }
+    }
+
+    #[test]
+    fn a_list_paragraph_without_a_definition_is_counted_as_corrupt() {
+        let paps = vec![run(0, 5, sprm(PILFO, &7u16.to_le_bytes()))];
+        let res = convert("item\r", paps, vec![], Lists::default(), vec![], "");
+        assert_eq!(res.markdown, "item");
+        assert_eq!(losses(&res), vec![(LossKind::CorruptParts, 1)]);
+    }
+
+    #[test]
+    fn structures_outside_the_streams_are_refused() {
+        let import_with = |clx: &[u8], pairs: &[(usize, (u32, u32))]| {
+            let mut all = vec![(0u32, 0u32); IDX_PLF_LFO + 1];
+            all[IDX_CLX] = (0, clx.len() as u32);
+            for &(index, pair) in pairs {
+                all[index] = pair;
+            }
+            let word = fib::tests::fib_bytes(0xA5EC, 0x00C1, 0, 14, 22, &all);
+            import(&ole(&word, clx), "assets").err()
+        };
+        let clx = pieces::tests::clx(&[], &[(0, 4, 0x4000_0000, 0)]);
+        // the PlcBtePapx / PlcBteChpx lie beyond the end of the table stream
+        let slice_error = Some(ImportError::Corrupt(format!(
+            "slice 100000+8 past {}",
+            clx.len()
+        )));
+        for index in [IDX_PLCF_BTE_PAPX, IDX_PLCF_BTE_CHPX] {
+            assert_eq!(import_with(&clx, &[(index, (100_000, 8))]), slice_error);
+        }
+        // so does the piece table itself
+        assert_eq!(
+            import_with(&clx, &[(IDX_CLX, (100_000, 8))]),
+            Some(ImportError::Corrupt("CLX outside table stream".into()))
+        );
+        // bytes that are not a compound file never reach the streams
+        assert_eq!(
+            import(b"just some text, no Word file", "assets").err(),
+            Some(ImportError::WrongFormat {
+                expected: "DOC",
+                detected: "text"
+            })
+        );
+        // a piece table that claims far more text than the document stream holds
+        let huge = pieces::tests::clx(&[], &[(0, 100_000, 0x4000_0000, 0)]);
+        let refused = import_with(&huge, &[]).unwrap().to_string();
+        assert!(
+            refused.starts_with("the document is corrupt: piece table claims 100000 characters"),
+            "{refused}"
+        );
     }
 }

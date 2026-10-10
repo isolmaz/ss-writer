@@ -11,6 +11,7 @@ use ssw_render::scene::{
     MIME_RGBA8, Paint, PathVerb, RadialGradient, Rect, Scene, SceneItem, Size, SpreadMode, Stroke,
     Transform,
 };
+use ssw_render::svg_to_scene::svg_to_scene;
 use ssw_render::world::TypstWorld;
 
 const PAGE: &str = "#set page(width: 200pt, height: 300pt, margin: 0pt)\n\
@@ -565,6 +566,69 @@ fn svg_images_become_nested_scenes() {
     assert!(close(placed.transform.tx, 0.0) && close(placed.transform.ty, 0.0));
     let bounds = scene.bounds().expect("bounds");
     assert_rect(bounds, 0.0, 0.0, 40.0, 20.0);
+}
+
+/// CRC-32 (the checksum of gzip files).
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in data {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A gzip file around `data`: one stored (uncompressed) deflate block, valid checksums.
+fn gzip_stored(data: &[u8]) -> Vec<u8> {
+    let len = u16::try_from(data.len()).expect("one stored block holds at most 65535 bytes");
+    // Magic, deflate, no flags, no time, no extra flags, unknown OS.
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    // Final block, stored: LEN and its complement, then the bytes.
+    out.push(1);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(&crc32(data).to_le_bytes());
+    out.extend_from_slice(&u32::from(len).to_le_bytes());
+    out
+}
+
+#[test]
+fn compressed_svg_images_that_usvg_cannot_read_are_left_out() {
+    let world = TypstWorld::new(None);
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"10\" viewBox=\"0 0 20 10\">\
+               <rect width=\"20\" height=\"10\" fill=\"#ff0000\"/></svg>";
+    let packed = gzip_stored(svg.as_bytes());
+    world
+        .set_virtual_file("plain.svg", svg.as_bytes().to_vec())
+        .expect("path");
+    world
+        .set_virtual_file("packed.svg", packed.clone())
+        .expect("path");
+    let page = |name: &str| {
+        format!("{PAGE}#image(\"{name}\", width: 40pt, height: 20pt, fit: \"stretch\")\nafter")
+    };
+
+    let plain = scene_in(&world, &page("plain.svg"));
+    assert_eq!(fills(&plain).len(), 1, "the picture's rectangle");
+
+    // Typst unpacks compressed SVG itself, this crate's usvg is built without that feature: the
+    // picture is dropped, the text after it is still converted.
+    let skipped = scene_in(&world, &page("packed.svg"));
+    assert!(fills(&skipped).is_empty());
+    assert_eq!(runs(&skipped).len(), 1);
+    assert_eq!(
+        svg_to_scene(&packed)
+            .expect_err("compressed SVG is not supported")
+            .to_string(),
+        "invalid SVG: enable svgz cargo feature to decode SVGZ data"
+    );
 }
 
 #[test]

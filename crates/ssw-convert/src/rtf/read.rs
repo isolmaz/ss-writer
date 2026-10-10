@@ -306,7 +306,8 @@ struct Reader {
     skip: usize,
     pn_text: String,
     fldinst: String,
-    pict_hex: String,
+    /// Values (0-15) of the hex digits of the picture data seen so far.
+    pict_nibbles: Vec<u8>,
     pict_kind: Option<&'static str>,
     pict_unsupported: bool,
     image_count: usize,
@@ -347,7 +348,7 @@ impl Reader {
             skip: 0,
             pn_text: String::new(),
             fldinst: String::new(),
-            pict_hex: String::new(),
+            pict_nibbles: Vec::new(),
             pict_kind: None,
             pict_unsupported: false,
             image_count: 0,
@@ -457,15 +458,15 @@ impl Reader {
     }
 
     fn finish_pict(&mut self) {
-        let hex = std::mem::take(&mut self.pict_hex);
+        let nibbles = std::mem::take(&mut self.pict_nibbles);
         let kind = self.pict_kind.take();
         let unsupported = std::mem::take(&mut self.pict_unsupported);
-        let bytes: Vec<u8> = hex
-            .as_bytes()
+        // A trailing odd digit is dropped.
+        let bytes: Vec<u8> = nibbles
             .as_chunks::<2>()
             .0
             .iter()
-            .filter_map(|[hi, lo]| Some(hex_value(*hi)? * 16 + hex_value(*lo)?))
+            .map(|pair| pair[0] * 16 + pair[1])
             .collect();
         match kind {
             Some(ext) if !bytes.is_empty() => {
@@ -478,7 +479,7 @@ impl Reader {
                 self.push_run(format!("![]({path})"), true);
             }
             _ => {
-                if unsupported || !hex.is_empty() {
+                if unsupported || !nibbles.is_empty() {
                     self.result
                         .record_loss(LossKind::UnsupportedImages, 1, None);
                 }
@@ -588,7 +589,7 @@ impl Reader {
             }
             "fldinst" => self.fldinst.clear(),
             "pict" => {
-                self.pict_hex.clear();
+                self.pict_nibbles.clear();
                 self.pict_kind = None;
                 self.pict_unsupported = false;
             }
@@ -721,12 +722,7 @@ impl Reader {
             self.skip -= 1;
             return;
         }
-        let cp = self.codepage();
-        if cp != self.pending_codepage {
-            self.flush_bytes();
-            self.pending_codepage = cp;
-        }
-        self.pending_bytes.push(b);
+        self.byte_raw(b);
     }
 
     fn codepage(&self) -> u32 {
@@ -795,9 +791,7 @@ impl Reader {
             }
             Dest::FldInst => self.fldinst.push_str(s),
             Dest::PnText => self.pn_text.push_str(s),
-            Dest::Pict => self
-                .pict_hex
-                .extend(s.chars().filter(char::is_ascii_hexdigit)),
+            Dest::Pict => self.pict_nibbles.extend(s.bytes().filter_map(hex_value)),
             Dest::Stylesheet => {
                 for c in s.chars() {
                     if c == ';' {
@@ -1254,6 +1248,13 @@ mod tests {
                 "{\\rtf1 1. not a list\\par# not heading\\par- dash\\par}",
                 "1\\. not a list\n\n\\# not heading\n\n\\- dash\n",
             ),
+            // only digits followed by `.` or `)` start a list in Markdown
+            (
+                "{\\rtf1 2) paren\\par 2024 was a year\\par}",
+                "2\\) paren\n\n2024 was a year\n",
+            ),
+            // a high surrogate that ends the input is replaced
+            ("{\\rtf1\\uc0 \\u-10240}", "\u{fffd}\n"),
             (
                 "{\\rtf1 a*b_c`d[e]f<g>h~i$j|k\\par}",
                 "a\\*b\\_c\\`d\\[e\\]f\\<g\\>h\\~i\\$j\\|k\n",
@@ -1603,6 +1604,88 @@ mod tests {
     fn font_charset_selects_code_page() {
         let rtf = "{\\rtf1\\ansicpg1252{\\fonttbl{\\f0\\fcharset0 A;}{\\f1\\fcharset238 B;}}\\f0 \\'bf \\f1 \\'bf\\par}";
         assert_eq!(md(rtf), "\u{bf} \u{17c}\n");
+    }
+
+    #[test]
+    fn picture_data_keeps_only_its_hex_digits_and_empty_pictures_vanish() {
+        // Characters that are not hex digits are skipped; an odd trailing digit is not a byte.
+        let r = import_rtf(b"{\\rtf1 a{\\pict\\pngblip 89 50 zz4E 4Q7 f}b\\par}").unwrap();
+        assert_eq!(r.markdown, "a![](assets/image-1.png)b\n");
+        assert_eq!(r.assets[0].bytes, vec![0x89, 0x50, 0x4E, 0x47]);
+        assert!(r.losses.is_empty());
+        for rtf in [
+            "{\\rtf1 a{\\pict}b\\par}",
+            "{\\rtf1 a{\\pict\\pngblip}b\\par}",
+        ] {
+            let r = import_rtf(rtf.as_bytes()).unwrap();
+            assert_eq!(r.markdown, "ab\n", "{rtf}");
+            assert!(r.assets.is_empty() && r.losses.is_empty(), "{rtf}");
+        }
+        // A single digit is no picture, but it was data: reported.
+        let r = import_rtf(b"{\\rtf1 a{\\pict\\pngblip 8}b\\par}").unwrap();
+        assert_eq!(r.markdown, "ab\n");
+        assert!(r.assets.is_empty());
+        assert_eq!(
+            r.losses.iter().map(|l| l.kind).collect::<Vec<_>>(),
+            [LossKind::UnsupportedImages]
+        );
+    }
+
+    #[test]
+    fn list_table_entries_without_their_parameters_are_ignored() {
+        // `\levelnfc` before any level, `\listid` and `\ls` without a number, `\ls` before a list id.
+        let rtf = "{\\rtf1{\\*\\listtable{\\list\\levelnfc0\\listid}{\\list{\\listlevel\\levelnfc0}\\listid2}}{\\*\\listoverridetable{\\listoverride\\ls1}{\\listoverride\\listid2\\ls}{\\listoverride\\listid2\\ls2}}\\pard\\ls1 a\\par\\pard\\ls2 b\\par}";
+        assert_eq!(md(rtf), "- a\n1. b\n");
+    }
+
+    #[test]
+    fn switched_off_or_parameterless_words_change_nothing() {
+        // (rtf, markdown, losses)
+        type Case<'a> = (&'a str, &'a str, Vec<(LossKind, usize)>);
+        let table: [Case; 5] = [
+            (
+                "{\\rtf1 a{\\v hid\\v0 shown}b\\par}",
+                "ashownb\n",
+                vec![(LossKind::HiddenText, 1)],
+            ),
+            ("{\\rtf1 a{\\super0 x}{\\sub0 y}b\\par}", "axyb\n", vec![]),
+            ("{\\rtf1 a\\f b\\par}", "ab\n", vec![]),
+            ("{\\rtf1 a\\itap1\\cols1 b\\par}", "ab\n", vec![]),
+            ("{\\rtf1 a\\u b\\par}", "ab\n", vec![]),
+        ];
+        for (rtf, expected, losses) in table {
+            let r = import_rtf(rtf.as_bytes()).unwrap();
+            assert_eq!(r.markdown, expected, "{rtf}");
+            let got: Vec<(LossKind, usize)> = r.losses.iter().map(|l| (l.kind, l.count)).collect();
+            assert_eq!(got, losses, "{rtf}");
+        }
+    }
+
+    #[test]
+    fn empty_paragraphs_and_rows_add_nothing() {
+        let table = [
+            // an empty paragraph of a footnote
+            (
+                "{\\rtf1 x{\\footnote\\par note}\\par}",
+                "x[^1]\n\n[^1]: note\n",
+            ),
+            // a row without cells
+            ("{\\rtf1\\trowd\\row a\\par}", "a\n"),
+            // a list label without any text
+            ("{\\rtf1\\pard{\\pntext 1.\\tab}\\par x\\par}", "x\n"),
+        ];
+        for (rtf, expected) in table {
+            assert_eq!(md(rtf), expected, "{rtf}");
+        }
+    }
+
+    #[test]
+    fn paragraphs_of_one_table_cell_join_into_a_line() {
+        let rtf = "{\\rtf1\\trowd\\cellx1000\\pard\\intbl a\\par\\par b\\par c\\cell\\row\\pard after\\par}";
+        let r = import_rtf(rtf.as_bytes()).unwrap();
+        assert_eq!(r.markdown, "| a b c |\n|---|\n\nafter\n");
+        let got: Vec<(LossKind, usize)> = r.losses.iter().map(|l| (l.kind, l.count)).collect();
+        assert_eq!(got, [(LossKind::MultiParagraphCells, 2)]);
     }
 
     #[test]

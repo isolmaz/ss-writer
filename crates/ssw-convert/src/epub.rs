@@ -9,7 +9,7 @@
 //! document `content.opf`, the EPUB 3 navigation document `nav.xhtml`, the EPUB 2 `toc.ncx`,
 //! `stylesheet.css`, one `chapter_N.xhtml` per chapter and `images/image-N.ext`.
 
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use zip::write::SimpleFileOptions;
@@ -313,10 +313,15 @@ impl<'a> Entry<'a> {
     }
 }
 
-/// Zips `entries` in order into memory. A fixed entry time keeps the archive reproducible.
+/// Zips `entries` in order into memory.
 fn write_zip(entries: &[Entry<'_>]) -> Result<Vec<u8>, EpubError> {
+    zip_into(Cursor::new(Vec::new()), entries).map(Cursor::into_inner)
+}
+
+/// Zips `entries` in order into `sink`. A fixed entry time keeps the archive reproducible.
+fn zip_into<W: Write + Seek>(sink: W, entries: &[Entry<'_>]) -> Result<W, EpubError> {
     let base = SimpleFileOptions::default().last_modified_time(zip::DateTime::default());
-    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let mut zip = ZipWriter::new(sink);
     for entry in entries {
         let method = if entry.stored {
             CompressionMethod::Stored
@@ -327,7 +332,7 @@ fn write_zip(entries: &[Entry<'_>]) -> Result<Vec<u8>, EpubError> {
         zip.write_all(entry.bytes)
             .map_err(zip::result::ZipError::Io)?;
     }
-    Ok(zip.finish()?.into_inner())
+    Ok(zip.finish()?)
 }
 
 /// Builds the ePub for the Markdown `src`; `file_name` supplies the fallback title.
@@ -461,6 +466,7 @@ fn build(
 mod tests {
     use super::*;
     use crate::assets::NoAssets;
+    use crate::test_sink::Limited;
     use std::io::{Cursor, Read};
 
     struct Png;
@@ -676,7 +682,6 @@ mod tests {
             bytes: b"x",
         };
         let err = write_zip(&[entry("OEBPS/a.xhtml"), entry("OEBPS/a.xhtml")]).unwrap_err();
-        assert!(matches!(err, EpubError::Zip(_)));
         assert!(
             err.to_string()
                 .starts_with("ePub archive could not be written: "),
@@ -685,6 +690,36 @@ mod tests {
         assert!(err.to_string().contains("Duplicate filename"), "{err}");
         let ok = write_zip(&[entry("mimetype"), entry("b")]).unwrap();
         assert!(ok.starts_with(b"PK\x03\x04"));
+    }
+
+    #[test]
+    fn a_sink_that_gives_out_at_any_byte_fails_the_archive() {
+        let entries = [
+            Entry::new("mimetype", true, b"application/epub+zip"),
+            Entry::new(
+                "OEBPS/a.xhtml",
+                false,
+                b"<p>some text some text some text</p>",
+            ),
+        ];
+        let full = write_zip(&entries).unwrap();
+        // The failure lands in a header, in stored data, in the flush of deflated data or in the
+        // central directory, depending on the budget; every one of them is reported.
+        for budget in 0..full.len() as u64 {
+            let sink = Limited {
+                inner: Cursor::new(Vec::new()),
+                budget,
+            };
+            let err = zip_into(sink, &entries).expect_err(&format!(
+                "a budget of {budget} bytes cannot hold the archive"
+            ));
+            assert!(err.to_string().contains("sink is full"), "{budget}: {err}");
+        }
+        let sink = Limited {
+            inner: Cursor::new(Vec::new()),
+            budget: full.len() as u64,
+        };
+        assert_eq!(zip_into(sink, &entries).unwrap().inner.into_inner(), full);
     }
 
     #[test]
@@ -746,10 +781,9 @@ mod tests {
                 && !id.contains(|c: char| c.is_ascii_uppercase())
         );
         assert!(groups[2].starts_with('5'), "{id}");
-        assert!(
-            matches!(groups[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
-            "{id}"
-        );
+        // RFC 4122 variant: the two high bits of the group are `10`.
+        let variant_digit = u8::from_str_radix(&groups[3][..1], 16).unwrap();
+        assert_eq!(variant_digit >> 2, 0b10, "{id}");
     }
 
     #[test]

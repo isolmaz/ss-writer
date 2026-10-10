@@ -452,7 +452,7 @@ impl InlineObjectProvider for ObjectProvider {
 }
 
 /// `size` scaled down to `max_width` when wider.
-fn fit(width: f32, height: f32, max_width: f32) -> (f32, f32) {
+pub(super) fn fit(width: f32, height: f32, max_width: f32) -> (f32, f32) {
     if width > max_width && max_width > 0.0 {
         let scale = max_width / width;
         (width * scale, height * scale)

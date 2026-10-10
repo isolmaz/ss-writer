@@ -322,6 +322,58 @@ fn clicking_a_row_opens_it_and_clicking_outside_closes() {
 }
 
 #[test]
+fn closing_twice_reports_closed_once() {
+    let (_host, mut quick) = setup(QuickOpenMode::Files);
+    quick.close();
+    assert!(!quick.is_visible());
+    assert_eq!(quick.take_events(), vec![QuickOpenEvent::Closed]);
+    quick.close();
+    assert!(quick.take_events().is_empty());
+}
+
+#[test]
+fn hovering_the_same_spot_again_keeps_the_highlight_and_the_message_is_not_a_row() {
+    let (mut host, mut quick) = setup(QuickOpenMode::Files);
+    let hover = host.theme.tokens.hover_bg;
+    let list = quick.list().bounds();
+    let hovered_rows = |host: &Host, quick: &QuickOpen| {
+        host.paint(quick)
+            .ops_in(list)
+            .into_iter()
+            .filter(|op| matches!(op, DrawOp::FillRoundedRect { color, .. } if *color == hover))
+            .count()
+    };
+    let row = quick.list().row_rect(2).expect("row 2").center();
+    for _ in 0..2 {
+        host.pointer(&mut quick, PointerEventKind::Move, row);
+        assert_eq!(hovered_rows(&host, &quick), 1);
+    }
+    let above = Point::new(row.x, list.y - 10.0);
+    for _ in 0..2 {
+        host.pointer(&mut quick, PointerEventKind::Move, above);
+        assert_eq!(hovered_rows(&host, &quick), 0);
+    }
+    // With nothing found the message sits where the rows would be: pressing it chooses nothing.
+    host.text(&mut quick, "zzzqq");
+    host.layout(&mut quick, WINDOW);
+    let message = quick.list().bounds().center();
+    assert!(quick.panel().contains(message));
+    assert!(host.click(&mut quick, message).handled);
+    assert!(quick.is_visible());
+    assert!(quick.take_events().is_empty());
+}
+
+#[test]
+fn a_key_the_box_does_not_use_is_left_alone_and_repaints_nothing() {
+    let (mut host, mut quick) = setup(QuickOpenMode::Files);
+    host.requests.take_invalidation();
+    assert!(!host.key(&mut quick, vk::F3).handled);
+    assert!(quick.is_visible());
+    assert!(quick.take_events().is_empty());
+    assert!(host.requests.take_invalidation().is_clean());
+}
+
+#[test]
 fn escape_closes_and_nothing_matching_shows_a_message() {
     let (mut host, mut quick) = setup(QuickOpenMode::Files);
     host.text(&mut quick, "zzzqq");

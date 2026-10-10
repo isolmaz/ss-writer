@@ -36,6 +36,12 @@ pub(super) fn u32_at(b: &[u8], o: usize) -> Result<u32> {
     }
 }
 
+/// The little-endian `u32` at the start of `b`, for callers that have already established that
+/// four bytes are there (indexing panics otherwise).
+pub(super) fn le32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
 /// Bounds-checked sub-slice `[off, off+len)`.
 pub(super) fn slice(b: &[u8], off: usize, len: usize) -> Result<&[u8]> {
     match off.checked_add(len).and_then(|e| b.get(off..e)) {
@@ -423,27 +429,27 @@ pub(super) mod tests {
         let cases: [(u16, u16, &str); 4] = [
             (0xA5DC, 0x0065, "Word 6/95"),
             (0xA5DB, 0x0023, "Word 2.0"),
-            (0xA5EC, 0x0068, "Word binary"),
-            (0xA5EC, 0x00C0, "Word binary"),
+            (0xA5EC, 0x0068, "Word binary format 0x0068"),
+            (0xA5EC, 0x00C0, "Word binary format 0x00c0"),
         ];
         for (ident, nfib, expect) in cases {
             let w = fib_bytes(ident, nfib, 0, 14, 22, &[]);
-            assert!(
-                matches!(
-                    Fib::parse(&w),
-                    Err(ImportError::UnsupportedVersion(m)) if m.contains(expect)
-                ),
-                "{ident:#06x}/{nfib:#06x} should be refused as {expect}"
+            assert_eq!(
+                Fib::parse(&w).err(),
+                Some(ImportError::UnsupportedVersion(expect.into())),
+                "{ident:#06x}/{nfib:#06x}"
             );
         }
-        assert!(matches!(
-            Fib::parse(&fib_bytes(0x1234, 0x00C1, 0, 14, 22, &[])),
-            Err(ImportError::Corrupt(_))
-        ));
-        assert!(matches!(
-            Fib::parse(&fib_bytes(0xA5EC, 0x00C1, 0, 14, 5, &[])),
-            Err(ImportError::Corrupt(_))
-        ));
+        assert_eq!(
+            Fib::parse(&fib_bytes(0x1234, 0x00C1, 0, 14, 22, &[])).err(),
+            Some(ImportError::Corrupt(
+                "not a Word document (wIdent 0x1234)".into()
+            ))
+        );
+        assert_eq!(
+            Fib::parse(&fib_bytes(0xA5EC, 0x00C1, 0, 14, 5, &[])).err(),
+            Some(ImportError::Corrupt("FibRgLw97 too short (cslw=5)".into()))
+        );
         assert!(Fib::parse(&[0xEC]).is_err());
         let w = fib_bytes(0xA5EC, 0x00C1, 0, 14, 22, &[]);
         for cut in 0..w.len() {
@@ -529,13 +535,42 @@ pub(super) mod tests {
             load(&[0xDB, 0xA5, 0, 1, 2, 3, 4, 5, 6, 7, 8]).err(),
             Some(ImportError::UnsupportedVersion("Word 2.0".into()))
         );
-        assert!(matches!(
-            load(&[0, 0, 0, 0, 0, 0, 0, 0, 0]),
-            Err(ImportError::Corrupt(_))
-        ));
-        assert!(matches!(load(&[0xD0, 0xCF]), Err(ImportError::Corrupt(_))));
+        let not_ole = Some(ImportError::Corrupt("not an OLE compound file".into()));
+        assert_eq!(load(&[0, 0, 0, 0, 0, 0, 0, 0, 0]).err(), not_ole);
+        assert_eq!(load(&[0xD0, 0xCF]).err(), not_ole);
         let mut magic_only = CFB_MAGIC.to_vec();
         magic_only.extend_from_slice(&[0; 600]);
-        assert!(matches!(load(&magic_only), Err(ImportError::Corrupt(_))));
+        let refused = load(&magic_only).err().unwrap().to_string();
+        assert!(
+            refused.starts_with("the document is corrupt: compound file: "),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn load_reports_a_data_stream_that_cannot_be_read() {
+        use std::io::Write as _;
+        let mut cf = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+        for (name, data) in [
+            ("/WordDocument", fib_bytes(0xA5EC, 0x00C1, 0, 14, 22, &[])),
+            ("/0Table", Vec::new()),
+            ("/Data", b"pictures".to_vec()),
+        ] {
+            cf.create_stream(name).unwrap().write_all(&data).unwrap();
+        }
+        cf.flush().unwrap();
+        let mut bytes = cf.into_inner().into_inner();
+        let (_, streams) = load(&bytes).unwrap();
+        assert_eq!(streams.data, b"pictures");
+        // point the directory entry of `Data` (UTF-16 name, start sector at byte 116 of the
+        // 128-byte entry) at a mini sector the file does not have
+        let name = [b'D', 0, b'a', 0, b't', 0, b'a', 0, 0, 0];
+        let entry = bytes.windows(name.len()).position(|w| w == name).unwrap();
+        bytes[entry + 116..entry + 120].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        let refused = load(&bytes).err().unwrap().to_string();
+        assert!(
+            refused.starts_with("the document is corrupt: stream /Data: "),
+            "{refused}"
+        );
     }
 }

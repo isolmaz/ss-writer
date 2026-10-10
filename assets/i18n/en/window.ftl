@@ -7,6 +7,12 @@ window-menu-lists = List
 
 window-encoding-bom = { $name } with BOM
 
+# The status bar's encoding menu (spec §4.2, §8).
+window-menu-reopen-encoding = Reopen with encoding
+window-menu-save-encoding = Save with encoding
+window-reopen-discard-title = Reopen with encoding
+window-reopen-discard-message = Reopening { $name } with another encoding replaces the text with the file on disk and discards your unsaved changes. Continue?
+
 window-error-title = SS Writer
 window-folder-missing = The folder { $path } does not exist.
 window-unsaved-title = Unsaved changes
@@ -18,11 +24,12 @@ window-open-folder-title = Open folder
 window-filter-markdown = Markdown
 window-filter-all = All files
 
-# The letters Alt+<letter> opens the File / Edit / Format / View menus with.
+# The letters Alt+<letter> opens the File / Edit / Format / View / Window menus with.
 window-menu-key-file = F
 window-menu-key-edit = E
 window-menu-key-format = O
 window-menu-key-view = V
+window-menu-key-window = W
 
 window-jumplist-recent = Recent
 window-jumplist-new-window = New window

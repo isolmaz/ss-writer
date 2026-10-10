@@ -53,6 +53,17 @@ mod tests {
             ("Ünïcödé Çafé", "ünïcödé-çafé"),
             ("Cafe\u{301}", "cafe\u{301}"),
             ("!\u{301}a", "a"),
+            // Every block of combining marks counts, first and last code point alike.
+            ("a\u{36F}", "a\u{36F}"),
+            ("a\u{1AB0}", "a\u{1AB0}"),
+            ("a\u{1AFF}", "a\u{1AFF}"),
+            ("a\u{1DC0}", "a\u{1DC0}"),
+            ("a\u{1DFF}", "a\u{1DFF}"),
+            ("a\u{20D0}", "a\u{20D0}"),
+            ("a\u{20FF}", "a\u{20FF}"),
+            ("a\u{FE20}", "a\u{FE20}"),
+            ("a\u{FE2F}", "a\u{FE2F}"),
+            ("\u{20D0}a", "a"),
             ("😀", ""),
             ("", ""),
         ];

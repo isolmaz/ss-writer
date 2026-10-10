@@ -14,11 +14,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use thiserror::Error;
 
 use crate::net::{Accept, FetchOptions, Http, NetError, Scheme, Url, fetch};
-use crate::store::{Store, StoreError, UnixSeconds};
+use crate::store::{Store, StoreError, UnixSeconds, query_optional, query_rows};
 
 /// Largest image downloaded.
 pub const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
@@ -131,15 +131,11 @@ impl RemoteImages {
         now: UnixSeconds,
     ) -> Result<Option<RemoteImage>, ImageError> {
         let key = key_of_url(&Url::parse(url)?);
-        let Some((mime, size)) = store
-            .conn
-            .query_row(
-                "SELECT mime, size FROM image_cache WHERE key = ?1",
-                [&key],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .optional()
-            .map_err(StoreError::from)?
+        let Some((mime, size)) = query_optional::<(String, i64), _>(
+            &store.conn,
+            "SELECT mime, size FROM image_cache WHERE key = ?1",
+            [&key],
+        )?
         else {
             return Ok(None);
         };
@@ -246,17 +242,11 @@ impl RemoteImages {
         if total <= limit {
             return Ok(());
         }
-        let mut stmt = store
-            .conn
-            .prepare("SELECT key, size FROM image_cache WHERE key != ?1 ORDER BY last_access, key")
-            .map_err(StoreError::from)?;
-        let victims = stmt
-            .query_map([keep], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(StoreError::from)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)?;
+        let victims: Vec<(String, i64)> = query_rows(
+            &store.conn,
+            "SELECT key, size FROM image_cache WHERE key != ?1 ORDER BY last_access, key",
+            [keep],
+        )?;
         for (key, size) in victims {
             if total <= limit {
                 break;

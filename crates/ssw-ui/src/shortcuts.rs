@@ -163,7 +163,7 @@ mod tests {
     }
 
     fn event(chord: &str) -> KeyEvent {
-        let chord: KeyChord = chord.parse().unwrap_or_else(|e| panic!("{e}"));
+        let chord: KeyChord = chord.parse().expect("a valid key chord");
         let mut mods = Modifiers::NONE;
         if chord.ctrl {
             mods |= Modifiers::CTRL;
@@ -511,6 +511,22 @@ mod tests {
         assert_eq!(
             router.route(&event("Ctrl+I"), &UsLayout, false),
             ShortcutOutcome::Unhandled
+        );
+    }
+
+    #[test]
+    fn kit_shortcuts_an_alt_key_code_beyond_a_byte_is_no_mnemonic() {
+        let mut router = router();
+        // 0x146 would read as 'F' if its high byte were dropped.
+        let wide = KeyEvent::press(0x146, Modifiers::ALT);
+        assert_eq!(
+            router.route(&wide, &UsLayout, false),
+            ShortcutOutcome::Unhandled
+        );
+        let letter = KeyEvent::press(key::F, Modifiers::ALT);
+        assert_eq!(
+            router.route(&letter, &UsLayout, false),
+            ShortcutOutcome::Mnemonic('F')
         );
     }
 }

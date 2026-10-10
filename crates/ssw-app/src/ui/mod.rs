@@ -11,6 +11,7 @@
 //! - [`perf_driver`]: the scripted performance scenarios behind `--perf-scenario`.
 //! - [`test_script`] and [`scripted_services`]: the scripted end-to-end harness behind
 //!   `--test-script` (the real controller, no native windows, scripted dialogs and shell).
+//! - [`screenshot`]: offscreen rendering of the window content into PNG (`screenshot` steps).
 //!
 //! Window callbacks only push [`controller::Request`]s; the owner of the message loop drains
 //! them outside of any window procedure.
@@ -31,6 +32,7 @@ pub mod overlays;
 pub mod perf_driver;
 pub mod platform;
 pub mod remote_images;
+pub mod screenshot;
 pub mod scripted_services;
 pub mod settings_window;
 pub mod shell_view;

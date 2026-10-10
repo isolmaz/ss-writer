@@ -120,7 +120,7 @@ pub enum Splitter {
     Inspector,
 }
 
-/// The three caption buttons, left to right.
+/// The three caption buttons, left to right: the discriminant is the slot from the left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CaptionButton {
     Minimize,
@@ -456,7 +456,7 @@ impl ShellLayout {
     pub fn caption_button_rect(&self, button: CaptionButton) -> Option<Rect> {
         let area = self.rects().caption_buttons?;
         let each = area.width / 3.0;
-        let index = CaptionButton::ALL.iter().position(|b| *b == button)?;
+        let index = button as usize;
         Some(Rect::new(
             area.x + index as f32 * each,
             area.y,
@@ -1018,6 +1018,28 @@ mod tests {
         assert_eq!(
             hit(&layout, 1278.0, 798.0),
             ChromeHit::Resize(ResizeEdge::BottomRight)
+        );
+        // A corner also reaches along the bottom and right edges, up to twice the border.
+        assert_eq!(
+            hit(&layout, 10.0, 798.0),
+            ChromeHit::Resize(ResizeEdge::BottomLeft)
+        );
+        assert_eq!(
+            hit(&layout, 1270.0, 798.0),
+            ChromeHit::Resize(ResizeEdge::BottomRight)
+        );
+        assert_eq!(
+            hit(&layout, 1278.0, 10.0),
+            ChromeHit::Resize(ResizeEdge::TopRight)
+        );
+        assert_eq!(
+            hit(&layout, 1278.0, 790.0),
+            ChromeHit::Resize(ResizeEdge::BottomRight)
+        );
+        // Beyond the corner reach the edge is a plain one.
+        assert_eq!(
+            hit(&layout, 1278.0, 14.0),
+            ChromeHit::Resize(ResizeEdge::Right)
         );
         // Caption buttons: 46 DIPs each from x = 1142.
         assert_eq!(

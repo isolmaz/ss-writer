@@ -37,6 +37,7 @@ use ssw_ui::shortcuts::{CharProbe, ShortcutOutcome, ShortcutRouter};
 use ssw_ui::theme::{DEFAULT_ACCENT, Theme};
 use ssw_ui::widgets::SharedClipboard;
 
+use super::menus::MenuState;
 use super::overlays::{OverlayAction, list_workspace_files, panel_files};
 use super::shell_view::{ShellAction, ShellView, ViewConfig, sidebar_options};
 use super::tree_source::{TreePaths, WorkspaceTree};
@@ -505,6 +506,8 @@ impl Controller {
             }
             ShellAction::Banner(HostEvent::Dismissed(BannerKind::Update)) => self.dismiss_update(),
             ShellAction::Banner(HostEvent::Dismissed(kind)) => self.banner_dismissed(&cell, kind),
+            // The status bar's encoding and line-ending clicks are popups the loop owner shows
+            // (`popup_for`); a click with no document open asks for nothing.
             ShellAction::Banner(HostEvent::Resized) | ShellAction::Status(_) => {}
             ShellAction::Editor(_, event) => self.editor_event(&cell, event),
             ShellAction::Inspector(event) => self.inspector_event(&cell, event),
@@ -652,7 +655,9 @@ impl Controller {
             .borrow()
             .active_tab()
             .and_then(|tab| tab.workspace.clone());
-        cell.view.borrow_mut().add_tab(entry, workspace);
+        cell.view
+            .borrow_mut()
+            .open_tab(entry, workspace, &self.docs);
         Ok(())
     }
 
@@ -1068,10 +1073,40 @@ impl Controller {
                     .collect()
             })
             .unwrap_or_default();
-        cell.view
-            .borrow_mut()
-            .overlays_mut()
-            .open_quick_open(mode, files, recent, &toc);
+        // The command mode lists every command, those that do not apply drawn disabled: the
+        // same enablement as the menus.
+        let state = self.menu_state(cell);
+        let mut view = cell.view.borrow_mut();
+        let overlays = view.overlays_mut();
+        overlays
+            .quick_open_mut()
+            .set_command_availability(&|command| state.enabled(command));
+        overlays.open_quick_open(mode, files, recent, &toc);
+    }
+
+    /// What the menus and the command palette need to know about window `cell`: the toggles'
+    /// check marks and which commands apply.
+    #[must_use]
+    pub fn menu_state(&self, cell: &WindowCell) -> MenuState {
+        let view = cell.view.borrow();
+        let layout = view.layout();
+        let active = view.active_tab();
+        let (typewriter, focus_mode) = active.map_or((false, false), |tab| {
+            (tab.editor.typewriter(), tab.editor.focus_mode())
+        });
+        MenuState {
+            has_document: active.is_some(),
+            save_back: active.is_some_and(|tab| tab.entry.can_save_back()),
+            sidebar: layout.sidebar_visible(),
+            inspector: layout.inspector_visible(),
+            status_bar: layout.status_bar_visible(),
+            format_pill: view.titlebar().pill_visible(),
+            typewriter,
+            focus_mode,
+            full_screen: layout.mode() == ShellMode::FullScreen,
+            zen: layout.mode() == ShellMode::Zen,
+            other_windows: self.windows.borrow().len() > 1,
+        }
     }
 
     /// Carries out what an overlay asked for.

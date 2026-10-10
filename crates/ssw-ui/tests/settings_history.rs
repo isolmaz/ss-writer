@@ -524,6 +524,31 @@ fn a_notched_wheel_eases_the_diff_to_its_target_frame_by_frame() {
 }
 
 #[test]
+fn a_diff_that_fits_the_panel_takes_no_wheel_and_has_nothing_to_animate() {
+    let (mut panel, mut host) = open();
+    select_first(&mut panel, &mut host);
+    assert!(panel.set_diff(3, vec![hunk()]));
+    host.layout(&mut panel);
+    let before = row_names(&host, &panel);
+    host.requests.take_invalidation();
+    // Nothing to scroll: the wheel over the changes is not taken and repaints nothing.
+    assert!(
+        !host
+            .wheel(&mut panel, Point::new(200.0, 400.0), -200.0)
+            .handled
+    );
+    assert!(host.requests.take_invalidation().is_clean());
+    assert_eq!(row_names(&host, &panel), before);
+    // A frame without an easing in progress changes nothing either.
+    host.event(
+        &mut panel,
+        Event::AnimationFrame(std::time::Duration::from_millis(16)),
+    );
+    assert!(host.requests.take_invalidation().is_clean());
+    assert_eq!(row_names(&host, &panel), before);
+}
+
+#[test]
 fn assistive_technology_selects_versions_and_scrolls_the_changes() {
     let (mut panel, mut host) = open_with_a_long_diff(Motion::reduced());
     // The list takes focus; a version row is selected like a click would.

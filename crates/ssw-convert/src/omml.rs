@@ -939,6 +939,9 @@ mod tests {
             r("k")
         );
         assert_eq!(math(&over).unwrap(), r"\overset{k}{X}");
+        // a function without an argument is just its name
+        let bare = format!("<m:func><m:fName>{}</m:fName></m:func>", r("sin"));
+        assert_eq!(math(&bare).unwrap(), r"\sin");
     }
 
     #[test]
@@ -1306,6 +1309,134 @@ mod tests {
             OmmlError::Unsupported("p".to_string())
         );
         assert!(OmmlError::Unsupported("x".into()).to_string().contains("x"));
+    }
+
+    #[test]
+    fn an_unsupported_element_is_reported_from_every_argument_slot() {
+        let ok = r("x");
+        let bad = "<m:blob/>";
+        let cases = [
+            ("w:ins wrapper", format!("<w:ins>{bad}</w:ins>")),
+            (
+                "sSup base",
+                format!("<m:sSup><m:e>{bad}</m:e><m:sup>{ok}</m:sup></m:sSup>"),
+            ),
+            (
+                "sSup exponent",
+                format!("<m:sSup><m:e>{ok}</m:e><m:sup>{bad}</m:sup></m:sSup>"),
+            ),
+            (
+                "sSub base",
+                format!("<m:sSub><m:e>{bad}</m:e><m:sub>{ok}</m:sub></m:sSub>"),
+            ),
+            (
+                "sSub index",
+                format!("<m:sSub><m:e>{ok}</m:e><m:sub>{bad}</m:sub></m:sSub>"),
+            ),
+            (
+                "sSubSup base",
+                format!(
+                    "<m:sSubSup><m:e>{bad}</m:e><m:sub>{ok}</m:sub><m:sup>{ok}</m:sup></m:sSubSup>"
+                ),
+            ),
+            (
+                "sSubSup index",
+                format!(
+                    "<m:sSubSup><m:e>{ok}</m:e><m:sub>{bad}</m:sub><m:sup>{ok}</m:sup></m:sSubSup>"
+                ),
+            ),
+            (
+                "sSubSup exponent",
+                format!(
+                    "<m:sSubSup><m:e>{ok}</m:e><m:sub>{ok}</m:sub><m:sup>{bad}</m:sup></m:sSubSup>"
+                ),
+            ),
+            (
+                "sPre index",
+                format!("<m:sPre><m:sub>{bad}</m:sub><m:sup>{ok}</m:sup><m:e>{ok}</m:e></m:sPre>"),
+            ),
+            (
+                "sPre exponent",
+                format!("<m:sPre><m:sub>{ok}</m:sub><m:sup>{bad}</m:sup><m:e>{ok}</m:e></m:sPre>"),
+            ),
+            (
+                "sPre base",
+                format!("<m:sPre><m:sub>{ok}</m:sub><m:sup>{ok}</m:sup><m:e>{bad}</m:e></m:sPre>"),
+            ),
+            ("bar body", format!("<m:bar><m:e>{bad}</m:e></m:bar>")),
+            (
+                "borderBox body",
+                format!("<m:borderBox><m:e>{bad}</m:e></m:borderBox>"),
+            ),
+            (
+                "fraction denominator",
+                format!("<m:f><m:num>{ok}</m:num><m:den>{bad}</m:den></m:f>"),
+            ),
+            (
+                "radical body",
+                format!("<m:rad><m:deg>{ok}</m:deg><m:e>{bad}</m:e></m:rad>"),
+            ),
+            (
+                "radical degree",
+                format!("<m:rad><m:deg>{bad}</m:deg><m:e>{ok}</m:e></m:rad>"),
+            ),
+            (
+                "nary lower limit",
+                format!("<m:nary><m:sub>{bad}</m:sub><m:sup>{ok}</m:sup><m:e>{ok}</m:e></m:nary>"),
+            ),
+            (
+                "nary upper limit",
+                format!("<m:nary><m:sub>{ok}</m:sub><m:sup>{bad}</m:sup><m:e>{ok}</m:e></m:nary>"),
+            ),
+            (
+                "nary body",
+                format!("<m:nary><m:sub>{ok}</m:sub><m:sup>{ok}</m:sup><m:e>{bad}</m:e></m:nary>"),
+            ),
+            ("delimiter part", format!("<m:d><m:e>{bad}</m:e></m:d>")),
+            (
+                "matrix cell",
+                format!("<m:m><m:mr><m:e>{ok}</m:e><m:e>{bad}</m:e></m:mr></m:m>"),
+            ),
+            (
+                "equation array row",
+                format!("<m:eqArr><m:e>{ok}</m:e><m:e>{bad}</m:e></m:eqArr>"),
+            ),
+            (
+                "function name",
+                format!("<m:func><m:fName>{bad}</m:fName><m:e>{ok}</m:e></m:func>"),
+            ),
+            (
+                "function argument",
+                format!("<m:func><m:fName>{ok}</m:fName><m:e>{bad}</m:e></m:func>"),
+            ),
+            ("accent body", format!("<m:acc><m:e>{bad}</m:e></m:acc>")),
+            (
+                "group character body",
+                format!("<m:groupChr><m:e>{bad}</m:e></m:groupChr>"),
+            ),
+            (
+                "limit base",
+                format!("<m:limLow><m:e>{bad}</m:e><m:lim>{ok}</m:lim></m:limLow>"),
+            ),
+            (
+                "limit bound",
+                format!("<m:limUpp><m:e>{ok}</m:e><m:lim>{bad}</m:lim></m:limUpp>"),
+            ),
+        ];
+        for (slot, xml) in cases {
+            assert_eq!(
+                math(&xml).unwrap_err(),
+                OmmlError::Unsupported("blob".to_string()),
+                "{slot}"
+            );
+        }
+        let paragraph = format!(
+            "<m:oMathPara {M_NS}><m:oMath>{ok}</m:oMath><m:oMath>{bad}</m:oMath></m:oMathPara>"
+        );
+        assert_eq!(
+            to_latex(&parse_xml(paragraph.as_bytes()).unwrap()).unwrap_err(),
+            OmmlError::Unsupported("blob".to_string())
+        );
     }
 
     #[test]

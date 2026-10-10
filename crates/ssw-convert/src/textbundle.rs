@@ -4,9 +4,10 @@
 //! refers to assets as `assets/<name>`. A pack is the same layout zipped, optionally inside one
 //! top-level folder.
 
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
 
+use crate::fault;
 use crate::import::Asset;
 
 /// Per-file size cap when reading (guards against zip bombs and absurd bundles).
@@ -99,8 +100,8 @@ fn read_dir_limited(
 ) -> Result<TextBundle, TextBundleError> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
+        let entry = fault::io(entry)?;
+        if fault::io(entry.file_type())?.is_file() {
             files.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -116,14 +117,14 @@ fn read_dir_limited(
             continue;
         };
         for entry in entries {
-            let entry = entry?;
+            let entry = fault::io(entry)?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let child_rel = format!("{rel}/{name}");
-            let kind = entry.file_type()?;
+            let kind = fault::io(entry.file_type())?;
             if kind.is_dir() {
                 stack.push((entry.path(), child_rel));
             } else if kind.is_file() {
-                let len = entry.metadata()?.len();
+                let len = fault::io(entry.metadata())?.len();
                 total += len;
                 if len > max_entry || total > max_total {
                     return Err(TextBundleError::TooLarge(child_rel));
@@ -159,8 +160,9 @@ pub fn read_pack(bytes: &[u8]) -> Result<TextBundle, TextBundleError> {
         entries.push((i, name));
     }
     // The text file closest to the root decides the bundle folder.
-    let mut best: Option<(usize, String)> = None;
-    for (_, name) in &entries {
+    // (depth, archive index of the text file, its folder)
+    let mut best: Option<(usize, usize, &str)> = None;
+    for (index, name) in &entries {
         let (dir, file) = name.rsplit_once('/').unwrap_or(("", name.as_str()));
         let siblings: Vec<&str> = entries
             .iter()
@@ -171,27 +173,17 @@ pub fn read_pack(bytes: &[u8]) -> Result<TextBundle, TextBundleError> {
             .collect();
         if pick_text_name(&siblings) == Some(file) {
             let depth = name.matches('/').count();
-            if best.as_ref().is_none_or(|(d, _)| depth < *d) {
-                best = Some((depth, dir.to_string()));
+            if best.is_none_or(|(d, ..)| depth < d) {
+                best = Some((depth, *index, dir));
             }
         }
     }
-    let (_, root) = best.ok_or(TextBundleError::MissingText)?;
+    let (_, text_index, root) = best.ok_or(TextBundleError::MissingText)?;
     let prefix = if root.is_empty() {
         String::new()
     } else {
         format!("{root}/")
     };
-    let siblings: Vec<&str> = entries
-        .iter()
-        .filter_map(|(_, n)| n.strip_prefix(prefix.as_str()).filter(|f| !f.contains('/')))
-        .collect();
-    let text_name = pick_text_name(&siblings).ok_or(TextBundleError::MissingText)?;
-    let text_index = entries
-        .iter()
-        .find(|(_, n)| n.strip_prefix(prefix.as_str()) == Some(text_name))
-        .map(|(i, _)| *i)
-        .ok_or(TextBundleError::MissingText)?;
     let text = decode_text(&read_entry(&mut archive, text_index, 0)?.0);
 
     let assets_prefix = format!("{prefix}assets/");
@@ -252,9 +244,14 @@ pub fn write_pack(text: &str, assets: &[Asset]) -> Result<Vec<u8>, TextBundleErr
     for a in assets {
         check_asset_path(&a.relative_path)?;
     }
+    zip_into(Cursor::new(Vec::new()), text, assets).map(Cursor::into_inner)
+}
+
+/// Zips the bundle into `sink`.
+fn zip_into<W: Write + Seek>(sink: W, text: &str, assets: &[Asset]) -> Result<W, TextBundleError> {
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
-    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let mut zip = zip::ZipWriter::new(sink);
     zip.start_file("info.json", options)?;
     zip.write_all(INFO_JSON.as_bytes())?;
     zip.start_file("text.markdown", options)?;
@@ -263,12 +260,13 @@ pub fn write_pack(text: &str, assets: &[Asset]) -> Result<Vec<u8>, TextBundleErr
         zip.start_file(a.relative_path.as_str(), options)?;
         zip.write_all(&a.bytes)?;
     }
-    Ok(zip.finish()?.into_inner())
+    Ok(zip.finish()?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_sink::Limited;
 
     fn asset(path: &str, bytes: &[u8]) -> Asset {
         Asset {
@@ -333,8 +331,11 @@ mod tests {
         ]
     }
 
+    /// An archive of `entries` (names ending in `/` are folders), stored uncompressed so that the
+    /// bytes of every entry can be found in it.
     fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let options = zip::write::SimpleFileOptions::default();
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, bytes) in entries {
             if name.ends_with('/') {
@@ -398,23 +399,14 @@ mod tests {
     fn missing_text_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("info.json"), "{}").unwrap();
-        assert!(matches!(
-            read_dir(tmp.path()),
-            Err(TextBundleError::MissingText)
-        ));
+        let missing = "the bundle has no text file";
+        assert_eq!(read_dir(tmp.path()).unwrap_err().to_string(), missing);
         let bytes = zip_of(&[("info.json", b"{}")]);
-        assert!(matches!(
-            read_pack(&bytes),
-            Err(TextBundleError::MissingText)
-        ));
-        assert!(matches!(
-            read_pack(b"not a zip"),
-            Err(TextBundleError::Zip(_))
-        ));
-        assert!(matches!(
-            read_dir(&tmp.path().join("nope")),
-            Err(TextBundleError::Io(_))
-        ));
+        assert_eq!(read_pack(&bytes).unwrap_err().to_string(), missing);
+        let message = read_pack(b"not a zip").unwrap_err().to_string();
+        assert!(message.starts_with("zip error: "), "{message}");
+        let message = read_dir(&tmp.path().join("nope")).unwrap_err().to_string();
+        assert!(message.starts_with("i/o error: "), "{message}");
     }
 
     #[test]
@@ -494,12 +486,17 @@ mod tests {
         // Each file fits the per-entry cap but together they exceed the total cap.
         let err = read_dir_limited(tmp.path(), 8, 10).unwrap_err();
         assert!(
-            matches!(&err, TextBundleError::TooLarge(p) if p.starts_with("assets/")),
+            err.to_string()
+                .starts_with("the bundle is too large: assets/"),
             "{err}"
         );
         // A single file above the per-entry cap.
         let err = read_dir_limited(tmp.path(), 5, 100).unwrap_err();
-        assert!(matches!(err, TextBundleError::TooLarge(_)));
+        assert!(
+            err.to_string()
+                .starts_with("the bundle is too large: assets/"),
+            "{err}"
+        );
         let ok = read_dir_limited(tmp.path(), 6, 12).unwrap();
         assert_eq!(ok.assets.len(), 2);
     }
@@ -514,8 +511,178 @@ mod tests {
             .unwrap();
         // A remaining total budget of 8 bytes makes the 16-byte entry exceed the limit.
         let err = read_entry(&mut archive, index, MAX_TOTAL_BYTES - 8).unwrap_err();
-        assert!(matches!(err, TextBundleError::TooLarge(_)));
+        assert!(
+            err.to_string().starts_with("the bundle is too large: "),
+            "{err}"
+        );
         let ok = read_entry(&mut archive, index, 0).unwrap();
         assert_eq!(ok.1, 16);
+    }
+
+    /// `entries` stored in an archive in which one byte of `needle` (the contents of one entry)
+    /// is flipped: the checksum of that entry no longer matches.
+    fn zip_with_damaged_entry(entries: &[(&str, &[u8])], needle: &[u8]) -> Vec<u8> {
+        let mut bytes = zip_of(entries);
+        let at = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap();
+        bytes[at] ^= 0xFF;
+        bytes
+    }
+
+    #[test]
+    fn entries_that_cannot_be_read_fail_the_pack() {
+        let entries: &[(&str, &[u8])] =
+            &[("text.md", b"text-body"), ("assets/a.bin", b"asset-bytes")];
+        // The contents of the text file, then of an asset, do not match their checksum.
+        for needle in [&b"text-body"[..], b"asset-bytes"] {
+            let bytes = zip_with_damaged_entry(entries, needle);
+            assert_eq!(
+                read_pack(&bytes).unwrap_err().to_string(),
+                "i/o error: Invalid checksum",
+                "{needle:?}"
+            );
+        }
+        // The first entry has lost its local header.
+        let mut bytes = zip_of(entries);
+        bytes[0] = b'X';
+        assert_eq!(
+            read_pack(&bytes).unwrap_err().to_string(),
+            "zip error: invalid Zip archive: Invalid local file header"
+        );
+        // An index beyond the archive.
+        let bytes = zip_of(entries);
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes[..])).unwrap();
+        assert_eq!(
+            read_entry(&mut archive, 9, 0).unwrap_err().to_string(),
+            "zip error: specified file not found in archive"
+        );
+    }
+
+    #[test]
+    fn assets_that_share_a_path_cannot_be_packed() {
+        let assets = [asset("assets/a.png", b"1"), asset("assets/a.png", b"2")];
+        let message = write_pack("t", &assets).unwrap_err().to_string();
+        assert!(message.starts_with("zip error: "), "{message}");
+        assert!(message.contains("Duplicate filename"), "{message}");
+    }
+
+    #[test]
+    fn a_sink_that_gives_out_at_any_byte_fails_the_pack() {
+        let assets = sample_assets();
+        let full = write_pack("text ü", &assets).unwrap();
+        // The failure lands in a header, in the data of an entry or in the central directory,
+        // depending on the budget; every one of them is reported.
+        for budget in 0..full.len() as u64 {
+            let sink = Limited {
+                inner: Cursor::new(Vec::new()),
+                budget,
+            };
+            let err = zip_into(sink, "text ü", &assets)
+                .expect_err(&format!("a budget of {budget} bytes cannot hold the pack"));
+            assert!(err.to_string().contains("sink is full"), "{budget}: {err}");
+        }
+        let sink = Limited {
+            inner: Cursor::new(Vec::new()),
+            budget: full.len() as u64,
+        };
+        let written = zip_into(sink, "text ü", &assets).unwrap();
+        assert_eq!(written.inner.into_inner(), full);
+    }
+
+    /// Asserts that `result` fails with an I/O error.
+    fn assert_io_failure(result: Result<(), TextBundleError>) {
+        let message = result.unwrap_err().to_string();
+        assert!(message.starts_with("i/o error: "), "{message}");
+    }
+
+    #[test]
+    fn a_bundle_that_cannot_be_written_reports_the_io_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The bundle folder is a file.
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert_io_failure(write_dir(&file, "t", &[]));
+        // `info.json`, then `text.markdown`, is a folder.
+        for name in ["info.json", "text.markdown"] {
+            let dir = tmp.path().join(format!("blocked-{name}"));
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+            assert_io_failure(write_dir(&dir, "t", &[]));
+        }
+        // A folder an asset belongs in is a file.
+        let dir = tmp.path().join("blocked-folder");
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(dir.join("assets").join("sub"), "x").unwrap();
+        assert_io_failure(write_dir(&dir, "t", &[asset("assets/sub/a.bin", b"1")]));
+        // An asset is a folder.
+        let dir = tmp.path().join("blocked-asset");
+        std::fs::create_dir_all(dir.join("assets").join("a.bin")).unwrap();
+        assert_io_failure(write_dir(&dir, "t", &[asset("assets/a.bin", b"1")]));
+    }
+
+    /// Holds `path` open without sharing, so that nobody else can read it.
+    #[cfg(windows)]
+    fn lock(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn files_that_cannot_be_read_fail_the_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text = tmp.path().join("text.md");
+        std::fs::write(&text, "t").unwrap();
+        let guard = lock(&text);
+        let message = read_dir(tmp.path()).unwrap_err().to_string();
+        assert!(message.starts_with("i/o error: "), "{message}");
+        drop(guard);
+
+        std::fs::create_dir(tmp.path().join("assets")).unwrap();
+        let asset = tmp.path().join("assets").join("a.bin");
+        std::fs::write(&asset, [1u8]).unwrap();
+        let guard = lock(&asset);
+        let message = read_dir(tmp.path()).unwrap_err().to_string();
+        assert!(message.starts_with("i/o error: "), "{message}");
+        drop(guard);
+        assert_eq!(read_dir(tmp.path()).unwrap().assets.len(), 1);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn a_folder_that_fails_while_it_is_listed_is_reported_wherever_it_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("text.md"), "t").unwrap();
+        std::fs::create_dir_all(tmp.path().join("assets").join("sub")).unwrap();
+        std::fs::write(tmp.path().join("assets").join("a.bin"), [1u8]).unwrap();
+        std::fs::write(tmp.path().join("assets").join("sub").join("b.bin"), [2u8]).unwrap();
+        let expected = read_dir(tmp.path()).unwrap();
+        assert_eq!(expected.assets.len(), 2);
+        let mut calls = 0;
+        loop {
+            crate::fault::arm(calls);
+            let result = read_dir(tmp.path());
+            crate::fault::disarm();
+            if !crate::fault::tripped() {
+                assert_eq!(
+                    result.unwrap(),
+                    expected,
+                    "{calls} checked calls all passed"
+                );
+                break;
+            }
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                format!("i/o error: {}", crate::fault::INJECTED),
+                "call {calls}"
+            );
+            calls += 1;
+        }
+        assert!(calls > 0, "the listing makes checked calls");
     }
 }

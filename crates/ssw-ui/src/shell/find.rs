@@ -5,6 +5,7 @@
 //! The bar works on the document it was given ([`SharedDocument`], the same handle the editor
 //! view uses): typing a query selects the first match at or after the caret (find as you type),
 //! `Enter` / `F3` select the next match and `Shift+Enter` / `Shift+F3` the previous one (wrapping),
+//! `Tab` / `Shift+Tab` move between the find box and the replace box of the open replace row,
 //! *Replace* replaces the current match and moves to the next, *Replace all* applies every
 //! replacement as **one** transaction (one undo step; `$1` expands capture groups in regex mode).
 //! Every selection it makes is reported as [`FindEvent::Reveal`] so the host can unfold folds,
@@ -78,7 +79,6 @@ pub struct ToggleChip {
     face: Face,
     name: String,
     on: bool,
-    enabled: bool,
     bounds: Rect,
     interaction: Interaction,
     changed: bool,
@@ -91,7 +91,6 @@ impl ToggleChip {
             face,
             name,
             on,
-            enabled: true,
             bounds: Rect::ZERO,
             interaction: Interaction::new(Motion::full()),
             changed: false,
@@ -155,9 +154,7 @@ impl Widget for ToggleChip {
 
     fn arrange(&mut self, cx: &mut LayoutCx, bounds: Rect) {
         self.bounds = bounds;
-        if self.enabled {
-            cx.add_tab_stop();
-        }
+        cx.add_tab_stop();
     }
 
     fn paint(&self, cx: &PaintCx, canvas: &mut dyn Canvas) {
@@ -210,9 +207,7 @@ impl Widget for ToggleChip {
     fn event(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
         match e {
             Event::Pointer(event) => {
-                let outcome = self
-                    .interaction
-                    .pointer(cx, self.bounds, event, self.enabled);
+                let outcome = self.interaction.pointer(cx, self.bounds, event, true);
                 if outcome == PointerOutcome::Clicked {
                     self.flip();
                 }
@@ -220,7 +215,6 @@ impl Widget for ToggleChip {
             }
             Event::Key(key)
                 if key.is_down
-                    && self.enabled
                     && cx.is_focused()
                     && matches!(key.vk, vk::SPACE | vk::RETURN)
                     && key.mods.is_empty() =>
@@ -245,7 +239,7 @@ impl Widget for ToggleChip {
     }
 
     fn access(&self, cx: &AccessCx, out: &mut AccessTree) {
-        let mut state = control_state(cx, self.enabled);
+        let mut state = control_state(cx, true);
         state.toggle = Some(if self.on {
             ToggleState::On
         } else {
@@ -259,11 +253,11 @@ impl Widget for ToggleChip {
 
     fn perform(&mut self, cx: &mut EventCx, a: &AccessAction) -> bool {
         match a {
-            AccessAction::Toggle if self.enabled => {
+            AccessAction::Toggle => {
                 self.flip();
                 true
             }
-            AccessAction::Focus if self.enabled => perform_focus(cx),
+            AccessAction::Focus => perform_focus(cx),
             _ => false,
         }
     }
@@ -607,12 +601,13 @@ impl FindBar {
         };
         let after = edit.new_range().end;
         let tx = Transaction::single(edit, before, Selection::caret(after));
-        let applied = self.doc.borrow_mut().apply(tx).is_ok();
-        if applied {
+        // The edit was made from the text just searched: the document takes it.
+        let applied = self.doc.borrow_mut().apply(tx);
+        applied.is_ok_and(|()| {
             self.events.push(FindEvent::Replaced { count: 1 });
             self.query_changed();
-        }
-        applied
+            true
+        })
     }
 
     /// Replaces every match in one undo step. Returns the number of replacements.
@@ -781,8 +776,9 @@ impl FindBar {
     }
 
     /// Keys of the bar while one of its controls has focus. Returns whether the key was used.
-    fn on_key(&mut self, cx: &EventCx, key: &KeyEvent) -> bool {
-        let focused = |id: WidgetId| cx.focus.is_focused(id);
+    fn on_key(&mut self, cx: &mut EventCx, key: &KeyEvent) -> bool {
+        let current = cx.focus.focused();
+        let focused = |id: WidgetId| current == Some(id);
         if !self.children().iter().any(|child| focused(child.id())) {
             return false;
         }
@@ -802,6 +798,19 @@ impl FindBar {
             }
             vk::RETURN if ctrl_only && self.replace_open && focused(self.replace.id()) => {
                 self.replace_all();
+            }
+            // Tab and Shift+Tab swap the two fields of the open replace row; the field entered
+            // is selected so typing replaces its text.
+            vk::TAB if (plain || shift_only) && self.replace_open => {
+                let to = if focused(self.find.id()) {
+                    &mut self.replace
+                } else if focused(self.replace.id()) {
+                    &mut self.find
+                } else {
+                    return false;
+                };
+                to.select_all();
+                cx.focus.focus(to.id());
             }
             _ => return false,
         }

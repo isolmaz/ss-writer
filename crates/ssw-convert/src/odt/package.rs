@@ -165,17 +165,63 @@ pub(super) mod tests {
         assert_eq!(package.read("nothing").unwrap(), None);
     }
 
+    /// Start of the `Display` text of every [`PackageError::Corrupt`].
+    const CORRUPT: &str = "not a valid ZIP package: ";
+
+    /// The message of the error in `result`.
+    fn failure<T: std::fmt::Debug>(result: Result<T, PackageError>) -> String {
+        result.unwrap_err().to_string()
+    }
+
+    /// Offset of the first record that starts with `signature`.
+    fn record(bytes: &[u8], signature: &[u8; 4]) -> usize {
+        bytes.windows(4).position(|w| w == signature).unwrap()
+    }
+
+    const LOCAL_HEADER: &[u8; 4] = b"PK\x03\x04";
+    const CENTRAL_HEADER: &[u8; 4] = b"PK\x01\x02";
+
     #[test]
     fn rejects_non_zip_data() {
-        assert!(matches!(
-            Package::open(b"This is not a zip file!"),
-            Err(PackageError::Corrupt(_))
-        ));
+        let message = failure(Package::open(b"This is not a zip file!"));
+        assert!(message.starts_with(CORRUPT), "{message}");
         let bytes = zip(&[("a", b"hello")]);
-        assert!(matches!(
-            Package::open(&bytes[..20]),
-            Err(PackageError::Corrupt(_))
-        ));
+        let message = failure(Package::open(&bytes[..20]));
+        assert!(message.starts_with(CORRUPT), "{message}");
+    }
+
+    #[test]
+    fn a_broken_local_header_is_reported_when_opening() {
+        let mut bytes = zip(&[("a", b"hello")]);
+        let local = record(&bytes, LOCAL_HEADER);
+        bytes[local] = b'X';
+        let message = failure(Package::open(&bytes));
+        assert!(message.starts_with(CORRUPT), "{message}");
+    }
+
+    #[test]
+    fn an_encrypted_entry_is_reported_on_read_and_leaves_the_others_readable() {
+        let mut bytes = zip(&[("a", b"hello"), ("b", b"fine")]);
+        // The flags field of the first central record: bit 0 = encrypted.
+        let central = record(&bytes, CENTRAL_HEADER);
+        bytes[central + 8] |= 1;
+        let mut package = Package::open(&bytes).unwrap();
+        let message = failure(package.read("a"));
+        assert!(message.starts_with(CORRUPT), "{message}");
+        assert_eq!(package.read("b").unwrap(), Some(b"fine".to_vec()));
+    }
+
+    #[test]
+    fn declared_sizes_beyond_the_limit_are_refused_when_opening() {
+        let mut bytes = zip(&[("a", b"hello")]);
+        // The uncompressed size of the central record claims one byte more than the limit.
+        let central = record(&bytes, CENTRAL_HEADER);
+        let claimed = u32::try_from(MAX_TOTAL + 1).unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&claimed.to_le_bytes());
+        assert_eq!(
+            failure(Package::open(&bytes)),
+            format!("package exceeds the size limit: more than {MAX_TOTAL} bytes uncompressed")
+        );
     }
 
     #[test]
@@ -195,7 +241,8 @@ pub(super) mod tests {
             *b ^= 0xFF;
         }
         let mut package = Package::open(&bytes).unwrap();
-        assert!(matches!(package.read("a"), Err(PackageError::Corrupt(_))));
+        let message = failure(package.read("a"));
+        assert!(message.starts_with(CORRUPT), "{message}");
     }
 
     #[test]
@@ -203,14 +250,20 @@ pub(super) mod tests {
         let names: Vec<String> = (0..=MAX_ENTRIES).map(|i| format!("f{i}")).collect();
         let files: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b""[..])).collect();
         let many = zip(&files);
-        assert!(matches!(
-            Package::open(&many),
-            Err(PackageError::TooLarge(_))
-        ));
+        assert_eq!(
+            failure(Package::open(&many)),
+            format!(
+                "package exceeds the size limit: {} entries (limit {MAX_ENTRIES})",
+                MAX_ENTRIES + 1
+            )
+        );
         let bytes = zip(&[("a", b"abc")]);
         let mut package = Package::open(&bytes).unwrap();
         package.read_total = MAX_TOTAL;
-        assert!(matches!(package.read("a"), Err(PackageError::TooLarge(_))));
+        assert_eq!(
+            failure(package.read("a")),
+            format!("package exceeds the size limit: more than {MAX_TOTAL} bytes uncompressed")
+        );
     }
 
     #[test]

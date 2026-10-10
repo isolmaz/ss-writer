@@ -680,9 +680,19 @@ impl Widget for Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canvas::DrawOp;
+    use crate::canvas::{DrawOp, RecordingCanvas};
     use crate::input::Modifiers;
     use crate::widgets::testkit::Harness;
+
+    fn icon_glyphs(canvas: &RecordingCanvas) -> Vec<char> {
+        canvas
+            .ops()
+            .filter_map(|op| match op {
+                DrawOp::Icon { glyph, .. } => Some(*glyph),
+                _ => None,
+            })
+            .collect()
+    }
 
     fn file_menu() -> Menu {
         Menu::new(
@@ -972,18 +982,9 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            canvas.ops().any(
-                |op| matches!(op, DrawOp::Icon { glyph: g, .. } if *g == glyph::CHEVRON_RIGHT)
-            )
-        );
         // Disabled items are grey; unchecked items draw no check mark.
         assert!(canvas.ops().any(|op| matches!(op, DrawOp::Text { text, color, .. } if text == "Locked" && *color == tokens.text_disabled)));
-        assert!(
-            !canvas
-                .ops()
-                .any(|op| matches!(op, DrawOp::Icon { glyph: g, .. } if *g == glyph::CHECK_MARK))
-        );
+        assert_eq!(icon_glyphs(&canvas), [glyph::CHEVRON_RIGHT]);
         // The submenu paints beside it, with the checked item marked.
         for _ in 0..2 {
             tap(&mut harness, &mut menu, vk::DOWN);
@@ -991,11 +992,7 @@ mod tests {
         tap(&mut harness, &mut menu, vk::RIGHT);
         let canvas = harness.paint(&menu);
         assert!(canvas.texts().contains(&"HTML"));
-        assert!(
-            canvas
-                .ops()
-                .any(|op| matches!(op, DrawOp::Icon { glyph: g, .. } if *g == glyph::CHECK_MARK))
-        );
+        assert!(icon_glyphs(&canvas).contains(&glyph::CHECK_MARK));
         // A closed menu paints nothing.
         let id = menu.id();
         menu.close(&mut harness.event_cx(id));
@@ -1120,6 +1117,27 @@ mod tests {
         let id = menu.id();
         menu.open_at(&mut harness.event_cx(id), Point::ZERO);
         tap(&mut harness, &mut menu, vk::DOWN);
+        tap(&mut harness, &mut menu, vk::UP);
+        assert_eq!(menu.highlighted(), None);
+        assert!(menu.is_open());
+    }
+
+    #[test]
+    fn kit_menu_without_enabled_items_highlights_nothing_even_when_closed() {
+        let mut harness = Harness::new();
+        let mut menu = Menu::new(
+            "Locked",
+            vec![
+                MenuEntry::Item(MenuItem::new(1, "Read only").disabled()),
+                MenuEntry::Separator,
+            ],
+        );
+        assert_eq!(menu.highlighted(), None, "a closed menu has no levels");
+        assert_eq!(menu.depth(), 0);
+        let id = menu.id();
+        menu.open_at(&mut harness.event_cx(id), Point::ZERO);
+        tap(&mut harness, &mut menu, vk::DOWN);
+        assert_eq!(menu.highlighted(), None);
         tap(&mut harness, &mut menu, vk::UP);
         assert_eq!(menu.highlighted(), None);
         assert!(menu.is_open());

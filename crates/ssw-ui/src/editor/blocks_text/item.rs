@@ -32,13 +32,6 @@ pub(super) enum Shape {
     Label(Box<dyn TextLayout>),
 }
 
-/// The dimmed source of the marker zone.
-struct Raw {
-    layout: Box<dyn TextLayout>,
-    /// Bytes of the layout text that are the `[ ]` / `[x]` of a task.
-    checkbox: Option<std::ops::Range<usize>>,
-}
-
 /// The marker column of an item.
 struct Marker {
     /// The source bytes of the zone: from the item start to the first child.
@@ -46,7 +39,8 @@ struct Marker {
     shape: Shape,
     /// The `[ ]` / `[x]` source of a task.
     checkbox: Option<TextRange>,
-    raw: Option<Raw>,
+    /// The dimmed source of the zone, laid out on one line.
+    raw: Option<Box<dyn TextLayout>>,
     /// Width of the column the content is moved right by.
     width: f32,
     /// The marker column of the shapes (without the room the raw source needs).
@@ -70,12 +64,12 @@ impl Marker {
     fn task_box(&self) -> Option<TaskBox> {
         let checkbox = self.checkbox?;
         let rect = match &self.raw {
+            // The source is one unwrapped line, so the checkbox is the span between its
+            // carets.
             Some(raw) => {
-                let bytes = raw.checkbox.clone()?;
-                raw.layout
-                    .range_rects(bytes)
-                    .into_iter()
-                    .reduce(|a, b| a.union(b))?
+                let from = raw.caret_rect(checkbox.start - self.zone.start, false);
+                let to = raw.caret_rect(checkbox.end - self.zone.start, false);
+                Rect::new(from.x, from.y, to.x - from.x, from.height)
             }
             None => self.box_rect(),
         };
@@ -88,7 +82,7 @@ impl Marker {
     fn paint(&self, cx: &BlockPaintCx<'_>, canvas: &mut dyn Canvas) {
         let tokens = &cx.theme.tokens;
         if let Some(raw) = &self.raw {
-            canvas.draw_text_layout(raw.layout.as_ref(), Point::ZERO, tokens.marker);
+            canvas.draw_text_layout(raw.as_ref(), Point::ZERO, tokens.marker);
             return;
         }
         let center_x = self.col / 2.0;
@@ -159,7 +153,7 @@ impl Marker {
     fn hit(&self, point: Point) -> usize {
         match &self.raw {
             Some(raw) => {
-                let hit = raw.layout.hit_test_point(point);
+                let hit = raw.hit_test_point(point);
                 (self.zone.start + hit.insertion_offset()).min(self.zone.end)
             }
             None => self.zone.end,
@@ -170,7 +164,7 @@ impl Marker {
         match &self.raw {
             Some(raw) => {
                 let at = offset.saturating_sub(self.zone.start).min(self.zone.len());
-                raw.layout.caret_rect(at, false)
+                raw.caret_rect(at, false)
             }
             None => Rect::new(self.width, 0.0, 0.0, self.line),
         }
@@ -181,9 +175,7 @@ impl Marker {
             return Vec::new();
         };
         match &self.raw {
-            Some(raw) => raw
-                .layout
-                .range_rects(part.start - self.zone.start..part.end - self.zone.start),
+            Some(raw) => raw.range_rects(part.start - self.zone.start..part.end - self.zone.start),
             None => vec![Rect::new(0.0, 0.0, self.width, self.line)],
         }
     }
@@ -232,26 +224,19 @@ pub(super) fn measure(ctx: &Ctx<'_>, spec: ItemSpec<'_>) -> ItemLayout {
     });
     let raw = cx.reveal.touches(lead).then(|| {
         let text = cx.buffer.slice(zone);
-        let layout = cx.text.layout(
+        cx.text.layout(
             &text,
             &style(cx, &cx.config.text_font, body),
             &[],
             &[],
             f32::INFINITY,
-        );
-        Raw {
-            layout,
-            checkbox: spec
-                .checkbox
-                .map(|checkbox| checkbox.start - zone.start..checkbox.end - zone.start),
-        }
+        )
     });
     let width = raw.as_ref().map_or(spec.col, |raw| {
         let advance = raw
-            .layout
             .size()
             .width
-            .max(raw.layout.caret_rect(raw.layout.text().len(), false).x);
+            .max(raw.caret_rect(raw.text().len(), false).x);
         spec.col.max(advance + 0.3 * body)
     });
     let marker = Marker {

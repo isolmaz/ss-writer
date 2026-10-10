@@ -69,12 +69,14 @@ fn locate(data: &[u8], o: usize) -> Option<Blip> {
     let lcb = u32le(data, o)? as usize;
     let cb_hdr = u16le(data, o + 4)? as usize;
     let mm = u16le(data, o + 6)?;
-    let mut p = o.checked_add(cb_hdr)?;
+    // `o + 7 < data.len()` (the reads above succeeded) and `data.len() <= isize::MAX`, so neither
+    // sum below can overflow a `usize` (`cb_hdr` is a u16, `lcb` a u32).
+    let mut p = o + cb_hdr;
     if mm == 0x0066 {
         // MM_SHAPEFILE: cchPicName + name follows the header
         p += 1 + *data.get(p)? as usize;
     }
-    let end = o.checked_add(lcb)?.min(data.len());
+    let end = (o + lcb).min(data.len());
     let mut found = None;
     walk(&data[..end], p, end, 0, &mut found);
     found
@@ -147,15 +149,17 @@ const MAX_PIXELS: u64 = 64 << 20;
 /// Converts a headerless DIB (BITMAPINFOHEADER of 40 bytes or more, uncompressed or
 /// bit-fields, 1/4/8/16/24/32 bits per pixel) to a PNG. `None` for anything else.
 pub(super) fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
-    let hdr = u32le(dib, 0)? as usize;
+    let head = dib.first_chunk::<40>()?;
+    let field = |o: usize| u32::from_le_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+    let hdr = field(0) as usize;
     if hdr < 40 || hdr > dib.len() {
         return None;
     }
-    let width = u32le(dib, 4)? as i32;
-    let height = u32le(dib, 8)? as i32;
-    let bpp = u32::from(u16le(dib, 14)?);
-    let compression = u32le(dib, 16)?;
-    let clr_used = u32le(dib, 32)? as usize;
+    let width = field(4) as i32;
+    let height = field(8) as i32;
+    let bpp = u32::from(u16::from_le_bytes([head[14], head[15]]));
+    let compression = field(16);
+    let clr_used = field(32) as usize;
     if width <= 0
         || height == 0
         || !matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32)
@@ -198,8 +202,10 @@ pub(super) fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
         Vec::new()
     };
     let stride = ((w as usize * bpp as usize).div_ceil(32)) * 4;
-    let pixels = dib.get(pal_at..)?;
-    if pixels.len() < stride.checked_mul(h as usize)? {
+    // `pal_at <= dib.len()` on every path above (the header, the 12 mask bytes and the palette
+    // were all bounds-checked); `w * h <= MAX_PIXELS` bounds `stride * h` far below `usize::MAX`.
+    let pixels = &dib[pal_at..];
+    if pixels.len() < stride * h as usize {
         return None;
     }
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
@@ -662,12 +668,66 @@ mod tests {
     }
 
     #[test]
+    fn the_first_bitmap_wins_and_an_fbse_without_a_blip_is_skipped() {
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 1];
+        let png = [0x89, b'P', b'N', b'G', 1, 2];
+        let first = pic_record(0x64, 0xF01D, 0x46A, 1, &jpeg, false);
+        let second = pic_record(0x64, 0xF01E, 0x6E0, 1, &png, false);
+        // header (68 bytes) followed by two blip records
+        let mut data = first.clone();
+        data.extend_from_slice(&second[68..]);
+        let total = data.len() as u32;
+        data[0..4].copy_from_slice(&total.to_le_bytes());
+        assert_eq!(
+            extract(&data, 0),
+            Picture::Image {
+                ext: "jpg",
+                bytes: jpeg.to_vec()
+            }
+        );
+        // an OfficeArtFBSE that embeds no BLIP is passed over; the record after it is read
+        let mut fbse = vec![0x02, 0x00];
+        fbse.extend_from_slice(&0xF007u16.to_le_bytes());
+        fbse.extend_from_slice(&36u32.to_le_bytes());
+        fbse.extend_from_slice(&[0u8; 36]);
+        let mut data = second[..68].to_vec();
+        data.extend_from_slice(&fbse);
+        data.extend_from_slice(&second[68..]);
+        let total = data.len() as u32;
+        data[0..4].copy_from_slice(&total.to_le_bytes());
+        assert_eq!(
+            extract(&data, 0),
+            Picture::Image {
+                ext: "png",
+                bytes: png.to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn bit_masks_inside_an_extended_header_do_not_shift_the_pixels() {
+        // A 52-byte header already contains the three masks, so the pixels start right after it
+        // (a 40-byte header is followed by the masks and only then by the pixels).
+        let masks: Vec<u8> = [0xF800u32, 0x07E0, 0x001F]
+            .iter()
+            .flat_map(|m| m.to_le_bytes())
+            .collect();
+        let mut d = dib(1, 1, 16, 3, &masks, &[], &[0xE0, 0x07, 0, 0]);
+        d[0..4].copy_from_slice(&52u32.to_le_bytes());
+        let (_, _, raw) = decode(&dib_to_png(&d).unwrap());
+        assert_eq!(raw, vec![0, 0, 255, 0]);
+    }
+
+    #[test]
     fn unlocatable_pictures_are_unreadable() {
         assert_eq!(extract(&[], 0), Picture::Unreadable);
         assert_eq!(extract(&[1, 2, 3], 1), Picture::Unreadable);
         let rec = pic_record(0x64, 0xF01D, 0x46A, 1, &[0xFF, 0xD8, 0], false);
-        // location beyond the stream, header size past the end, lcb overflow, record with no blip
+        // location beyond the stream, header size past the end, record with no blip
         assert_eq!(extract(&rec, u32::MAX), Picture::Unreadable);
+        // a blip record that carries only its UID and tag bytes, no image data
+        let hollow = pic_record(0x64, 0xF01D, 0x46A, 1, &[], false);
+        assert_eq!(extract(&hollow, 0), Picture::Unreadable);
         let mut bad = rec.clone();
         bad[4..6].copy_from_slice(&0xFFFFu16.to_le_bytes());
         assert_eq!(extract(&bad, 0), Picture::Unreadable);

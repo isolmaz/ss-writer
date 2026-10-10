@@ -516,7 +516,7 @@ impl DropTarget {
     }
 
     /// Asks the handler about the current drag; `ask` picks which callback. Refuses without a
-    /// session and for data of no accepted kind.
+    /// session (no `DragEnter` came first) and for data of no accepted kind.
     fn consult(
         &self,
         keys: MODIFIERKEYS_FLAGS,
@@ -529,8 +529,21 @@ impl DropTarget {
             .borrow()
             .clone()
             .ok_or_else(|| Error::from(E_UNEXPECTED))?;
+        Ok(self.answer(&session, keys, pt, allowed, ask))
+    }
+
+    /// What the handler makes of the drag of `session`; `ask` picks which callback. Refuses data
+    /// of no accepted kind.
+    fn answer(
+        &self,
+        session: &Session,
+        keys: MODIFIERKEYS_FLAGS,
+        pt: &POINTL,
+        allowed: AllowedEffects,
+        ask: impl FnOnce(&dyn DropHandler, &DragEvent<'_>) -> Effect,
+    ) -> Effect {
         if !session.kinds.any() {
-            return Ok(Effect::None);
+            return Effect::None;
         }
         let (x, y) = self.client_point(pt);
         let event = DragEvent {
@@ -542,11 +555,11 @@ impl DropTarget {
             files: &session.files,
         };
         let effect = ask(self.handler.as_ref(), &event);
-        Ok(if allowed.allows(effect) {
+        if allowed.allows(effect) {
             effect
         } else {
             Effect::None
-        })
+        }
     }
 }
 
@@ -567,10 +580,11 @@ impl IDropTarget_Impl for DropTarget_Impl {
         } else {
             Vec::new()
         };
-        *self.session.borrow_mut() = Some(Rc::new(Session { kinds, files }));
-        let effect = self.consult(grfkeystate, pt, allowed, |handler, event| {
+        let session = Rc::new(Session { kinds, files });
+        *self.session.borrow_mut() = Some(Rc::clone(&session));
+        let effect = self.answer(&session, grfkeystate, pt, allowed, |handler, event| {
             handler.drag_enter(event)
-        })?;
+        });
         set_effect(pdweffect, effect);
         let screen = POINT { x: pt.x, y: pt.y };
         self.forward(|helper| {

@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+use ssw_io::encoding::TextEncoding;
 use ssw_io::fs::FsError;
 use ssw_io::history::SnapshotReason;
 use ssw_io::save::SaveStamp;
@@ -16,7 +17,9 @@ use ssw_io::watch::{DocChange, FsEvent, Watcher, path_key};
 
 use crate::workers::Waker;
 
-use super::{DocEntry, DocError, Documents, ExternalState, Source, load_file, replace_text};
+use super::{
+    DocEntry, DocError, Documents, ExternalState, Source, load_file, load_file_as, replace_text,
+};
 
 /// What happened to a document because its file changed on disk.
 #[derive(Debug)]
@@ -243,8 +246,22 @@ impl Documents {
     /// # Errors
     /// [`DocError::Load`] when the file cannot be read, [`DocError::Untitled`] for buffers.
     pub fn reload(&self, entry: &DocEntry) -> Result<(), DocError> {
+        self.reload_with(entry, None)
+    }
+
+    /// "Reopen with encoding" (spec §4.2): [`Documents::reload`] decoding the file as
+    /// `encoding` instead of the detected one. The BOM, if the file has one for that encoding,
+    /// and the line endings are recorded as for any load.
+    ///
+    /// # Errors
+    /// As [`Documents::reload`].
+    pub fn reload_as(&self, entry: &DocEntry, encoding: TextEncoding) -> Result<(), DocError> {
+        self.reload_with(entry, Some(encoding))
+    }
+
+    fn reload_with(&self, entry: &DocEntry, forced: Option<TextEncoding>) -> Result<(), DocError> {
         let path = entry.path().ok_or(DocError::Untitled)?;
-        let loaded = load_file(self.env.fs.as_ref(), &path, self.env.tld.as_deref())?;
+        let loaded = load_file_as(self.env.fs.as_ref(), &path, self.env.tld.as_deref(), forced)?;
         // The history is a safety net: a failed snapshot must not block the reload.
         let _ = self.snapshot(entry, SnapshotReason::BeforeExternalReload);
         let tracked = !matches!(loaded.source, Source::TextBundle { .. });

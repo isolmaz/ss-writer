@@ -609,7 +609,7 @@ impl BlockLayout for TextBlock {
 }
 
 /// The composition when it lies inside `range`.
-fn composition_in<'a>(cx: &BlockCx<'a>, range: TextRange) -> Option<&'a Composition> {
+pub(super) fn composition_in<'a>(cx: &BlockCx<'a>, range: TextRange) -> Option<&'a Composition> {
     cx.composition.filter(|comp| range.touches(comp.at))
 }
 

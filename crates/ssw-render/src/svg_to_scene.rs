@@ -418,6 +418,42 @@ mod tests {
     }
 
     #[test]
+    fn clip_geometry_comes_from_paths_groups_and_text_only() {
+        // usvg never keeps an `<image>` in a clip path, so the collector is pointed at a normal
+        // document root to see what it does with one: an image adds nothing.
+        let tree = usvg::Tree::from_str(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="20">
+              <rect width="5" height="5"/>
+              <image width="20" height="20" xlink:href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="/>
+              <g transform="translate(10 10)"><rect width="2" height="3"/></g></svg>"##,
+            &options(),
+        )
+        .expect("valid svg");
+        // usvg wraps the image in a group that scales its unit size to 20x20.
+        let wrapped: Vec<bool> = tree
+            .root()
+            .children()
+            .iter()
+            .map(|node| match node {
+                usvg::Node::Group(group) => group
+                    .children()
+                    .iter()
+                    .any(|child| matches!(child, usvg::Node::Image(_))),
+                _ => false,
+            })
+            .collect();
+        assert_eq!(
+            wrapped,
+            [false, true, false],
+            "the image is part of the tree"
+        );
+        let mut path = Path::new();
+        collect_geometry(tree.root(), &Transform::IDENTITY, &mut path);
+        let b = path.bounds().expect("geometry of the two rectangles");
+        assert_eq!((b.x, b.y, b.right(), b.bottom()), (0.0, 0.0, 12.0, 13.0));
+    }
+
+    #[test]
     fn text_becomes_filled_outlines() {
         let s = scene(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="20">

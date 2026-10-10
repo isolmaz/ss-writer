@@ -271,11 +271,55 @@ fn a_dollar_is_literal_outside_regex_mode() {
 }
 
 #[test]
+fn tab_and_shift_tab_move_between_the_find_and_the_replace_box() {
+    let doc: SharedDocument = Rc::new(RefCell::new(Document::new("foo")));
+    let (mut host, mut bar) = open_bar(&doc, true);
+    let (find_id, replace_id) = (bar.find_box().id(), bar.replace_box().id());
+    host.text(&mut bar, "foo");
+    assert!(host.key(&mut bar, vk::TAB).handled);
+    assert!(host.focus.is_focused(replace_id));
+    host.text(&mut bar, "bar");
+    assert_eq!(
+        (bar.find_box().text(), bar.replace_box().text()),
+        ("foo", "bar")
+    );
+    // The box entered is selected: typing replaces what it held.
+    assert!(host.key_with(&mut bar, vk::TAB, Modifiers::SHIFT).handled);
+    assert!(host.focus.is_focused(find_id));
+    assert_eq!(bar.find_box().selection(), 0..3);
+    host.text(&mut bar, "o");
+    assert_eq!(bar.find_box().text(), "o");
+    assert!(host.key(&mut bar, vk::TAB).handled);
+    assert!(host.focus.is_focused(replace_id));
+    assert_eq!(bar.replace_box().selection(), 0..3);
+}
+
+#[test]
+fn tab_is_left_alone_without_a_replace_row_with_a_modifier_or_on_another_control() {
+    let (mut host, mut bar, _doc) = setup("text");
+    assert!(!host.key(&mut bar, vk::TAB).handled, "no replace row");
+    let doc: SharedDocument = Rc::new(RefCell::new(Document::new("text")));
+    let (mut host, mut bar) = open_bar(&doc, true);
+    let find_id = bar.find_box().id();
+    assert!(!host.key_with(&mut bar, vk::TAB, Modifiers::CTRL).handled);
+    assert!(host.focus.is_focused(find_id));
+    click_named(&mut host, &mut bar, "Match case");
+    assert!(!host.focus.is_focused(find_id));
+    assert!(
+        !host.key(&mut bar, vk::TAB).handled,
+        "a toggle has the focus"
+    );
+}
+
+#[test]
 fn escape_closes_the_bar_and_hands_focus_back() {
     let (mut host, mut bar, _doc) = setup("text");
     assert!(host.key(&mut bar, vk::ESCAPE).handled);
     assert!(!bar.is_visible());
     assert_eq!(bar.take_events(), vec![FindEvent::Closed]);
+    // Closing a hidden bar again reports nothing.
+    bar.close();
+    assert!(bar.take_events().is_empty());
     host.layout(&mut bar, WINDOW);
     assert!(host.focus.tab_order().is_empty());
     assert_eq!(host.focus.focused(), None);
@@ -503,6 +547,9 @@ fn a_toggle_chip_reports_one_change_per_flip_from_clicks_keys_and_assistive_tech
             .key_with(&mut chip, vk::RETURN, Modifiers::SHIFT)
             .handled
     );
+    // Only Space and Return flip it, even with focus.
+    assert!(!host.key(&mut chip, vk::ESCAPE).handled);
+    assert_eq!(chip.take_changed(), None);
     assert!(host.key(&mut chip, vk::SPACE).handled);
     assert_eq!(chip.take_changed(), Some(false));
     // A held key does not flip it again.
@@ -573,6 +620,9 @@ fn a_toggle_chip_repaints_its_focus_halo_and_eases_its_hover() {
     assert!(!has_ring(host.paint(&chip)));
     host.focus_on(chip.id());
     assert!(has_ring(host.paint(&chip)));
+    // A repaint that does not reach the chip draws nothing of it.
+    let away = Rect::new(500.0, 500.0, 5.0, 5.0);
+    assert_eq!(host.paint_damaged(&chip, Some(away)).ops().count(), 0);
 }
 
 #[test]

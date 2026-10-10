@@ -33,10 +33,14 @@ pub struct PaletteEntry {
     pub shortcut: Option<String>,
     /// Byte ranges of `label` matched by the query.
     pub highlights: Vec<Range<usize>>,
+    /// Whether the command applies now (see [`CommandPalette::set_availability`]); a disabled
+    /// command is listed but drawn disabled and cannot be run.
+    pub enabled: bool,
 }
 
 impl PaletteEntry {
-    /// The list row showing this entry: group, label with highlights, shortcut at the right.
+    /// The list row showing this entry: group, label with highlights, shortcut at the right;
+    /// disabled when the command does not apply.
     #[must_use]
     pub fn to_row(&self) -> Row {
         Row {
@@ -44,6 +48,7 @@ impl PaletteEntry {
             label: self.label.clone(),
             highlights: self.highlights.clone(),
             detail: self.shortcut.clone().unwrap_or_default(),
+            disabled: !self.enabled,
             ..Row::default()
         }
     }
@@ -54,6 +59,7 @@ struct Item {
     command: CommandId,
     group: String,
     shortcut: Option<String>,
+    enabled: bool,
 }
 
 /// Every command with its label and shortcut, ready to be filtered.
@@ -73,6 +79,7 @@ impl CommandPalette {
                 command,
                 group: localizer.text(command.group().label_id()),
                 shortcut: shortcuts.shortcut_label(command),
+                enabled: true,
             })
             .collect();
         let labels = CommandId::all()
@@ -90,6 +97,22 @@ impl CommandPalette {
         for item in &mut self.items {
             item.shortcut = shortcuts.shortcut_label(item.command);
         }
+    }
+
+    /// Marks which commands apply now: `enabled` answers for every command (the app passes the
+    /// same enablement its menus use). Commands start enabled.
+    pub fn set_availability(&mut self, enabled: &dyn Fn(CommandId) -> bool) {
+        for item in &mut self.items {
+            item.enabled = enabled(item.command);
+        }
+    }
+
+    /// Whether `command` applies now.
+    #[must_use]
+    pub fn is_enabled(&self, command: CommandId) -> bool {
+        self.items
+            .iter()
+            .any(|item| item.command == command && item.enabled)
     }
 
     /// Number of commands (all of `CommandId::ALL`).
@@ -118,6 +141,7 @@ impl CommandPalette {
                     group: item.group.clone(),
                     shortcut: item.shortcut.clone(),
                     highlights: highlight_ranges(label, &found.indices),
+                    enabled: item.enabled,
                 }
             })
             .collect()

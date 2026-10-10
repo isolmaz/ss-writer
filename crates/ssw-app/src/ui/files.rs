@@ -998,7 +998,7 @@ impl Controller {
                     Ok(entry) => {
                         let mut view = target.view.borrow_mut();
                         let workspace = view.active_tab().and_then(|tab| tab.workspace.clone());
-                        view.add_tab(entry, workspace);
+                        view.open_tab(entry, workspace, &docs);
                         target.dirty.set(true);
                     }
                     Err(error) => report_later(&outbox, error),

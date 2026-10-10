@@ -749,18 +749,9 @@ impl Store {
                 // old composition into the host text and compose over the new extent.
                 let selection = self.finish_composition();
                 self.composition_started(Some(range));
-                self.with_view(|view| {
-                    if let (Some(comp), Some(selection)) = (view.composition_mut(), selection) {
-                        comp.selection = selection;
-                        comp.dirty = true;
-                    }
-                });
+                self.with_view(|view| view.resume_composition(selection));
             }
-            _ => self.with_view(|view| {
-                if let Some(comp) = view.composition_mut() {
-                    comp.dirty = true;
-                }
-            }),
+            _ => self.with_view(View::mark_composition_dirty),
         }
     }
 

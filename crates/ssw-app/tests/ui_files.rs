@@ -1394,6 +1394,30 @@ fn a_placeholder_opens_in_the_background_with_taskbar_progress() {
 }
 
 #[test]
+fn a_placeholder_that_finishes_downloading_replaces_the_pristine_untitled_tab() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        text_file("cloud.md", "# Cloud\n"),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        let cloud = rig.work.join("cloud.md");
+        make_placeholder(&cloud);
+        let window = rig.window();
+        rig.controller.new_untitled(&window);
+        assert_eq!(rig.tab_count(), 2);
+        rig.controller.open_file(&window, &cloud).unwrap();
+        assert_eq!(
+            rig.tab_count(),
+            2,
+            "the Untitled tab stays while it downloads"
+        );
+        rig.wait_for("the file", || rig.active().path().is_some());
+        assert_eq!(rig.tab_count(), 2, "the file took the Untitled tab's place");
+        assert_eq!(rig.path(), canonical_path(&cloud));
+    });
+}
+
+#[test]
 fn a_placeholder_that_cannot_be_read_is_reported_and_a_closed_window_reads_nothing() {
     let files = vec![
         text_file("a.md", "# A\n"),

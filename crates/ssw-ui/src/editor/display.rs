@@ -832,13 +832,13 @@ impl Builder<'_> {
             }
             InlineKind::Code { .. } => {
                 let style = self.style(&Fmt { mono: true, ..*fmt });
+                // A code span's content is never empty: a closing run of backticks directly
+                // after the opening one would just be a longer opening run.
                 let range = self.flat(node, &style, reveal);
-                if range.start < range.end {
-                    self.pills.push(Pill {
-                        disp: range,
-                        color: self.p.tokens.code_bg,
-                    });
-                }
+                self.pills.push(Pill {
+                    disp: range,
+                    color: self.p.tokens.code_bg,
+                });
             }
             InlineKind::Link(link) => {
                 let range = self.wrapper(node, &Fmt { link: true, ..*fmt }, reveal);
@@ -902,13 +902,12 @@ impl Builder<'_> {
                         ..*fmt
                     })
                 };
+                // The parser only accepts a non-empty label, which is the node's content.
                 let range = self.flat(node, &style, reveal);
-                if range.start < range.end {
-                    self.links.push(LinkSpan {
-                        disp: range,
-                        target: LinkTarget::Footnote(label.clone()),
-                    });
-                }
+                self.links.push(LinkSpan {
+                    disp: range,
+                    target: LinkTarget::Footnote(label.clone()),
+                });
             }
             InlineKind::SoftBreak => {
                 let style = self.style(fmt);
@@ -1085,7 +1084,13 @@ mod tests {
         assert_eq!(d.pills[1].disp, 4..5);
         assert_eq!(d.links.len(), 3);
         assert_eq!(d.links[0].target, LinkTarget::Url("http://x".into()));
-        assert!(matches!(d.links[1].target, LinkTarget::Wiki { .. }));
+        assert_eq!(
+            d.links[1].target,
+            LinkTarget::Wiki {
+                target: "Note".into(),
+                heading: None,
+            }
+        );
         assert_eq!(d.links[2].target, LinkTarget::Footnote("1".into()));
         assert!(d.link_at(6).is_some());
         assert!(d.link_at(5).is_none());
@@ -1097,6 +1102,22 @@ mod tests {
         assert_eq!(bold.style.weight, FontWeight::BOLD);
         let sup = d.styles.last().expect("superscript run");
         assert!(sup.style.baseline_shift > 0.0);
+    }
+
+    #[test]
+    fn elements_without_visible_content_add_no_pills_or_links() {
+        // An empty link text, an empty wiki alias and a highlight wrapping only an empty link
+        // all hide their markers and leave nothing to colour or click.
+        let link = display("a[](http://x)b", None, &NoObjects, None);
+        assert_eq!(link.text, "ab");
+        assert!(link.links.is_empty());
+        let wiki = display("a[[Note|]]b", None, &NoObjects, None);
+        assert_eq!(wiki.text, "ab");
+        assert!(wiki.links.is_empty());
+        let highlight = display("a ==[](http://x)== b", None, &NoObjects, None);
+        assert_eq!(highlight.text, "a  b");
+        assert!(highlight.pills.is_empty());
+        assert!(highlight.links.is_empty());
     }
 
     #[test]

@@ -288,8 +288,17 @@ fn nothing_the_provider_reports_that_is_not_a_word_of_the_text_is_drawn() {
     impl SpellProvider for Bogus {
         fn check(&self, _text: &str) -> Vec<Range<usize>> {
             // Checked text: "a   b é" — an empty range, the separator made for the code span, a
+            // range that starts in the text before the code span and ends in the separator, a
             // range past the end, a reversed range, a range inside the two bytes of é, and é.
-            vec![3..3, 2..3, 100..105, Range { start: 5, end: 2 }, 7..8, 6..8]
+            vec![
+                3..3,
+                2..3,
+                1..3,
+                100..105,
+                Range { start: 5, end: 2 },
+                7..8,
+                6..8,
+            ]
         }
         fn suggestions(&self, _word: &str) -> Vec<String> {
             Vec::new()

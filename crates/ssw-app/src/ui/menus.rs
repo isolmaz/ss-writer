@@ -1,5 +1,5 @@
-//! The File / Edit / Format / View / Help popup menus: native menu models built from [`CommandId`]s,
-//! Fluent labels and the keymap's first chord of each command (spec §1, §11).
+//! The File / Edit / Format / View / Window / Help popup menus: native menu models built from
+//! [`CommandId`]s, Fluent labels and the keymap's first chord of each command (spec §1, §6, §11).
 
 use ssw_core::command::CommandId;
 use ssw_core::i18n::Localizer;
@@ -14,6 +14,8 @@ use CommandId as C;
 pub struct MenuState {
     /// A document is open: editing, saving and exporting commands are enabled.
     pub has_document: bool,
+    /// The active document was imported from a Word / ODT / RTF file that can be written back.
+    pub save_back: bool,
     /// The sidebar is shown.
     pub sidebar: bool,
     /// The inspector is shown.
@@ -30,6 +32,8 @@ pub struct MenuState {
     pub full_screen: bool,
     /// Zen mode is on.
     pub zen: bool,
+    /// Another window is open: there is something for Window → Merge all windows to merge.
+    pub other_windows: bool,
 }
 
 impl MenuState {
@@ -49,10 +53,16 @@ impl MenuState {
         }
     }
 
-    /// Whether `command` can run now: the document commands need a document.
+    /// Whether `command` can run now: the document commands need a document, merging needs a
+    /// second window, saving back needs an imported word-processor file. The menus and the
+    /// command palette both ask this.
     #[must_use]
     pub fn enabled(&self, command: CommandId) -> bool {
-        self.has_document || !needs_document(command)
+        match command {
+            C::WindowMergeAll => self.other_windows,
+            C::FileSaveBackToWord => self.save_back,
+            _ => self.has_document || !needs_document(command),
+        }
     }
 }
 
@@ -64,7 +74,6 @@ fn needs_document(command: CommandId) -> bool {
             command,
             C::FileSave
                 | C::FileSaveAs
-                | C::FileSaveBackToWord
                 | C::FileVersionHistory
                 | C::FileExport
                 | C::FilePrint
@@ -212,6 +221,18 @@ const VIEW: &[Section] = &[
     Section::Items(&[C::ViewNextPane]),
 ];
 
+/// Spec §6: new window, merge all windows, and the tab commands.
+const WINDOW: &[Section] = &[
+    Section::Items(&[C::FileNewWindow, C::WindowMergeAll]),
+    Section::Items(&[
+        C::TabNew,
+        C::TabClose,
+        C::TabReopenClosed,
+        C::TabNext,
+        C::TabPrevious,
+    ]),
+];
+
 const HELP: &[Section] = &[
     Section::Items(&[C::HelpWelcome, C::HelpKeyboardShortcuts]),
     Section::Items(&[C::HelpReportIssue, C::HelpCheckForUpdates]),
@@ -263,6 +284,7 @@ pub fn build_menu(
         MenuKind::Edit => EDIT,
         MenuKind::Format => FORMAT,
         MenuKind::View => VIEW,
+        MenuKind::Window => WINDOW,
         MenuKind::Help => HELP,
     };
     let mut entries = Vec::new();
@@ -394,6 +416,28 @@ mod tests {
     }
 
     #[test]
+    fn saving_back_needs_an_imported_word_processor_document() {
+        let plain = MenuState {
+            has_document: true,
+            ..MenuState::default()
+        };
+        assert!(plain.enabled(CommandId::FileSave));
+        assert!(!plain.enabled(CommandId::FileSaveBackToWord));
+        let imported = MenuState {
+            save_back: true,
+            ..plain
+        };
+        assert!(imported.enabled(CommandId::FileSaveBackToWord));
+        let i18n = localizer_for("en");
+        let file = build_menu(MenuKind::File, &i18n, &Keymap::default(), &plain);
+        let back = items(&file)
+            .into_iter()
+            .find(|entry| entry.id == menu_id(CommandId::FileSaveBackToWord))
+            .unwrap();
+        assert!(!back.enabled);
+    }
+
+    #[test]
     fn the_help_menu_lists_the_help_commands_and_works_without_a_document() {
         let i18n = localizer_for("en");
         let keymap = Keymap::default();
@@ -431,6 +475,52 @@ mod tests {
             .filter(|entry| matches!(entry, MenuEntry::Separator))
             .count();
         assert_eq!(separators, 2);
+    }
+
+    #[test]
+    fn the_window_menu_lists_new_window_merge_all_and_the_tab_commands() {
+        let i18n = localizer_for("en");
+        let keymap = Keymap::default();
+        let menu = |other_windows: bool| {
+            let state = MenuState {
+                other_windows,
+                ..MenuState::default()
+            };
+            build_menu(MenuKind::Window, &i18n, &keymap, &state)
+        };
+        let alone = menu(false);
+        let entries = items(&alone);
+        let commands: Vec<_> = entries
+            .iter()
+            .map(|entry| command_for_menu_id(entry.id).unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                CommandId::FileNewWindow,
+                CommandId::WindowMergeAll,
+                CommandId::TabNew,
+                CommandId::TabClose,
+                CommandId::TabReopenClosed,
+                CommandId::TabNext,
+                CommandId::TabPrevious,
+            ]
+        );
+        let labels: Vec<_> = entries.iter().map(|entry| entry.label.as_str()).collect();
+        assert_eq!(labels[..2], ["New window", "Merge all windows"]);
+        assert_eq!(
+            entries[0].accelerator,
+            Some(
+                KeyChord::new(ssw_core::keymap::vk::N)
+                    .with_ctrl()
+                    .with_shift()
+            )
+        );
+        // Merging needs another window; everything else works without a document.
+        let enabled: Vec<_> = entries.iter().map(|entry| entry.enabled).collect();
+        assert_eq!(enabled, [true, false, true, true, true, true, true]);
+        let together = menu(true);
+        assert!(items(&together).iter().all(|entry| entry.enabled));
     }
 
     #[test]

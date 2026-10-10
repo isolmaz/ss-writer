@@ -280,9 +280,7 @@ pub(crate) mod testkit {
 
         pub fn node(&self, widget: &dyn Control) -> AccessNode {
             let tree = self.tree(widget);
-            tree.root()
-                .cloned()
-                .unwrap_or_else(|| panic!("widget inserted no root node"))
+            tree.root().cloned().expect("widget inserted no root node")
         }
 
         pub fn perform(&mut self, widget: &mut dyn Control, action: AccessAction) -> bool {
@@ -645,7 +643,7 @@ impl TypeAhead {
         current: Option<usize>,
         matches: impl Fn(usize, &str) -> bool,
     ) -> Option<usize> {
-        if count == 0 || self.buffer.is_empty() {
+        if count == 0 {
             return None;
         }
         let lower = self.buffer.to_lowercase();

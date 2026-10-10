@@ -1269,6 +1269,16 @@ mod tests {
     }
 
     #[test]
+    fn table_columns_follow_their_markdown_alignment() {
+        let document = doc("| a | b | c |\n|--:|:--|:-:|\n| 1 | 2 | 3 |\n");
+        let rows = document.descendants(Ns::W, "tr");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(vals(row, "jc"), ["right", "left", "center"]);
+        }
+    }
+
+    #[test]
     fn footnotes_keep_multiple_paragraphs() {
         let bytes = export("x[^1]\n\n[^1]: first\n\n    second\n");
         let notes = part(&bytes, "word/footnotes.xml");
@@ -1364,7 +1374,8 @@ mod tests {
         assert_eq!(real.len(), 2);
         // a list inside a note is flattened to its text
         assert_eq!(real[0].descendants(Ns::W, "p").len(), 2);
-        assert!(real[0].text().contains("one two"), "{}", real[0].text());
+        let first_text = real[0].text();
+        assert!(first_text.contains("one two"), "{first_text}");
         // an empty note keeps its reference mark
         assert_eq!(real[1].descendants(Ns::W, "p").len(), 1);
         assert_eq!(real[1].descendants(Ns::W, "footnoteRef").len(), 1);

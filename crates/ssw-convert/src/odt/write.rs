@@ -6,7 +6,7 @@
 //! the pictures. The `mimetype` entry comes first and is stored uncompressed.
 
 use std::collections::HashMap;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, Write};
 
 use ssw_core::markdown::ast::{
     Alignment, Block, BlockKind, CalloutKind, Inline, InlineKind, Table,
@@ -169,27 +169,21 @@ struct ImageInfo {
     height: u32,
 }
 
-fn be16(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from(u16::from_be_bytes([
-        *b.get(at)?,
-        *b.get(at + 1)?,
-    ])))
+/// The `N` bytes at `at`; `None` when the data ends before them.
+fn bytes_at<const N: usize>(b: &[u8], at: usize) -> Option<[u8; N]> {
+    b.get(at..).and_then(|rest| rest.first_chunk()).copied()
+}
+
+fn be16(b: &[u8], at: usize) -> Option<u16> {
+    bytes_at(b, at).map(u16::from_be_bytes)
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes([
-        *b.get(at)?,
-        *b.get(at + 1)?,
-        *b.get(at + 2)?,
-        *b.get(at + 3)?,
-    ]))
+    bytes_at(b, at).map(u32::from_be_bytes)
 }
 
-fn le16(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from(u16::from_le_bytes([
-        *b.get(at)?,
-        *b.get(at + 1)?,
-    ])))
+fn le16(b: &[u8], at: usize) -> Option<u16> {
+    bytes_at(b, at).map(u16::from_le_bytes)
 }
 
 /// Format and pixel size of a PNG, JPEG or GIF.
@@ -201,7 +195,12 @@ fn image_info(b: &[u8]) -> Option<ImageInfo> {
             }
             ("png", "image/png", be32(b, 16)?, be32(b, 20)?)
         } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
-            ("gif", "image/gif", le16(b, 6)?, le16(b, 8)?)
+            (
+                "gif",
+                "image/gif",
+                u32::from(le16(b, 6)?),
+                u32::from(le16(b, 8)?),
+            )
         } else if b.starts_with(&[0xFF, 0xD8]) {
             let (w, h) = jpeg_size(b)?;
             ("jpg", "image/jpeg", w, h)
@@ -223,16 +222,23 @@ fn jpeg_size(b: &[u8]) -> Option<(u32, u32)> {
         while *b.get(i)? != 0xFF {
             i += 1;
         }
-        while *b.get(i)? == 0xFF {
+        // A run of 0xFF bytes is padding before the marker byte.
+        let marker = loop {
             i += 1;
-        }
-        let marker = *b.get(i)?;
+            let byte = *b.get(i)?;
+            if byte != 0xFF {
+                break byte;
+            }
+        };
         match marker {
             0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => {
-                return Some((be16(b, i + 6)?, be16(b, i + 4)?));
+                // Height comes first in the frame header, then width.
+                let height = u32::from(be16(b, i + 4)?);
+                let width = u32::from(be16(b, i + 6)?);
+                return Some((width, height));
             }
             0x01 | 0xD0..=0xD8 => i += 1,
-            _ => i += 1 + usize::try_from(be16(b, i + 1)?).ok()?,
+            _ => i += 1 + usize::from(be16(b, i + 1)?),
         }
     }
 }
@@ -1113,26 +1119,36 @@ pub fn export_odt(
         writer.element("text:p", "Text_20_body", ParaProps::default(), "", "");
     }
 
-    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
-    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    zip.start_file("mimetype", stored)?;
-    zip.write_all(MIME.as_bytes())?;
     let parts = [
         ("META-INF/manifest.xml", manifest_xml(&writer.media)),
         ("content.xml", writer.content_xml()),
         ("styles.xml", styles_xml(options)),
         ("meta.xml", meta_xml(options)),
     ];
+    zip_package(Cursor::new(Vec::new()), &parts, &writer.media).map(Cursor::into_inner)
+}
+
+/// Writes the package into `sink`: the stored `mimetype` first, then the XML `parts` and the
+/// `Pictures/` of `media`, all deflated.
+fn zip_package<W: Write + Seek>(
+    sink: W,
+    parts: &[(&str, String)],
+    media: &[(String, &'static str, Vec<u8>)],
+) -> Result<W, ExportError> {
+    let mut zip = ZipWriter::new(sink);
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    zip.start_file("mimetype", stored)?;
+    zip.write_all(MIME.as_bytes())?;
     for (name, xml) in parts {
-        zip.start_file(name, deflated)?;
+        zip.start_file(*name, deflated)?;
         zip.write_all(xml.as_bytes())?;
     }
-    for (file, _, bytes) in &writer.media {
+    for (file, _, bytes) in media {
         zip.start_file(format!("Pictures/{file}"), deflated)?;
         zip.write_all(bytes)?;
     }
-    Ok(zip.finish()?.into_inner())
+    Ok(zip.finish()?)
 }
 
 #[cfg(test)]
@@ -1141,6 +1157,7 @@ mod tests {
 
     use super::*;
     use crate::docx::{MathImage, PageSize};
+    use crate::test_sink::Limited;
 
     fn png(w: u32, h: u32) -> Vec<u8> {
         let mut v = vec![
@@ -1165,6 +1182,67 @@ mod tests {
         v.extend_from_slice(&w.to_be_bytes());
         v.extend_from_slice(&[0; 8]);
         v
+    }
+
+    /// A resource provider without any images.
+    fn no_image(_: &str) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// A resource provider without any rendered formulas.
+    fn no_math(_: &str, _: bool) -> Option<MathImage> {
+        None
+    }
+
+    #[test]
+    fn formulas_and_images_without_a_provider_fall_back_to_text() {
+        let bytes = export_with(
+            "$x$ and ![alt](a.png)\n",
+            &ExportOptions::default(),
+            &mut no_image,
+            &mut no_math,
+        );
+        let xml = text_part(&bytes, "content.xml");
+        assert_lacks(&xml, &["draw:frame", "Pictures/"]);
+        assert!(
+            archive_names(&bytes)
+                .iter()
+                .all(|n| !n.starts_with("Pictures/"))
+        );
+    }
+
+    fn archive_names(bytes: &[u8]) -> Vec<String> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_sink_that_gives_out_at_any_byte_fails_the_package() {
+        let parts = [("content.xml", "<office:document-content/>".to_string())];
+        let media = [("image1.png".to_string(), "image/png", png(2, 2))];
+        let full = zip_package(Cursor::new(Vec::new()), &parts, &media)
+            .unwrap()
+            .into_inner();
+        // The failure lands in the mimetype, in the XML part, in the picture or in the central
+        // directory, depending on the budget; every one of them is reported.
+        for budget in 0..full.len() as u64 {
+            let sink = Limited {
+                inner: Cursor::new(Vec::new()),
+                budget,
+            };
+            let err = zip_package(sink, &parts, &media).expect_err(&format!(
+                "a budget of {budget} bytes cannot hold the package"
+            ));
+            assert!(err.to_string().contains("sink is full"), "{budget}: {err}");
+        }
+        let sink = Limited {
+            inner: Cursor::new(Vec::new()),
+            budget: full.len() as u64,
+        };
+        let written = zip_package(sink, &parts, &media).unwrap();
+        assert_eq!(written.inner.into_inner(), full);
     }
 
     fn export_with(
@@ -1266,13 +1344,20 @@ mod tests {
         assert_eq!(info(&skipping), Some(("jpg", "image/jpeg", 9, 11)));
         let mut wrong_chunk = png(5, 7);
         wrong_chunk[12] = b'X';
-        let cases: [Vec<u8>; 9] = [
+        let cases: [Vec<u8>; 15] = [
             wrong_chunk,
             png(0, 7),
             png(5, 0),
+            png(5, 7)[..18].to_vec(),
             png(5, 7)[..20].to_vec(),
             gif(0, 4),
+            b"GIF89a".to_vec(),
             b"GIF89a\x01".to_vec(),
+            b"GIF89a\x01\x00".to_vec(),
+            // a JPEG that ends in padding, before the marker, in the frame height or width
+            vec![0xFF, 0xD8, 0xFF],
+            jpeg(2, 3)[..4].to_vec(),
+            jpeg(2, 3)[..9].to_vec(),
             vec![0xFF, 0xD8, 0xFF, 0xD9, 0x00],
             vec![0xFF, 0xD8],
             b"BM nothing".to_vec(),
@@ -1559,7 +1644,6 @@ mod tests {
         );
         assert_lacks(&huge, &["draw:frame"]);
         let mut big = |_: &str| Some(png(100_000, 50_000));
-        let mut no_math = |_: &str, _: bool| -> Option<MathImage> { None };
         let bytes = export_with(
             "![](big.png)\n",
             &ExportOptions::default(),
@@ -1617,16 +1701,29 @@ mod tests {
         let mut document = parse_document(md);
         document.blocks[0].children[1].kind = BlockKind::ThematicBreak;
         let options = ExportOptions::default();
-        let mut image = |_: &str| None::<Vec<u8>>;
-        let mut math = |_: &str, _: bool| -> Option<MathImage> { None };
         let mut resources = Resources {
-            image: &mut image,
-            math: &mut math,
+            image: &mut no_image,
+            math: &mut no_math,
         };
         let mut writer = Writer::new(md, &options, &mut resources);
         writer.blocks(&document.blocks, Ctx::default());
         assert_eq!(writer.body.matches("<text:list-item>").count(), 2);
         assert_eq!(writer.body.matches("<text:list ").count(), 1);
+    }
+
+    #[test]
+    fn a_list_without_items_writes_nothing() {
+        let md = "- a\n";
+        let mut document = parse_document(md);
+        document.blocks[0].children.clear();
+        let options = ExportOptions::default();
+        let mut resources = Resources {
+            image: &mut no_image,
+            math: &mut no_math,
+        };
+        let mut writer = Writer::new(md, &options, &mut resources);
+        writer.blocks(&document.blocks, Ctx::default());
+        assert_eq!(writer.body, "");
     }
 
     #[test]
@@ -1655,11 +1752,9 @@ mod tests {
 
     #[test]
     fn text_xml_keeps_line_breaks_tabs_and_trailing_spaces() {
-        let mut image = |_: &str| -> Option<Vec<u8>> { None };
-        let mut math = |_: &str, _: bool| -> Option<MathImage> { None };
         let mut resources = Resources {
-            image: &mut image,
-            math: &mut math,
+            image: &mut no_image,
+            math: &mut no_math,
         };
         let mut writer = Writer::new("", &ExportOptions::default(), &mut resources);
         assert_eq!(
@@ -1695,7 +1790,10 @@ mod tests {
         let io = ExportError::from(std::io::Error::other("disk full"));
         assert_eq!(io, ExportError::Package("disk full".into()));
         let zip = ExportError::from(zip::result::ZipError::FileNotFound);
-        assert!(matches!(zip, ExportError::Package(_)));
+        assert_eq!(
+            zip,
+            ExportError::Package("specified file not found in archive".into())
+        );
         assert!(io.to_string().contains("disk full"));
     }
 }

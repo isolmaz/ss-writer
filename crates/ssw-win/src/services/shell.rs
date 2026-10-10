@@ -216,6 +216,10 @@ impl<H: ShellHost> Shell for WindowsShell<H> {
         .map_err(|error| failed(SERVICE, error))?;
         recycle_item(&operation, &item)
     }
+
+    fn open_default_apps_settings(&mut self) -> Result<(), ServiceError> {
+        crate::assoc::open_default_apps_settings(&mut self.host, self.owner)
+    }
 }
 
 /// Moves `item` to the Recycle Bin with `operation`, synchronously and without any

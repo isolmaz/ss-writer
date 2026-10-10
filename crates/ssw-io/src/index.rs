@@ -19,14 +19,14 @@ use std::time::UNIX_EPOCH;
 
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, Transaction, params};
 use ssw_core::markdown::ast::{
     BlockKind, ImageKind, Inline, InlineKind, LinkKind, WikiLink, iter_inlines,
 };
 use ssw_core::markdown::parse_document;
 use ssw_core::text::TextRange;
 
-use crate::store::{Store, StoreError, UnixSeconds, key_of, path_text};
+use crate::store::{Store, StoreError, UnixSeconds, key_of, path_text, query_optional, query_rows};
 
 /// Markdown files larger than this are listed but not parsed.
 pub const MAX_PARSE_BYTES: u64 = 16 * 1024 * 1024;
@@ -486,19 +486,13 @@ fn root_identity(root: &Path) -> Result<(String, String), StoreError> {
     Ok((text, key))
 }
 
-fn find_root(tx: &rusqlite::Connection, key: &str) -> Result<Option<Root>, StoreError> {
-    Ok(tx
-        .query_row(
-            "SELECT id, path FROM index_roots WHERE key = ?1",
-            [key],
-            |row| {
-                Ok(Root {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                })
-            },
-        )
-        .optional()?)
+fn find_root(conn: &Connection, key: &str) -> Result<Option<Root>, StoreError> {
+    let row: Option<(i64, String)> = query_optional(
+        conn,
+        "SELECT id, path FROM index_roots WHERE key = ?1",
+        [key],
+    )?;
+    Ok(row.map(|(id, text)| Root { id, text }))
 }
 
 /// Delete the file `rel_key`; with `children` also everything below it (it was a folder).
@@ -639,60 +633,50 @@ impl Store {
     ) -> Result<IndexStats, StoreError> {
         let (root_text, root_key) = root_identity(root)?;
         let (found, truncated) = walk(root, &root_text, opts, cancel)?;
-        let tx = self.conn.transaction()?;
-        let root_id: i64 = tx.query_row(
-            "INSERT INTO index_roots (key, path, indexed_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(key) DO UPDATE SET path = excluded.path, indexed_at = excluded.indexed_at
-             RETURNING id",
-            params![root_key, root_text, now],
-            |row| row.get(0),
-        )?;
-        let mut existing: HashMap<String, (i64, i64, bool)> = HashMap::new();
-        {
-            let mut stmt = tx.prepare(
-                "SELECT rel_key, size, mtime, placeholder FROM index_files WHERE root_id = ?1",
+        self.in_transaction(|tx| {
+            let root_id: i64 = tx.query_row(
+                "INSERT INTO index_roots (key, path, indexed_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET path = excluded.path, indexed_at = excluded.indexed_at
+                 RETURNING id",
+                params![root_key, root_text, now],
+                |row| row.get(0),
             )?;
-            let rows = stmt.query_map([root_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, bool>(3)?,
-                    ),
-                ))
-            })?;
-            for row in rows {
-                let (key, state) = row?;
-                existing.insert(key, state);
+            let rows: Vec<(String, i64, i64, bool)> = query_rows(
+                tx,
+                "SELECT rel_key, size, mtime, placeholder FROM index_files WHERE root_id = ?1",
+                [root_id],
+            )?;
+            let existing: HashMap<String, (i64, i64, bool)> = rows
+                .into_iter()
+                .map(|(key, size, mtime, placeholder)| (key, (size, mtime, placeholder)))
+                .collect();
+            let mut stats = IndexStats {
+                truncated,
+                ..IndexStats::default()
+            };
+            let mut seen = HashSet::new();
+            for file in &found {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(StoreError::Cancelled);
+                }
+                let rel_key = key_of(&file.rel);
+                let placeholder = is_placeholder(&file.path);
+                stats.placeholders += usize::from(placeholder);
+                let unchanged = existing
+                    .get(&rel_key)
+                    .is_some_and(|state| *state == (file.size, file.mtime, placeholder));
+                if !unchanged && store_file(tx, root_id, file, placeholder)? {
+                    stats.parsed += 1;
+                }
+                seen.insert(rel_key);
             }
-        }
-        let mut stats = IndexStats {
-            truncated,
-            ..IndexStats::default()
-        };
-        let mut seen = HashSet::new();
-        for file in &found {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(StoreError::Cancelled);
+            for key in existing.keys().filter(|key| !seen.contains(*key)) {
+                stats.removed += remove_path(tx, root_id, key, false)?;
             }
-            let rel_key = key_of(&file.rel);
-            let placeholder = is_placeholder(&file.path);
-            stats.placeholders += usize::from(placeholder);
-            let unchanged = existing
-                .get(&rel_key)
-                .is_some_and(|state| *state == (file.size, file.mtime, placeholder));
-            if !unchanged && store_file(&tx, root_id, file, placeholder)? {
-                stats.parsed += 1;
-            }
-            seen.insert(rel_key);
-        }
-        for key in existing.keys().filter(|key| !seen.contains(*key)) {
-            stats.removed += remove_path(&tx, root_id, key, false)?;
-        }
-        stats.files = count_files(&tx, root_id)?;
-        tx.commit()?;
-        Ok(stats)
+            // The count reads the table the statements above just wrote, so it cannot fail where
+            // they succeeded; a failure would simply travel on.
+            count_files(tx, root_id).map(|files| IndexStats { files, ..stats })
+        })
     }
 
     /// Apply file-system events to the index of `root` (see [`IndexChange`]). Does nothing
@@ -708,72 +692,73 @@ impl Store {
         is_placeholder: &dyn Fn(&Path) -> bool,
     ) -> Result<IndexStats, StoreError> {
         let (_, root_key) = root_identity(root)?;
-        let tx = self.conn.transaction()?;
-        let Some(found_root) = find_root(&tx, &root_key)? else {
-            return Ok(IndexStats::default());
-        };
-        let mut stats = IndexStats::default();
-        let mut count = count_files(&tx, found_root.id)?;
-        for change in changes {
-            let (path, removed) = match change {
-                IndexChange::Changed(path) => (path, false),
-                IndexChange::Removed(path) => (path, true),
+        self.in_transaction(|tx| {
+            let Some(found_root) = find_root(tx, &root_key)? else {
+                return Ok(IndexStats::default());
             };
-            let Some(rel) = relative_path(&found_root.text, path_text(path)?) else {
-                continue;
-            };
-            let metadata = match std::fs::metadata(path) {
-                Ok(metadata) if !removed => metadata,
-                _ => {
-                    stats.removed += remove_path(&tx, found_root.id, &key_of(&rel), true)?;
+            let mut stats = IndexStats::default();
+            let mut count = count_files(tx, found_root.id)?;
+            for change in changes {
+                let (path, removed) = match change {
+                    IndexChange::Changed(path) => (path, false),
+                    IndexChange::Removed(path) => (path, true),
+                };
+                let Some(rel) = relative_path(&found_root.text, path_text(path)?) else {
                     continue;
+                };
+                let metadata = match std::fs::metadata(path) {
+                    Ok(metadata) if !removed => metadata,
+                    _ => {
+                        stats.removed += remove_path(tx, found_root.id, &key_of(&rel), true)?;
+                        continue;
+                    }
+                };
+                let mut candidates = Vec::new();
+                if metadata.is_dir() {
+                    for entry in WalkBuilder::new(path)
+                        .standard_filters(false)
+                        .build()
+                        .flatten()
+                    {
+                        if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                            candidates.extend(found_from(&found_root.text, &entry));
+                        }
+                    }
+                } else {
+                    candidates.push(Found {
+                        rel: rel.clone(),
+                        path: path.clone(),
+                        size: metadata.len() as i64,
+                        mtime: modified_millis(&metadata),
+                    });
                 }
-            };
-            let mut candidates = Vec::new();
-            if metadata.is_dir() {
-                for entry in WalkBuilder::new(path)
-                    .standard_filters(false)
-                    .build()
-                    .flatten()
-                {
-                    if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                        candidates.extend(found_from(&found_root.text, &entry));
+                for candidate in candidates {
+                    let rel_key = key_of(&candidate.rel);
+                    if !is_included(Path::new(&found_root.text), &candidate.rel, opts) {
+                        stats.removed += remove_path(tx, found_root.id, &rel_key, false)?;
+                        continue;
+                    }
+                    let known: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM index_files WHERE root_id = ?1 AND rel_key = ?2)",
+                        params![found_root.id, rel_key],
+                        |row| row.get(0),
+                    )?;
+                    if !known && count >= opts.max_files {
+                        stats.truncated = true;
+                        continue;
+                    }
+                    count += usize::from(!known);
+                    let placeholder = is_placeholder(&candidate.path);
+                    stats.placeholders += usize::from(placeholder);
+                    if store_file(tx, found_root.id, &candidate, placeholder)? {
+                        stats.parsed += 1;
                     }
                 }
-            } else {
-                candidates.push(Found {
-                    rel: rel.clone(),
-                    path: path.clone(),
-                    size: metadata.len() as i64,
-                    mtime: modified_millis(&metadata),
-                });
             }
-            for candidate in candidates {
-                let rel_key = key_of(&candidate.rel);
-                if !is_included(Path::new(&found_root.text), &candidate.rel, opts) {
-                    stats.removed += remove_path(&tx, found_root.id, &rel_key, false)?;
-                    continue;
-                }
-                let known: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM index_files WHERE root_id = ?1 AND rel_key = ?2)",
-                    params![found_root.id, rel_key],
-                    |row| row.get(0),
-                )?;
-                if !known && count >= opts.max_files {
-                    stats.truncated = true;
-                    continue;
-                }
-                count += usize::from(!known);
-                let placeholder = is_placeholder(&candidate.path);
-                stats.placeholders += usize::from(placeholder);
-                if store_file(&tx, found_root.id, &candidate, placeholder)? {
-                    stats.parsed += 1;
-                }
-            }
-        }
-        stats.files = count_files(&tx, found_root.id)?;
-        tx.commit()?;
-        Ok(stats)
+            // The first count above read this table already, so this one cannot fail; a failure
+            // would simply travel on.
+            count_files(tx, found_root.id).map(|files| IndexStats { files, ..stats })
+        })
     }
 
     /// Drop the index of `root`.
@@ -796,24 +781,25 @@ impl Store {
         let Some(found_root) = find_root(&self.conn, &root_key)? else {
             return Ok(Vec::new());
         };
-        let mut stmt = self.conn.prepare(
+        let rows: Vec<(String, i64, i64, bool, bool)> = query_rows(
+            &self.conn,
             "SELECT rel, size, mtime, markdown, placeholder FROM index_files
              WHERE root_id = ?1 ORDER BY rel_key",
+            [found_root.id],
         )?;
-        let files = stmt
-            .query_map([found_root.id], |row| {
-                let rel: String = row.get(0)?;
-                Ok(IndexedFile {
+        Ok(rows
+            .into_iter()
+            .map(
+                |(rel, size, modified_ms, markdown, placeholder)| IndexedFile {
                     path: PathBuf::from(format!("{}\\{}", found_root.text, rel.replace('/', "\\"))),
                     rel,
-                    size: row.get::<_, i64>(1)? as u64,
-                    modified_ms: row.get(2)?,
-                    markdown: row.get(3)?,
-                    placeholder: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(files)
+                    size: size as u64,
+                    modified_ms,
+                    markdown,
+                    placeholder,
+                },
+            )
+            .collect())
     }
 
     /// Headings of `file` in document order. Empty when the file is unknown or not parsed.
@@ -832,21 +818,21 @@ impl Store {
         let Some(rel) = relative_path(&found_root.text, path_text(file)?) else {
             return Ok(Vec::new());
         };
-        let mut stmt = self.conn.prepare(
+        let rows: Vec<(u8, String, i64)> = query_rows(
+            &self.conn,
             "SELECT h.level, h.text, h.pos FROM index_headings h
              JOIN index_files f ON f.id = h.file_id
              WHERE f.root_id = ?1 AND f.rel_key = ?2 ORDER BY h.ord",
+            params![found_root.id, key_of(&rel)],
         )?;
-        let headings = stmt
-            .query_map(params![found_root.id, key_of(&rel)], |row| {
-                Ok(IndexedHeading {
-                    level: row.get(0)?,
-                    text: row.get(1)?,
-                    offset: row.get::<_, i64>(2)? as usize,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(headings)
+        Ok(rows
+            .into_iter()
+            .map(|(level, text, offset)| IndexedHeading {
+                level,
+                text,
+                offset: offset as usize,
+            })
+            .collect())
     }
 
     /// Every link site in `root` that points at `target`: wikilinks, relative Markdown links,
@@ -865,25 +851,16 @@ impl Store {
         };
         let target_key = key_of(&rel);
         let (stem_key, name_key, wiki_key) = file_keys(&target_key);
-        let mut stmt = self.conn.prepare(
+        // (rel, wiki, target, target_key, heading, range_start, range_end)
+        type LinkRow = (String, bool, String, String, Option<String>, i64, i64);
+        let rows: Vec<LinkRow> = query_rows(
+            &self.conn,
             "SELECT f.rel, l.wiki, l.target, l.target_key, l.heading, l.range_start, l.range_end
              FROM index_links l JOIN index_files f ON f.id = l.file_id
              WHERE f.root_id = ?1 AND l.leaf_key IN (?2, ?3)
              ORDER BY f.rel_key, l.ord",
+            params![found_root.id, stem_key, name_key],
         )?;
-        let rows = stmt
-            .query_map(params![found_root.id, stem_key, name_key], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, bool>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)? as usize,
-                    row.get::<_, i64>(6)? as usize,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
         let wiki_suffix = format!("\\{wiki_key}");
         Ok(rows
             .into_iter()
@@ -899,7 +876,7 @@ impl Store {
                 wiki,
                 target,
                 heading,
-                range: TextRange::new(start, end),
+                range: TextRange::new(start as usize, end as usize),
             })
             .collect())
     }
@@ -919,5 +896,39 @@ impl Store {
             }
         }
         Ok(sources)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_is_what_a_reader_sees_of_every_kind_of_inline() {
+        // (Markdown paragraph, what a reader reads). Headings are ATX lines, so line breaks
+        // cannot occur in them; the paragraphs here are the way to reach every kind.
+        let cases = [
+            ("plain", "plain"),
+            ("a\\*b", "a*b"),
+            ("x $m$ y", "x m y"),
+            ("see [[Note]] now", "see Note now"),
+            ("1 &amp; 2", "1 & 2"),
+            ("`code` here", "code here"),
+            ("one\ntwo", "one two"),
+            ("one  \ntwo", "one two"),
+            ("one\\\ntwo", "one two"),
+            ("**s** *e* ~u~ ~~x~~ ==h==", "s e u x h"),
+            ("a [l *m*](n.md) b", "a l m b"),
+            ("a![o](p.png)b", "ab"),
+            ("a[^1]b\n\n[^1]: note\n", "ab"),
+            ("a<s>b", "ab"),
+        ];
+        for (src, expected) in cases {
+            let document = parse_document(src);
+            let block = document.iter_blocks().next().unwrap();
+            let mut out = String::new();
+            plain_text(&block.inlines, src, &mut out);
+            assert_eq!(out, expected, "{src:?}");
+        }
     }
 }

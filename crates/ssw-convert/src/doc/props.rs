@@ -2,7 +2,7 @@
 //! distilled from them (only what Markdown can use), and the PlcBteChpx / PlcBtePapx FKP pages
 //! that attach them to CP ranges.
 
-use super::fib::{Result, slice, u32_at};
+use super::fib::{Result, le32, slice};
 use super::pieces::Pieces;
 
 // ---- sprm iteration ---------------------------------------------------------------------
@@ -285,11 +285,12 @@ pub(super) fn read_runs(
         return Ok(Vec::new());
     }
     let plc = slice(src.table, fc as usize, lcb as usize)?;
+    // n + 1 CPs, then n page numbers: `plc` holds at least 4 + 8 * n bytes
     let n = (lcb as usize - 4) / 8;
     let mut runs = Vec::new();
     let mut cps = Vec::new();
-    for i in 0..n {
-        let pn = u32_at(plc, (n + 1) * 4 + i * 4)? & 0x003F_FFFF;
+    for pn in plc[(n + 1) * 4..].as_chunks::<4>().0.iter().take(n) {
+        let pn = le32(pn) & 0x003F_FFFF;
         let Some(page) = (pn as usize)
             .checked_mul(512)
             .and_then(|o| src.word.get(o..o + 512))
@@ -307,8 +308,9 @@ pub(super) fn read_runs(
             continue;
         }
         for r in 0..crun {
-            let fa = u32_at(page, r * 4)?;
-            let fb = u32_at(page, (r + 1) * 4)?;
+            // (`(crun + 1) * 4 <= 511`: the CP array lies inside the 512-byte page)
+            let fa = le32(&page[r * 4..]);
+            let fb = le32(&page[(r + 1) * 4..]);
             let parsed = match kind {
                 Kind::Chpx => chpx_at(page, crun, r),
                 Kind::Papx => Some(papx_at(page, crun, r, src.data)),
@@ -556,6 +558,8 @@ mod tests {
         }
         g.extend(sprm(CHP_CISTD, &[9, 0]));
         g.extend(sprm(CHP_CPICLOCATION, &[5, 0, 0, 0]));
+        // a sprm that is not a character property is skipped
+        g.extend(sprm(0x2000 | 0x0123, &[0]));
         g.extend(sprm(CHP_CSYMBOL, &[1, 0, 0x41, 0xF0]));
         g.extend(sprm(CHP_CSYMBOL, &[1, 0]));
         let mut c = Chp::default();
@@ -728,6 +732,22 @@ mod tests {
             read_runs(Kind::Papx, &src, 0, table2.len() as u32, &mut bad).unwrap();
             assert_eq!(bad, 1);
         }
+    }
+
+    #[test]
+    fn huge_grpprl_needs_every_byte_it_declares() {
+        // PrcData: cb = 5, then istd (2 bytes) and the grpprl
+        let data = [5u8, 0, 9, 9, 1, 2, 3];
+        assert_eq!(huge_grpprl(&data, 0), Some(vec![1, 2, 3]));
+        assert_eq!(huge_grpprl(&data, 100), None, "no length at all");
+        assert_eq!(huge_grpprl(&data, 6), None, "length cut in half");
+        assert_eq!(
+            huge_grpprl(&[6, 0, 1, 2], 0),
+            None,
+            "declares more than there is"
+        );
+        assert_eq!(huge_grpprl(&[1, 0, 7], 0), None, "no room for the istd");
+        assert_eq!(huge_grpprl(&[2, 0, 7, 7], 0), Some(Vec::new()), "istd only");
     }
 
     #[test]

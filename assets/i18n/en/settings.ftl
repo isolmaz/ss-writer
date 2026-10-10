@@ -31,6 +31,9 @@ settings-opt-new-file-selected = Selected folder
 settings-opt-new-file-default = Default folder
 settings-general-sync-file-name = Sync file name with first heading
 settings-general-check-updates = Check for updates
+settings-general-default-apps = Default app
+settings-general-default-apps-hint = Opens Windows Settings, where you choose the app that opens Markdown and text files.
+settings-general-default-apps-button = Default apps…
 
 # --- Appearance --------------------------------------------------------------------------------
 settings-appearance-theme = Theme

@@ -19,6 +19,7 @@ mod notices;
 mod package;
 mod perf;
 mod run;
+mod screenshots;
 mod winget;
 mod wix;
 mod workspace;
@@ -41,6 +42,7 @@ fn execute(args: impl Iterator<Item = String>) -> Result<(), Error> {
         Command::DocsCheck { strict } => docs_check::run(&Workspace::locate()?, strict),
         Command::Icons => icons::run(&Workspace::locate()?),
         Command::Perf(args) => perf::run(&Workspace::locate()?, &args),
+        Command::Screenshots(args) => screenshots::run(&Workspace::locate()?, &args),
     }
 }
 

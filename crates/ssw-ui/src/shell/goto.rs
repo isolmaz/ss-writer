@@ -359,10 +359,11 @@ impl Widget for GoToLine {
         }
         let id = self.input.id();
         self.input.access(&cx.for_widget(id), out);
-        if let Some(mut node) = out.node(id).cloned() {
+        // `access` just put the text box's node into the tree.
+        out.node(id).cloned().into_iter().for_each(|mut node| {
             node.description = self.hint_text();
             out.insert(node);
-        }
+        });
         out.insert(AccessNode::new(
             self.hint_id,
             Role::Text,

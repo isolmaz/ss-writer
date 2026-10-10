@@ -439,10 +439,12 @@ impl BannerHost {
                             action,
                         }),
                         Slot::ToggleDetails => {
-                            if let Some(details) = entry.details.as_mut() {
-                                details.expanded = !details.expanded;
-                                resized = true;
-                            }
+                            // Only the import banner has this slot, and it always has details.
+                            resized |= entry
+                                .details
+                                .as_mut()
+                                .map(|details| details.expanded = !details.expanded)
+                                .is_some();
                         }
                     },
                     BannerEvent::Closed => closed.push(entry.kind),

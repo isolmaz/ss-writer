@@ -1,5 +1,6 @@
-//! Context menus (spec §2.6, §3.1, §5, §6): the tab menu, the sidebar item / root / header menus
-//! and the editor menus (plain edit menu, spelling suggestions, table cell menu, callout type).
+//! Context menus (spec §2.6, §3.1, §4.2, §5, §6, §8): the tab menu, the sidebar item / root /
+//! header menus, the editor menus (plain edit menu, spelling suggestions, table cell menu, callout
+//! type) and the status bar's encoding and line-ending menus.
 //!
 //! A window callback never shows a menu. The loop owner turns a [`ShellAction`] into a
 //! [`Popup`] with [`Controller::popup_for`], shows [`Popup::model`] at [`Popup::at`] with
@@ -17,6 +18,7 @@ use ssw_core::keymap::Keymap;
 use ssw_core::markdown::ast::CalloutKind;
 use ssw_core::ops::blocks;
 use ssw_core::text::TextRange;
+use ssw_io::encoding::{LineEnding, TextEncoding, TextFormat};
 use ssw_io::fileops::{self, FileOpError, NameError};
 use ssw_ui::editor::EditorEvent;
 use ssw_ui::editor::blocks_media::MediaEvent;
@@ -26,9 +28,10 @@ use ssw_ui::services::{
     ClipboardContent, MessageBoxButtons, MessageBoxIcon, MessageBoxOptions, MessageBoxResult,
 };
 use ssw_ui::shell::sidebar::{HeaderMenu, NodeKey, SidebarEntry, SidebarEvent};
+use ssw_ui::shell::statusbar::StatusEvent;
 use ssw_ui::shell::tabs::{TabMenu, TabsEvent};
 use ssw_ui::shell::titlebar::TitleEvent;
-use ssw_win::menus::{MenuEntry, MenuItem, MenuModel};
+use ssw_win::menus::{MenuEntry, MenuItem, MenuModel, Submenu};
 
 use CommandId as C;
 
@@ -36,7 +39,7 @@ use super::controller::{Controller, WindowCell};
 use super::export::DiagramFormat;
 use super::menus::menu_id;
 use super::shell_view::ShellAction;
-use crate::documents::{DocError, canonical_path};
+use crate::documents::{DocEntry, DocError, Source, canonical_path};
 use crate::workers::WindowId;
 
 /// Ids of menu items that are not commands start here (above every command id).
@@ -82,6 +85,17 @@ pub enum Action {
         /// The chosen type.
         kind: CalloutKind,
     },
+    /// Read the active document's file again, decoded as this encoding.
+    ReopenWithEncoding(TextEncoding),
+    /// Write the active document in this encoding from now on.
+    SaveWithEncoding {
+        /// The encoding.
+        encoding: TextEncoding,
+        /// Whether a byte-order mark is written.
+        bom: bool,
+    },
+    /// Write the active document with these line endings from now on.
+    LineEnding(LineEnding),
 }
 
 /// A popup menu to show: the model, where, and what each item does.
@@ -167,6 +181,22 @@ impl<'a> Builder<'a> {
         if let Some(action) = action {
             self.actions.push((id, action));
         }
+    }
+
+    /// A submenu whose items `fill` adds. A disabled submenu offers no actions.
+    fn submenu(&mut self, label: String, enabled: bool, fill: impl FnOnce(&mut Self)) {
+        let outer = std::mem::take(&mut self.entries);
+        let known = self.actions.len();
+        fill(self);
+        if !enabled {
+            self.actions.truncate(known);
+        }
+        let children = std::mem::replace(&mut self.entries, outer);
+        let mut submenu = Submenu::new(label, children);
+        if !enabled {
+            submenu = submenu.disabled();
+        }
+        self.entries.push(MenuEntry::Submenu(submenu));
     }
 
     fn finish(mut self, at: Point) -> Popup {
@@ -391,9 +421,104 @@ pub fn callout_menu(
     builder.finish(below(anchor))
 }
 
+/// What the encoding and line-ending menus of the status bar (spec §4.2, §8) need to know about
+/// the active document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatMenu {
+    /// Encoding, BOM and line endings the document is written with.
+    pub format: TextFormat,
+    /// A plain text file: only then are encoding and line endings the file's own (a document
+    /// imported from Word, ODT or RTF, or a bundle, is written by its own converter).
+    pub text_file: bool,
+    /// The document has a file that can be read again.
+    pub on_disk: bool,
+}
+
+/// The status bar's encoding menu: "Reopen with encoding" (decode the file again) and "Save with
+/// encoding" (write the document in another one), each listing [`TextEncoding::selectable`].
+#[must_use]
+pub fn encoding_menu(menu: FormatMenu, anchor: Rect, i18n: &Localizer, keymap: &Keymap) -> Popup {
+    let mut builder = Builder::new(i18n, keymap);
+    let encodings = TextEncoding::selectable();
+    builder.submenu(
+        i18n.text("window-menu-reopen-encoding"),
+        menu.text_file && menu.on_disk,
+        |builder| {
+            for &encoding in &encodings {
+                let current = menu.format.encoding == encoding;
+                builder.custom(
+                    encoding.name().to_owned(),
+                    move |item| if current { item.radio() } else { item },
+                    Some(Action::ReopenWithEncoding(encoding)),
+                );
+            }
+        },
+    );
+    builder.submenu(
+        i18n.text("window-menu-save-encoding"),
+        menu.text_file,
+        |builder| {
+            for &encoding in &encodings {
+                // UTF-8 is written with or without a byte-order mark; UTF-16 and UTF-32 always
+                // with one, the legacy code pages never.
+                let marks: &[bool] = match encoding {
+                    TextEncoding::Utf8 => &[false, true],
+                    other if other.supports_bom() => &[true],
+                    _ => &[false],
+                };
+                for &bom in marks {
+                    let label = if bom && encoding == TextEncoding::Utf8 {
+                        i18n.format(
+                            "window-encoding-bom",
+                            &[("name", Arg::Str(encoding.name()))],
+                        )
+                    } else {
+                        encoding.name().to_owned()
+                    };
+                    let current = menu.format.encoding == encoding && menu.format.bom == bom;
+                    builder.custom(
+                        label,
+                        move |item| if current { item.radio() } else { item },
+                        Some(Action::SaveWithEncoding { encoding, bom }),
+                    );
+                }
+            }
+        },
+    );
+    builder.finish(below(anchor))
+}
+
+/// The status bar's line-ending menu: LF, CRLF, CR, the document's current style marked.
+#[must_use]
+pub fn line_ending_menu(
+    menu: FormatMenu,
+    anchor: Rect,
+    i18n: &Localizer,
+    keymap: &Keymap,
+) -> Popup {
+    let mut builder = Builder::new(i18n, keymap);
+    for (label, line_ending) in [
+        ("statusbar-eol-lf", LineEnding::Lf),
+        ("statusbar-eol-crlf", LineEnding::Crlf),
+        ("statusbar-eol-cr", LineEnding::Cr),
+    ] {
+        let current = menu.format.line_ending == line_ending;
+        let enabled = menu.text_file;
+        builder.custom(
+            i18n.text(label),
+            move |item| {
+                let item = if current { item.radio() } else { item };
+                if enabled { item } else { item.disabled() }
+            },
+            enabled.then_some(Action::LineEnding(line_ending)),
+        );
+    }
+    builder.finish(below(anchor))
+}
+
 impl Controller {
-    /// The popup menu `action` asks for (tab, sidebar, editor, spelling, table, callout), if it
-    /// is a menu request.
+    /// The popup menu `action` asks for (tab, sidebar, editor, spelling, table, callout, status
+    /// bar), if it is a menu request.
     #[must_use]
     pub fn popup_for(&self, window: WindowId, action: &ShellAction) -> Option<Popup> {
         let cell = self.window(window)?;
@@ -446,8 +571,23 @@ impl Controller {
                     anchor,
                 },
             ) => Some(callout_menu(*range, *kind, *anchor, i18n, &keymap)),
+            ShellAction::Status(StatusEvent::EncodingClicked { anchor }) => {
+                Self::format_menu(&cell).map(|menu| encoding_menu(menu, *anchor, i18n, &keymap))
+            }
+            ShellAction::Status(StatusEvent::LineEndingClicked { anchor }) => {
+                Self::format_menu(&cell).map(|menu| line_ending_menu(menu, *anchor, i18n, &keymap))
+            }
             _ => None,
         }
+    }
+
+    /// What the status bar menus need to know about the active document of `cell`.
+    fn format_menu(cell: &WindowCell) -> Option<FormatMenu> {
+        cell.view.borrow().active_tab().map(|tab| FormatMenu {
+            format: tab.entry.format(),
+            text_file: tab.entry.source() == Source::Text,
+            on_disk: tab.entry.path().is_some(),
+        })
     }
 
     /// Carries out the item `id` the user chose in `popup` (window `window`).
@@ -486,8 +626,51 @@ impl Controller {
                     }
                 }
             }
+            Action::ReopenWithEncoding(encoding) => self.reopen_with_encoding(&cell, encoding),
+            Action::SaveWithEncoding { encoding, bom } => {
+                if let Some(tab) = cell.view.borrow().active_tab() {
+                    tab.entry.set_save_encoding(encoding, bom);
+                }
+            }
+            Action::LineEnding(line_ending) => {
+                if let Some(tab) = cell.view.borrow().active_tab() {
+                    tab.entry.set_save_line_ending(line_ending);
+                }
+            }
         }
         self.refresh(&cell);
+    }
+
+    /// Reads the active document's file again as `encoding` (spec §4.2). Unsaved changes are
+    /// replaced by the file's text, so they are confirmed first.
+    fn reopen_with_encoding(&self, cell: &Rc<WindowCell>, encoding: TextEncoding) {
+        let entry = cell
+            .view
+            .borrow()
+            .active_tab()
+            .map(|tab| Rc::clone(&tab.entry));
+        // The menu is only offered for an active document.
+        if let Some(entry) = entry
+            && (!entry.is_dirty() || self.confirm_discarding(&entry))
+            && let Err(error) = self.docs().reload_as(&entry, encoding)
+        {
+            self.report(&error);
+        }
+    }
+
+    /// Asks whether the unsaved changes of `entry` may be replaced by the text of its file.
+    fn confirm_discarding(&self, entry: &DocEntry) -> bool {
+        let name = entry.title(self.i18n());
+        let answer = self.dialogs.borrow_mut().message_box(&MessageBoxOptions {
+            title: self.i18n().text("window-reopen-discard-title"),
+            message: self.i18n().format(
+                "window-reopen-discard-message",
+                &[("name", Arg::Str(&name))],
+            ),
+            buttons: MessageBoxButtons::YesNo,
+            icon: Some(MessageBoxIcon::Warning),
+        });
+        matches!(answer, Ok(MessageBoxResult::Yes))
     }
 
     /// The sidebar events that are file operations rather than menus: a committed rename and

@@ -5,7 +5,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::rc::Rc;
 
-use windows::Win32::Foundation::{E_FAIL, HWND};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::TextServices::{
     CLSID_TF_ThreadMgr, ITfCompositionView, ITfContext, ITfContextOwnerCompositionServices,
@@ -15,7 +15,8 @@ use windows::Win32::UI::TextServices::{
 use windows::core::{HRESULT, IUnknown, Interface, Result, implement};
 
 use super::{TextStore, TextStoreHost};
-use crate::com::{OsResultExt, WinError};
+use crate::com::{OsResultExt, WinError, delivered};
+use crate::fault::check;
 
 /// The body of an edit session: runs once with the edit cookie.
 type EditBody = Box<dyn FnOnce(u32) -> Result<()>>;
@@ -36,8 +37,8 @@ impl ITfEditSession_Impl for ClosureSession_Impl {
     }
 }
 
-/// The activated thread manager. Deactivates it when dropped, whichever way setup or teardown
-/// ends.
+/// The thread manager that setup activates. Deactivates it when dropped, whichever way setup or
+/// teardown ends.
 struct ActiveThreadMgr(ITfThreadMgr);
 
 impl Deref for ActiveThreadMgr {
@@ -50,7 +51,7 @@ impl Deref for ActiveThreadMgr {
 
 impl Drop for ActiveThreadMgr {
     fn drop(&mut self) {
-        // SAFETY: balances the successful `Activate`; a failure leaves nothing to clean up.
+        // SAFETY: balances the `Activate` of setup; a failure leaves nothing to clean up.
         let _ = unsafe { self.0.Deactivate() };
     }
 }
@@ -93,12 +94,13 @@ impl TextServices {
     pub fn new(hwnd: HWND, host: Rc<dyn TextStoreHost>) -> std::result::Result<Self, WinError> {
         // SAFETY: plain in-process activation of the system thread manager.
         let thread_mgr: ITfThreadMgr =
-            unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER) }
+            check(unsafe { CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER) })
                 .ctx("CoCreateInstance(TF_ThreadMgr)")?;
-        // SAFETY: plain call on the live thread manager.
-        let client_id = unsafe { thread_mgr.Activate() }.ctx("ITfThreadMgr::Activate")?;
-        // From here on the guard deactivates the manager, also when `attach` fails.
+        // From here on the guard deactivates the manager whichever way setup ends (its result
+        // is ignored), so no activation outlives a failed `Activate` or `attach`.
         let thread_mgr = ActiveThreadMgr(thread_mgr);
+        // SAFETY: plain call on the live thread manager.
+        let client_id = check(unsafe { thread_mgr.Activate() }).ctx("ITfThreadMgr::Activate")?;
         let (store, doc_mgr, context, edit_sink_cookie) =
             Self::attach(&thread_mgr, client_id, hwnd, host)?;
         Ok(Self {
@@ -121,28 +123,26 @@ impl TextServices {
         host: Rc<dyn TextStoreHost>,
     ) -> std::result::Result<(TextStore, ITfDocumentMgr, ITfContext, u32), WinError> {
         let store = TextStore::new(hwnd, host);
-        let unknown: IUnknown = store.interface().cast().ctx("QueryInterface(IUnknown)")?;
+        let unknown: IUnknown =
+            check(store.interface().cast::<IUnknown>()).ctx("QueryInterface(IUnknown)")?;
         // SAFETY: plain calls on live interfaces; the out parameters are valid for the calls.
         unsafe {
-            let doc_mgr = thread_mgr
-                .CreateDocumentMgr()
-                .ctx("ITfThreadMgr::CreateDocumentMgr")?;
+            let doc_mgr =
+                check(thread_mgr.CreateDocumentMgr()).ctx("ITfThreadMgr::CreateDocumentMgr")?;
             let mut context: Option<ITfContext> = None;
             let mut text_store_cookie = 0u32;
-            doc_mgr
-                .CreateContext(client_id, 0, &unknown, &mut context, &mut text_store_cookie)
-                .ctx("ITfDocumentMgr::CreateContext")?;
-            let context = context
-                .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))
-                .ctx("ITfDocumentMgr::CreateContext")?;
+            let created =
+                doc_mgr.CreateContext(client_id, 0, &unknown, &mut context, &mut text_store_cookie);
+            let context =
+                delivered(check(created), context).ctx("ITfDocumentMgr::CreateContext")?;
             // Our object is also the text-edit sink: it reads the IME's display attributes at
             // the end of every edit.
-            let source: ITfSource = context.cast().ctx("QueryInterface(ITfSource)")?;
-            let edit_sink_cookie = source
-                .AdviseSink(&ITfTextEditSink::IID, &unknown)
+            let source: ITfSource =
+                check(context.cast::<ITfSource>()).ctx("QueryInterface(ITfSource)")?;
+            let edit_sink_cookie = check(source.AdviseSink(&ITfTextEditSink::IID, &unknown))
                 .ctx("ITfSource::AdviseSink(ITfTextEditSink)")?;
             // TSF calls `ITextStoreACP2::AdviseSink` here.
-            doc_mgr.Push(&context).ctx("ITfDocumentMgr::Push")?;
+            check(doc_mgr.Push(&context)).ctx("ITfDocumentMgr::Push")?;
             // The previous focus document manager is a null out parameter when the window had
             // none; windows-rs reports that as an "empty" error (HRESULT 0), not a failure.
             let _ = thread_mgr.AssociateFocus(hwnd, &doc_mgr);
@@ -200,10 +200,9 @@ impl TextServices {
     /// # Errors
     /// Fails when TSF rejects the request.
     pub fn terminate_composition(&self) -> std::result::Result<(), WinError> {
-        let services: ITfContextOwnerCompositionServices = self
-            .context
-            .cast()
-            .ctx("QueryInterface(ITfContextOwnerCompositionServices)")?;
+        let services: ITfContextOwnerCompositionServices =
+            check(self.context.cast::<ITfContextOwnerCompositionServices>())
+                .ctx("QueryInterface(ITfContextOwnerCompositionServices)")?;
         // SAFETY: plain call on the live composition services; a null view terminates all.
         unsafe { services.TerminateComposition(None::<&ITfCompositionView>) }
             .ctx("ITfContextOwnerCompositionServices::TerminateComposition")
@@ -216,7 +215,7 @@ impl Drop for TextServices {
         // SAFETY: plain calls on live interfaces during teardown; failures leave nothing to
         // clean up (the window or thread is going away).
         unsafe {
-            if let Ok(source) = self.context.cast::<ITfSource>() {
+            if let Ok(source) = check(self.context.cast::<ITfSource>()) {
                 let _ = source.UnadviseSink(self.edit_sink_cookie);
             }
             let _ = self

@@ -1708,6 +1708,11 @@ fn uia_provider_scroll_pattern_reads_and_requests_percentages() {
     assert!(fixture.sink.take().is_empty());
     let plain: IScrollProvider = child_named(&root, "Plain").cast().expect("scroll");
     assert_code(uia!(plain.HorizontalScrollPercent()), NOT_SUPPORTED);
+    assert_code(uia!(plain.VerticalScrollPercent()), NOT_SUPPORTED);
+    assert_code(uia!(plain.HorizontalViewSize()), NOT_SUPPORTED);
+    assert_code(uia!(plain.VerticalViewSize()), NOT_SUPPORTED);
+    assert_code(uia!(plain.HorizontallyScrollable()), NOT_SUPPORTED);
+    assert_code(uia!(plain.VerticallyScrollable()), NOT_SUPPORTED);
     assert_code(
         uia!(plain.Scroll(ScrollAmount_NoAmount, ScrollAmount_NoAmount)),
         NOT_SUPPORTED,
@@ -1801,6 +1806,10 @@ fn uia_text_provider_ranges_compare_move_scroll_and_report_geometry() {
     // Without a registered source the editor offers no text.
     assert_code(uia!(text.DocumentRange()), NOT_SUPPORTED);
     assert_code(uia!(text.GetSelection()), NOT_SUPPORTED);
+    assert_code(
+        uia!(text.RangeFromPoint(UiaPoint { x: 0.0, y: 0.0 })),
+        NOT_SUPPORTED,
+    );
     let button: ITextProvider = child_named(&fixture.bridge.root_provider(), "Save")
         .cast()
         .expect("text");
@@ -1958,6 +1967,18 @@ fn uia_text_provider_ranges_compare_move_scroll_and_report_geometry() {
         uia!(selected.GetAttributeValue(UIA_FontNameAttributeId)),
         NOT_SUPPORTED,
     );
+    // Once the editor left the tree, its range has no element and the text pattern no text.
+    let mut gone = AccessTree::new(fixture.ids.root);
+    gone.insert(AccessNode::new(
+        fixture.ids.root,
+        Role::Window,
+        "SS Writer",
+        Rect::new(0.0, 0.0, 640.0, 480.0),
+    ));
+    publish(&fixture, gone);
+    assert_code(uia!(selected.GetEnclosingElement()), ELEMENT_NOT_AVAILABLE);
+    assert_code(uia!(text.GetSelection()), ELEMENT_NOT_AVAILABLE);
+    assert_code(uia!(text.GetVisibleRanges()), ELEMENT_NOT_AVAILABLE);
 }
 
 #[test]
@@ -2079,6 +2100,39 @@ impl IUIAutomationEventHandler_Impl for EventLog_Impl {
     }
 }
 
+/// The snapshot after the app moved the editor's selection, added a child to the window (the
+/// returned node), toggled a check box and focused "Save" since [`initial`]: one change of every
+/// kind UIA is told about.
+fn with_every_kind_of_change(ids: Ids) -> (AccessTree, WidgetId) {
+    let mut tree = build_tree(
+        ids,
+        &Snapshot {
+            remember: NodeToggle::On,
+            name: "Ada",
+            focused: Some(ids.save),
+        },
+    );
+    let mut editor = tree.node(ids.editor).cloned().expect("editor node");
+    editor
+        .patterns
+        .text
+        .as_mut()
+        .expect("text pattern")
+        .selection = vec![0..5];
+    tree.insert(editor);
+    let extra = WidgetId::allocate();
+    let mut window = tree.root().cloned().expect("root node");
+    window.children.push(extra);
+    tree.insert(window);
+    tree.insert(AccessNode::new(
+        extra,
+        Role::Button,
+        "Extra",
+        Rect::new(10.0, 400.0, 50.0, 20.0),
+    ));
+    (tree, extra)
+}
+
 #[test]
 fn uia_listening_clients_receive_text_selection_events_for_published_changes() {
     let fixture = Fixture::new();
@@ -2098,33 +2152,7 @@ fn uia_listening_clients_receive_text_selection_events_for_published_changes() {
     ))
     .expect("handler registered");
     let ids = fixture.ids;
-    let mut tree = build_tree(
-        ids,
-        &Snapshot {
-            remember: NodeToggle::On,
-            name: "Ada",
-            focused: Some(ids.save),
-        },
-    );
-    // The selection moves, a child appears, and a toggle changes in one snapshot.
-    let mut editor = tree.node(ids.editor).cloned().expect("editor node");
-    editor
-        .patterns
-        .text
-        .as_mut()
-        .expect("text pattern")
-        .selection = vec![0..5];
-    tree.insert(editor);
-    let extra = WidgetId::allocate();
-    let mut window = tree.root().cloned().expect("root node");
-    window.children.push(extra);
-    tree.insert(window);
-    tree.insert(AccessNode::new(
-        extra,
-        Role::Button,
-        "Extra",
-        Rect::new(10.0, 400.0, 50.0, 20.0),
-    ));
+    let (tree, _extra) = with_every_kind_of_change(ids);
     let changes = fixture.bridge.update(tree).expect("snapshot published");
     assert!(changes.contains(&UiaChange::FocusChanged(ids.save)));
     assert!(changes.contains(&UiaChange::StructureChanged(ids.root)));
@@ -2140,4 +2168,81 @@ fn uia_listening_clients_receive_text_selection_events_for_published_changes() {
         .expect("the selection event reaches the client");
     assert_eq!(event, UIA_Text_TextSelectionChangedEventId.0);
     uia!(client.automation.RemoveAllEventHandlers()).expect("handlers removed");
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn uia_a_failing_event_raise_fails_the_update_but_the_snapshot_is_published() {
+    use ssw_win::fault::{arm, disarm, tripped};
+    use ssw_win::uia::UiaError;
+    use windows::Win32::Foundation::E_FAIL;
+
+    let fixture = Fixture::new();
+    let client = Client::new(&fixture);
+    let (sender, _receiver) = mpsc::channel();
+    let handler: IUIAutomationEventHandler = EventLog {
+        sender: Mutex::new(sender),
+    }
+    .into();
+    // A registered handler is what makes UIA report that clients are listening.
+    uia!(client.automation.AddAutomationEventHandler(
+        UIA_Text_TextSelectionChangedEventId,
+        &client.root,
+        TreeScope_Subtree,
+        None::<&IUIAutomationCacheRequest>,
+        &handler
+    ))
+    .expect("handler registered");
+    let ids = fixture.ids;
+    // Every raised event fails the update in turn (the focus, the toggle, the new child and the
+    // selection are raised at least), and the update that raises all of them gets through.
+    let mut failures = Vec::new();
+    let mut raised = 0;
+    for call in 0.. {
+        publish(&fixture, build_tree(ids, &initial()));
+        let (changed, extra) = with_every_kind_of_change(ids);
+        arm(call);
+        let outcome = fixture.bridge.update(changed);
+        let hit = tripped();
+        disarm();
+        // The snapshot is the current one whether or not its events were raised.
+        assert!(
+            fixture.bridge.tree().node(extra).is_some(),
+            "call {call}: the new snapshot is published"
+        );
+        if !hit {
+            raised = outcome.expect("nothing failed").len();
+            break;
+        }
+        failures.push(outcome.map(|changes| changes.len()).map_err(|error| {
+            let UiaError::Com(error) = error;
+            error.code()
+        }));
+    }
+    assert!(raised >= 4, "{raised} changes");
+    assert_eq!(failures, vec![Err(E_FAIL); raised]);
+    uia!(client.automation.RemoveAllEventHandlers()).expect("handlers removed");
+}
+
+#[test]
+fn uia_a_bridge_without_a_window_works_in_unscaled_client_pixels() {
+    let ids = Ids::new();
+    let bridge = UiaBridge::new(HWND::default(), Arc::new(Recorder::default()), ids.root);
+    bridge
+        .update(build_tree(ids, &initial()))
+        .expect("snapshot published");
+    let root = bridge.root_provider();
+    // No window has no DPI (1 DIP is 1 pixel) and no client origin (the screen is the client
+    // area), in both directions.
+    let save = child_named(&root, "Save");
+    let rect: UiaRect = uia!(fragment_of(&save).BoundingRectangle()).expect("rectangle");
+    assert_eq!(
+        (rect.left, rect.top, rect.width, rect.height),
+        (10.0, 10.0, 80.0, 32.0)
+    );
+    let screen = root
+        .cast::<IRawElementProviderFragmentRoot>()
+        .expect("root");
+    let found = uia!(screen.ElementProviderFromPoint(50.0, 20.0)).expect("over Save");
+    assert_eq!(name_of_provider(&found.cast().expect("simple")), "Save");
 }

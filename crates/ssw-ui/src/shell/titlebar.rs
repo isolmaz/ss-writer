@@ -2,8 +2,8 @@
 //!
 //! The title row holds the sidebar toggle and the document tabs ([`DocumentTabs`]); the area at
 //! its right end is reserved for the caption buttons that `ssw-win` draws. The command row holds
-//! the File / Edit / Format / View / Help menu buttons (they request native popup menus through
-//! [`TitleEvent::MenuRequested`]), the B I U pill and the inspector toggle.
+//! the File / Edit / Format / View / Window / Help menu buttons (they request native popup menus
+//! through [`TitleEvent::MenuRequested`]), the B I U pill and the inspector toggle.
 //!
 //! [`TitleBar`] answers the window-chrome hit test ([`TitleBar::chrome_hit`]): caption
 //! (draggable), tabs and buttons (client), caption buttons and resize borders (from
@@ -62,6 +62,7 @@ pub struct TitleStrings {
     pub edit: String,
     pub format: String,
     pub view: String,
+    pub window: String,
     pub help: String,
     pub bold: String,
     pub italic: String,
@@ -88,6 +89,7 @@ impl TitleStrings {
             edit: localizer.text("cmd-group-edit"),
             format: localizer.text("cmd-group-format"),
             view: localizer.text("cmd-group-view"),
+            window: localizer.text("cmd-group-window"),
             help: localizer.text("cmd-group-help"),
             bold: localizer.text("cmd-format-bold"),
             italic: localizer.text("cmd-format-italic"),
@@ -107,16 +109,18 @@ pub enum MenuKind {
     Edit,
     Format,
     View,
+    Window,
     Help,
 }
 
 impl MenuKind {
     /// Left-to-right order in the command row.
-    pub const ALL: [MenuKind; 5] = [
+    pub const ALL: [MenuKind; 6] = [
         MenuKind::File,
         MenuKind::Edit,
         MenuKind::Format,
         MenuKind::View,
+        MenuKind::Window,
         MenuKind::Help,
     ];
 }
@@ -374,6 +378,7 @@ impl TitleBar {
                     MenuKind::Edit => &strings.edit,
                     MenuKind::Format => &strings.format,
                     MenuKind::View => &strings.view,
+                    MenuKind::Window => &strings.window,
                     MenuKind::Help => &strings.help,
                 };
                 (menu, Button::new(ButtonKind::Subtle, label))
@@ -826,7 +831,7 @@ mod tests {
     use super::*;
     use crate::canvas::DrawOp;
     use crate::input::{KeyEvent, Modifiers, PointerButton, PointerEventKind};
-    use crate::shell::layout::CaptionButton;
+    use crate::shell::layout::{CaptionButton, ResizeEdge};
     use crate::widgets::testkit::Harness;
 
     const MAIN_FTL: &str = include_str!("../../../../assets/i18n/en/main.ftl");
@@ -858,6 +863,7 @@ mod tests {
         assert_eq!(strings.edit, "Edit");
         assert_eq!(strings.format, "Format");
         assert_eq!(strings.view, "View");
+        assert_eq!(strings.window, "Window");
         assert_eq!(strings.help, "Help");
         assert_eq!(strings.bold, "Bold");
         assert_eq!(strings.sidebar_toggle, "Sidebar");
@@ -901,8 +907,12 @@ mod tests {
             Rect::new(192.0, 44.0, 54.0, 32.0)
         );
         assert_eq!(
+            bar.menu_rect(MenuKind::Window),
+            Rect::new(248.0, 44.0, 70.0, 32.0)
+        );
+        assert_eq!(
             bar.menu_rect(MenuKind::Help),
-            Rect::new(248.0, 44.0, 54.0, 32.0)
+            Rect::new(320.0, 44.0, 54.0, 32.0)
         );
         assert_eq!(
             bar.inspector_toggle_rect(),
@@ -948,8 +958,8 @@ mod tests {
     fn tab_order_follows_the_visual_order() {
         let (harness, bar, _) = setup();
         let order = harness.focus.tab_order();
-        // toggle, tabs, 5 menus, 3 pill items, inspector toggle, and the strip's new-tab button.
-        assert_eq!(order.len(), 12);
+        // toggle, tabs, 6 menus, 3 pill items, inspector toggle, and the strip's new-tab button.
+        assert_eq!(order.len(), 13);
         assert_eq!(order[0], bar.sidebar.id);
         assert_eq!(order[1], bar.tabs().id());
         assert_eq!(order[order.len() - 1], bar.inspector.id);
@@ -1155,10 +1165,10 @@ mod tests {
             bar.chrome_hit(&layout, Point::new(950.0, 20.0)),
             ChromeHit::CaptionButton(CaptionButton::Maximize)
         );
-        assert!(matches!(
+        assert_eq!(
             bar.chrome_hit(&layout, Point::new(500.0, 1.0)),
-            ChromeHit::Resize(_)
-        ));
+            ChromeHit::Resize(ResizeEdge::Top)
+        );
         // The command row is never caption.
         assert_eq!(
             bar.chrome_hit(&layout, Point::new(500.0, 60.0)),
@@ -1174,7 +1184,7 @@ mod tests {
         harness.arrange(&mut bar, Rect::new(0.0, 0.0, 1000.0, 80.0));
         assert_eq!(bar.pill_rect(), Rect::ZERO);
         assert_eq!(bar.pill_item_rect(FormatToggle::Bold), Rect::ZERO);
-        assert_eq!(harness.focus.tab_order().len(), 9);
+        assert_eq!(harness.focus.tab_order().len(), 10);
         // A click where the pill used to be does nothing.
         harness.click(&mut bar, Point::new(870.0, 60.0));
         assert!(bar.take_events().is_empty());
@@ -1201,10 +1211,13 @@ mod tests {
         assert_eq!(title_children, vec![Role::ToggleButton, Role::Tab]);
         let command_children: Vec<_> = tree.children(rows[1].id).collect();
         let names: Vec<&str> = command_children.iter().map(|n| n.name.as_str()).collect();
-        assert_eq!(names[..5], ["File", "Edit", "Format", "View", "Help"]);
-        assert_eq!(command_children[5].role, Role::Group);
-        assert_eq!(tree.children(command_children[5].id).count(), 3);
-        assert_eq!(command_children[6].name, "Inspector");
+        assert_eq!(
+            names[..6],
+            ["File", "Edit", "Format", "View", "Window", "Help"]
+        );
+        assert_eq!(command_children[6].role, Role::Group);
+        assert_eq!(tree.children(command_children[6].id).count(), 3);
+        assert_eq!(command_children[7].name, "Inspector");
         // Every node is reachable from the root.
         assert_eq!(tree.walk().len(), tree.len());
     }
@@ -1220,7 +1233,7 @@ mod tests {
         let canvas = harness.paint(&bar);
         let texts = canvas.texts();
         for expected in [
-            "todo", "data.csv", "File", "Edit", "Format", "View", "Help", "B", "I", "U",
+            "todo", "data.csv", "File", "Edit", "Format", "View", "Window", "Help", "B", "I", "U",
         ] {
             assert!(texts.contains(&expected), "missing {expected}: {texts:?}");
         }

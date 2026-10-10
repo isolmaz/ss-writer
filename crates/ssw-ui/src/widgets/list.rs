@@ -259,12 +259,10 @@ impl ListView {
         self.set_selection((low..=high).collect());
     }
 
-    /// Moves the cursor to `index` and updates the selection according to `mods`.
+    /// Moves the cursor to the existing row `index` and updates the selection according to
+    /// `mods`. Every caller resolves `index` against the rows first (keys clamp it, the pointer
+    /// hit-tests, access actions look up the row id), so it is always in range.
     fn go(&mut self, index: usize, mods: crate::input::Modifiers) {
-        if self.items.is_empty() {
-            return;
-        }
-        let index = index.min(self.items.len() - 1);
         match self.mode {
             SelectionMode::Multiple if mods.shift() => {
                 let anchor = self.anchor.unwrap_or(index);

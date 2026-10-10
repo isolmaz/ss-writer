@@ -47,7 +47,17 @@
 //! | `assert-clipboard <file>` | the clipboard's text equals the file |
 //! | `assert-dialog <kind> <text>` | a dialog of the kind showed a title or message containing the text |
 //! | `dump-state <json-path>` | writes windows, tabs, documents, banners, dialogs, shell requests |
+//! | `theme light\|dark` | overrides the colors of every window (never touches the OS theme) |
+//! | `screenshot <png> [width height] [scale]` | paints the active window (overlays and popups included) offscreen into a PNG: DIPs (default 1440 900), scale 0.5 to 4 (default 1; 2 is hi-DPI) |
+//! | `settings-page <page>` | shows a page of the open Settings window (`general`, `appearance`, `editor`, `sidebar`, `attachments`, `export`, `shortcuts`, `advanced`) |
+//! | `screenshot-settings <png> [width height] [scale]` | the same for the Settings window (default 900 640); open it with `command settings.open` |
 //! | `quit` | ends the script (a clean exit) |
+//!
+//! `theme` and the screenshot steps switch the harness to the real DirectWrite text engine and
+//! give the editors the block renderers of the window (tables, callouts, math, diagrams,
+//! images), so the pixels are what a window shows; a script without them keeps the headless
+//! monospace engine. Mica does not exist offscreen: the solid fallback is painted. A script
+//! that uses them needs COM on its thread ([`ScriptHost`] provides it).
 
 use std::cell::RefCell;
 use std::fmt;
@@ -59,6 +69,7 @@ use serde_json::{Value, json};
 use ssw_core::command::CommandId;
 use ssw_core::edit::Selection;
 use ssw_core::keymap::KeyChord;
+use ssw_core::settings::SettingsSection;
 use ssw_ui::input::{Event, KeyEvent, Modifiers, TextInput, vk};
 use ssw_ui::services::{
     Clipboard, ClipboardContent, Clock, FakeClock, MemoryClipboard, MessageBoxResult,
@@ -66,11 +77,16 @@ use ssw_ui::services::{
 use ssw_ui::shell::tabs::TabsEvent;
 use ssw_ui::shell::titlebar::TitleEvent;
 use ssw_ui::shortcuts::{CharProbe, ShortcutOutcome};
-use ssw_ui::text::MonoTextEngine;
+use ssw_ui::text::{MonoTextEngine, TextLayoutEngine};
+use ssw_ui::theme::{DEFAULT_ACCENT, Theme};
 use ssw_ui::widgets::SharedClipboard;
+use ssw_ui::widgets::anim::Motion;
+use ssw_win::chrome::{ChromeState, paint_caption_buttons};
 
 use super::controller::{Controller, Request, WindowCell};
+use super::screenshot::{Geometry, Visuals};
 use super::scripted_services::{Answer, DialogKind, ScriptedServices};
+use super::settings_window::{SettingsCell, SettingsSetup, WINDOW_SIZE, WindowsKeyNames};
 use super::shell_view::{ShellAction, TabView};
 use crate::app::{AppCore, PumpReport, ShellHost};
 use crate::args::Args;
@@ -263,9 +279,66 @@ pub enum Op {
     },
     /// `dump-state <json-path>`.
     DumpState(PathBuf),
+    /// `theme light|dark`.
+    Theme(ThemeChoice),
+    /// `screenshot <png> [width height] [scale]`.
+    Screenshot(Shot),
+    /// `settings-page <page>`.
+    SettingsPage(SettingsSection),
+    /// `screenshot-settings <png> [width height] [scale]`.
+    ScreenshotSettings(Shot),
     /// `quit`.
     Quit,
 }
+
+/// The colors `theme` switches to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeChoice {
+    /// The light theme with the default accent.
+    Light,
+    /// The dark theme with the default accent.
+    Dark,
+}
+
+impl ThemeChoice {
+    fn theme(self) -> Theme {
+        match self {
+            Self::Light => Theme::light(DEFAULT_ACCENT),
+            Self::Dark => Theme::dark(DEFAULT_ACCENT),
+        }
+    }
+}
+
+/// Where and how large a `screenshot` is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shot {
+    /// The PNG file to write.
+    pub path: PathBuf,
+    /// Width in DIPs.
+    pub width: u32,
+    /// Height in DIPs.
+    pub height: u32,
+    /// The DPI scale in percent (100 is 96 DPI, 200 is hi-DPI).
+    pub scale_percent: u32,
+}
+
+impl Shot {
+    fn scale(&self) -> f32 {
+        self.scale_percent as f32 / 100.0
+    }
+}
+
+/// Default size of a window screenshot in DIPs.
+const WINDOW_SHOT: (u32, u32) = (1440, 900);
+/// Default size of a Settings window screenshot in DIPs.
+const SETTINGS_SHOT: (u32, u32) = (900, 640);
+/// Smallest and largest side of a screenshot in DIPs.
+const SHOT_SIDE: std::ops::RangeInclusive<u32> = 64..=8192;
+/// Smallest and largest scale of a screenshot.
+const SHOT_SCALE: std::ops::RangeInclusive<f32> = 0.5..=4.0;
+/// Animation frame times (ms) delivered before a screenshot: the first fixes the start time of
+/// every running transition, the later ones finish it.
+const SETTLE_FRAMES: [u64; 3] = [0, 1_000, 2_000];
 
 /// A step and the line it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,6 +492,55 @@ fn dialog_kind(word: &str) -> Parsed<DialogKind> {
     DialogKind::from_name(word).ok_or_else(|| format!("unknown dialog kind `{word}`"))
 }
 
+fn shot_side(name: &str, word: &str) -> Parsed<u32> {
+    word.parse::<u32>()
+        .ok()
+        .filter(|side| SHOT_SIDE.contains(side))
+        .ok_or_else(|| {
+            format!(
+                "{name} needs a size between {} and {} DIPs, found `{word}`",
+                SHOT_SIDE.start(),
+                SHOT_SIDE.end()
+            )
+        })
+}
+
+fn shot_scale(name: &str, word: &str) -> Parsed<u32> {
+    word.parse::<f32>()
+        .ok()
+        .filter(|scale| SHOT_SCALE.contains(scale))
+        .map(|scale| (scale * 100.0).round() as u32)
+        .ok_or_else(|| format!("{name} needs a scale between 0.5 and 4, found `{word}`"))
+}
+
+/// `<png> [width height] [scale]`.
+fn parse_shot(name: &str, rest: &str, default: (u32, u32)) -> Parsed<Shot> {
+    let all = words(rest)?;
+    let Some((path, extra)) = all.split_first() else {
+        return Err(format!("{name} needs a path"));
+    };
+    let ((width, height), scale_percent) = match extra {
+        [] => (default, 100),
+        [scale] => (default, shot_scale(name, scale)?),
+        [width, height] => ((shot_side(name, width)?, shot_side(name, height)?), 100),
+        [width, height, scale] => (
+            (shot_side(name, width)?, shot_side(name, height)?),
+            shot_scale(name, scale)?,
+        ),
+        _ => {
+            return Err(format!(
+                "{name} takes a path, then a width and height and a scale, each optional"
+            ));
+        }
+    };
+    Ok(Shot {
+        path: PathBuf::from(path),
+        width,
+        height,
+        scale_percent,
+    })
+}
+
 fn parse_answer(rest: &str) -> Parsed<Op> {
     let all = words(rest)?;
     let Some((kind, choice)) = all.split_first() else {
@@ -563,6 +685,22 @@ fn parse_line(line: &str) -> Parsed<Vec<Op>> {
             }
         }
         "dump-state" => Op::DumpState(path_arg(name, rest)?),
+        "theme" => Op::Theme(match one(name, rest)?.as_str() {
+            "light" => ThemeChoice::Light,
+            "dark" => ThemeChoice::Dark,
+            other => return Err(format!("unknown theme `{other}` (light or dark)")),
+        }),
+        "screenshot" => Op::Screenshot(parse_shot(name, rest, WINDOW_SHOT)?),
+        "screenshot-settings" => Op::ScreenshotSettings(parse_shot(name, rest, SETTINGS_SHOT)?),
+        "settings-page" => {
+            let page = one(name, rest)?;
+            Op::SettingsPage(
+                SettingsSection::ALL
+                    .into_iter()
+                    .find(|section| section.key() == page)
+                    .ok_or_else(|| format!("unknown settings page `{page}`"))?,
+            )
+        }
         "quit" => {
             no_args(name, rest)?;
             Op::Quit
@@ -625,13 +763,18 @@ pub struct ScriptRunner {
     services: ScriptedServices,
     clipboard: Rc<RefCell<MemoryClipboard>>,
     clock: Rc<FakeClock>,
-    engine: MonoTextEngine,
+    engine: Box<dyn TextLayoutEngine>,
     pending: ClipboardContent,
     wait_limit: Duration,
     quit: bool,
     external: Vec<String>,
     autosave_errors: Vec<String>,
     unhandled: Vec<String>,
+    /// The windows (ids) whose editors got the block renderers of [`Visuals::editor_setup`].
+    equipped: Vec<u64>,
+    /// The offscreen renderer, once `theme` or a screenshot step started it. Declared last: it
+    /// drops after the controller, whose editors hold COM objects of it.
+    visuals: Option<Rc<Visuals>>,
 }
 
 impl fmt::Debug for ScriptRunner {
@@ -661,13 +804,15 @@ impl ScriptRunner {
             services,
             clipboard,
             clock,
-            engine: MonoTextEngine::default(),
+            engine: Box::new(MonoTextEngine::default()),
             pending: ClipboardContent::default(),
             wait_limit: DEFAULT_WAIT_LIMIT,
             quit: false,
             external: Vec::new(),
             autosave_errors: Vec::new(),
             unhandled: Vec::new(),
+            equipped: Vec::new(),
+            visuals: None,
         }
     }
 
@@ -745,6 +890,17 @@ impl ScriptRunner {
                 }
                 Request::Action(window, action) => self.controller.handle_action(window, action),
                 Request::Quit => self.quit = true,
+                Request::OpenSettings => {
+                    self.controller.create_settings(SettingsSetup {
+                        probe: Box::new(NoAltGr),
+                        key_names: Box::new(WindowsKeyNames),
+                        motion: Motion::reduced(),
+                        size: WINDOW_SIZE,
+                        scale: 1.0,
+                    });
+                }
+                Request::Settings(event) => self.controller.settings_event(event),
+                Request::CloseSettings => self.controller.close_settings(),
                 // There are no native windows to create or destroy, and no taskbar button.
                 Request::NewWindow(_) | Request::CloseWindow(_) | Request::TaskbarProgress(..) => {}
                 other => self.unhandled.push(format!("{other:?}")),
@@ -934,6 +1090,10 @@ impl ScriptRunner {
                 std::fs::write(path, format!("{state:#}"))
                     .map_err(|error| format!("cannot write {}: {error}", path.display()))
             }
+            Op::Theme(choice) => self.set_theme(*choice),
+            Op::Screenshot(shot) => self.screenshot(shot),
+            Op::SettingsPage(section) => self.settings_page(*section),
+            Op::ScreenshotSettings(shot) => self.screenshot_settings(shot),
             Op::Quit => {
                 self.quit = true;
                 Ok(())
@@ -979,7 +1139,7 @@ impl ScriptRunner {
     /// Delivers an event to the window content and carries out what it asks for.
     fn deliver(&mut self, event: &Event) -> StepResult {
         let window = self.window()?;
-        let actions = window.view.borrow_mut().event(event, &self.engine);
+        let actions = window.view.borrow_mut().event(event, &*self.engine);
         for action in actions {
             self.controller.handle_action(window.id, action);
         }
@@ -1085,6 +1245,118 @@ impl ScriptRunner {
         Ok(())
     }
 
+    // ----- screenshots ---------------------------------------------------------------------
+
+    /// Starts the offscreen renderer (once): the real text engine from now on, and the block
+    /// renderers of the window in every editor that does not have them yet.
+    fn begin_visuals(&mut self) -> Result<Rc<Visuals>, String> {
+        let visuals = match &self.visuals {
+            Some(visuals) => Rc::clone(visuals),
+            None => {
+                let visuals = Rc::new(Visuals::new()?);
+                self.engine = Box::new(visuals.text().clone());
+                self.visuals = Some(Rc::clone(&visuals));
+                visuals
+            }
+        };
+        let setup = visuals.editor_setup(self.controller.i18n());
+        for cell in self.controller.windows() {
+            if !self.equipped.contains(&cell.id.0) {
+                cell.view.borrow_mut().set_editor_setup(Rc::clone(&setup));
+                self.equipped.push(cell.id.0);
+            }
+        }
+        Ok(visuals)
+    }
+
+    fn set_theme(&mut self, choice: ThemeChoice) -> StepResult {
+        self.begin_visuals()?;
+        let theme = choice.theme();
+        self.controller.set_theme(theme);
+        if let Some(cell) = self.controller.settings_cell() {
+            cell.view.borrow_mut().set_theme(theme);
+        }
+        Ok(())
+    }
+
+    /// Delivers the animation frames a window would have had: every transition (hover, toggle,
+    /// expansion) ends at its target before the picture is taken.
+    fn finish_animations(&mut self) -> StepResult {
+        for millis in SETTLE_FRAMES {
+            let frame = Event::AnimationFrame(Duration::from_millis(millis));
+            self.deliver(&frame)?;
+            if let Some(cell) = self.controller.settings_cell() {
+                let events = cell.view.borrow_mut().event(&frame, &*self.engine);
+                for event in events {
+                    self.controller.settings_event(event);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn screenshot(&mut self, shot: &Shot) -> StepResult {
+        let visuals = self.begin_visuals()?;
+        let geometry = Geometry::new(shot.width, shot.height, shot.scale())?;
+        self.finish_animations()?;
+        let window = self.window()?;
+        let theme = self.controller.theme();
+        let mut view = window.view.borrow_mut();
+        visuals.set_base(
+            view.active_tab()
+                .and_then(|tab| tab.entry.path())
+                .and_then(|path| path.parent().map(Path::to_path_buf)),
+        );
+        // The base folder and the text engine changed what the objects and lines look like.
+        for tab in view.tabs_mut() {
+            tab.editor.invalidate_objects();
+        }
+        view.resize(geometry.size(), geometry.scale());
+        let width = geometry.size().width;
+        let chrome = view.layout().mode().shows_chrome();
+        let text = visuals.text().clone();
+        let png = visuals.render(geometry, theme.tokens.window_bg, &mut |canvas| {
+            view.paint(canvas, &text, false);
+            view.requests_mut().take_invalidation();
+            if chrome {
+                paint_caption_buttons(canvas, width, ChromeState::default(), &theme.tokens);
+            }
+        })?;
+        write_png(&shot.path, &png)
+    }
+
+    fn open_settings_cell(&self) -> Result<Rc<SettingsCell>, String> {
+        self.controller.settings_cell().ok_or_else(|| {
+            "the Settings window is not open (command settings.open opens it)".to_owned()
+        })
+    }
+
+    fn settings_page(&mut self, section: SettingsSection) -> StepResult {
+        let cell = self.open_settings_cell()?;
+        let mut view = cell.view.borrow_mut();
+        view.window_mut().select_section(section);
+        view.requests_mut().invalidate_all();
+        Ok(())
+    }
+
+    fn screenshot_settings(&mut self, shot: &Shot) -> StepResult {
+        let visuals = self.begin_visuals()?;
+        let cell = self.open_settings_cell()?;
+        let geometry = Geometry::new(shot.width, shot.height, shot.scale())?;
+        self.finish_animations()?;
+        let theme = self.controller.theme();
+        let mut view = cell.view.borrow_mut();
+        view.resize(geometry.size(), geometry.scale());
+        let width = geometry.size().width;
+        let text = visuals.text().clone();
+        let png = visuals.render(geometry, theme.tokens.window_bg, &mut |canvas| {
+            view.paint(canvas, &text, false);
+            view.requests_mut().take_invalidation();
+            paint_caption_buttons(canvas, width, ChromeState::default(), &theme.tokens);
+        })?;
+        write_png(&shot.path, &png)
+    }
+
     // ----- state dump ----------------------------------------------------------------------
 
     fn state(&self) -> Value {
@@ -1161,6 +1433,15 @@ impl ScriptRunner {
     }
 }
 
+/// Writes `bytes` to `path`, creating the folders above it.
+fn write_png(path: &Path, bytes: &[u8]) -> StepResult {
+    let failed = |error: std::io::Error| format!("cannot write {}: {error}", path.display());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(failed)?;
+    }
+    std::fs::write(path, bytes).map_err(failed)
+}
+
 fn assert_file(path: &Path, expected: &Path) -> StepResult {
     let actual = read_bytes(path)?;
     let wanted = read_bytes(expected)?;
@@ -1225,6 +1506,9 @@ pub struct ScriptHost;
 
 impl ShellHost for ScriptHost {
     fn run(&mut self, core: AppCore, args: &Args) -> i32 {
+        // Bound first, so it is dropped after every COM object of the screenshot steps. A thread
+        // that cannot have COM only fails the scripts that take screenshots.
+        let _com = ssw_win::com::ComGuard::apartment_threaded().ok();
         let Some(path) = args.test.script.as_deref() else {
             eprintln!("SS Writer: --test-script names no script file");
             return EXIT_SCRIPT_UNREADABLE;
@@ -1311,6 +1595,112 @@ mod tests {
         format!("\"{}\"", path.display())
     }
 
+    /// A runner that ran `script` in a fresh profile below `root`.
+    fn ran(root: &Path, script: &str) -> ScriptRunner {
+        let mut runner = ScriptRunner::start(core(root));
+        runner.run(&Script::parse(script).unwrap()).unwrap();
+        runner
+    }
+
+    /// The text of the active document of the first window.
+    fn document_text(runner: &ScriptRunner) -> String {
+        let window = runner.controller().active_window().unwrap();
+        let view = window.view.borrow();
+        view.active_tab().unwrap().entry.document().borrow().text()
+    }
+
+    /// How the active editor of the first window presents its document.
+    fn presented_as(runner: &ScriptRunner) -> ssw_ui::editor::DocumentKind {
+        let window = runner.controller().active_window().unwrap();
+        let view = window.view.borrow();
+        view.active_tab().unwrap().editor.config().document_kind
+    }
+
+    #[test]
+    fn typing_after_the_replace_command_goes_to_the_find_and_replace_boxes() {
+        // The file is opened first: the tab's pending return of the focus to the editor must
+        // not take the keyboard from the bar that opens after it.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.md");
+        std::fs::write(&file, "# Title\n").unwrap();
+        let script = format!(
+            "open {}\ncommand search.replace\ntype launch\nkey tab\ntype release\n",
+            quoted(&file)
+        );
+        let mut runner = ran(tmp.path(), &script);
+        {
+            let window = runner.controller().active_window().unwrap();
+            let view = window.view.borrow();
+            let find = view.overlays().find();
+            assert!(find.is_replace_open());
+            assert_eq!(find.find_box().text(), "launch");
+            assert_eq!(find.replace_box().text(), "release");
+        }
+        assert_eq!(document_text(&runner), "# Title\n");
+        runner.finish();
+    }
+
+    #[test]
+    fn typing_after_quick_open_and_the_palette_goes_to_their_boxes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.md");
+        std::fs::write(&file, "# Title\n").unwrap();
+        let script = format!(
+            "open {}\ncommand search.quick_open\nwait-idle\ntype atl\n",
+            quoted(&file)
+        );
+        let mut runner = ran(tmp.path(), &script);
+        let typed = |runner: &ScriptRunner| {
+            let window = runner.controller().active_window().unwrap();
+            let view = window.view.borrow();
+            view.overlays().quick_open().input().text().to_owned()
+        };
+        assert_eq!(typed(&runner), "atl");
+        assert_eq!(document_text(&runner), "# Title\n");
+        let palette = "key escape\ncommand search.command_palette\nwait-idle\ntype export\n";
+        runner.run(&Script::parse(palette).unwrap()).unwrap();
+        assert_eq!(typed(&runner), ">export");
+        assert_eq!(document_text(&runner), "# Title\n");
+        runner.finish();
+    }
+
+    #[test]
+    fn a_document_is_presented_the_way_its_file_type_wants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (diagram, plain, note) = (
+            tmp.path().join("d.mmd"),
+            tmp.path().join("t.txt"),
+            tmp.path().join("n.md"),
+        );
+        std::fs::write(&diagram, "flowchart LR\n  A --> B\n").unwrap();
+        std::fs::write(&plain, "# not a heading\n").unwrap();
+        std::fs::write(&note, "# heading\n").unwrap();
+        let mut runner = ran(tmp.path(), &format!("open {}\n", quoted(&diagram)));
+        assert_eq!(presented_as(&runner), ssw_ui::editor::DocumentKind::Mermaid);
+        for (file, kind) in [
+            (&plain, ssw_ui::editor::DocumentKind::PlainText),
+            (&note, ssw_ui::editor::DocumentKind::Markdown),
+        ] {
+            let script = Script::parse(&format!("open {}\n", quoted(file))).unwrap();
+            runner.run(&script).unwrap();
+            assert_eq!(presented_as(&runner), kind);
+        }
+        runner.finish();
+    }
+
+    #[test]
+    fn saving_an_untitled_document_under_a_plain_name_changes_how_it_is_presented() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.txt");
+        let script = format!("new\ntype hello\nsave-as {}\n", quoted(&out));
+        let mut runner = ran(tmp.path(), &script);
+        assert_eq!(
+            presented_as(&runner),
+            ssw_ui::editor::DocumentKind::PlainText
+        );
+        runner.finish();
+    }
+
     #[test]
     fn every_step_parses_with_its_arguments() {
         let script = Script::parse(
@@ -1356,6 +1746,15 @@ assert-selection 1 2
 assert-clipboard clip.txt
 assert-dialog message-box Unsaved changes
 dump-state state.json
+theme dark
+theme light
+screenshot shot.png
+screenshot "my shot.png" 2
+screenshot a.png 800 600
+screenshot a.png 800 600 1.5
+settings-page appearance
+screenshot-settings s.png
+screenshot-settings s.png 450 320 2.0
 quit
 "#,
         )
@@ -1363,6 +1762,12 @@ quit
         assert_eq!(script.steps()[0].line, 4);
         let ops: Vec<Op> = script.steps().iter().map(|step| step.op.clone()).collect();
         let p = PathBuf::from;
+        let shot = |path: &str, width: u32, height: u32, scale_percent: u32| Shot {
+            path: PathBuf::from(path),
+            width,
+            height,
+            scale_percent,
+        };
         let expected = vec![
             Op::Open(p("C:\\Notes\\a b.md")),
             Op::Command(CommandId::FileNew),
@@ -1424,6 +1829,15 @@ quit
                 contains: "Unsaved changes".to_owned(),
             },
             Op::DumpState(p("state.json")),
+            Op::Theme(ThemeChoice::Dark),
+            Op::Theme(ThemeChoice::Light),
+            Op::Screenshot(shot("shot.png", 1440, 900, 100)),
+            Op::Screenshot(shot("my shot.png", 1440, 900, 200)),
+            Op::Screenshot(shot("a.png", 800, 600, 100)),
+            Op::Screenshot(shot("a.png", 800, 600, 150)),
+            Op::SettingsPage(SettingsSection::Appearance),
+            Op::ScreenshotSettings(shot("s.png", 900, 640, 100)),
+            Op::ScreenshotSettings(shot("s.png", 450, 320, 200)),
             Op::Quit,
         ];
         assert_eq!(ops, expected);
@@ -1463,6 +1877,27 @@ quit
             ("assert-dirty maybe", "needs true or false, found `maybe`"),
             ("assert-dialog", "needs a dialog kind and a text"),
             ("assert-dialog message-box", "assert-dialog needs text"),
+            ("theme", "theme takes 1 argument(s), found 0"),
+            ("theme blue", "unknown theme `blue` (light or dark)"),
+            ("screenshot", "screenshot needs a path"),
+            ("screenshot-settings", "screenshot-settings needs a path"),
+            (
+                "screenshot a.png 800",
+                "screenshot needs a scale between 0.5 and 4, found `800`",
+            ),
+            (
+                "screenshot a.png 10 600",
+                "needs a size between 64 and 8192 DIPs, found `10`",
+            ),
+            ("screenshot a.png 800 9000", "found `9000`"),
+            ("screenshot a.png 800 600 5", "found `5`"),
+            ("screenshot a.png 800 600 big", "found `big`"),
+            ("screenshot a.png 1 2 3 4", "each optional"),
+            (
+                "settings-page",
+                "settings-page takes 1 argument(s), found 0",
+            ),
+            ("settings-page colors", "unknown settings page `colors`"),
         ] {
             let error = Script::parse(&format!("\nnew\n{line}")).unwrap_err();
             let ScriptError::Syntax {
@@ -1752,15 +2187,15 @@ quit
     }
 
     #[test]
-    fn quit_ends_the_script_and_opening_files_adds_tabs() {
+    fn quit_ends_the_script_and_opening_files_adds_tabs_after_replacing_the_unused_one() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.md");
         let b = tmp.path().join("b.txt");
         std::fs::write(&a, "# A\n").unwrap();
         std::fs::write(&b, "plain\n").unwrap();
         let script = format!(
-            "open {a}\nopen {b}\nassert-tabs 3\ntab 2\nassert-text-is # A\\n\ntab 3\n\
-             assert-text-is plain\\n\nopen {a}\nassert-tabs 3\nassert-text-is # A\\n\n\
+            "open {a}\nopen {b}\nassert-tabs 2\ntab 1\nassert-text-is # A\\n\ntab 2\n\
+             assert-text-is plain\\n\nopen {a}\nassert-tabs 2\nassert-text-is # A\\n\n\
              quit\nassert-text-is never reached\n",
             a = quoted(&a),
             b = quoted(&b),
@@ -1930,6 +2365,90 @@ quit
         let unhandled = dump["unhandled_requests"].as_array().unwrap();
         assert_eq!(unhandled.len(), 1, "{unhandled:?}");
         assert!(unhandled[0].as_str().unwrap().contains("CloseRequested"));
+    }
+
+    /// The pixel size from the header of a PNG file and the number of distinct colors.
+    fn png_facts(path: &Path) -> ((u32, u32), usize) {
+        let bytes = std::fs::read(path).unwrap();
+        assert!(Magic::Png.matches(&bytes), "{} is a PNG", path.display());
+        let side = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+        let image = ssw_win::wic::Wic::new().unwrap().decode(&bytes).unwrap();
+        let colors: std::collections::HashSet<[u8; 4]> = (0..image.height)
+            .flat_map(|y| (0..image.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| image.pixel(x, y))
+            .collect();
+        ((side(16), side(20)), colors.len())
+    }
+
+    #[test]
+    fn screenshots_paint_the_window_and_the_settings_window_offscreen() {
+        let _com = ssw_win::com::ComGuard::apartment_threaded().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let window = tmp.path().join("shots").join("window.png");
+        let hidpi = tmp.path().join("hidpi.png");
+        let settings = tmp.path().join("settings.png");
+        run(
+            tmp.path(),
+            &format!(
+                "theme dark\nnew\ntype # Title\\n\\nSome **bold** text and $x^2$.\\n\n\
+                 screenshot {window} 320 200\nscreenshot {hidpi} 160 100 2\n\
+                 command settings.open\nsettings-page editor\n\
+                 screenshot-settings {settings} 450 320\n",
+                window = quoted(&window),
+                hidpi = quoted(&hidpi),
+                settings = quoted(&settings),
+            ),
+        )
+        .unwrap();
+        let (size, colors) = png_facts(&window);
+        assert_eq!(size, (320, 200));
+        assert!(
+            colors > 8,
+            "the window is drawn, not a flat color: {colors}"
+        );
+        assert_eq!(png_facts(&hidpi).0, (320, 200), "160x100 DIPs at scale 2");
+        let (size, colors) = png_facts(&settings);
+        assert_eq!(size, (450, 320));
+        assert!(colors > 8, "{colors}");
+    }
+
+    #[test]
+    fn the_settings_steps_need_the_settings_window() {
+        let _com = ssw_win::com::ComGuard::apartment_threaded().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (line, message) = failure(run(tmp.path(), "new\nsettings-page general\n"));
+        assert_eq!(
+            (line, message.contains("Settings window is not open")),
+            (2, true)
+        );
+        let shot = tmp.path().join("s.png");
+        let (line, message) = failure(run(
+            tmp.path(),
+            &format!("screenshot-settings {}\n", quoted(&shot)),
+        ));
+        assert_eq!((line, message.contains("not open")), (1, true));
+        assert!(!shot.exists());
+    }
+
+    #[test]
+    fn a_screenshot_too_large_for_a_bitmap_or_into_a_missing_drive_fails() {
+        let _com = ssw_win::com::ComGuard::apartment_threaded().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let shot = tmp.path().join("big.png");
+        let (line, message) = failure(run(
+            tmp.path(),
+            &format!("new\nscreenshot {} 8192 8192 4\n", quoted(&shot)),
+        ));
+        assert_eq!(line, 2);
+        assert!(message.contains("larger than"), "{message}");
+        let blocked = tmp.path().join("file");
+        std::fs::write(&blocked, "x").unwrap();
+        let under_a_file = blocked.join("shot.png");
+        let (_, message) = failure(run(
+            tmp.path(),
+            &format!("screenshot {} 100 100\n", quoted(&under_a_file)),
+        ));
+        assert!(message.contains("cannot write"), "{message}");
     }
 
     #[test]

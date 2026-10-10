@@ -5,7 +5,7 @@ use ssw_core::markdown::ast::Block;
 use ssw_core::text::TextRange;
 
 use crate::canvas::Canvas;
-use crate::editor::block::{BlockCx, BlockLayout, BlockPaintCx, HEADING_SCALE};
+use crate::editor::block::{BlockCx, BlockLayout, BlockPaintCx, HEADING_SCALE, composition_in};
 use crate::editor::config::{EditorStrings, LinkTarget};
 use crate::editor::display::{Display, DisplayParams, GapPolicy, build, raw};
 use crate::geometry::{Color, CornerRadii, Point, Rect};
@@ -59,7 +59,7 @@ impl TextBlock {
     fn inline(ctx: &Ctx<'_>, block: &Block, base: &TextStyle, gap: GapPolicy) -> Self {
         let cx = ctx.cx;
         let source = cx.buffer.slice(block.range);
-        let composition = cx.composition.filter(|comp| block.range.touches(comp.at));
+        let composition = composition_in(cx, block.range);
         let display = build(&DisplayParams {
             src: &source,
             range: block.range,
@@ -100,7 +100,7 @@ impl TextBlock {
         label: String,
     ) -> Self {
         let source = cx.buffer.slice(range);
-        let composition = cx.composition.filter(|comp| range.touches(comp.at));
+        let composition = composition_in(cx, range);
         let display = raw(&source, range, composition);
         let layout = display.layout(cx.text, base, (cx.width - 2.0 * pad).max(1.0));
         let height = layout.size().height + 2.0 * pad;

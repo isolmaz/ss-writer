@@ -651,11 +651,10 @@ impl Converter<'_> {
         if !block.inlines.is_empty() {
             return self.paragraph(&block.inlines);
         }
-        let mut text = html.text(self.src);
-        if text.ends_with('\n') {
-            text.pop();
-        }
-        format!("#ssw-html({}, block: true)", string_literal(&text))
+        // Every line of the block text ends with a newline; the literal does not need the last.
+        let text = html.text(self.src);
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        format!("#ssw-html({}, block: true)", string_literal(text))
     }
 
     fn inlines(&mut self, inlines: &[Inline]) -> String {

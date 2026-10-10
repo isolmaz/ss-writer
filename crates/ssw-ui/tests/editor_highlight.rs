@@ -757,3 +757,80 @@ fn diff_headers_are_comments() {
         ]
     );
 }
+
+#[test]
+fn shell_options_need_a_letter_or_a_second_dash_after_the_dash() {
+    assert_eq!(
+        toks(Language::Bash, "echo --all - x"),
+        [("echo", Function), ("--all", Attribute)],
+        "a long option is one token, a lone dash is not an option"
+    );
+}
+
+#[test]
+fn an_exponent_marker_without_digits_ends_the_number_at_the_suffix() {
+    assert_eq!(
+        toks(Language::Rust, "1em 1e"),
+        [("1em", Number), ("1e", Number)]
+    );
+}
+
+#[test]
+fn rust_raw_string_prefixes_are_plain_words_without_a_quote_or_hash() {
+    assert_eq!(toks(Language::Rust, "r br cr"), NO_TOKENS);
+}
+
+#[test]
+fn yaml_keys_must_be_complete_quoted_scalars_followed_by_a_colon() {
+    assert_eq!(
+        toks(Language::Yaml, "- "),
+        NO_TOKENS,
+        "a bare list dash has no key"
+    );
+    assert_eq!(
+        toks(Language::Yaml, "\"abc: 1"),
+        [("\"abc: 1", Str)],
+        "an unterminated quoted key is an unterminated string"
+    );
+    assert_eq!(
+        toks(Language::Yaml, "\"a\" b: c"),
+        [("\"a\"", Str)],
+        "a quoted scalar not followed by a colon is a value"
+    );
+}
+
+#[test]
+fn toml_quoted_keys_must_be_terminated() {
+    assert_eq!(
+        toks(Language::Toml, "\"abc = 1"),
+        [("\"abc = 1", Str)],
+        "an unterminated double-quoted key is an unterminated string"
+    );
+    assert_eq!(
+        toks(Language::Toml, "'abc = 1"),
+        [("'abc = 1", Str)],
+        "an unterminated single-quoted key is an unterminated string"
+    );
+}
+
+#[test]
+fn markdown_fences_without_a_language_and_blank_lines_inside_them() {
+    assert_eq!(
+        toks(Language::Markdown, "```\n\ncode\n```\n"),
+        [("```", Comment), ("code", Str), ("```", Comment)],
+        "no language label token, no token for the blank line inside the fence"
+    );
+}
+
+#[test]
+fn markdown_only_dash_star_and_underscore_runs_are_rules_and_a_number_alone_is_no_list() {
+    assert_eq!(
+        toks(Language::Markdown, "***\n___\n"),
+        [("***", Keyword), ("___", Keyword)]
+    );
+    assert_eq!(
+        toks(Language::Markdown, "aaa\n===\n12\n1\n"),
+        NO_TOKENS,
+        "runs of other characters and digits without a marker are plain text"
+    );
+}

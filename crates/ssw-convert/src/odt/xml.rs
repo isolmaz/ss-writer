@@ -149,10 +149,11 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Element, XmlError> {
             }
             Event::Empty(start) => attach(&mut stack, &mut root, element_of(&start))?,
             Event::End(_) => {
-                let element = stack
+                // The reader refuses an end tag that closes nothing, so an element is open.
+                stack
                     .pop()
-                    .ok_or_else(|| XmlError::Malformed("unbalanced end tag".into()))?;
-                attach(&mut stack, &mut root, element)?;
+                    .map(|element| attach(&mut stack, &mut root, element))
+                    .transpose()?;
             }
             Event::Text(text) => push_text(&mut stack, &text.xml10_content()),
             Event::CData(data) => push_text(&mut stack, &data.xml10_content()),
@@ -225,10 +226,16 @@ mod tests {
 
     #[test]
     fn rejects_broken_input() {
-        assert!(matches!(parse(b"<a><b></a>"), Err(XmlError::Malformed(_))));
-        assert!(matches!(parse(b"</a>"), Err(XmlError::Malformed(_))));
-        assert!(matches!(parse(b"<a><b>"), Err(XmlError::Malformed(_))));
-        assert!(matches!(parse(b"<a/><b/>"), Err(XmlError::Malformed(_))));
+        for broken in [&b"<a><b></a>"[..], b"</a>", b"<a><b>"] {
+            let message = parse(broken).unwrap_err().to_string();
+            assert!(
+                message.starts_with("malformed XML: "),
+                "{broken:?}: {message}"
+            );
+        }
+        let second_root = XmlError::Malformed("more than one root element".into());
+        assert_eq!(parse(b"<a/><b/>"), Err(second_root.clone()));
+        assert_eq!(parse(b"<a></a><b></b>"), Err(second_root));
         assert_eq!(parse(b"  "), Err(XmlError::Empty));
         assert_eq!(parse(b""), Err(XmlError::Empty));
         assert_eq!(

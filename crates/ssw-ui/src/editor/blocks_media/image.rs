@@ -13,6 +13,7 @@ use ssw_core::text::{Buffer, TextRange};
 use crate::canvas::Canvas;
 use crate::editor::block::{
     BlockCx, BlockDrag, BlockEdit, BlockLayout, BlockPaintCx, BlockPress, SpecialRenderer,
+    composition_in,
 };
 use crate::editor::config::{EditorEvent, EditorStrings};
 use crate::editor::object::{ObjectKind, ObjectRequest, ObjectState, ObjectVisual};
@@ -78,7 +79,7 @@ impl SpecialRenderer for ImageRenderer {
                 src: block.range,
                 pad: 0,
             }];
-            let composition = cx.composition.filter(|comp| block.range.touches(comp.at));
+            let composition = composition_in(cx, block.range);
             let mut display = display_of(block.range, &rows, cx.buffer, composition).display;
             let base = TextStyle::new(cx.config.code_font.clone(), cx.config.body_size() * 0.95);
             for marker in &inline.markers {
@@ -102,7 +103,7 @@ impl SpecialRenderer for ImageRenderer {
                         visual: info.visual,
                         rect: Rect::new(0.0, top, size.width, size.height),
                     },
-                    resize_target(cx.buffer, inline, image),
+                    Some(resize_target(cx.buffer, inline, image)),
                 )
             }
             other => {
@@ -231,16 +232,16 @@ impl BlockLayout for ImageLayout {
                     _ => *rect,
                 };
                 draw_visual(canvas, *visual, shown);
-                if cx.hovered && self.resize.is_some() {
+                if cx.hovered
+                    && let Some(handle) = self.handle()
+                {
                     canvas.stroke_rounded_rect(
                         shown,
                         CornerRadii::uniform(2.0),
                         tokens.accent,
                         1.0,
                     );
-                    if let Some(handle) = self.handle() {
-                        canvas.fill_rounded_rect(handle, CornerRadii::uniform(2.0), tokens.accent);
-                    }
+                    canvas.fill_rounded_rect(handle, CornerRadii::uniform(2.0), tokens.accent);
                 }
             }
             Body::Placeholder {
@@ -354,24 +355,22 @@ impl ResizeTarget {
     }
 }
 
-fn resize_target(buffer: &Buffer, inline: &Inline, image: &Image) -> Option<ResizeTarget> {
+fn resize_target(buffer: &Buffer, inline: &Inline, image: &Image) -> ResizeTarget {
     if matches!(image.kind, ImageKind::Html) {
-        return Some(ResizeTarget::Tag {
+        return ResizeTarget::Tag {
             range: inline.range,
             tag: buffer.slice(inline.range).into_owned(),
-        });
+        };
     }
-    let close = inline.markers.get(1)?;
-    let text = buffer.slice(*close);
-    let len = if text.starts_with('|') {
-        text.find(']')?
-    } else {
-        0
-    };
-    Some(ResizeTarget::Suffix(TextRange::new(
-        close.start,
-        close.start + len,
-    )))
+    // Markdown images carry the opening `![` and the closing `](dest)` markers; the closing
+    // one starts at the `|300` size suffix when there is one, else at the `]`.
+    let close = inline.markers[1];
+    let suffix = buffer
+        .slice(close)
+        .bytes()
+        .take_while(|&b| b != b']')
+        .count();
+    ResizeTarget::Suffix(TextRange::new(close.start, close.start + suffix))
 }
 
 /// The resize handle being dragged.
@@ -428,8 +427,8 @@ fn attribute_span(tag: &str, name: &str) -> Option<(usize, usize, usize)> {
         let before = &tag[..start];
         if before.ends_with(char::is_whitespace) {
             let value = &tag[start + needle.len()..];
-            let len = match value.chars().next()? {
-                quote @ ('"' | '\'') => value[1..].find(quote)? + 2,
+            let len = match value.chars().next() {
+                Some(quote @ ('"' | '\'')) => value[1..].find(quote)? + 2,
                 _ => value
                     .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
                     .unwrap_or(value.len()),

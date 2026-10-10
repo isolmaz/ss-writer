@@ -8,7 +8,7 @@ use ssw_core::markdown::ast::{Block, InlineKind, LinkKind};
 use ssw_core::text::TextRange;
 
 use crate::canvas::{Canvas, ImageId};
-use crate::editor::block::{BlockCx, BlockLayout, BlockPaintCx, SpecialRenderer};
+use crate::editor::block::{BlockCx, BlockLayout, BlockPaintCx, SpecialRenderer, composition_in};
 use crate::editor::config::{EditorStrings, LinkTarget};
 use crate::geometry::{CornerRadii, Point, Rect};
 use crate::text::{FontWeight, StyledRange, TextLayout, TextStyle};
@@ -71,7 +71,7 @@ impl SpecialRenderer for AttachmentRenderer {
                 src: block.range,
                 pad: 0,
             }];
-            let composition = cx.composition.filter(|comp| block.range.touches(comp.at));
+            let composition = composition_in(cx, block.range);
             let mut display = display_of(block.range, &rows, cx.buffer, composition).display;
             let base = TextStyle::new(cx.config.code_font.clone(), cx.config.body_size() * 0.95);
             for marker in &inline.markers {

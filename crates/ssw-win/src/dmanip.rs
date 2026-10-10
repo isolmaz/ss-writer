@@ -32,7 +32,7 @@ use std::time::Duration;
 use ssw_ui::geometry::Size;
 use ssw_ui::input::WheelEvent;
 use ssw_ui::scroll_physics::{Extent, Scroller, WheelLines};
-use windows::Win32::Foundation::{HWND, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::DirectManipulation::{
     DIRECTMANIPULATION_BUILDING, DIRECTMANIPULATION_CONFIGURATION,
     DIRECTMANIPULATION_CONFIGURATION_INTERACTION, DIRECTMANIPULATION_CONFIGURATION_RAILS_X,
@@ -62,6 +62,7 @@ use windows::core::{Ref, implement};
 
 use crate::com::{OsResultExt, WinError};
 use crate::dpi::dip_to_px;
+use crate::fault::check;
 
 /// Zoom factors closer than this are the same zoom.
 const ZOOM_EPSILON: f64 = 1e-6;
@@ -247,14 +248,19 @@ impl IDirectManipulationViewportEventHandler_Impl for Handler_Impl {
         _viewport: Ref<'_, IDirectManipulationViewport>,
         content: Ref<'_, IDirectManipulationContent>,
     ) -> windows::core::Result<()> {
-        let content = content.ok()?;
-        let mut matrix = [0f32; 6];
-        // SAFETY: `content` is the live content DirectManipulation passed to this callback and
-        // `matrix` holds the six floats of the transform.
-        unsafe { content.GetContentTransform(&mut matrix) }?;
-        let _ = self.events.send(Pending::Content(matrix));
-        Ok(())
+        // A call without content, or content that cannot tell its transform, queues nothing.
+        content.ok().and_then(content_matrix).map(|matrix| {
+            let _ = self.events.send(Pending::Content(matrix));
+        })
     }
+}
+
+/// The six floats of the transform of `content`.
+fn content_matrix(content: &IDirectManipulationContent) -> windows::core::Result<[f32; 6]> {
+    let mut matrix = [0f32; 6];
+    // SAFETY: `content` is a live content object and `matrix` holds the six floats of the
+    // transform.
+    unsafe { content.GetContentTransform(&mut matrix) }.map(|()| matrix)
 }
 
 /// A DirectManipulation viewport over the client area of one window, in manual-update mode.
@@ -292,6 +298,11 @@ fn rect_px(size: Size, scale: f32) -> RECT {
     }
 }
 
+/// The zoom `current`, when it differs from the zoom `known` by more than rounding noise.
+fn zoom_change(current: f64, known: f64) -> Option<f64> {
+    ((current - known).abs() > ZOOM_EPSILON).then_some(current)
+}
+
 impl DirectManipulation {
     /// Creates the viewport for `hwnd`: vertical panning with inertia (and pinch zoom when
     /// `config` asks for it), manual updates, `viewport` visible out of `content`, both in DIPs
@@ -314,18 +325,19 @@ impl DirectManipulation {
         }
         // SAFETY: standard in-process COM activation; the calling thread's apartment is the
         // caller's responsibility (documented on the module).
-        let manager: IDirectManipulationManager =
-            unsafe { CoCreateInstance(&DirectManipulationManager, None, CLSCTX_INPROC_SERVER) }
-                .ctx("create the DirectManipulation manager")?;
+        let manager: IDirectManipulationManager = check(unsafe {
+            CoCreateInstance(&DirectManipulationManager, None, CLSCTX_INPROC_SERVER)
+        })
+        .ctx("create the DirectManipulation manager")?;
         // SAFETY: live manager and a window handle owned by the caller; every pointer argument
         // below is a reference to a local that outlives its call.
         let (update_manager, viewport_object, content_object, events, cookie) = unsafe {
-            let update_manager: IDirectManipulationUpdateManager = manager
-                .GetUpdateManager()
-                .ctx("get the DirectManipulation update manager")?;
-            let viewport_object: IDirectManipulationViewport = manager
-                .CreateViewport(None::<&IDirectManipulationFrameInfoProvider>, hwnd)
-                .ctx("create the DirectManipulation viewport")?;
+            let update_manager: IDirectManipulationUpdateManager =
+                check(manager.GetUpdateManager())
+                    .ctx("get the DirectManipulation update manager")?;
+            let viewport_object: IDirectManipulationViewport =
+                check(manager.CreateViewport(None::<&IDirectManipulationFrameInfoProvider>, hwnd))
+                    .ctx("create the DirectManipulation viewport")?;
             let mut configuration = DIRECTMANIPULATION_CONFIGURATION_INTERACTION.0
                 | DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_Y.0
                 | DIRECTMANIPULATION_CONFIGURATION_TRANSLATION_INERTIA.0
@@ -335,43 +347,37 @@ impl DirectManipulation {
                 configuration |= DIRECTMANIPULATION_CONFIGURATION_SCALING.0
                     | DIRECTMANIPULATION_CONFIGURATION_SCALING_INERTIA.0;
             }
-            viewport_object
-                .ActivateConfiguration(DIRECTMANIPULATION_CONFIGURATION(configuration))
-                .ctx("configure the DirectManipulation viewport")?;
-            viewport_object
-                .SetViewportOptions(DIRECTMANIPULATION_VIEWPORT_OPTIONS_MANUALUPDATE)
-                .ctx("select manual updates")?;
+            check(
+                viewport_object
+                    .ActivateConfiguration(DIRECTMANIPULATION_CONFIGURATION(configuration)),
+            )
+            .ctx("configure the DirectManipulation viewport")?;
+            check(
+                viewport_object
+                    .SetViewportOptions(DIRECTMANIPULATION_VIEWPORT_OPTIONS_MANUALUPDATE),
+            )
+            .ctx("select manual updates")?;
 
             let (sender, events) = channel();
             let handler: IDirectManipulationViewportEventHandler =
                 Handler { events: sender }.into();
-            let cookie = viewport_object
-                .AddEventHandler(Some(hwnd), &handler)
+            let cookie = check(viewport_object.AddEventHandler(Some(hwnd), &handler))
                 .ctx("add the viewport event handler")?;
 
-            viewport_object
-                .SetViewportRect(&rect_px(viewport, scale))
+            check(viewport_object.SetViewportRect(&rect_px(viewport, scale)))
                 .ctx("set the viewport rectangle")?;
-            manager
-                .Activate(hwnd)
-                .ctx("activate DirectManipulation for the window")?;
-            viewport_object
-                .Enable()
-                .ctx("enable the DirectManipulation viewport")?;
+            check(manager.Activate(hwnd)).ctx("activate DirectManipulation for the window")?;
+            check(viewport_object.Enable()).ctx("enable the DirectManipulation viewport")?;
 
-            let content_object: IDirectManipulationContent = viewport_object
-                .GetPrimaryContent()
-                .ctx("get the primary content")?;
-            content_object
-                .SetContentRect(&rect_px(content, scale))
+            let content_object: IDirectManipulationContent =
+                check(viewport_object.GetPrimaryContent()).ctx("get the primary content")?;
+            check(content_object.SetContentRect(&rect_px(content, scale)))
                 .ctx("set the content rectangle")?;
             if let Some(zoom) = config.zoom {
-                let primary: IDirectManipulationPrimaryContent = viewport_object
-                    .GetPrimaryContent()
-                    .ctx("get the primary content for zoom limits")?;
-                primary
-                    .SetZoomBoundaries(zoom.min, zoom.max)
-                    .ctx("set the zoom limits")?;
+                let primary: IDirectManipulationPrimaryContent =
+                    check(viewport_object.GetPrimaryContent())
+                        .ctx("get the primary content for zoom limits")?;
+                check(primary.SetZoomBoundaries(zoom.min, zoom.max)).ctx("set the zoom limits")?;
             }
             (
                 update_manager,
@@ -408,11 +414,9 @@ impl DirectManipulation {
         self.scale = scale;
         // SAFETY: live viewport and content; the rectangles are locals that outlive the calls.
         unsafe {
-            self.viewport
-                .SetViewportRect(&rect_px(viewport, scale))
+            check(self.viewport.SetViewportRect(&rect_px(viewport, scale)))
                 .ctx("set the viewport rectangle")?;
-            self.content
-                .SetContentRect(&rect_px(content, scale))
+            check(self.content.SetContentRect(&rect_px(content, scale)))
                 .ctx("set the content rectangle")
         }
     }
@@ -423,7 +427,7 @@ impl DirectManipulation {
     /// Fails when the query fails.
     pub fn viewport_rect(&self) -> Result<RECT, WinError> {
         // SAFETY: plain getter on a live viewport.
-        unsafe { self.viewport.GetViewportRect() }.ctx("get the viewport rectangle")
+        check(unsafe { self.viewport.GetViewportRect() }).ctx("get the viewport rectangle")
     }
 
     /// The content rectangle DirectManipulation uses, in pixels.
@@ -432,7 +436,7 @@ impl DirectManipulation {
     /// Fails when the query fails.
     pub fn content_rect(&self) -> Result<RECT, WinError> {
         // SAFETY: plain getter on live content.
-        unsafe { self.content.GetContentRect() }.ctx("get the content rectangle")
+        check(unsafe { self.content.GetContentRect() }).ctx("get the content rectangle")
     }
 
     /// Hands a pointer to the viewport (`SetContact`). Call it inside `WM_POINTERDOWN` for touch
@@ -442,7 +446,7 @@ impl DirectManipulation {
     /// Fails when the pointer id is unknown (`ERROR_NOT_FOUND`) or already finished.
     pub fn set_contact(&self, pointer_id: u32) -> Result<(), WinError> {
         // SAFETY: plain call on a live viewport.
-        unsafe { self.viewport.SetContact(pointer_id) }.ctx("set the manipulation contact")
+        check(unsafe { self.viewport.SetContact(pointer_id) }).ctx("set the manipulation contact")
     }
 
     /// One manipulation frame: advances the contact and the inertia, then delivers what the
@@ -452,19 +456,19 @@ impl DirectManipulation {
     /// Fails when DirectManipulation fails to update or to report its status.
     pub fn update(&mut self, listener: &mut dyn DmListener) -> Result<DmStatus, WinError> {
         // SAFETY: plain call on the live update manager; `None` selects the default frame info.
-        unsafe {
+        check(unsafe {
             self.update_manager
                 .Update(None::<&IDirectManipulationFrameInfoProvider>)
-        }
+        })
         .ctx("update DirectManipulation")?;
         while let Ok(pending) = self.events.try_recv() {
             match pending {
                 Pending::Status { current, previous } => listener.status_changed(current, previous),
                 Pending::Content(matrix) => {
                     let transform = DmTransform::from_matrix(&matrix, self.scale);
-                    if (transform.zoom - self.zoom).abs() > ZOOM_EPSILON {
-                        self.zoom = transform.zoom;
-                        listener.zoomed(transform.zoom);
+                    if let Some(zoom) = zoom_change(transform.zoom, self.zoom) {
+                        self.zoom = zoom;
+                        listener.zoomed(zoom);
                     }
                     listener.scrolled(transform.offset_x, transform.offset_y);
                 }
@@ -479,7 +483,7 @@ impl DirectManipulation {
     /// Fails when the query fails.
     pub fn status(&self) -> Result<DmStatus, WinError> {
         // SAFETY: plain getter on a live viewport.
-        unsafe { self.viewport.GetStatus() }
+        check(unsafe { self.viewport.GetStatus() })
             .map(DmStatus::from_raw)
             .ctx("get the viewport status")
     }
@@ -489,10 +493,7 @@ impl DirectManipulation {
     /// # Errors
     /// Fails when the query fails.
     pub fn content_transform(&self) -> Result<DmTransform, WinError> {
-        let mut matrix = [0f32; 6];
-        // SAFETY: live content; `matrix` holds the six floats of the transform.
-        unsafe { self.content.GetContentTransform(&mut matrix) }
-            .ctx("get the content transform")?;
+        let matrix = check(content_matrix(&self.content)).ctx("get the content transform")?;
         Ok(DmTransform::from_matrix(&matrix, self.scale))
     }
 
@@ -502,7 +503,7 @@ impl DirectManipulation {
     /// Fails when DirectManipulation cannot stop the viewport.
     pub fn stop(&self) -> Result<(), WinError> {
         // SAFETY: plain call on a live viewport.
-        unsafe { self.viewport.Stop() }.ctx("stop the viewport")
+        check(unsafe { self.viewport.Stop() }).ctx("stop the viewport")
     }
 
     /// Re-seats the content at once so that the visible top is `offset` DIPs (in zoomed DIPs) at
@@ -535,7 +536,7 @@ impl DirectManipulation {
         let width = f64::from(viewport.right - viewport.left) / zoom;
         let height = f64::from(viewport.bottom - viewport.top) / zoom;
         // SAFETY: plain call on a live viewport.
-        unsafe {
+        check(unsafe {
             self.viewport.ZoomToRect(
                 0.0,
                 top as f32,
@@ -543,7 +544,7 @@ impl DirectManipulation {
                 (top + height) as f32,
                 animate,
             )
-        }
+        })
         .ctx("move the content")
     }
 
@@ -554,7 +555,7 @@ impl DirectManipulation {
     /// Fails when the manager rejects the window.
     pub fn activate(&self) -> Result<(), WinError> {
         // SAFETY: plain call on a live manager with the window the viewport was created for.
-        unsafe { self.manager.Activate(self.hwnd) }.ctx("activate DirectManipulation")
+        check(unsafe { self.manager.Activate(self.hwnd) }).ctx("activate DirectManipulation")
     }
 
     /// Stops DirectManipulation from processing input for the window; call when it is
@@ -564,7 +565,7 @@ impl DirectManipulation {
     /// Fails when the manager rejects the window.
     pub fn deactivate(&self) -> Result<(), WinError> {
         // SAFETY: plain call on a live manager with the window the viewport was created for.
-        unsafe { self.manager.Deactivate(self.hwnd) }.ctx("deactivate DirectManipulation")
+        check(unsafe { self.manager.Deactivate(self.hwnd) }).ctx("deactivate DirectManipulation")
     }
 }
 
@@ -604,15 +605,28 @@ pub fn pointer_id(wparam: WPARAM) -> u32 {
 /// that land on the scrollable area.
 #[must_use]
 pub fn pointer_client_position(hwnd: HWND, wparam: WPARAM) -> Option<(i32, i32)> {
-    let mut info = POINTER_INFO::default();
-    // SAFETY: valid out pointer; unknown ids make the call fail.
-    unsafe { GetPointerInfo(pointer_id(wparam), &mut info) }.ok()?;
-    let mut point = info.ptPixelLocation;
-    // SAFETY: converts the screen position in the local `point` with the caller's window handle;
-    // a window that is gone makes the call fail.
+    let info = pointer_info(pointer_id(wparam))?;
+    screen_to_client(hwnd, info.ptPixelLocation)
+}
+
+/// The screen position `point` as a position in the client area of `hwnd`; `None` when the
+/// window cannot convert it (it is gone).
+fn screen_to_client(hwnd: HWND, mut point: POINT) -> Option<(i32, i32)> {
+    // SAFETY: converts the local `point` with the caller's window handle; a window that is gone
+    // makes the call fail.
     unsafe { ScreenToClient(hwnd, &mut point) }
         .as_bool()
         .then_some((point.x, point.y))
+}
+
+/// What the system knows about pointer `id`; `None` when it does not know the pointer (any
+/// more).
+fn pointer_info(id: u32) -> Option<POINTER_INFO> {
+    let mut info = POINTER_INFO::default();
+    // SAFETY: valid out pointer; unknown ids make the call fail.
+    unsafe { GetPointerInfo(id, &mut info) }
+        .is_ok()
+        .then_some(info)
 }
 
 /// Whether the pointer whose id is in the `wParam` of a pointer message is a pen. The pen acts
@@ -631,10 +645,12 @@ fn pointer_type(id: u32) -> Option<POINTER_INPUT_TYPE> {
 
 /// True while pointer `id` still touches the surface.
 fn contact_held(id: u32) -> bool {
-    let mut info = POINTER_INFO::default();
-    // SAFETY: valid out pointer; unknown ids make the call fail.
-    unsafe { GetPointerInfo(id, &mut info) }.is_ok()
-        && info.pointerFlags.contains(POINTER_FLAG_INCONTACT)
+    pointer_info(id).as_ref().is_some_and(in_contact)
+}
+
+/// Whether the pointer described by `info` touches the surface.
+fn in_contact(info: &POINTER_INFO) -> bool {
+    info.pointerFlags.contains(POINTER_FLAG_INCONTACT)
 }
 
 /// Where a [`ScrollDriver`] scrolls: sizes in DIPs.
@@ -830,10 +846,7 @@ impl ScrollDriver {
         kind: Option<POINTER_INPUT_TYPE>,
     ) -> Result<bool, WinError> {
         match kind {
-            Some(kind) if wants_contact(msg, kind) => {
-                self.start_contact(id)?;
-                Ok(true)
-            }
+            Some(kind) if wants_contact(msg, kind) => self.start_contact(id).and(Ok(true)),
             _ => Ok(false),
         }
     }
@@ -844,9 +857,23 @@ impl ScrollDriver {
     /// # Errors
     /// Fails when the transform cannot be re-seated or the pointer is unknown.
     pub fn start_contact(&mut self, id: u32) -> Result<(), WinError> {
+        self.start_contact_with(id, DirectManipulation::set_contact)
+    }
+
+    /// [`start_contact`](Self::start_contact) with `hand_over` giving the pointer to the
+    /// viewport (that is [`DirectManipulation::set_contact`]): a caller that has no real touch
+    /// pointer, a test, can stand in for the viewport's acceptance of one.
+    ///
+    /// # Errors
+    /// Fails when the transform cannot be re-seated or `hand_over` fails.
+    pub fn start_contact_with(
+        &mut self,
+        id: u32,
+        hand_over: impl FnOnce(&DirectManipulation, u32) -> Result<(), WinError>,
+    ) -> Result<(), WinError> {
         self.scroller.stop();
         self.reseat()?;
-        self.dm.set_contact(id)?;
+        hand_over(&self.dm, id)?;
         self.contact = Some(id);
         Ok(())
     }
@@ -990,10 +1017,105 @@ impl ScrollDriver {
         self.dm.stop()?;
         let transform = self.dm.content_transform()?;
         self.scroller.adopt(transform.offset_y);
-        if (transform.zoom - self.zoom).abs() > ZOOM_EPSILON {
-            self.note_zoom(Some(transform.zoom));
-        }
+        self.note_zoom(zoom_change(transform.zoom, self.zoom));
         self.contact = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::E_POINTER;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::Input::Pointer::POINTER_FLAG_INRANGE;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
+    };
+    use windows::core::w;
+
+    #[test]
+    fn a_zoom_counts_as_changed_beyond_rounding_noise() {
+        assert_eq!(zoom_change(2.0, 1.0), Some(2.0));
+        assert_eq!(zoom_change(0.5, 1.0), Some(0.5));
+        assert_eq!(zoom_change(1.0, 1.0), None);
+        assert_eq!(zoom_change(1.0 + ZOOM_EPSILON / 2.0, 1.0), None);
+        let beyond = 1.0 + ZOOM_EPSILON * 2.0;
+        assert_eq!(zoom_change(beyond, 1.0), Some(beyond));
+    }
+
+    #[test]
+    fn a_pointer_is_held_while_its_flags_say_it_touches_the_surface() {
+        let touching = POINTER_INFO {
+            pointerFlags: POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
+            ..POINTER_INFO::default()
+        };
+        let hovering = POINTER_INFO {
+            pointerFlags: POINTER_FLAG_INRANGE,
+            ..POINTER_INFO::default()
+        };
+        assert!(in_contact(&touching));
+        assert!(!in_contact(&hovering));
+        assert!(!in_contact(&POINTER_INFO::default()));
+        // A pointer the system does not know is not held, whatever it was.
+        assert!(pointer_info(0x7777).is_none());
+        assert!(!contact_held(0x7777));
+    }
+
+    #[test]
+    fn screen_positions_become_client_positions_until_the_window_is_gone() {
+        // SAFETY: a window of a system class, far off every monitor, never shown or activated;
+        // created, used and destroyed on this thread.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!(""),
+                WS_OVERLAPPEDWINDOW,
+                -20000,
+                -20000,
+                200,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let mut origin = POINT { x: 0, y: 0 };
+        // SAFETY: the window was just created on this thread.
+        assert!(unsafe { ClientToScreen(hwnd, &mut origin) }.as_bool());
+        let at = |dx, dy| {
+            screen_to_client(
+                hwnd,
+                POINT {
+                    x: origin.x + dx,
+                    y: origin.y + dy,
+                },
+            )
+        };
+        assert_eq!(at(5, 7), Some((5, 7)));
+        assert_eq!(at(-3, 0), Some((-3, 0)));
+        // SAFETY: destroys the window created above, on its own thread.
+        unsafe { DestroyWindow(hwnd) }.unwrap();
+        assert_eq!(at(5, 7), None);
+    }
+
+    #[test]
+    fn a_content_update_without_content_is_refused_and_queues_nothing() {
+        let (sender, events) = channel();
+        let handler: IDirectManipulationViewportEventHandler = Handler { events: sender }.into();
+        // SAFETY: a call into a live handler, with the null arguments DirectManipulation would
+        // never pass.
+        let error = unsafe {
+            handler.OnContentUpdated(
+                None::<&IDirectManipulationViewport>,
+                None::<&IDirectManipulationContent>,
+            )
+        }
+        .unwrap_err();
+        assert_eq!(error.code(), E_POINTER);
+        assert!(events.try_recv().is_err());
     }
 }

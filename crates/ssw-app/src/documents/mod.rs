@@ -36,7 +36,7 @@ use crate::clock::AppClock;
 
 pub use external::{ExternalAction, ExternalOutcome, FolderWatches, Resolution};
 pub use load::{
-    ConvertedFormat, DocMode, LoadError, Loaded, Source, canonical_path, load_file,
+    ConvertedFormat, DocMode, LoadError, Loaded, Source, canonical_path, load_file, load_file_as,
     loss_message_id, mode_for_path, strip_extended_prefix,
 };
 pub use reload::{line_edits, replace_text};
@@ -194,6 +194,19 @@ impl DocEntry {
         self.state.borrow().untitled.is_some()
     }
 
+    /// Whether this is an untitled buffer nobody has used: no text, no undo or redo history and
+    /// no unsaved changes. Opening a file replaces such a tab instead of keeping it beside the
+    /// new one.
+    #[must_use]
+    pub fn is_pristine_untitled(&self) -> bool {
+        let document = self.document.borrow();
+        self.is_untitled()
+            && !self.is_dirty()
+            && document.buffer().is_empty()
+            && !document.can_undo()
+            && !document.can_redo()
+    }
+
     /// The tab title (spec §6): the file stem for Markdown files, the file name for everything
     /// else, "Untitled" / "Untitled 2" for buffers.
     #[must_use]
@@ -235,6 +248,16 @@ impl DocEntry {
     #[must_use]
     pub fn source(&self) -> Source {
         self.state.borrow().source.clone()
+    }
+
+    /// Whether "Save back to Word" applies: the document was imported from a word-processor
+    /// file that the exporter can write again.
+    #[must_use]
+    pub fn can_save_back(&self) -> bool {
+        matches!(
+            &self.state.borrow().source,
+            Source::Converted(format) if format.can_save_back()
+        )
     }
 
     /// How the editor treats the document.

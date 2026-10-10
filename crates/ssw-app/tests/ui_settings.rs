@@ -444,6 +444,16 @@ fn browsing_a_folder_stores_the_chosen_path_and_the_logs_folder_opens_in_the_she
 }
 
 #[test]
+fn the_default_apps_button_asks_the_shell_for_the_settings_page_and_changes_nothing() {
+    let fx = fixture(None);
+    let _cell = fx.controller.create_settings(setup());
+    let before = fx.controller.settings().clone();
+    fx.controller.settings_event(SettingsEvent::OpenDefaultApps);
+    assert_eq!(fx.services.shell_log(), [ShellRecord::OpenDefaultApps]);
+    assert_eq!(*fx.controller.settings(), before);
+}
+
+#[test]
 fn edits_are_merged_so_the_app_zoom_is_not_undone_by_a_stale_window() {
     let current = Settings {
         appearance: ssw_core::settings::Appearance {

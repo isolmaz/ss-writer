@@ -1767,13 +1767,36 @@ mod tests {
             None,
         );
         button.paint(&cx, &mut canvas);
-        canvas
+        let fills: Vec<Color> = canvas
             .ops()
-            .find_map(|op| match op {
+            .filter_map(|op| match op {
                 DrawOp::FillRoundedRect { color, .. } => Some(*color),
                 _ => None,
             })
-            .expect("a background")
+            .collect();
+        assert_eq!(fills.len(), 1, "one background per paint");
+        fills[0]
+    }
+
+    #[test]
+    fn a_test_button_that_was_never_measured_paints_its_background_without_a_label() {
+        let host = Host::new();
+        let mut button = TestButton::new(30, "Lazy");
+        button.bounds = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let cx = PaintCx::new(
+            button.id,
+            &host.theme,
+            1.0,
+            &host.text,
+            &host.focus,
+            &host.capture,
+            None,
+        );
+        let mut canvas = RecordingCanvas::new();
+        button.paint(&cx, &mut canvas);
+        assert!(canvas.texts().is_empty(), "no layout, no label");
+        assert_eq!(canvas.ops().count(), 1, "just the background");
+        assert_eq!(background(&host, &button), host.theme.tokens.surface);
     }
 
     #[test]
@@ -1821,6 +1844,9 @@ mod tests {
         assert!(!deliver(&mut host, &mut buttons[0], PointerEventKind::Leave, far).handled);
         let moved = deliver(&mut host, &mut buttons[0], PointerEventKind::Move, far);
         assert!(!moved.handled, "a move elsewhere is not the button's");
+        let entered = deliver(&mut host, &mut buttons[0], PointerEventKind::Enter, far);
+        assert!(!entered.handled, "enter alone is not a hover");
+        assert!(!buttons[0].hovered);
     }
 
     #[test]

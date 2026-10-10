@@ -223,7 +223,8 @@ impl DocumentTabs {
         let Some(index) = self.index_of(key) else {
             return;
         };
-        if let Some(meta) = self.meta.iter_mut().find(|meta| meta.key == key) {
+        // Every tab of the strip has its entry here, so the one tab's entry is the only match.
+        for meta in self.meta.iter_mut().filter(|meta| meta.key == key) {
             meta.path = Some(path.to_owned());
         }
         self.strip.set_title(index, title_for_path(path));
@@ -310,17 +311,17 @@ impl DocumentTabs {
         if !self.tabs_area().contains(point) {
             return None;
         }
-        (0..self.strip.len()).find_map(|index| {
-            if !self.strip.tab_rect(index).contains(point) {
-                return None;
-            }
-            let key = self.strip.key_at(index)?;
-            if self.strip.close_rect(index).contains(point) {
-                Some(TabHit::Close(key))
-            } else {
-                Some(TabHit::Tab(key))
-            }
-        })
+        (0..self.strip.len())
+            .filter(|&index| self.strip.tab_rect(index).contains(point))
+            .find_map(|index| {
+                self.strip.key_at(index).map(|key| {
+                    if self.strip.close_rect(index).contains(point) {
+                        TabHit::Close(key)
+                    } else {
+                        TabHit::Tab(key)
+                    }
+                })
+            })
     }
 
     /// The position a tab dropped from another window at `point` would take: the boundary

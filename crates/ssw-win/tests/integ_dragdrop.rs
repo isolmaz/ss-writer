@@ -24,8 +24,8 @@ use support::MachineLock;
 use windows::Win32::Foundation::{
     DATA_S_SAMEFORMATETC, DRAGDROP_E_ALREADYREGISTERED, DRAGDROP_E_NOTREGISTERED,
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_DVASPECT,
-    DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_NOTIMPL, E_POINTER, E_UNEXPECTED, HGLOBAL, HWND,
-    OLE_E_ADVISENOTSUPPORTED, POINT, POINTL, S_OK,
+    DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_FAIL, E_NOTIMPL, E_POINTER, E_UNEXPECTED, HGLOBAL,
+    HWND, OLE_E_ADVISENOTSUPPORTED, POINT, POINTL, S_OK,
 };
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
@@ -800,32 +800,38 @@ fn a_drag_that_leaves_is_reported_once() {
 
 #[test]
 fn a_target_without_the_shells_drag_image_helper_still_answers() {
-    // This thread is not in a single-threaded apartment (it never initialized COM, or it
-    // implicitly joined the process's multi-threaded one while another test runs), so the
-    // target is created without the shell's helper.
+    // A thread that is not in a single-threaded apartment creates the target without the
+    // shell's helper: first a thread that never initialized COM, then the same thread in a
+    // multi-threaded apartment (where a drop target is not valid and the helper would be
+    // reached through a proxy).
     let window = HiddenWindow::new();
-    let handler = recorder(|_| Effect::Copy);
-    let target = drop_target(window.hwnd(), handler.clone());
-    let data = data_object(&DragContent {
-        text: Some("x".to_owned()),
-        ..DragContent::default()
-    })
-    .unwrap();
-    let at = window.screen(0, 0);
-    let none = DragKeys::default();
-    let all = AllowedEffects::ALL;
-    assert_eq!(
-        enter(&target, &data, none, at, all).unwrap(),
-        DROPEFFECT_COPY
-    );
-    assert_eq!(over(&target, none, at, all).unwrap(), DROPEFFECT_COPY);
-    leave(&target).unwrap();
-    enter(&target, &data, none, at, all).unwrap();
-    assert_eq!(
-        drop_on(&target, &data, none, at, all).unwrap(),
-        DROPEFFECT_COPY
-    );
-    assert_eq!(handler.calls().len(), 5);
+    let answers = || {
+        let handler = recorder(|_| Effect::Copy);
+        let target = drop_target(window.hwnd(), handler.clone());
+        let data = data_object(&DragContent {
+            text: Some("x".to_owned()),
+            ..DragContent::default()
+        })
+        .unwrap();
+        let at = window.screen(0, 0);
+        let none = DragKeys::default();
+        let all = AllowedEffects::ALL;
+        assert_eq!(
+            enter(&target, &data, none, at, all).unwrap(),
+            DROPEFFECT_COPY
+        );
+        assert_eq!(over(&target, none, at, all).unwrap(), DROPEFFECT_COPY);
+        leave(&target).unwrap();
+        enter(&target, &data, none, at, all).unwrap();
+        assert_eq!(
+            drop_on(&target, &data, none, at, all).unwrap(),
+            DROPEFFECT_COPY
+        );
+        assert_eq!(handler.calls().len(), 5);
+    };
+    answers();
+    let _com = ComGuard::multi_threaded().unwrap();
+    answers();
 }
 
 #[test]
@@ -1133,6 +1139,24 @@ fn the_data_object_rejects_what_it_cannot_serve() {
         assert_eq!(code(data.DUnadvise(1)), OLE_E_ADVISENOTSUPPORTED);
         assert_eq!(code(data.EnumDAdvise()), OLE_E_ADVISENOTSUPPORTED);
     }
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_failing_allocation_is_the_failure_of_the_data_request() {
+    let _ole = ole();
+    let work = Workspace::new();
+    let data = data_object(&full_content(&work)).unwrap();
+    let served = raw(&data, CF_UNICODETEXT.0);
+    let wanted = request(CF_UNICODETEXT.0);
+    ssw_win::fault::arm(0);
+    // SAFETY: `wanted` is a valid FORMATETC for the call.
+    let failed = unsafe { data.GetData(&wanted) };
+    assert!(ssw_win::fault::tripped());
+    ssw_win::fault::disarm();
+    assert_eq!(code(failed), E_FAIL);
+    // Once the allocation works again the same request is served.
+    assert_eq!(raw(&data, CF_UNICODETEXT.0), served);
 }
 
 #[test]

@@ -557,12 +557,11 @@ impl SidebarView {
         let Some(index) = self.row_at(point) else {
             return Some(self.root_key);
         };
-        let key = self.rows[index].key;
-        let node = find(&self.roots, key)?;
-        if node.entry.is_folder() {
-            Some(key)
+        let row = &self.rows[index];
+        if row.expandable {
+            Some(row.key)
         } else {
-            Some(parent_of(&self.roots, key).unwrap_or(self.root_key))
+            Some(parent_of(&self.roots, row.key).unwrap_or(self.root_key))
         }
     }
 
@@ -677,10 +676,16 @@ impl SidebarView {
     }
 
     /// Lists the children of `folder`, keeping the expanded state (and the listings) of entries
-    /// that still exist in `previous`.
-    fn list(&mut self, folder: NodeKey, previous: Option<Vec<Node>>) -> Vec<Node> {
+    /// that still exist in `previous`. Borrows the source and the options rather than the view,
+    /// so the caller can hold the node the listing is for.
+    fn list(
+        source: &mut dyn TreeSource,
+        options: &SidebarOptions,
+        folder: NodeKey,
+        previous: Option<Vec<Node>>,
+    ) -> Vec<Node> {
         let mut previous = previous.unwrap_or_default();
-        let entries = self.source.children(folder, &self.options);
+        let entries = source.children(folder, options);
         let mut nodes = Vec::with_capacity(entries.len());
         for entry in entries {
             let old = previous
@@ -692,7 +697,7 @@ impl SidebarView {
                 node.id = old.id;
                 if node.entry.is_folder() && old.expanded {
                     node.expanded = true;
-                    node.children = Some(self.list(node.entry.key, old.children));
+                    node.children = Some(Self::list(source, options, node.entry.key, old.children));
                 }
             }
             nodes.push(node);
@@ -705,7 +710,12 @@ impl SidebarView {
     pub fn refresh_all(&mut self) {
         self.root_name = self.source.root_name();
         let previous = std::mem::take(&mut self.roots);
-        self.roots = self.list(self.root_key, Some(previous));
+        self.roots = Self::list(
+            &mut *self.source,
+            &self.options,
+            self.root_key,
+            Some(previous),
+        );
         self.rebuild_rows();
     }
 
@@ -723,10 +733,12 @@ impl SidebarView {
             return;
         }
         let previous = node.children.take();
-        let listed = self.list(folder, previous);
-        if let Some(node) = find_mut(&mut self.roots, folder) {
-            node.children = Some(listed);
-        }
+        node.children = Some(Self::list(
+            &mut *self.source,
+            &self.options,
+            folder,
+            previous,
+        ));
         self.rebuild_rows();
     }
 
@@ -756,12 +768,8 @@ impl SidebarView {
             return false;
         }
         node.expanded = expanded;
-        let needs_listing = expanded && node.children.is_none();
-        if needs_listing {
-            let listed = self.list(key, None);
-            if let Some(node) = find_mut(&mut self.roots, key) {
-                node.children = Some(listed);
-            }
+        if expanded && node.children.is_none() {
+            node.children = Some(Self::list(&mut *self.source, &self.options, key, None));
         }
         let had_selection = self.selected.is_some();
         self.rebuild_rows();
@@ -911,13 +919,6 @@ impl SidebarView {
         !inside_source && folder != current_parent
     }
 
-    fn cancel_drag(&mut self) {
-        if let Some(drag) = self.drag.take() {
-            self.events.push(SidebarEvent::DragCancelled(drag.source));
-        }
-        self.press = None;
-    }
-
     fn header_pointer(&mut self, cx: &mut EventCx, event: &PointerEvent) -> EventResult {
         self.forward_to_buttons(cx, &Event::Pointer(*event))
     }
@@ -1053,8 +1054,11 @@ impl SidebarView {
     }
 
     fn key(&mut self, key: &KeyEvent, cx: &mut EventCx) -> bool {
-        if self.drag.is_some() && key.vk == vk::ESCAPE {
-            self.cancel_drag();
+        if key.vk == vk::ESCAPE
+            && let Some(drag) = self.drag.take()
+        {
+            self.events.push(SidebarEvent::DragCancelled(drag.source));
+            self.press = None;
             return true;
         }
         let current = self.selected.and_then(|k| self.row_of(k));
@@ -2654,6 +2658,41 @@ mod tests {
         let notch = wheel_notch(&f, -1.0);
         f.harness.send(&mut f.view, notch);
         assert_eq!(f.view.renaming(), Some(7));
+    }
+
+    #[test]
+    fn an_open_rename_box_stays_put_when_its_row_is_hidden_by_a_collapse() {
+        let mut f = fixture(SidebarOptions::default());
+        f.view.user_expand(1, true);
+        f.view.take_events();
+        f.layout();
+        let id = f.view.id();
+        let mut cx = f.harness.event_cx(id);
+        assert!(f.view.begin_rename(&mut cx, 3));
+        f.layout();
+        let row = f
+            .view
+            .row_rect(f.view.row_of(3).expect("row of the renamed node"));
+        let placed = f.view.rename.as_ref().expect("renaming").text_box.bounds();
+        assert!(placed.y >= row.y && placed.bottom() <= row.bottom());
+        f.view.user_expand(1, false);
+        f.layout();
+        assert_eq!(f.view.renaming(), Some(3));
+        let kept = f.view.rename.as_ref().expect("renaming").text_box.bounds();
+        assert_eq!(kept, placed, "no row to follow, so the box is not moved");
+    }
+
+    #[test]
+    fn right_on_a_file_leaves_the_selection_and_the_tree_alone() {
+        let mut f = fixture(SidebarOptions::default());
+        f.focus_tree();
+        f.view.select_key(7);
+        f.view.take_events();
+        let rows = f.view.row_count();
+        assert!(f.key(vk::RIGHT));
+        assert_eq!(f.view.selected_key(), Some(7));
+        assert_eq!(f.view.row_count(), rows);
+        assert!(f.view.take_events().is_empty());
     }
 
     #[test]

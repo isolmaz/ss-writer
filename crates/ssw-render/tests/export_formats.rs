@@ -593,6 +593,20 @@ fn images_are_read_from_the_document_directory_only() {
         .expect_err("undecodable image");
     assert!(matches!(err, ExportError::Layout(_)), "{err:?}");
     assert!(err.to_string().starts_with("layout failed:"), "{err}");
+    // Every output reports the same layout failure instead of producing a partial file.
+    let broken = "![broken](broken.png)";
+    let pdf = exporter
+        .export_pdf(broken, &options, &NoDiagrams)
+        .expect_err("pdf of an undecodable image");
+    let png = exporter
+        .export_png(broken, &options, &NoDiagrams, &PageSelection::All, 72.0)
+        .expect_err("png of an undecodable image");
+    let jpg = exporter
+        .export_jpg(broken, &options, &NoDiagrams, &PageSelection::All, 72.0, 80)
+        .expect_err("jpeg of an undecodable image");
+    for failure in [&pdf, &png, &jpg] {
+        assert_eq!(failure, &err);
+    }
     // The exporter keeps working.
     assert!(exporter.layout_pages("fine", &options, &NoDiagrams).is_ok());
 

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use ssw_convert::import::{Asset, ImportError, ImportResult, Loss};
 use ssw_convert::textbundle::{self, TextBundleError};
-use ssw_io::encoding::{self, TextFormat};
+use ssw_io::encoding::{self, TextEncoding, TextFormat};
 use ssw_io::fs::{FileSystem, FsError};
 use ssw_io::save::{SaveStamp, WriteAccess, write_access};
 
@@ -266,6 +266,21 @@ fn bundle_text_file(fs: &dyn FileSystem, dir: &Path) -> Result<String, FsError> 
 /// [`LoadError`] when the file cannot be read, is refused by an importer, or is a broken
 /// bundle.
 pub fn load_file(fs: &dyn FileSystem, path: &Path, tld: Option<&str>) -> Result<Loaded, LoadError> {
+    load_file_as(fs, path, tld, None)
+}
+
+/// [`load_file`] where `forced` names the encoding a text file is decoded with instead of the
+/// detected one ("reopen with encoding", spec §4.2). Files read through an importer have no
+/// encoding to choose and ignore it.
+///
+/// # Errors
+/// As [`load_file`].
+pub fn load_file_as(
+    fs: &dyn FileSystem,
+    path: &Path,
+    tld: Option<&str>,
+    forced: Option<TextEncoding>,
+) -> Result<Loaded, LoadError> {
     let meta = fs.metadata(path)?;
     let access = write_access(fs, path).unwrap_or(WriteAccess::Writable);
     let extension = extension_of(path);
@@ -325,7 +340,10 @@ pub fn load_file(fs: &dyn FileSystem, path: &Path, tld: Option<&str>) -> Result<
             }
         }
         _ => {
-            let decoded = encoding::decode(&bytes, tld);
+            let decoded = match forced {
+                Some(chosen) => encoding::decode_as(&bytes, chosen),
+                None => encoding::decode(&bytes, tld),
+            };
             ssw_win::perf::mark_latest(crate::perf::DOC_DECODED);
             Loaded {
                 text: decoded.text,

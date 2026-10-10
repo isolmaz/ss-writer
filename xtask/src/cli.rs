@@ -25,6 +25,11 @@ Commands:
                            release build, fixtures in target/perf, every performance scenario N times
                            (default 5, off-screen window, fresh profile per run), report in
                            target/perf/report.md; --write-docs fills docs/performance.md too
+  screenshots [--scale N] [--only NAME]... [--no-build]
+                           release build, demo documents and scenario scripts in target/screens,
+                           every scenario run hidden in the light and dark theme (offscreen
+                           rendering, nothing is shown), PNG files in docs/screenshots;
+                           --scale 2 for hi-DPI (default 1)
   help                     this text
 ";
 
@@ -48,6 +53,19 @@ pub enum Command {
     Icons,
     /// `perf`.
     Perf(PerfArgs),
+    /// `screenshots`.
+    Screenshots(ScreenshotArgs),
+}
+
+/// Arguments of `screenshots`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ScreenshotArgs {
+    /// The DPI scale in percent (100 is 96 DPI).
+    pub scale_percent: u32,
+    /// Only these scenarios (all when empty).
+    pub only: Vec<String>,
+    /// Use the release build that is there.
+    pub no_build: bool,
 }
 
 /// Arguments of `perf`.
@@ -91,6 +109,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Error> 
         "docs-check" => parse_docs_check(args),
         "icons" => no_more_args(args).map(|()| Command::Icons),
         "perf" => parse_perf(args),
+        "screenshots" => parse_screenshots(args),
         other => Err(Error::Usage(format!("unknown command `{other}`"))),
     }
 }
@@ -191,6 +210,36 @@ fn parse_perf(mut args: impl Iterator<Item = String>) -> Result<Command, Error> 
         }
     }
     Ok(Command::Perf(PerfArgs { runs, write_docs }))
+}
+
+fn parse_screenshots(mut args: impl Iterator<Item = String>) -> Result<Command, Error> {
+    let mut parsed = ScreenshotArgs {
+        scale_percent: 100,
+        only: Vec::new(),
+        no_build: false,
+    };
+    while let Some(arg) = args.next() {
+        let (flag, inline) = split_flag(&arg);
+        match (flag, inline) {
+            ("--no-build", None) => parsed.no_build = true,
+            ("--only", _) => parsed.only.push(flag_value(flag, inline, &mut args)?),
+            ("--scale", _) => {
+                let raw = flag_value(flag, inline, &mut args)?;
+                parsed.scale_percent = raw
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|scale| (0.5..=4.0).contains(scale))
+                    .map(|scale| (scale * 100.0).round() as u32)
+                    .ok_or_else(|| {
+                        Error::Usage(format!(
+                            "`{flag}` needs a number from 0.5 to 4, got `{raw}`"
+                        ))
+                    })?;
+            }
+            _ => return Err(unknown_argument(&arg)),
+        }
+    }
+    Ok(Command::Screenshots(parsed))
 }
 
 fn parse_docs_check(args: impl Iterator<Item = String>) -> Result<Command, Error> {
@@ -329,9 +378,56 @@ mod tests {
     }
 
     #[test]
+    fn screenshots_take_scale_scenarios_and_no_build() {
+        assert_eq!(
+            parse_strs(&["screenshots"]).unwrap(),
+            Command::Screenshots(ScreenshotArgs {
+                scale_percent: 100,
+                only: vec![],
+                no_build: false
+            })
+        );
+        assert_eq!(
+            parse_strs(&[
+                "screenshots",
+                "--scale",
+                "2",
+                "--only",
+                "settings",
+                "--only=zen-focus",
+                "--no-build"
+            ])
+            .unwrap(),
+            Command::Screenshots(ScreenshotArgs {
+                scale_percent: 200,
+                only: vec!["settings".to_owned(), "zen-focus".to_owned()],
+                no_build: true
+            })
+        );
+        assert_eq!(
+            parse_strs(&["screenshots", "--scale=1.5"]).unwrap(),
+            Command::Screenshots(ScreenshotArgs {
+                scale_percent: 150,
+                only: vec![],
+                no_build: false
+            })
+        );
+        for bad in [
+            &["screenshots", "--scale", "9"][..],
+            &["screenshots", "--scale", "x"][..],
+            &["screenshots", "--scale"][..],
+            &["screenshots", "--only"][..],
+            &["screenshots", "--no-build=1"][..],
+            &["screenshots", "--bogus"][..],
+        ] {
+            assert!(matches!(parse_strs(bad), Err(Error::Usage(_))), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn unknown_and_missing_commands_and_stray_arguments() {
         assert!(usage_message(parse_strs(&[])).contains("missing command"));
-        assert!(usage_message(parse_strs(&["screenshots"])).contains("screenshots"));
+        assert!(usage_message(parse_strs(&["frobnicate"])).contains("frobnicate"));
         assert!(usage_message(parse_strs(&["coverage", "--x"])).contains("--x"));
         assert!(usage_message(parse_strs(&["icons", "--size"])).contains("--size"));
         assert!(usage_message(parse_strs(&["docs-check", "--loose"])).contains("--loose"));

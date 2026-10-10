@@ -23,7 +23,7 @@ use crate::fonts::TEXT_FAMILY;
 use crate::frame_to_scene::{BASELINE_MARKER, frame_to_scene};
 use crate::scene::{Color, Scene};
 use crate::typst_markup::string_literal;
-use crate::world::{MITEX_DIR, TypstWorld, lock};
+use crate::world::{CompileError, MITEX_DIR, TypstWorld, lock};
 
 /// Formulas kept in the cache; the cache is emptied when it is full.
 const MAX_CACHE_ENTRIES: usize = 512;
@@ -68,6 +68,12 @@ impl MathError {
         Self {
             message: message.into(),
         }
+    }
+}
+
+impl From<CompileError> for MathError {
+    fn from(error: CompileError) -> Self {
+        Self::new(error.message)
     }
 }
 
@@ -127,8 +133,9 @@ fn shared() -> &'static MathRenderer {
 /// Typst accepts it, so an exported document never fails because of a bad formula.
 pub(crate) fn export_expression(latex: &str, display: bool) -> Result<String, MathError> {
     let expression = typst_expression(latex, display)?;
-    shared().render(latex, display, 12.0, Color::BLACK)?;
-    Ok(expression)
+    shared()
+        .render(latex, display, 12.0, Color::BLACK)
+        .map(|_| expression)
 }
 
 /// The import line that brings `mitex-scope` into a Typst document.
@@ -191,16 +198,19 @@ impl MathRenderer {
     ) -> Result<Scene, MathError> {
         let expression = typst_expression(latex, display)?;
         let source = page_source(&expression, display, font_size_pt, color);
-        let document = self
-            .world
-            .compile(&source)
-            .map_err(|e| MathError::new(e.message))?;
-        // A formula always yields exactly one page; the default scene is never returned.
-        Ok(document
-            .pages()
-            .first()
-            .map(|page| frame_to_scene(&page.frame))
-            .unwrap_or_default())
+        self.compile_page(&source).map(|document| {
+            // A formula always yields exactly one page; the default scene is never returned.
+            document
+                .pages()
+                .first()
+                .map(|page| frame_to_scene(&page.frame))
+                .unwrap_or_default()
+        })
+    }
+
+    /// Compiles the one-page document of a formula; Typst's errors become [`MathError`]s.
+    fn compile_page(&self, source: &str) -> Result<PagedDocument, MathError> {
+        self.world.compile(source).map_err(MathError::from)
     }
 
     /// See [`render_math_svg`].
@@ -244,9 +254,7 @@ impl MathRenderer {
         check_font_size(font_size_pt)?;
         let expression = typst_expression(latex, display)?;
         let source = picture_source(&expression, font_size_pt, color);
-        self.world
-            .compile(&source)
-            .map_err(|e| MathError::new(e.message))
+        self.compile_page(&source)
     }
 
     #[cfg(test)]
@@ -641,6 +649,30 @@ mod tests {
         assert!(!picture.contains("#01020304"));
         assert!(picture.contains("size: 12.5pt, fill: rgb(\"#ff000080\")"));
         assert!(picture.ends_with("\n#EXPR\n"));
+    }
+
+    #[test]
+    fn typst_errors_become_math_errors() {
+        let renderer = MathRenderer::new();
+        let err = renderer
+            .compile_page("#nosuchfunction()")
+            .expect_err("not a Typst document");
+        assert!(err.message.contains("unknown variable"), "{err}");
+        assert_eq!(
+            renderer.compile_page("x").expect("compiles").pages().len(),
+            1
+        );
+        // The conversion keeps the message and drops the hints.
+        let converted = MathError::from(CompileError {
+            message: "boom".to_owned(),
+            hints: vec!["try again".to_owned()],
+        });
+        assert_eq!(
+            converted,
+            MathError {
+                message: "boom".to_owned()
+            }
+        );
     }
 
     #[test]

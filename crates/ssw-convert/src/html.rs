@@ -655,11 +655,14 @@ impl<'a> Renderer<'a> {
         // Footnote bodies may reference further footnotes, which extends the list.
         while i < self.used_footnotes.len() {
             let number = i + 1;
-            let def = self.footnote_defs.get(&self.used_footnotes[i]).copied();
+            // A reference only exists for a defined label, so the empty fallback never shows.
+            let content = self
+                .footnote_defs
+                .get(&self.used_footnotes[i])
+                .copied()
+                .map_or(&[][..], |def| def.children.as_slice());
             let mut body = String::new();
-            if let Some(def) = def {
-                self.blocks(&def.children, &mut body);
-            }
+            self.blocks(content, &mut body);
             let back =
                 format!(" <a href=\"#fnref-{number}\" class=\"footnote-backref\">\u{21A9}</a>");
             match body.rfind("</p>") {

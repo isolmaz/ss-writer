@@ -107,6 +107,9 @@ pub enum SettingsEvent {
     /// The Browse button of a folder option was pressed: show a folder picker and answer with
     /// [`SettingsWindow::set_folder`].
     BrowseFolder(FieldId),
+    /// General → Default apps…: open the system page where the user picks the app that opens
+    /// Markdown and text files (spec §12).
+    OpenDefaultApps,
     /// Advanced → Open logs folder.
     OpenLogsFolder,
     /// Advanced → Open settings.json: open the file in the editor.
@@ -120,6 +123,7 @@ pub enum SettingsEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowKey {
     Field(FieldId),
+    DefaultApps,
     OpenLogs,
     OpenFile,
     Reset,
@@ -261,6 +265,14 @@ fn build_form(
         .filter(|def| def.section == section)
         .map(|def| field_row(loc, env, settings, languages, def))
         .collect();
+    if section == SettingsSection::General {
+        rows.push(action_row(
+            loc,
+            env.motion,
+            RowKey::DefaultApps,
+            "settings-general-default-apps",
+        ));
+    }
     if section == SettingsSection::Advanced {
         rows.push(action_row(
             loc,
@@ -304,6 +316,20 @@ fn find_form_mut(
         .iter_mut()
         .find(|(candidate, _)| *candidate == section)
         .map(|(_, form)| form)
+}
+
+/// The form of a section whose page is a form: every section but Shortcuts, which is also the
+/// only section no field belongs to.
+fn page_form(forms: &[(SettingsSection, Form<RowKey>)], section: SettingsSection) -> &Form<RowKey> {
+    find_form(forms, section).expect("every page but Shortcuts is a form")
+}
+
+/// [`page_form`], mutably.
+fn page_form_mut(
+    forms: &mut [(SettingsSection, Form<RowKey>)],
+    section: SettingsSection,
+) -> &mut Form<RowKey> {
+    find_form_mut(forms, section).expect("every page but Shortcuts is a form")
 }
 
 /// Records `chords` as the override of `command`, or drops the override when they are the
@@ -392,18 +418,8 @@ impl SettingsWindow {
     fn refresh_enabled(&mut self) {
         for def in FIELDS {
             let enabled = is_enabled(def.id, &self.settings);
-            if let Some(form) = self.form_mut(def.section) {
-                form.set_enabled(RowKey::Field(def.id), enabled);
-            }
+            page_form_mut(&mut self.forms, def.section).set_enabled(RowKey::Field(def.id), enabled);
         }
-    }
-
-    fn form(&self, section: SettingsSection) -> Option<&Form<RowKey>> {
-        find_form(&self.forms, section)
-    }
-
-    fn form_mut(&mut self, section: SettingsSection) -> Option<&mut Form<RowKey>> {
-        find_form_mut(&mut self.forms, section)
     }
 
     /// The settings as edited so far.
@@ -475,15 +491,12 @@ impl SettingsWindow {
     /// The message under the control of `field` while its typed value is refused.
     #[must_use]
     pub fn error(&self, field: FieldId) -> Option<&str> {
-        self.form(field.section())
-            .and_then(|form| form.error(RowKey::Field(field)))
+        page_form(&self.forms, field.section()).error(RowKey::Field(field))
     }
 
     /// Answers [`SettingsEvent::BrowseFolder`]: stores the chosen folder like a typed value.
     pub fn set_folder(&mut self, field: FieldId, path: &str) {
-        if let Some(form) = self.form_mut(field.section()) {
-            form.set_text(RowKey::Field(field), path);
-        }
+        page_form_mut(&mut self.forms, field.section()).set_text(RowKey::Field(field), path);
         self.commit(field, Change::Edited(path.to_owned()));
     }
 
@@ -542,9 +555,7 @@ impl SettingsWindow {
             .as_ref()
             .err()
             .map(|problem| problem.message(&self.loc));
-        if let Some(form) = self.form_mut(def.section) {
-            form.set_error(RowKey::Field(field), message);
-        }
+        page_form_mut(&mut self.forms, def.section).set_error(RowKey::Field(field), message);
         if outcome.is_ok() {
             self.events
                 .push(SettingsEvent::Changed(SettingsChange::Field(field)));
@@ -572,6 +583,7 @@ impl SettingsWindow {
         }
         for (key, change) in changes {
             match key {
+                RowKey::DefaultApps => self.events.push(SettingsEvent::OpenDefaultApps),
                 RowKey::OpenLogs => self.events.push(SettingsEvent::OpenLogsFolder),
                 RowKey::OpenFile => self.events.push(SettingsEvent::OpenSettingsFile),
                 RowKey::Reset => self.events.push(SettingsEvent::ResetSettings),
@@ -676,7 +688,8 @@ impl Widget for SettingsWindow {
         if section == SettingsSection::Shortcuts {
             self.shortcuts.arrange(cx, viewport);
             self.scroll.arrange(cx, viewport, 0.0);
-        } else if let Some(form) = find_form_mut(&mut self.forms, section) {
+        } else {
+            let form = page_form_mut(&mut self.forms, section);
             let content = form.layout(cx, viewport);
             self.scroll.arrange(cx, viewport, content);
         }
@@ -716,9 +729,8 @@ impl Widget for SettingsWindow {
             self.shortcuts.paint(cx, canvas);
             return;
         }
-        if let Some(form) = self.form(self.section) {
-            self.scroll.paint(cx, canvas, form);
-        }
+        self.scroll
+            .paint(cx, canvas, page_form(&self.forms, self.section));
     }
 
     fn event(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
@@ -742,9 +754,8 @@ impl Widget for SettingsWindow {
         let children = if self.section == SettingsSection::Shortcuts {
             self.shortcuts.access(cx, out)
         } else {
-            // Every page but Shortcuts is a form.
-            self.form(self.section)
-                .map_or_else(Vec::new, |form| self.scroll.access(cx, out, form))
+            self.scroll
+                .access(cx, out, page_form(&self.forms, self.section))
         };
         out.insert(
             AccessNode::new(

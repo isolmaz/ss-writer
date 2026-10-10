@@ -52,7 +52,8 @@ mod tests {
             (b"{\\rt", Some("text")),
         ];
         for (input, want) in cases {
-            assert_eq!(sniff(input), want, "{:?}", String::from_utf8_lossy(input));
+            let shown = String::from_utf8_lossy(input);
+            assert_eq!(sniff(input), want, "{shown:?}");
         }
     }
 

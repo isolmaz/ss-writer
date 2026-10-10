@@ -10,7 +10,7 @@ use ssw_core::text::{Buffer, TextRange};
 
 use crate::canvas::Canvas;
 use crate::editor::block::{
-    BlockCx, BlockLayout, BlockPaintCx, BlockPress, BlockRenderer, FallbackRenderer,
+    BlockCx, BlockLayout, BlockPaintCx, BlockPress, BlockRenderer, FallbackRenderer, composition_in,
 };
 use crate::editor::config::{EditorEvent, EditorStrings};
 use crate::editor::highlight::{Highlighter, Language, SyntaxColors, Token};
@@ -109,7 +109,7 @@ impl CodeRenderer {
         if let Some(close) = fence.and_then(|fence| fence.close) {
             rows.push(line_row(cx.buffer, close.start));
         }
-        let composition = cx.composition.filter(|comp| block.range.touches(comp.at));
+        let composition = composition_in(cx, block.range);
         let mut source = display_of(block.range, &rows, cx.buffer, composition);
 
         let size = cx.config.body_size() * 0.9;

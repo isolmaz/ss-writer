@@ -524,6 +524,21 @@ fn assistive_technology_can_press_toolbar_buttons() {
     assert!(toolbar.is_menu_open());
 }
 
+#[test]
+fn keys_and_pointers_the_toolbar_has_no_use_for_pass_through_and_repaint_nothing() {
+    let (mut host, mut toolbar) = toolbar();
+    host.requests.take_invalidation();
+    assert!(!host.key(&mut toolbar, KEY_A).handled);
+    assert!(
+        !host
+            .pointer(&mut toolbar, PointerEventKind::Move, Point::new(5.0, 5.0))
+            .handled
+    );
+    assert!(toolbar.is_visible());
+    assert!(toolbar.take_events().is_empty());
+    assert!(host.requests.take_invalidation().is_clean());
+}
+
 // ------------------------------------------------------------------------ link popup
 
 fn link_popup(anchor: Rect) -> (Host, LinkEditPopup) {
@@ -626,6 +641,16 @@ fn the_buttons_remove_and_apply_and_escape_or_an_outside_press_cancel() {
     popup.show(anchor, "T", "u");
     popup.apply();
     assert_eq!(popup.take_events().len(), 1);
+}
+
+#[test]
+fn a_plain_letter_key_is_left_to_the_editor_and_repaints_nothing() {
+    let (mut host, mut popup) = link_popup(Rect::new(300.0, 100.0, 60.0, 20.0));
+    host.requests.take_invalidation();
+    assert!(!host.key(&mut popup, KEY_A).handled);
+    assert!(popup.is_visible());
+    assert!(popup.take_events().is_empty());
+    assert!(host.requests.take_invalidation().is_clean());
 }
 
 #[test]
@@ -831,6 +856,37 @@ fn clicking_a_row_accepts_and_pressing_outside_dismisses() {
     low.open(Rect::new(100.0, 570.0, 2.0, 20.0), "");
     host.layout(&mut low, WINDOW);
     assert_eq!(low.bounds().y, 428.0);
+}
+
+#[test]
+fn a_press_in_the_panel_padding_chooses_nothing_and_a_still_pointer_repaints_nothing() {
+    let (mut host, mut list) = completion("");
+    // The padding above the first row is inside the panel but not on a row.
+    let padding = Point::new(list.bounds().x + 1.0, list.bounds().y + 1.0);
+    assert!(list.bounds().contains(padding));
+    assert!(host.click(&mut list, padding).handled);
+    assert!(list.is_visible());
+    assert!(list.take_events().is_empty());
+    // Hovering the same row again, or leaving twice, changes nothing on screen.
+    let at = list.list().row_rect(1).expect("row").center();
+    host.requests.take_invalidation();
+    assert!(host.pointer(&mut list, PointerEventKind::Move, at).handled);
+    assert!(!host.requests.take_invalidation().is_clean());
+    assert!(host.pointer(&mut list, PointerEventKind::Move, at).handled);
+    assert!(host.requests.take_invalidation().is_clean());
+    let outside = Point::new(5.0, 5.0);
+    assert!(
+        !host
+            .pointer(&mut list, PointerEventKind::Move, outside)
+            .handled
+    );
+    assert!(!host.requests.take_invalidation().is_clean());
+    assert!(
+        !host
+            .pointer(&mut list, PointerEventKind::Move, outside)
+            .handled
+    );
+    assert!(host.requests.take_invalidation().is_clean());
 }
 
 #[test]

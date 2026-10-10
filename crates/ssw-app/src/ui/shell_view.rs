@@ -18,7 +18,7 @@ use ssw_core::stats;
 use ssw_core::text::TextRange;
 use ssw_ui::canvas::Canvas;
 use ssw_ui::editor::blocks_table::TableControl;
-use ssw_ui::editor::{EditorConfig, EditorEvent, EditorStrings, EditorView};
+use ssw_ui::editor::{DocumentKind, EditorConfig, EditorEvent, EditorStrings, EditorView};
 use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{Cursor, Event, FocusEvent, PointerButton, PointerEvent, PointerEventKind};
 use ssw_ui::services::Clock;
@@ -41,7 +41,7 @@ use ssw_ui::widgets::{Control, SharedClipboard};
 use super::clipboard::key_command;
 use super::history::HistoryHost;
 use super::overlays::{NoShortcuts, OverlayAction, OverlayEnv, OverlayRects, Overlays};
-use crate::documents::{DocEntry, DocMode};
+use crate::documents::{DocEntry, DocMode, Documents};
 
 /// Something the user did that the window cannot carry out by itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +146,9 @@ struct StatusKey {
     head: usize,
     zoom: u32,
     format: (bool, bool, bool),
+    /// Encoding, BOM and line endings: the status bar shows them and the user changes them
+    /// without touching the text.
+    file_format: ssw_io::encoding::TextFormat,
 }
 
 /// The composed window content.
@@ -195,6 +198,21 @@ impl fmt::Debug for ShellView {
             .field("tabs", &self.tabs.len())
             .field("active", &self.active)
             .finish_non_exhaustive()
+    }
+}
+
+/// Makes `editor` present its document the way the file type wants (spec §4.1): live Markdown,
+/// plain lines, or a whole Mermaid diagram.
+fn present_as(editor: &mut EditorView, mode: DocMode) {
+    let kind = match mode {
+        DocMode::Markdown => DocumentKind::Markdown,
+        DocMode::Plain => DocumentKind::PlainText,
+        DocMode::Mermaid => DocumentKind::Mermaid,
+    };
+    if editor.config().document_kind != kind {
+        let mut config = editor.config().clone();
+        config.document_kind = kind;
+        editor.set_config(config);
     }
 }
 
@@ -539,6 +557,7 @@ impl ShellView {
         }
         let mut editor = EditorView::new(Rc::clone(entry.document()), Rc::clone(&self.clock));
         editor.set_config(self.editor_config.clone());
+        present_as(&mut editor, entry.mode());
         editor.set_strings(self.editor_strings.clone());
         editor.set_clipboard(Rc::clone(&self.clipboard));
         let table = self
@@ -554,6 +573,25 @@ impl ShellView {
         });
         self.activate_tab(key);
         key
+    }
+
+    /// Opens `entry` as the result of "open a file": an active tab that is a pristine untitled
+    /// document (see [`DocEntry::is_pristine_untitled`]) is replaced and its document released,
+    /// every other tab stays. Returns the key of the new tab.
+    pub fn open_tab(
+        &mut self,
+        entry: Rc<DocEntry>,
+        workspace: Option<PathBuf>,
+        docs: &Documents,
+    ) -> u64 {
+        let unused = self
+            .active_tab()
+            .filter(|tab| tab.entry.is_pristine_untitled())
+            .map(|tab| tab.key);
+        if let Some(removed) = unused.and_then(|key| self.close_tab(key)) {
+            docs.release(&removed.entry);
+        }
+        self.add_tab(entry, workspace)
     }
 
     /// Makes the tab with `key` active. Returns whether it exists.
@@ -653,9 +691,11 @@ impl ShellView {
             .is_some_and(|table| table.execute(&mut tab.editor, &clipboard, command))
     }
 
-    /// Refreshes the tab titles and dirty dots (`show_dirty`: autosave is off).
+    /// Refreshes the tab titles and dirty dots (`show_dirty`: autosave is off) and the way each
+    /// editor presents its document (a Save as can change the file type).
     pub fn sync_tabs(&mut self, show_dirty: bool) {
-        for tab in &self.tabs {
+        for tab in &mut self.tabs {
+            present_as(&mut tab.editor, tab.entry.mode());
             let tabs = self.titlebar.tabs_mut();
             if let Some(path) = tab.entry.path() {
                 let path = path.to_string_lossy();
@@ -813,10 +853,14 @@ impl ShellView {
             }
         }
         self.focus.commit_tab_order();
-        for id in self.overlays.take_focus_requests() {
-            self.focus.focus(id);
+        let mut wanted = self.overlays.take_focus_requests();
+        wanted.extend(self.history.take_focus_request());
+        if !wanted.is_empty() {
+            // A panel that just opened takes the keyboard. A pending return to the editor (a
+            // tab opened or activated since the last layout) is older than that request.
+            self.refocus_editor = false;
         }
-        if let Some(id) = self.history.take_focus_request() {
+        for id in wanted {
             self.focus.focus(id);
         }
         if self.history.take_refocus() {
@@ -1288,6 +1332,7 @@ impl ShellView {
         let underline = tab.editor.style_active(InlineStyle::Underline);
         let document = tab.entry.document().borrow();
         let selection = document.primary_selection();
+        let format = tab.entry.format();
         let key = StatusKey {
             tab: tab.key,
             version: document.version(),
@@ -1295,6 +1340,7 @@ impl ShellView {
             head: selection.head,
             zoom: tab.editor.zoom_percent(),
             format: (bold, italic, underline),
+            file_format: format,
         };
         self.titlebar.set_format_state(FormatState {
             bold,
@@ -1341,7 +1387,6 @@ impl ShellView {
                 stats::for_range_plain(&source, selection.range()).words
             }
         });
-        let format = tab.entry.format();
         let encoding = if format.bom {
             self.localizer.format(
                 "window-encoding-bom",

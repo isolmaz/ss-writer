@@ -282,6 +282,13 @@ impl Recorder {
         self.lock().latencies.len()
     }
 
+    /// Forgets every mark, frame and input sample and the frame phase; time zero stays the
+    /// creation of the process. For a process that measures several runs one after the other
+    /// (tests); a normal run records once.
+    pub fn reset(&self) {
+        *self.lock() = State::default();
+    }
+
     /// Everything recorded so far.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
@@ -316,6 +323,13 @@ pub fn recorder() -> Option<&'static Recorder> {
 #[must_use]
 pub fn enabled() -> bool {
     RECORDER.get().is_some()
+}
+
+/// [`Recorder::reset`] on the process-wide recorder; nothing before [`enable`].
+pub fn reset() {
+    if let Some(recorder) = RECORDER.get() {
+        recorder.reset();
+    }
 }
 
 /// [`Recorder::mark`] on the process-wide recorder; nothing before [`enable`].
@@ -454,6 +468,29 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_forgets_everything_and_starts_a_clean_run() {
+        let recorder = live();
+        recorder.mark("a");
+        recorder.set_phase(3);
+        recorder.content_painted(true);
+        recorder.input_received();
+        recorder.frame(1.0, 2.0, 3.0);
+        recorder.input_received();
+        assert!(recorder.frame_count() == 1 && recorder.latency_count() == 1);
+        recorder.reset();
+        let snapshot = recorder.snapshot();
+        assert!(snapshot.marks.is_empty() && snapshot.frames.is_empty());
+        assert!(snapshot.input_latency_ms.is_empty());
+        assert_eq!(recorder.frame_count() + recorder.latency_count(), 0);
+        // The pending input and the content flag went too: the next frame starts from zero.
+        recorder.frame(4.0, 5.0, 6.0);
+        let snapshot = recorder.snapshot();
+        assert_eq!(snapshot.frames[0].phase, 0);
+        assert_eq!(snapshot.marks, [(MARK_FIRST_PRESENT, 6.0)]);
+        assert!(snapshot.input_latency_ms.is_empty());
+    }
+
+    #[test]
     fn frames_carry_their_phase_and_mark_the_first_present() {
         let recorder = manual(0.0);
         assert_eq!(recorder.frame_count(), 0);
@@ -550,6 +587,7 @@ mod tests {
         mark_latest("early");
         input_received();
         content_painted(true);
+        reset();
         let mut inert = FrameTimer::begin();
         inert.drawn();
         inert.presented();
@@ -584,5 +622,7 @@ mod tests {
         assert!(frame.drawn_ms - frame.start_ms >= 2.0);
         assert!(frame.presented_ms - frame.drawn_ms >= 2.0);
         assert_eq!(snapshot.input_latency_ms.len(), 1);
+        reset();
+        assert!(global.snapshot().marks.is_empty() && global.snapshot().frames.is_empty());
     }
 }

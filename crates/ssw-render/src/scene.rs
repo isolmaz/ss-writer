@@ -111,23 +111,22 @@ impl Rect {
 /// Accumulates a bounding box.
 #[derive(Clone, Copy, Debug, Default)]
 struct BoundsBuilder {
-    min: Option<Point>,
-    max: Option<Point>,
+    /// The top left and bottom right corner of everything added so far.
+    corners: Option<(Point, Point)>,
 }
 
 impl BoundsBuilder {
     fn add(&mut self, p: Point) {
-        let min = self.min.get_or_insert(p);
+        let (min, max) = self.corners.get_or_insert((p, p));
         min.x = min.x.min(p.x);
         min.y = min.y.min(p.y);
-        let max = self.max.get_or_insert(p);
         max.x = max.x.max(p.x);
         max.y = max.y.max(p.y);
     }
 
     fn finish(self) -> Option<Rect> {
-        let (min, max) = (self.min?, self.max?);
-        Some(Rect::new(min.x, min.y, max.x - min.x, max.y - min.y))
+        self.corners
+            .map(|(min, max)| Rect::new(min.x, min.y, max.x - min.x, max.y - min.y))
     }
 }
 
@@ -1236,6 +1235,19 @@ mod tests {
             ("#gggggg", None),
             ("#\u{1000}", None),
             ("#a\u{00ff}bcd", None),
+            // A bad digit in any position of each of the four forms.
+            ("#0g0", None),
+            ("#00g", None),
+            ("#g000", None),
+            ("#0g00", None),
+            ("#00g0", None),
+            ("#000g", None),
+            ("#00gg00", None),
+            ("#0000gg", None),
+            ("#gg000000", None),
+            ("#00gg0000", None),
+            ("#0000gg00", None),
+            ("#000000gg", None),
         ];
         for (text, expected) in table {
             assert_eq!(Color::from_hex(text), expected, "{text}");

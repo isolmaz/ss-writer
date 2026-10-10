@@ -9,7 +9,7 @@ use ssw_core::text::TextRange;
 
 use crate::canvas::Canvas;
 use crate::editor::block::{
-    BlockCx, BlockLayout, BlockPaintCx, BlockPress, BlockRenderer, FallbackRenderer,
+    BlockCx, BlockLayout, BlockPaintCx, BlockPress, BlockRenderer, FallbackRenderer, composition_in,
 };
 use crate::editor::config::{EditorEvent, EditorStrings};
 use crate::editor::object::{ObjectKind, ObjectRequest, ObjectState, ObjectVisual};
@@ -110,7 +110,7 @@ impl BlockRenderer for MathRenderer {
                 ObjectState::Ready(_) => tokens.text,
                 ObjectState::Pending | ObjectState::Blocked => tokens.text_muted,
             };
-            let composition = cx.composition.filter(|comp| block.range.touches(comp.at));
+            let composition = composition_in(cx, block.range);
             let mut source = display_of(block.range, &rows, cx.buffer, composition);
             let base = TextStyle::new(cx.config.code_font.clone(), cx.config.body_size() * 0.95);
             for marker in &block.markers {
@@ -145,6 +145,8 @@ impl BlockRenderer for MathRenderer {
             )
         });
         let height = scene.map_or(text_height, |(_, rect)| rect.bottom() + MARGIN);
+        // The source part names the block while it is shown.
+        let access = text.is_none().then_some(access);
         Box::new(SceneLayout {
             text,
             scene,
@@ -158,22 +160,21 @@ impl BlockRenderer for MathRenderer {
     }
 }
 
-/// The opening and closing delimiter lines and the content between them.
+/// The opening and closing delimiter lines and the content between them. The parser gives
+/// every math block its opening delimiter as the first marker and the closing delimiter as the
+/// second one, which an unterminated block lacks.
 fn delimiter_rows(cx: &BlockCx<'_>, block: &Block, content: &[Row]) -> Vec<Row> {
-    let line_row = |offset: usize| Row {
-        src: TextRange::new(offset, cx.buffer.line_range(cx.buffer.line_of(offset)).end),
+    let line_row = |marker: &TextRange| Row {
+        src: TextRange::new(
+            marker.start,
+            cx.buffer.line_range(cx.buffer.line_of(marker.start)).end,
+        ),
         pad: 0,
     };
     let mut rows = Vec::with_capacity(content.len() + 2);
-    if let Some(open) = block.markers.first() {
-        rows.push(line_row(open.start));
-    }
+    rows.extend(block.markers.first().map(line_row));
     rows.extend_from_slice(content);
-    if block.markers.len() > 1
-        && let Some(close) = block.markers.last()
-    {
-        rows.push(line_row(close.start));
-    }
+    rows.extend(block.markers.get(1).map(line_row));
     rows
 }
 
@@ -277,7 +278,7 @@ pub(super) fn measure_mermaid(
         range: block.range,
         width: cx.width,
         menu,
-        access: strings.mermaid_diagram.clone(),
+        access: Some(strings.mermaid_diagram.clone()),
     })
 }
 
@@ -292,7 +293,8 @@ struct SceneLayout {
     width: f32,
     /// The Mermaid source offered to the context menu.
     menu: Option<String>,
-    access: String,
+    /// The accessible name; a layout without one is named by its source part.
+    access: Option<String>,
 }
 
 impl BlockLayout for SceneLayout {
@@ -375,8 +377,13 @@ impl BlockLayout for SceneLayout {
         }))
     }
 
-    fn access_label(&self, _strings: &EditorStrings) -> String {
-        self.access.clone()
+    fn access_label(&self, strings: &EditorStrings) -> String {
+        self.access.clone().unwrap_or_else(|| {
+            self.text
+                .as_ref()
+                .map(|text| text.access_label(strings))
+                .unwrap_or_default()
+        })
     }
 }
 

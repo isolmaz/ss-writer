@@ -39,7 +39,7 @@ use crate::widgets::{
 };
 
 use super::palette::{CommandPalette, ShortcutLabels};
-use super::picker::{ROW_HEIGHT, Row, RowClick, RowKey, RowList, RowOutcome, highlight_ranges};
+use super::picker::{ROW_HEIGHT, Row, RowClick, RowList, RowOutcome, highlight_ranges};
 
 /// Widest panel.
 const MAX_WIDTH: f32 = 560.0;
@@ -226,6 +226,13 @@ impl QuickOpen {
         self.rebuild();
     }
 
+    /// Tells the command mode which commands apply now (`enabled` is asked for every command).
+    /// The others stay listed, drawn disabled, and choosing one does nothing.
+    pub fn set_command_availability(&mut self, enabled: &dyn Fn(CommandId) -> bool) {
+        self.palette.set_availability(enabled);
+        self.rebuild();
+    }
+
     #[must_use]
     pub fn is_visible(&self) -> bool {
         self.visible
@@ -316,12 +323,13 @@ impl QuickOpen {
     }
 
     /// Chooses the selected row: the overlay closes and reports the choice. Returns whether a
-    /// row was selected.
+    /// row was chosen; a disabled command is not (the overlay stays open).
     pub fn activate(&mut self) -> bool {
         let Some(selected) = self.list.selected() else {
             return false;
         };
         let event = match self.hits[selected] {
+            Hit::Command(command) if !self.palette.is_enabled(command) => return false,
             Hit::File(index) => QuickOpenEvent::OpenFile {
                 path: self.files[index].clone(),
             },
@@ -543,9 +551,9 @@ impl Widget for QuickOpen {
                     return EventResult::handled();
                 }
                 vk::UP | vk::DOWN | vk::PAGE_UP | vk::PAGE_DOWN => {
-                    if self.list.key(key) == RowKey::Moved {
-                        cx.invalidate(self.panel);
-                    }
+                    // The guard admits unmodified keys only, and those always answer `Moved`.
+                    self.list.key(key);
+                    cx.invalidate(self.panel);
                     return EventResult::handled();
                 }
                 _ => {}

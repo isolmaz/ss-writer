@@ -25,7 +25,6 @@ use ssw_io::net::{Http, WinHttp};
 use ssw_io::session::{RecentKind, Session, WindowPlacement};
 use ssw_ui::geometry::Point;
 use ssw_ui::services::{Clock, Dialogs, Shell};
-use ssw_ui::shell::layout::ShellMode;
 use ssw_ui::shell::titlebar::{MenuKind, TitleEvent};
 use ssw_ui::theme::ThemeMode;
 use ssw_ui::widgets::SharedClipboard;
@@ -52,7 +51,7 @@ use ssw_win::window::{
 use windows::Win32::Foundation::HWND;
 
 use super::controller::{Controller, Request, WindowCell};
-use super::menus::{MenuState, build_menu, command_for_menu_id};
+use super::menus::{build_menu, command_for_menu_id};
 use super::platform::Platform;
 use super::settings_window::{
     SettingsNative, SettingsSetup, WINDOW_SIZE, WindowsKeyNames, window_rect,
@@ -549,25 +548,6 @@ impl UiApp {
 
     // ----- menus ---------------------------------------------------------------------------
 
-    fn menu_state(&self, cell: &WindowCell) -> MenuState {
-        let view = cell.view.borrow();
-        let layout = view.layout();
-        let (typewriter, focus_mode) = view.active_tab().map_or((false, false), |tab| {
-            (tab.editor.typewriter(), tab.editor.focus_mode())
-        });
-        MenuState {
-            has_document: view.active_tab().is_some(),
-            sidebar: layout.sidebar_visible(),
-            inspector: layout.inspector_visible(),
-            status_bar: layout.status_bar_visible(),
-            format_pill: view.titlebar().pill_visible(),
-            typewriter,
-            focus_mode,
-            full_screen: layout.mode() == ShellMode::FullScreen,
-            zen: layout.mode() == ShellMode::Zen,
-        }
-    }
-
     /// Shows the popup of `menu` below its button and runs the chosen command.
     fn show_menu(&self, id: WindowId, menu: MenuKind, anchor: Point) {
         let Some(cell) = self.controller.window(id) else {
@@ -577,7 +557,7 @@ impl UiApp {
             menu,
             self.controller.i18n(),
             &self.controller.keymap(),
-            &self.menu_state(&cell),
+            &self.controller.menu_state(&cell),
         );
         let Some(chosen) = self.show_popup(id, &model, anchor) else {
             return;

@@ -15,6 +15,7 @@ use image::{ExtendedColorType, ImageEncoder};
 use ssw_core::markdown::parse_document;
 use ssw_core::settings::{ExportSettings, PageSize};
 use thiserror::Error;
+use typst::diag::SourceDiagnostic;
 use typst::utils::Scalar;
 use typst_layout::{Page, PagedDocument};
 use typst_pdf::PdfOptions;
@@ -217,6 +218,12 @@ impl Exporter {
     ) -> Result<PagedDocument, ExportError> {
         let _exclusive = lock(&self.gate);
         let document = self.to_typst(markdown, options, diagrams);
+        self.compile_document(document)
+    }
+
+    /// Registers the files of `document` in the world and compiles its source; the caller holds
+    /// the gate.
+    fn compile_document(&self, document: TypstDocument) -> Result<PagedDocument, ExportError> {
         for (path, bytes) in document.files {
             self.world.set_virtual_file(&path, bytes)?;
         }
@@ -242,10 +249,7 @@ impl Exporter {
         diagrams: &dyn DiagramSvg,
     ) -> Result<Vec<u8>, ExportError> {
         let document = self.compile(markdown, options, diagrams)?;
-        typst_pdf::pdf(&document, &PdfOptions::default()).map_err(|errors| {
-            let messages: Vec<String> = errors.iter().map(|e| e.message.to_string()).collect();
-            ExportError::Pdf(messages.join(" | "))
-        })
+        typst_pdf::pdf(&document, &PdfOptions::default()).map_err(pdf_error)
     }
 
     /// The selected pages as PNG files (one entry per page) at `dpi` pixels per inch.
@@ -283,12 +287,13 @@ impl Exporter {
     pub fn export_diagram_png(&self, svg: &str, dpi: f32) -> Result<Vec<u8>, ExportError> {
         check_resolution(dpi)?;
         let _exclusive = lock(&self.gate);
-        self.world
-            .set_virtual_file(DIAGRAM_PICTURE, svg.as_bytes().to_vec())?;
-        let document = self.world.compile(&format!(
-            "#set page(width: auto, height: auto, margin: {DIAGRAM_MARGIN_PT}pt, fill: white)\n\
-             #image(\"{DIAGRAM_PICTURE}\")\n"
-        ))?;
+        let document = self.compile_document(TypstDocument {
+            source: format!(
+                "#set page(width: auto, height: auto, margin: {DIAGRAM_MARGIN_PT}pt, fill: white)\n\
+                 #image(\"{DIAGRAM_PICTURE}\")\n"
+            ),
+            files: vec![(DIAGRAM_PICTURE.to_owned(), svg.as_bytes().to_vec())],
+        })?;
         let render = RenderOptions {
             pixel_per_pt: Scalar::new(f64::from(dpi) / POINTS_PER_INCH),
             render_bleed: false,
@@ -333,6 +338,15 @@ impl Exporter {
             })
             .collect())
     }
+}
+
+/// The PDF writer's diagnostics as one error, messages joined with ` | `.
+fn pdf_error(errors: impl IntoIterator<Item = SourceDiagnostic>) -> ExportError {
+    let messages: Vec<String> = errors
+        .into_iter()
+        .map(|error| error.message.to_string())
+        .collect();
+    ExportError::Pdf(messages.join(" | "))
 }
 
 fn check_resolution(dpi: f32) -> Result<(), ExportError> {
@@ -414,6 +428,8 @@ fn straight(px: [u8; 4]) -> [u8; 4] {
 
 #[cfg(test)]
 mod tests {
+    use typst::syntax::Span;
+
     use super::*;
 
     #[test]
@@ -519,8 +535,12 @@ mod tests {
             assert_eq!(check_resolution(dpi), Ok(()), "{dpi}");
         }
         for dpi in [0.99, 0.0, -1.0, 600.01, f32::NAN, f32::INFINITY] {
-            assert!(
-                matches!(check_resolution(dpi), Err(ExportError::Resolution(_))),
+            // NaN never equals itself: compare the rendered message.
+            assert_eq!(
+                check_resolution(dpi)
+                    .expect_err("outside the range")
+                    .to_string(),
+                format!("resolution {dpi} dpi is outside 1-600"),
                 "{dpi}"
             );
         }
@@ -608,14 +628,55 @@ mod tests {
             double_height.abs_diff(2 * height) <= 1,
             "{double_height} vs {height}"
         );
-        assert!(matches!(
+        assert_eq!(
             exporter.export_diagram_png(svg, 0.0),
-            Err(ExportError::Resolution(_))
-        ));
-        assert!(matches!(
-            exporter.export_diagram_png("not an svg", 72.0),
-            Err(ExportError::Layout(_))
-        ));
+            Err(ExportError::Resolution(0.0))
+        );
+        let invalid = exporter
+            .export_diagram_png("not an svg", 72.0)
+            .expect_err("not a picture");
+        assert!(
+            invalid.to_string().starts_with("layout failed: "),
+            "{invalid}"
+        );
+    }
+
+    #[test]
+    fn pdf_errors_join_the_writer_messages() {
+        let diagnostics = ["first problem", "second problem"]
+            .map(|message| SourceDiagnostic::error(Span::detached(), message));
+        assert_eq!(
+            pdf_error(diagnostics),
+            ExportError::Pdf("first problem | second problem".to_owned())
+        );
+        assert_eq!(pdf_error(Vec::new()), ExportError::Pdf(String::new()));
+        assert_eq!(
+            ExportError::Pdf("one | two".to_owned()).to_string(),
+            "PDF export failed: one | two"
+        );
+    }
+
+    #[test]
+    fn a_document_file_outside_the_root_is_rejected_before_compiling() {
+        let exporter = Exporter::new(None);
+        let document = TypstDocument {
+            source: "text".to_owned(),
+            files: vec![
+                ("ssw-diagram-0.svg".to_owned(), Vec::new()),
+                ("../escape.svg".to_owned(), Vec::new()),
+            ],
+        };
+        let err = exporter
+            .compile_document(document)
+            .expect_err("the second file escapes the root");
+        assert_eq!(
+            err,
+            ExportError::Path(InvalidPath("../escape.svg".to_owned()))
+        );
+        assert_eq!(
+            err.to_string(),
+            "invalid virtual file path \"../escape.svg\""
+        );
     }
 
     #[test]

@@ -8,16 +8,22 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use rusqlite::{Connection, ErrorCode, OptionalExtension};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Params, Row, Transaction};
 use thiserror::Error;
 
 /// Unix time in seconds.
 pub type UnixSeconds = i64;
 
-/// How long a connection waits for a lock held by another connection.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// The settings of every connection: wait up to five seconds for a lock held by another
+/// connection, write-ahead logging (readers never block the writer) with the relaxed `NORMAL`
+/// sync mode that is safe with it, and enforced foreign keys.
+const CONNECTION_PRAGMAS: &str = "
+    PRAGMA busy_timeout = 5000;
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA foreign_keys = ON;
+";
 
 /// Ordered schema migrations: `MIGRATIONS[n]` upgrades a database at `user_version = n` to
 /// `n + 1`. Released migrations are never edited; changes are appended.
@@ -190,12 +196,13 @@ impl Store {
     /// [`StoreError::UnsupportedSchema`] for a database written by a newer version, and
     /// [`StoreError::Sqlite`] for any other database failure.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
+        // The folder of a bare file name is the empty path, which always exists; a drive root
+        // or the empty path itself has no folder to create.
+        let parent = path.parent().unwrap_or(Path::new(""));
+        std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
         match open_connection(path) {
             Ok(conn) => Ok(Self {
                 conn,
@@ -208,15 +215,35 @@ impl Store {
                     ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt
                 ) =>
             {
-                let aside = quarantine(path)?;
-                Ok(Self {
-                    conn: open_connection(path)?,
-                    path: path.to_path_buf(),
-                    quarantined: Some(aside),
+                // Whatever stops the fresh database from opening is reported as it is.
+                quarantine(path).and_then(|aside| {
+                    open_connection(path).map(|conn| Self {
+                        conn,
+                        path: path.to_path_buf(),
+                        quarantined: Some(aside),
+                    })
                 })
             }
             Err(other) => Err(other),
         }
+    }
+
+    /// Run `body` in one transaction: it is committed when `body` returns `Ok` and rolled back
+    /// when `body` or the commit fails, so a failed operation changes nothing.
+    ///
+    /// # Errors
+    /// What `body` returns, and [`StoreError::Sqlite`] when the transaction cannot begin or
+    /// commit.
+    pub(crate) fn in_transaction<T>(
+        &mut self,
+        body: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        self.conn
+            .transaction()
+            .map_err(StoreError::from)
+            .and_then(|tx| {
+                body(&tx).and_then(|value| tx.commit().map(|()| value).map_err(StoreError::from))
+            })
     }
 
     /// The database file.
@@ -236,9 +263,7 @@ impl Store {
     /// # Errors
     /// [`StoreError::Sqlite`] on database failure.
     pub fn schema_version(&self) -> Result<i64, StoreError> {
-        Ok(self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+        user_version(&self.conn).map_err(StoreError::from)
     }
 
     /// Value stored under `key`.
@@ -268,19 +293,64 @@ impl Store {
     }
 }
 
+/// The schema version recorded in the database file.
+fn user_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+}
+
+/// Every row of `sql` decoded as `T`, a tuple of column types (`(i64, String)`).
+///
+/// # Errors
+/// [`StoreError::Sqlite`] when the statement cannot be prepared or run, or a column does not
+/// have the type `T` asks for.
+pub(crate) fn query_rows<T, P>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<T>, StoreError>
+where
+    P: Params,
+    T: for<'r> TryFrom<&'r Row<'r>, Error = rusqlite::Error>,
+{
+    conn.prepare(sql)
+        .and_then(|mut stmt| {
+            stmt.query_map(params, |row| T::try_from(row))
+                .and_then(|rows| rows.collect::<Result<Vec<T>, _>>())
+        })
+        .map_err(StoreError::from)
+}
+
+/// The first row of `sql` decoded as `T` (see [`query_rows`]); `None` when there is none.
+///
+/// # Errors
+/// As [`query_rows`].
+pub(crate) fn query_optional<T, P>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<Option<T>, StoreError>
+where
+    P: Params,
+    T: for<'r> TryFrom<&'r Row<'r>, Error = rusqlite::Error>,
+{
+    conn.query_row(sql, params, |row| T::try_from(row))
+        .optional()
+        .map_err(StoreError::from)
+}
+
 /// Connect, configure and migrate.
 fn open_connection(path: &Path) -> Result<Connection, StoreError> {
     let mut conn = Connection::open(path)?;
-    conn.busy_timeout(BUSY_TIMEOUT)?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "foreign_keys", true)?;
-    migrate(&mut conn)?;
+    // The first statement that reads the file is where a file that is not a database fails.
+    let version = conn
+        .execute_batch(CONNECTION_PRAGMAS)
+        .and_then(|()| user_version(&conn))?;
+    migrate(&mut conn, version)?;
     Ok(conn)
 }
 
-fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+/// Bring a database at schema `version` to the latest one, one transaction per migration.
+fn migrate(conn: &mut Connection, version: i64) -> Result<(), StoreError> {
     if !(0..=latest_schema_version()).contains(&version) {
         return Err(StoreError::UnsupportedSchema {
             found: version,
@@ -288,12 +358,18 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         });
     }
     for (index, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-        let tx = conn.transaction()?;
-        tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", index as i64 + 1)?;
-        tx.commit()?;
+        apply_migration(conn, index, sql)?;
     }
     Ok(())
+}
+
+/// Run migration number `index` and record the schema version it produces, atomically.
+fn apply_migration(conn: &mut Connection, index: usize, sql: &str) -> rusqlite::Result<()> {
+    conn.transaction().and_then(|tx| {
+        tx.execute_batch(sql)
+            .and_then(|()| tx.pragma_update(None, "user_version", index as i64 + 1))
+            .and_then(|()| tx.commit())
+    })
 }
 
 /// `path` with `suffix` appended to the whole file name.
@@ -398,5 +474,100 @@ mod tests {
         let path = tmp.path().join("state.db");
         let error = quarantine(&path).unwrap_err();
         assert!(matches!(&error, StoreError::Io { path: failed, .. } if failed == &path));
+    }
+
+    fn open_store(tmp: &tempfile::TempDir) -> Store {
+        Store::open(&tmp.path().join("state.db")).unwrap()
+    }
+
+    #[test]
+    fn a_transaction_commits_what_its_body_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = open_store(&tmp);
+        let rows = store
+            .in_transaction(|tx| {
+                tx.execute("INSERT INTO kv (key, value) VALUES ('a', '1')", [])?;
+                Ok(7)
+            })
+            .unwrap();
+        assert_eq!(rows, 7);
+        assert_eq!(store.kv_get("a").unwrap().as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_failing_body_rolls_back_its_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = open_store(&tmp);
+        let error = store
+            .in_transaction(|tx| {
+                tx.execute("INSERT INTO kv (key, value) VALUES ('a', '1')", [])?;
+                Err::<(), StoreError>(StoreError::Cancelled)
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "operation was cancelled");
+        assert_eq!(store.kv_get("a").unwrap(), None);
+    }
+
+    #[test]
+    fn a_commit_that_violates_a_deferred_constraint_fails_and_rolls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = open_store(&tmp);
+        store
+            .conn
+            .execute_batch(
+                "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE child (
+                     parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED
+                 );",
+            )
+            .unwrap();
+        let error = store
+            .in_transaction(|tx| {
+                tx.execute("INSERT INTO child (parent_id) VALUES (7)", [])?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("FOREIGN KEY constraint failed"),
+            "{error}"
+        );
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM child", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn a_transaction_cannot_start_inside_another_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = open_store(&tmp);
+        store.conn.execute_batch("BEGIN").unwrap();
+        let error = store.in_transaction(|_| Ok(())).unwrap_err();
+        assert!(
+            error.to_string().contains("within a transaction"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rows_are_decoded_into_tuples_and_a_wrong_column_type_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(&tmp);
+        store.kv_set("one", "1").unwrap();
+        store.kv_set("two", "2").unwrap();
+        let rows: Vec<(String, String)> = query_rows(
+            &store.conn,
+            "SELECT key, value FROM kv WHERE key != ?1 ORDER BY key",
+            ["one"],
+        )
+        .unwrap();
+        assert_eq!(rows, [("two".to_owned(), "2".to_owned())]);
+        let none: Option<(String,)> =
+            query_optional(&store.conn, "SELECT key FROM kv WHERE key = ?1", ["three"]).unwrap();
+        assert_eq!(none, None);
+        let error =
+            query_rows::<(i64, i64), _>(&store.conn, "SELECT key, value FROM kv", []).unwrap_err();
+        assert!(error.to_string().contains("Invalid column type"), "{error}");
     }
 }

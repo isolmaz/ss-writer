@@ -1645,6 +1645,10 @@ mod tests {
         harness.run_animations(&mut view);
         assert_eq!(view.offset().y, 100.0);
         assert!(!harness.requests.invalidation().is_clean());
+        // A frame while neither bar moves repaints nothing.
+        harness.requests.take_invalidation();
+        harness.frame(&mut view, 16);
+        assert!(harness.requests.invalidation().is_clean());
         // Showing a rectangle scrolls just enough.
         assert!(view.ensure_visible(Rect::new(0.0, 250.0, 50.0, 20.0)));
         assert_eq!(view.offset().y, 170.0);
@@ -1745,6 +1749,24 @@ mod tests {
         ));
         assert_eq!(view.offset(), Point::ZERO);
         assert!(view.take_scrolled());
+        // Each axis can be addressed on its own; the content is as wide as the view, so the
+        // horizontal share has nothing to scroll.
+        assert!(harness.perform(
+            &mut view,
+            AccessAction::ScrollTo {
+                horizontal: None,
+                vertical: Some(50.0)
+            }
+        ));
+        assert_eq!(view.offset(), Point::new(0.0, 200.0));
+        assert!(harness.perform(
+            &mut view,
+            AccessAction::ScrollTo {
+                horizontal: Some(50.0),
+                vertical: None
+            }
+        ));
+        assert_eq!(view.offset(), Point::new(0.0, 200.0));
         assert!(!harness.perform(&mut view, AccessAction::Invoke));
         view.scroll_to(Point::new(0.0, 400.0));
         let tree = harness.tree(&view);

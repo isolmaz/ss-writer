@@ -823,6 +823,68 @@ fn rescan_reports_listing_failures() {
 }
 
 #[test]
+fn rescan_reports_a_loaded_subfolder_that_cannot_be_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    touch(&dir.path().join("sub").join("x.md"), "x");
+    let fault = Arc::new(FaultFs::new());
+    let mut ws = Workspace::open(fault.clone(), dir.path()).unwrap();
+    let sub = dir.path().join("sub");
+    ws.load_children(&sub).unwrap();
+    // The folder itself lists fine; its loaded subfolder does not.
+    fault.fail_for_path(FsOp::ListDir, &sub, FsFailure::AccessDenied, 1);
+    let error = ws
+        .apply(&event(dir.path(), FsEventKind::Rescan))
+        .unwrap_err();
+    assert_eq!(error, FsError::AccessDenied(sub));
+}
+
+#[test]
+fn events_below_folders_that_are_not_loaded_are_ignored() {
+    let (dir, mut ws) = watched_tree();
+    // `cold` was never expanded: nothing below it is tracked, however deep.
+    let deep = dir.path().join("cold").join("deeper").join("x.md");
+    touch(&deep, "x");
+    assert!(!ws.apply(&event(&deep, FsEventKind::Created)).unwrap());
+    // Neither is a removal there, nor one below a folder the tree does not know at all.
+    let frozen = dir.path().join("cold").join("frozen.md");
+    assert!(!ws.apply(&event(&frozen, FsEventKind::Removed)).unwrap());
+    let ghost = dir.path().join("nowhere").join("x.md");
+    assert!(!ws.apply(&event(&ghost, FsEventKind::Removed)).unwrap());
+
+    // Nothing was disturbed: the folder loads fresh, with everything on disk.
+    let cold = dir.path().join("cold");
+    ws.load_children(&cold).unwrap();
+    assert_eq!(
+        child_names(ws.node(&cold).unwrap()),
+        ["deeper", "frozen.md"]
+    );
+}
+
+#[test]
+fn folders_come_first_whichever_order_the_disk_lists_them_in() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("a-folder")).unwrap();
+    touch(&dir.path().join("b-file.md"), "x");
+    std::fs::create_dir(dir.path().join("c-folder")).unwrap();
+    touch(&dir.path().join("d-file.md"), "x");
+    let ws = Workspace::open(real(), dir.path()).unwrap();
+
+    let ascending = ViewOptions::default();
+    assert_eq!(
+        listing(&ws, dir.path(), &ascending),
+        ["a-folder", "c-folder", "b-file.md", "d-file.md"]
+    );
+    let descending = ViewOptions {
+        descending: true,
+        ..ascending
+    };
+    assert_eq!(
+        listing(&ws, dir.path(), &descending),
+        ["c-folder", "a-folder", "d-file.md", "b-file.md"]
+    );
+}
+
+#[test]
 fn the_documents_folder_exists() {
     let documents = known_documents_dir().unwrap();
     assert!(documents.is_absolute());

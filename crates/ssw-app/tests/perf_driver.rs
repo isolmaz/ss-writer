@@ -2,11 +2,14 @@
 //! is ticked by the test, frames are produced by sending `WM_PAINT` to our own window, typed
 //! characters are posted to its queue. Nothing is shown, activated or injected.
 //!
-//! The recorder is process-wide: run these tests with nextest (one process per test).
+//! The recorder is process-wide: every scenario run holds [`RECORDER_LOCK`] and resets the
+//! recorder first, so the tests pass both under nextest (one process per test) and under
+//! `cargo test` (threads of one process).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -24,6 +27,10 @@ use ssw_win::window::{current_os_version, send_message};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, HMENU, MSG, PM_REMOVE, PeekMessageW, TranslateMessage, WM_PAINT,
 };
+
+/// Held for the whole of one scenario run: the recorder and its marks belong to one run at a
+/// time.
+static RECORDER_LOCK: Mutex<()> = Mutex::new(());
 
 struct NoPopups;
 
@@ -117,8 +124,11 @@ fn run_scenario(
         driver: Driver::Hardware,
         install_crash_handler: false,
     };
+    // A failed test poisons the lock; the next one starts from a reset recorder anyway.
+    let _run = RECORDER_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     // Like `main`: the recorder runs from the first moment, so the startup marks exist.
     ssw_win::perf::enable();
+    ssw_win::perf::reset();
     ssw_win::perf::mark(ssw_app::perf::MAIN_ENTERED);
     let code = Rc::new(RefCell::new(None));
     let seen = Rc::clone(&code);

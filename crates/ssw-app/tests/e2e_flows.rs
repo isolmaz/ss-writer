@@ -260,3 +260,92 @@ fn exporting_to_docx_writes_a_word_document() {
         out = q(&out),
     ));
 }
+
+/// The decoded pixels of a PNG file, after checking its signature and its size.
+fn png(path: &Path, width: u32, height: u32) -> image::RgbaImage {
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{}", path.display());
+    let side = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+    assert_eq!(
+        (side(16), side(20)),
+        (width, height),
+        "IHDR of {}",
+        path.display()
+    );
+    image::load_from_memory(&bytes).unwrap().to_rgba8()
+}
+
+fn distinct_colors(image: &image::RgbaImage) -> usize {
+    image
+        .pixels()
+        .map(|pixel| pixel.0)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+/// The mean of the red channel: the theme's surface dominates it.
+fn mean_red(image: &image::RgbaImage) -> f64 {
+    let total: u64 = image.pixels().map(|pixel| u64::from(pixel.0[0])).sum();
+    total as f64 / f64::from(image.width() * image.height())
+}
+
+#[test]
+fn screenshot_steps_render_the_window_offscreen_in_the_chosen_theme() {
+    let flow = Flow::new();
+    let dark = flow.path("shots").join("dark.png");
+    let light = flow.path("shots").join("light.png");
+    let hidpi = flow.path("hidpi.png");
+    let settings = flow.path("settings.png");
+    flow.run(&format!(
+        "theme dark\nnew\n\
+         type # Release plan\\n\\nSome **bold** text, a task list and math: $x^2 + y^2$.\\n\\n- [ ] ship it\\n\n\
+         screenshot {dark} 640 400\n\
+         theme light\n\
+         screenshot {light} 640 400\n\
+         screenshot {hidpi} 320 200 2\n\
+         command settings.open\nsettings-page appearance\n\
+         screenshot-settings {settings} 450 320\n",
+        dark = q(&dark),
+        light = q(&light),
+        hidpi = q(&hidpi),
+        settings = q(&settings),
+    ));
+    let dark = png(&dark, 640, 400);
+    let light = png(&light, 640, 400);
+    assert!(
+        distinct_colors(&dark) > 8,
+        "the dark window is drawn, not flat"
+    );
+    assert!(
+        distinct_colors(&light) > 8,
+        "the light window is drawn, not flat"
+    );
+    assert!(
+        mean_red(&dark) < 100.0 && mean_red(&light) > 150.0,
+        "dark {} light {}",
+        mean_red(&dark),
+        mean_red(&light)
+    );
+    assert_ne!(dark.as_raw(), light.as_raw());
+    assert!(
+        distinct_colors(&png(&hidpi, 640, 400)) > 8,
+        "320x200 DIPs at scale 2"
+    );
+    assert!(distinct_colors(&png(&settings, 450, 320)) > 8);
+}
+
+#[test]
+fn a_screenshot_of_a_closed_settings_window_fails_the_script_with_its_line() {
+    let flow = Flow::new();
+    let out = flow.path("settings.png");
+    let output = flow.launch(&format!("new\nscreenshot-settings {}\n", q(&out)));
+    assert_eq!(output.status.code(), Some(8));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("line 2") && stderr.contains("not open"),
+        "{stderr}"
+    );
+    assert!(!out.exists());
+    let invalid = flow.launch("screenshot out.png 10 10\n");
+    assert_eq!(invalid.status.code(), Some(7));
+}

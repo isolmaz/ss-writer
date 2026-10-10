@@ -44,6 +44,8 @@ use windows::core::{BOOL, BSTR, GUID, IUnknown, Interface, PCWSTR, PWSTR, Ref, R
 use super::TextStoreHost;
 use super::store::Store;
 use super::view::{AcpSelection, TextChange};
+use crate::com::delivered;
+use crate::fault::check;
 
 /// Writes `value` through an out pointer TSF may pass as null.
 fn put<T>(pointer: *mut T, value: T) {
@@ -81,16 +83,22 @@ fn ts_change(change: TextChange) -> TS_TEXTCHANGE {
 }
 
 /// The canonical `IUnknown` pointer: the COM object identity `AdviseSink`/`UnadviseSink` compare.
-fn identity(unknown: &IUnknown) -> Result<usize> {
-    Ok(unknown.cast::<IUnknown>()?.as_raw() as usize)
+fn identity(unknown: &IUnknown) -> usize {
+    // Every COM object answers a query for `IUnknown` with its one canonical pointer; an object
+    // that did not would be its own identity.
+    unknown
+        .cast::<IUnknown>()
+        .map_or(unknown.as_raw() as usize, |canonical| {
+            canonical.as_raw() as usize
+        })
 }
 
 /// The ACP extent of a TSF range. Needs no edit cookie.
 fn range_extent(range: &ITfRange) -> Option<Range<usize>> {
-    let acp: ITfRangeACP = range.cast().ok()?;
+    let acp = check(range.cast::<ITfRangeACP>()).ok()?;
     let (mut start, mut count) = (0i32, 0i32);
     // SAFETY: both out pointers are valid for the call.
-    unsafe { acp.GetExtent(&mut start, &mut count) }.ok()?;
+    check(unsafe { acp.GetExtent(&mut start, &mut count) }).ok()?;
     let start = start.max(0) as usize;
     Some(start..start + count.max(0) as usize)
 }
@@ -98,7 +106,7 @@ fn range_extent(range: &ITfRange) -> Option<Range<usize>> {
 /// The ACP extent of a composition.
 fn composition_extent(view: &ITfCompositionView) -> Option<Range<usize>> {
     // SAFETY: plain call on TSF's live composition view.
-    let range = unsafe { view.GetRange() }.ok()?;
+    let range = check(unsafe { view.GetRange() }).ok()?;
     range_extent(&range)
 }
 
@@ -140,16 +148,20 @@ impl AttributeReader {
         // SAFETY: COM calls on live interfaces with valid out parameters; `cookie` is the
         // read-only edit cookie of the running edit.
         unsafe {
-            let value = property.GetValue(cookie, range).ok()?;
-            let atom = i32::try_from(&value).ok()?;
-            let guid = self.categories.GetGUID(atom as u32).ok()?;
+            // A value that is no integer is no GUID atom: the run carries no style.
+            let atom = check(property.GetValue(cookie, range))
+                .ok()
+                .and_then(|value| i32::try_from(&value).ok())?;
+            let guid = check(self.categories.GetGUID(atom as u32)).ok()?;
             let mut info: Option<ITfDisplayAttributeInfo> = None;
             let mut owner = GUID::zeroed();
-            self.display
-                .GetDisplayAttributeInfo(&guid, &mut info, &mut owner)
-                .ok()?;
+            let found = self
+                .display
+                .GetDisplayAttributeInfo(&guid, &mut info, &mut owner);
+            // A manager that succeeds without delivering the info knows no attribute either.
+            let info = delivered(check(found), info).ok()?;
             let mut attribute = TF_DISPLAYATTRIBUTE::default();
-            info?.GetAttributeInfo(&mut attribute).ok()?;
+            check(info.GetAttributeInfo(&mut attribute)).ok()?;
             Some(style_of(attribute.bAttr))
         }
     }
@@ -159,12 +171,12 @@ impl AttributeReader {
         // SAFETY: COM calls on live interfaces with valid out parameters; `cookie` is the
         // read-only edit cookie of the running edit.
         let (property, ranges) = unsafe {
-            let property = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
-            let whole = context.GetStart(cookie)?;
-            let end = context.GetEnd(cookie)?;
-            whole.ShiftEndToRange(cookie, &end, TF_ANCHOR_END)?;
+            let property = check(context.GetProperty(&GUID_PROP_ATTRIBUTE))?;
+            let whole = check(context.GetStart(cookie))?;
+            let end = check(context.GetEnd(cookie))?;
+            check(whole.ShiftEndToRange(cookie, &end, TF_ANCHOR_END))?;
             let mut ranges: Option<IEnumTfRanges> = None;
-            property.EnumRanges(cookie, &mut ranges, &whole)?;
+            check(property.EnumRanges(cookie, &mut ranges, &whole))?;
             (property, ranges)
         };
         // No enumerator means no runs.
@@ -185,7 +197,7 @@ impl AttributeReader {
             let mut next: [Option<ITfRange>; 1] = [None];
             let mut fetched = 0u32;
             // SAFETY: `next` and `fetched` are valid out parameters for the call.
-            unsafe { ranges.Next(&mut next, &mut fetched) }?;
+            check(unsafe { ranges.Next(&mut next, &mut fetched) })?;
             let Some(range) = next[0].take() else { break };
             if let (Some(style), Some(extent)) =
                 (self.style(property, cookie, &range), range_extent(&range))
@@ -257,11 +269,11 @@ impl ITextStoreACP2_Impl for StoreObject_Impl {
         let unknown = punk.ok()?;
         // ITextStoreACP2 reuses the ITextStoreACPSink interface.
         let sink: ITextStoreACPSink = unknown.cast()?;
-        self.store.advise_sink(sink, identity(unknown)?, dwmask)
+        self.store.advise_sink(sink, identity(unknown), dwmask)
     }
 
     fn UnadviseSink(&self, punk: Ref<IUnknown>) -> Result<()> {
-        self.store.unadvise_sink(identity(punk.ok()?)?)
+        self.store.unadvise_sink(identity(punk.ok()?))
     }
 
     fn RequestLock(&self, dwlockflags: u32) -> Result<windows::core::HRESULT> {

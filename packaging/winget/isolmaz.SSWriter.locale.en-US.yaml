@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+# Rendered by `cargo xtask dist` into dist/winget/ (version, hash and product code are filled in there).
+PackageIdentifier: isolmaz.SSWriter
+PackageVersion: {{Version}}
+PackageLocale: en-US
+Publisher: isolmaz
+PublisherUrl: https://github.com/isolmaz
+PublisherSupportUrl: https://github.com/isolmaz/ss-writer/issues
+PackageName: SS Writer
+PackageUrl: https://github.com/isolmaz/ss-writer
+License: MIT
+LicenseUrl: https://github.com/isolmaz/ss-writer/blob/main/LICENSE
+Copyright: Copyright (c) 2026 isolmaz
+ShortDescription: Markdown & Text Editor
+Description: >-
+  A fast native Windows 11 editor for Markdown and plain text with live rendering,
+  workspaces, math, Mermaid diagrams, and import and export of DOCX, ODT, RTF, ePub, HTML
+  and PDF.
+Tags:
+  - markdown
+  - editor
+  - text-editor
+  - writing
+  - docx
+ReleaseNotesUrl: https://github.com/isolmaz/ss-writer/releases/tag/v{{Version}}
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

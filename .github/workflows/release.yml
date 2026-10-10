@@ -1,0 +1,46 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` builds the MSI, the portable zip, checksums and the winget manifests and
+# publishes them as a GitHub release. The tag must equal v + `[workspace.package] version`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install WiX 7
+        run: dotnet tool install --global wix --version 7.0.0
+      - name: Docs are in sync
+        run: cargo xtask docs-check --strict
+      # WiX 7 requires accepting the Open Source Maintenance Fee EULA (https://wixtoolset.org/osmf/).
+      # `--accept-wix-eula` passes `-acceptEula wix7`; the repository owner accepts it here.
+      - name: Build MSI, portable zip, notices, checksums and winget manifests
+        run: cargo xtask dist --accept-wix-eula --expect-tag "${GITHUB_REF_NAME}"
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/SSWriter-*-x64.msi \
+            dist/SSWriter-*-x64-portable.zip \
+            dist/SHA256SUMS.txt \
+            dist/winget/*.yaml \
+            --title "SS Writer ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --verify-tag

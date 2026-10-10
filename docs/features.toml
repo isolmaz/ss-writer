@@ -1,0 +1,186 @@
+# User-visible features of SS Writer: one entry per feature, each tied to the section of
+# docs/spec.md that defines its behavior. The README and the website are generated from this
+# file; `cargo xtask docs-check` verifies that
+#   * every `spec` value names an existing section of docs/spec.md,
+#   * every spec section is covered by a feature (or listed in `non_feature_sections`),
+#   * every `title` appears on a README.md line (warning; failure with `--strict`).
+#
+# Fields: id (lowercase words joined by `-`), title (the README lists the feature under this
+# exact title), spec (section number such as "2.2"), description (one or two sentences).
+
+# Sections that describe no user-visible feature.
+non_feature_sections = ["14"]
+
+[[feature]]
+id = "native-window"
+title = "Native Windows 11 window"
+spec = "1"
+description = "Custom title bar with tabs, Mica Alt backdrop, system light and dark themes with live accent color, high contrast support, per-monitor DPI and native menus."
+
+[[feature]]
+id = "live-rendering"
+title = "Live Markdown rendering"
+spec = "2.1"
+description = "A WYSIWYG-hybrid editor: Markdown markers hide until the caret touches the element, with the source always one keystroke away."
+
+[[feature]]
+id = "typing-behaviors"
+title = "Smart typing"
+spec = "2.2"
+description = "Lists continue and renumber, Tab indents items, fences and math blocks close themselves, pasted URLs become links, tasks toggle with a click and completed tasks sink to the end."
+
+[[feature]]
+id = "smart-paste"
+title = "Smart paste"
+spec = "2.3"
+description = "Images become files, copied files become embeds or attachment chips, Word and browser HTML converts to Markdown, VS Code text stays plain, and Ctrl+Shift+V always pastes plain text."
+
+[[feature]]
+id = "selection-navigation"
+title = "Selection and navigation"
+spec = "2.4"
+description = "Click, drag, double- and triple-click selection with Unicode word boundaries, drag and drop between tabs, and full keyboard navigation."
+
+[[feature]]
+id = "undo-redo"
+title = "Undo and redo"
+spec = "2.5"
+description = "Operation-based history in which typing groups naturally, every command is one step and undo restores the selection."
+
+[[feature]]
+id = "spell-check"
+title = "Spell check"
+spec = "2.6"
+description = "The Windows spell checker with red squiggles, suggestions, Add to dictionary and Ignore, skipping code, URLs, math and front matter."
+
+[[feature]]
+id = "writing-modes"
+title = "Typewriter, focus, full screen and zen modes"
+spec = "2.7"
+description = "Typewriter scrolling with a dead zone, focus mode that dims other paragraphs, full screen, zen mode and app-wide zoom."
+
+[[feature]]
+id = "folding"
+title = "Heading folding"
+spec = "2.8"
+description = "Fold a section from the gutter chevron; fold state is remembered per file and never written into the document."
+
+[[feature]]
+id = "formatting-ui"
+title = "Formatting pill and selection toolbar"
+spec = "2.9"
+description = "A B I U pill that reflects the caret state and a selection toolbar with headings, lists, highlight colors, links, tables, images and more."
+
+[[feature]]
+id = "markdown-elements"
+title = "Rich Markdown elements"
+spec = "3"
+description = "Headings, emphasis, highlights, tasks, callouts, code blocks, math, Mermaid diagrams, footnotes, front matter, page breaks and more, rendered natively and exported faithfully."
+
+[[feature]]
+id = "tables"
+title = "Table editing"
+spec = "3.1"
+description = "Edit cells in place with Tab and Enter navigation, a cell context menu for rows, columns and alignment, copy as Markdown, CSV or HTML, and automatic pipe alignment."
+
+[[feature]]
+id = "links-wikilinks"
+title = "Links and wikilinks"
+spec = "3.2"
+description = "Relative links open inside the app, wikilinks complete with fuzzy matching, missing targets can be created, renames update links, and backlinks are listed in the inspector."
+
+[[feature]]
+id = "images-attachments"
+title = "Images and attachments"
+spec = "3.3"
+description = "WIC and SVG images with resize handles, remote images with a cache and safe defaults, attachment chips for other files and configurable attachment folders."
+
+[[feature]]
+id = "file-formats"
+title = "Markdown, text, Office and TextBundle files"
+spec = "4.1"
+description = "Open and save Markdown, plain text, Mermaid, TextBundle, DOCX, ODT and RTF; import legacy DOC; every import reports what could not be represented."
+
+[[feature]]
+id = "encodings-line-endings"
+title = "Encodings and line endings"
+spec = "4.2"
+description = "Automatic encoding detection including legacy code pages, BOM and original line endings preserved on save, and reopen or save with another encoding from the status bar."
+
+[[feature]]
+id = "safe-saving"
+title = "Autosave and safe saving"
+spec = "4.3"
+description = "Autosave after a pause, atomic writes, retries on sharing violations, read-only handling, external change detection with diff-based reload, and OneDrive placeholders that are never hydrated by indexing."
+
+[[feature]]
+id = "new-untitled"
+title = "New and untitled documents"
+spec = "4.4"
+description = "Create documents inside a workspace with inline rename, or keep unsaved buffers in the session with periodic backup."
+
+[[feature]]
+id = "version-history"
+title = "Version history"
+spec = "4.5"
+description = "Deduplicated snapshots with a history panel to list, diff and restore, kept for 30 days by default."
+
+[[feature]]
+id = "crash-recovery"
+title = "Crash recovery"
+spec = "4.6"
+description = "Emergency save of unsaved documents on a crash and an offer to recover them at the next launch; a local rolling log and no telemetry."
+
+[[feature]]
+id = "workspace-sidebar"
+title = "Workspace sidebar"
+spec = "5"
+description = "A live file tree with sorting and filters, context menu actions, drag and drop, a background index and Recycle Bin deletion."
+
+[[feature]]
+id = "tabs-windows-session"
+title = "Tabs, windows and session restore"
+spec = "6"
+description = "Draggable tabs that move between windows, shared documents across tabs, single instance behavior and full session restore."
+
+[[feature]]
+id = "search"
+title = "Find, replace and Quick Open"
+spec = "7"
+description = "Find with case, word and regex options, replace all as one undo step, go to line, fuzzy Quick Open, a command palette and search across a folder."
+
+[[feature]]
+id = "inspector-status-bar"
+title = "Inspector and status bar"
+spec = "8"
+description = "A contents tree with level filter, document statistics, file information, backlinks and a status bar with caret position, word count, zoom, encoding and line endings."
+
+[[feature]]
+id = "copy-export-print"
+title = "Copy, share, export and print"
+spec = "9"
+description = "Copy as Markdown, HTML, rich text or plain text, share files, export to PDF, PNG, JPG, HTML, ePub, DOCX, ODT, RTF, TXT and TextBundle, and print through the system dialog."
+
+[[feature]]
+id = "settings"
+title = "Settings"
+spec = "10"
+description = "Human-editable settings with a settings window for general, appearance, editor, sidebar, attachments, export, shortcuts and advanced options."
+
+[[feature]]
+id = "keyboard-shortcuts"
+title = "Keyboard shortcuts"
+spec = "11"
+description = "A complete default keymap without Ctrl+Alt conflicts, every command rebindable, with conflicts flagged."
+
+[[feature]]
+id = "windows-integration"
+title = "Windows integration"
+spec = "12"
+description = "File associations, an Open with SS Writer folder verb, a Jump List, an Explorer preview pane, touch and pen input, IME and dictation support and UI Automation for every control."
+
+[[feature]]
+id = "distribution-updates"
+title = "Installer, portable zip and updates"
+spec = "13"
+description = "A per-user MSI that needs no administrator rights, a portable zip, a winget package and a weekly update notification that can be turned off."

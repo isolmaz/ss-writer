@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SS Writer per-user installer (WiX 7; the schema namespace is the one shared by WiX 4 and later).
+
+  Built by `cargo xtask dist`, which passes these preprocessor variables:
+    Version      X.Y.Z from [workspace.package] in Cargo.toml
+    ProductCode  braced GUID derived from the version
+    BinDir       directory holding SSWriter.exe and ssw_preview.dll (target\release)
+    AssetsDir    the assets\ directory
+    LicenseFile  LICENSE
+    NoticesFile  dist\THIRD-PARTY-NOTICES.txt
+
+  No administrator rights: everything is installed under %LOCALAPPDATA%\Programs\SS Writer and
+  registered under HKCU. Registration lives in Registration.wxs.
+
+  Per-user packages should use HKCU key paths (ICE38) and remove their directories (ICE64);
+  every component below does. The harvested assets use file key paths, so `xtask dist` runs
+  `wix build` with -sice ICE38 -sice ICE64.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="SS Writer"
+           Manufacturer="isolmaz"
+           Version="$(var.Version)"
+           ProductCode="$(var.ProductCode)"
+           UpgradeCode="5E0A1C77-3B9D-4F3A-9E41-7C2B8D6F1A05"
+           Scope="perUser">
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Same UpgradeCode, newer Version: uninstall the old one first. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of SS Writer is already installed." />
+
+    <!-- Spec: Windows 11 22H2 (build 22621) or later. Uninstall and repair are always allowed. -->
+    <Launch Condition="Installed OR WindowsBuild &gt;= 22621"
+            Message="SS Writer requires Windows 11 version 22H2 (build 22621) or later." />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/isolmaz/ss-writer" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/isolmaz/ss-writer/issues" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LocalProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="SS Writer">
+          <Directory Id="ASSETSFOLDER" Name="assets" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="SS Writer" Level="1">
+      <ComponentGroupRef Id="Application" />
+      <ComponentGroupRef Id="Assets" />
+      <ComponentGroupRef Id="Registration" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="Application" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable">
+        <File Id="SSWriterExe" Source="$(var.BinDir)\SSWriter.exe" />
+        <RegistryValue Root="HKCU" Key="Software\SS Writer\Components" Name="MainExecutable"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="PreviewHandlerLibrary">
+        <File Id="SswPreviewDll" Source="$(var.BinDir)\ssw_preview.dll" />
+        <RegistryValue Root="HKCU" Key="Software\SS Writer\Components" Name="PreviewHandlerLibrary"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="LegalFiles">
+        <File Id="LicenseFile" Name="LICENSE" Source="$(var.LicenseFile)" />
+        <File Id="ThirdPartyNoticesFile" Name="THIRD-PARTY-NOTICES.txt" Source="$(var.NoticesFile)" />
+        <RegistryValue Root="HKCU" Key="Software\SS Writer\Components" Name="LegalFiles"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <!-- Remove the (then empty) install folders on uninstall. User data lives in
+           %LOCALAPPDATA%\SS Writer and %APPDATA%\SS Writer and is kept. -->
+      <Component Id="InstallFolderCleanup">
+        <RemoveFolder Id="RemoveAssetsFolder" Directory="ASSETSFOLDER" On="uninstall" />
+        <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\SS Writer\Components" Name="InstallFolderCleanup"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <!-- Start menu entry. The AppUserModelID must equal the one the app sets with
+           SetCurrentProcessExplicitAppUserModelID so that pinning, the taskbar button and the
+           Jump List belong together. -->
+      <Component Id="StartMenuShortcut" Directory="ProgramMenuFolder">
+        <Shortcut Id="StartMenuShortcutLink"
+                  Name="SS Writer"
+                  Description="Markdown &amp; Text Editor"
+                  Target="[INSTALLFOLDER]SSWriter.exe"
+                  WorkingDirectory="INSTALLFOLDER">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="isolmaz.SSWriter" />
+        </Shortcut>
+        <RegistryValue Root="HKCU" Key="Software\SS Writer\Components" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <!-- Everything under assets\ (fonts, localization files), including subdirectories. -->
+    <ComponentGroup Id="Assets" Directory="ASSETSFOLDER">
+      <Files Include="$(var.AssetsDir)\**" />
+    </ComponentGroup>
+  </Fragment>
+</Wix>

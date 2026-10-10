@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Project automation: coverage, mutants, screenshots, docs sync, distribution."
+description = "Project automation: coverage, mutants, docs sync, distribution."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,3 +11,16 @@ publish = false
 workspace = true
 
 [dependencies]
+# `docs-check` compares the default keymap with the spec §11 table.
+ssw-core = { path = "../crates/ssw-core" }
+fluent-syntax = "0.12"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+toml = "0.8"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

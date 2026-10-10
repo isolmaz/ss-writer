@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Per-user (HKCU) shell registration for SS Writer (spec section 12):
+    - file associations through ProgIDs + OpenWithProgids, plus Default Apps capabilities;
+    - the folder verb "Open with SS Writer";
+    - the Explorer preview handler (ssw_preview.dll) for .md, .markdown and .mmd.
+
+  Nothing here takes over a default: Windows lets the user pick SS Writer in "Open with" or in
+  Settings > Default apps. Removing the product removes every value written here.
+
+  The preview handler CLSID below must equal the CLSID that the ssw-preview crate implements.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?define PreviewClsid = "{B7D4E2A1-6C3F-4E8B-A5D9-2F1C0E7B94A3}" ?>
+  <?define PreviewHandlerIid = "{8895b1c6-b41f-4c1c-a562-0d564250836f}" ?>
+  <?define PreviewSurrogateAppId = "{6d2b5079-2f0b-48dd-ab7f-97cec514d30b}" ?>
+
+  <Fragment>
+    <ComponentGroup Id="Registration" Directory="INSTALLFOLDER">
+
+      <!-- ProgIDs: one per document family. -->
+      <Component Id="ProgIdMarkdown">
+        <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.Markdown">
+          <RegistryValue Type="string" Value="Markdown Document" KeyPath="yes" />
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
+        </RegistryKey>
+        <RegistryValue Root="HKCU" Key="Software\Classes\.md\OpenWithProgids" Name="SSWriter.Markdown" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.markdown\OpenWithProgids" Name="SSWriter.Markdown" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.mdx\OpenWithProgids" Name="SSWriter.Markdown" Type="string" Value="" />
+      </Component>
+
+      <Component Id="ProgIdMermaid">
+        <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.Mermaid">
+          <RegistryValue Type="string" Value="Mermaid Diagram" KeyPath="yes" />
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
+        </RegistryKey>
+        <RegistryValue Root="HKCU" Key="Software\Classes\.mmd\OpenWithProgids" Name="SSWriter.Mermaid" Type="string" Value="" />
+      </Component>
+
+      <Component Id="ProgIdText">
+        <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.Text">
+          <RegistryValue Type="string" Value="Text Document" KeyPath="yes" />
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
+        </RegistryKey>
+        <RegistryValue Root="HKCU" Key="Software\Classes\.txt\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+      </Component>
+
+      <Component Id="ProgIdTextBundle">
+        <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.TextBundle">
+          <RegistryValue Type="string" Value="TextBundle Document" KeyPath="yes" />
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
+        </RegistryKey>
+        <RegistryValue Root="HKCU" Key="Software\Classes\.textbundle\OpenWithProgids" Name="SSWriter.TextBundle" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.textpack\OpenWithProgids" Name="SSWriter.TextBundle" Type="string" Value="" />
+      </Component>
+
+      <Component Id="ProgIdWord">
+        <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.Word">
+          <RegistryValue Type="string" Value="Word Document" KeyPath="yes" />
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
+        </RegistryKey>
+        <RegistryValue Root="HKCU" Key="Software\Classes\.docx\OpenWithProgids" Name="SSWriter.Word" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.doc\OpenWithProgids" Name="SSWriter.Word" Type="string" Value="" />
+      </Component>
+
+      <Component Id="ProgIdOpenDocument">
+        <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.OpenDocument">
+          <RegistryValue Type="string" Value="OpenDocument Text" KeyPath="yes" />
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
+        </RegistryKey>
+        <RegistryValue Root="HKCU" Key="Software\Classes\.odt\OpenWithProgids" Name="SSWriter.OpenDocument" Type="string" Value="" />
+      </Component>
+
+      <Component Id="ProgIdRichText">
+        <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.RichText">
+          <RegistryValue Type="string" Value="Rich Text Document" KeyPath="yes" />
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
+        </RegistryKey>
+        <RegistryValue Root="HKCU" Key="Software\Classes\.rtf\OpenWithProgids" Name="SSWriter.RichText" Type="string" Value="" />
+      </Component>
+
+      <!-- Settings > Default apps lists the app through its capabilities. -->
+      <Component Id="DefaultAppsCapabilities">
+        <RegistryKey Root="HKCU" Key="Software\SS Writer\Capabilities">
+          <RegistryValue Name="ApplicationName" Type="string" Value="SS Writer" KeyPath="yes" />
+          <RegistryValue Name="ApplicationDescription" Type="string" Value="Markdown &amp; Text Editor" />
+          <RegistryKey Key="FileAssociations">
+            <RegistryValue Name=".md" Type="string" Value="SSWriter.Markdown" />
+            <RegistryValue Name=".markdown" Type="string" Value="SSWriter.Markdown" />
+            <RegistryValue Name=".mdx" Type="string" Value="SSWriter.Markdown" />
+            <RegistryValue Name=".mmd" Type="string" Value="SSWriter.Mermaid" />
+            <RegistryValue Name=".txt" Type="string" Value="SSWriter.Text" />
+            <RegistryValue Name=".textbundle" Type="string" Value="SSWriter.TextBundle" />
+            <RegistryValue Name=".textpack" Type="string" Value="SSWriter.TextBundle" />
+            <RegistryValue Name=".docx" Type="string" Value="SSWriter.Word" />
+            <RegistryValue Name=".doc" Type="string" Value="SSWriter.Word" />
+            <RegistryValue Name=".odt" Type="string" Value="SSWriter.OpenDocument" />
+            <RegistryValue Name=".rtf" Type="string" Value="SSWriter.RichText" />
+          </RegistryKey>
+        </RegistryKey>
+        <RegistryValue Root="HKCU" Key="Software\RegisteredApplications" Name="SS Writer"
+                       Type="string" Value="Software\SS Writer\Capabilities" />
+      </Component>
+
+      <!-- Explorer: right-click a folder > Open with SS Writer. -->
+      <Component Id="FolderVerb">
+        <RegistryKey Root="HKCU" Key="Software\Classes\Directory\shell\SSWriter">
+          <RegistryValue Type="string" Value="Open with SS Writer" KeyPath="yes" />
+          <RegistryValue Name="Icon" Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" />
+          <RegistryKey Key="command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
+        </RegistryKey>
+      </Component>
+
+      <!-- Explorer preview pane: COM class in ssw_preview.dll, hosted by prevhost.exe. -->
+      <Component Id="PreviewHandlerRegistration">
+        <RegistryKey Root="HKCU" Key="Software\Classes\CLSID\$(var.PreviewClsid)">
+          <RegistryValue Type="string" Value="SS Writer Preview Handler" KeyPath="yes" />
+          <RegistryValue Name="AppID" Type="string" Value="$(var.PreviewSurrogateAppId)" />
+          <RegistryValue Name="DisplayName" Type="string" Value="SS Writer Preview Handler" />
+          <RegistryKey Key="InprocServer32">
+            <RegistryValue Type="string" Value="[INSTALLFOLDER]ssw_preview.dll" />
+            <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment" />
+          </RegistryKey>
+        </RegistryKey>
+        <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\PreviewHandlers"
+                       Name="$(var.PreviewClsid)" Type="string" Value="SS Writer Preview Handler" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.md\shellex\$(var.PreviewHandlerIid)"
+                       Type="string" Value="$(var.PreviewClsid)" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.markdown\shellex\$(var.PreviewHandlerIid)"
+                       Type="string" Value="$(var.PreviewClsid)" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.mmd\shellex\$(var.PreviewHandlerIid)"
+                       Type="string" Value="$(var.PreviewClsid)" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

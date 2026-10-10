@@ -1,0 +1,923 @@
+//! The workspace index (spec §5): file list, headings and links of Markdown files, kept in the
+//! state database for Quick Open, wikilink completion, backlinks and rename updates.
+//!
+//! * [`Store::index_workspace`] walks the root (honoring `.gitignore` files, never `.git`, and
+//!   hidden items per [`IndexOptions`]) and only re-reads files whose size or modification time
+//!   changed. OneDrive placeholders (decided by the predicate the caller passes) are listed but
+//!   never read, so indexing cannot hydrate them.
+//! * [`Store::index_apply_changes`] updates single paths from file-system events. A change to a
+//!   `.gitignore` file needs a full [`Store::index_workspace`] run.
+//! * Links are stored with a normalized target so [`Store::index_backlinks`] and
+//!   [`Store::index_links_to`] find every wikilink (`[[name]]`, `[[folder/name]]`, shortest
+//!   unambiguous suffix of the path, extension optional) and every relative Markdown link,
+//!   reference definition or image that points at a file. All matching is case-insensitive.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::UNIX_EPOCH;
+
+use ignore::WalkBuilder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use rusqlite::{OptionalExtension, Transaction, params};
+use ssw_core::markdown::ast::{
+    BlockKind, ImageKind, Inline, InlineKind, LinkKind, WikiLink, iter_inlines,
+};
+use ssw_core::markdown::parse_document;
+use ssw_core::text::TextRange;
+
+use crate::store::{Store, StoreError, UnixSeconds, key_of, path_text};
+
+/// Markdown files larger than this are listed but not parsed.
+pub const MAX_PARSE_BYTES: u64 = 16 * 1024 * 1024;
+
+const MARKDOWN_EXTENSIONS: [&str; 3] = ["md", "markdown", "mdx"];
+
+/// What to index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexOptions {
+    /// Include hidden items (dot-files and files with the hidden attribute).
+    pub show_hidden: bool,
+    /// Stop after this many files (spec §10 "index limits").
+    pub max_files: usize,
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            show_hidden: false,
+            max_files: 100_000,
+        }
+    }
+}
+
+/// Outcome of an indexing run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexStats {
+    /// Files in the index for this root after the run.
+    pub files: usize,
+    /// Files that were (re)read and parsed.
+    pub parsed: usize,
+    /// Files dropped from the index.
+    pub removed: usize,
+    /// Files listed without reading because the placeholder predicate matched.
+    pub placeholders: usize,
+    /// The walk stopped at [`IndexOptions::max_files`].
+    pub truncated: bool,
+}
+
+/// A file-system event for [`Store::index_apply_changes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexChange {
+    /// Created, modified or renamed to this path (a folder is indexed recursively).
+    Changed(PathBuf),
+    /// Deleted or renamed away (a folder removes everything below it).
+    Removed(PathBuf),
+}
+
+/// A file of the index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedFile {
+    pub path: PathBuf,
+    /// Path relative to the root, `/` separated.
+    pub rel: String,
+    pub size: u64,
+    /// Modification time, milliseconds since the Unix epoch.
+    pub modified_ms: i64,
+    pub markdown: bool,
+    pub placeholder: bool,
+}
+
+/// A heading of a Markdown file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedHeading {
+    pub level: u8,
+    /// Plain text of the heading.
+    pub text: String,
+    /// Byte offset of the heading in the file.
+    pub offset: usize,
+}
+
+/// A place in a file that links to another file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkSite {
+    /// The file containing the link.
+    pub source: PathBuf,
+    /// `[[wikilink]]` rather than a Markdown link, reference definition or image.
+    pub wiki: bool,
+    /// The target as the parser resolved it (wikilink target text, or Markdown destination).
+    pub target: String,
+    /// The `#fragment` / `[[target#heading]]` part.
+    pub heading: Option<String>,
+    /// Byte range of the target text in the source file (what a rename update rewrites).
+    pub range: TextRange,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Markdown analysis
+// ---------------------------------------------------------------------------------------------
+
+struct HeadingRow {
+    level: u8,
+    text: String,
+    offset: usize,
+}
+
+struct LinkRow {
+    wiki: bool,
+    target: String,
+    target_key: String,
+    leaf_key: String,
+    heading: Option<String>,
+    range: TextRange,
+}
+
+#[derive(Default)]
+struct Analysis {
+    headings: Vec<HeadingRow>,
+    links: Vec<LinkRow>,
+}
+
+fn is_markdown_extension(ext: &str) -> bool {
+    MARKDOWN_EXTENSIONS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(ext))
+}
+
+fn is_markdown_path(rel: &str) -> bool {
+    rel.rsplit_once('.')
+        .is_some_and(|(_, ext)| is_markdown_extension(ext))
+}
+
+/// `name` without a Markdown extension (other names are returned unchanged).
+fn strip_markdown_extension(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && is_markdown_extension(ext) => stem,
+        _ => name,
+    }
+}
+
+/// `name` without its last extension (dot-files keep their name).
+fn file_stem(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name,
+    }
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(high), Some(low)) = (
+                bytes.get(i + 1).and_then(|b| hex_value(*b)),
+                bytes.get(i + 2).and_then(|b| hex_value(*b)),
+            )
+        {
+            out.push(high * 16 + low);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// True for `scheme:` prefixes (`https:`, `mailto:`, `file:`, drive letters like `C:`).
+fn has_scheme(dest: &str) -> bool {
+    dest.find(':').is_some_and(|colon| {
+        let scheme = &dest[..colon];
+        scheme
+            .bytes()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    })
+}
+
+/// Resolve a Markdown destination written in the file `source_rel` (root-relative, `/`
+/// separated) to a root-relative path and optional `#fragment`. `None` for URLs, same-file
+/// anchors, absolute paths outside the workspace and paths escaping the root.
+fn resolve_destination(source_rel: &str, dest: &str) -> Option<(String, Option<String>)> {
+    if dest.is_empty() || dest.starts_with('#') || dest.starts_with("//") || has_scheme(dest) {
+        return None;
+    }
+    let (path_part, fragment) = match dest.split_once('#') {
+        Some((path, fragment)) => (path, Some(percent_decode(fragment))),
+        None => (dest, None),
+    };
+    let path_part = path_part.split('?').next().unwrap_or(path_part);
+    let decoded = percent_decode(path_part).replace('\\', "/");
+    let mut parts: Vec<&str> = if decoded.starts_with('/') {
+        Vec::new()
+    } else {
+        let mut dir: Vec<&str> = source_rel.split('/').collect();
+        dir.pop();
+        dir
+    };
+    for segment in decoded.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            name => parts.push(name),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some((parts.join("/"), fragment))
+}
+
+fn markdown_link(source_rel: &str, dest: &str, range: TextRange) -> Option<LinkRow> {
+    resolve_destination(source_rel, dest).map(|(path, heading)| {
+        let name = path.rsplit('/').next().unwrap_or(&path);
+        LinkRow {
+            wiki: false,
+            target: dest.to_owned(),
+            target_key: key_of(&path),
+            leaf_key: key_of(file_stem(name)),
+            heading,
+            range,
+        }
+    })
+}
+
+fn wiki_link(link: &WikiLink) -> Option<LinkRow> {
+    let target = link.target.trim().replace('\\', "/");
+    if target.is_empty() {
+        return None;
+    }
+    let without_extension = strip_markdown_extension(&target);
+    let target_key = key_of(without_extension);
+    let leaf_key = target_key
+        .rsplit('\\')
+        .next()
+        .unwrap_or(&target_key)
+        .to_owned();
+    Some(LinkRow {
+        wiki: true,
+        target: link.target.clone(),
+        target_key,
+        leaf_key,
+        heading: link.heading.clone(),
+        range: link.target_range,
+    })
+}
+
+/// The text a reader sees in a heading.
+fn plain_text(inlines: &[Inline], src: &str, out: &mut String) {
+    for inline in inlines {
+        match &inline.kind {
+            InlineKind::Text => out.push_str(inline.range.get(src).unwrap_or_default()),
+            InlineKind::Escape | InlineKind::InlineMath | InlineKind::WikiLink(_) => {
+                out.push_str(inline.content.get(src).unwrap_or_default());
+            }
+            InlineKind::Entity { decoded } => out.push_str(decoded),
+            InlineKind::Code { text } => out.push_str(text),
+            InlineKind::SoftBreak | InlineKind::HardBreak => out.push(' '),
+            InlineKind::Emphasis
+            | InlineKind::Strong
+            | InlineKind::Underline
+            | InlineKind::Strikethrough
+            | InlineKind::Highlight { .. }
+            | InlineKind::Link(_) => plain_text(&inline.children, src, out),
+            InlineKind::Image(_) | InlineKind::FootnoteRef { .. } | InlineKind::RawHtml => {}
+        }
+    }
+}
+
+fn analyze(src: &str, source_rel: &str) -> Analysis {
+    let document = parse_document(src);
+    let mut analysis = Analysis::default();
+    for block in document.iter_blocks() {
+        match &block.kind {
+            BlockKind::Heading { level, .. } => {
+                let mut text = String::new();
+                plain_text(&block.inlines, src, &mut text);
+                analysis.headings.push(HeadingRow {
+                    level: *level,
+                    text: text.trim().to_owned(),
+                    offset: block.range.start,
+                });
+            }
+            BlockKind::LinkReferenceDefinition(definition) => analysis.links.extend(markdown_link(
+                source_rel,
+                &definition.dest,
+                definition.dest_range,
+            )),
+            _ => {}
+        }
+        for group in block.inline_groups() {
+            for inline in iter_inlines(group) {
+                let row = match &inline.kind {
+                    InlineKind::Link(link) => match &link.kind {
+                        LinkKind::Inline { dest_range, .. } => {
+                            markdown_link(source_rel, &link.dest, *dest_range)
+                        }
+                        LinkKind::Reference { .. } | LinkKind::Autolink { .. } => None,
+                    },
+                    InlineKind::Image(image) => match &image.kind {
+                        ImageKind::Inline { dest_range, .. } => {
+                            markdown_link(source_rel, &image.dest, *dest_range)
+                        }
+                        ImageKind::Reference { .. } | ImageKind::Html => None,
+                    },
+                    InlineKind::WikiLink(link) => wiki_link(link),
+                    _ => None,
+                };
+                analysis.links.extend(row);
+            }
+        }
+    }
+    analysis
+}
+
+// ---------------------------------------------------------------------------------------------
+// Walking
+// ---------------------------------------------------------------------------------------------
+
+struct Found {
+    rel: String,
+    path: PathBuf,
+    size: i64,
+    mtime: i64,
+}
+
+fn modified_millis(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
+/// `path` relative to `root` (case-insensitive), `/` separated.
+fn relative_path(root: &str, path: &str) -> Option<String> {
+    let root = root.replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    let path = path.replace('\\', "/");
+    path.get(..root.len())
+        .filter(|head| key_of(head) == key_of(root))
+        .and_then(|_| path[root.len()..].strip_prefix('/'))
+        .filter(|rest| !rest.is_empty())
+        .map(str::to_owned)
+}
+
+fn found_from(root: &str, entry: &ignore::DirEntry) -> Option<Found> {
+    entry
+        .path()
+        .to_str()
+        .and_then(|path| relative_path(root, path))
+        .zip(entry.metadata().ok())
+        .map(|(rel, meta)| Found {
+            rel,
+            path: entry.path().to_path_buf(),
+            size: meta.len() as i64,
+            mtime: modified_millis(&meta),
+        })
+}
+
+fn walk(
+    root: &Path,
+    root_text: &str,
+    opts: &IndexOptions,
+    cancel: &AtomicBool,
+) -> Result<(Vec<Found>, bool), StoreError> {
+    let walker = WalkBuilder::new(root)
+        .hidden(!opts.show_hidden)
+        .parents(false)
+        .ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .git_ignore(true)
+        .require_git(false)
+        .follow_links(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build();
+    let mut files = Vec::new();
+    for entry in walker.flatten() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(StoreError::Cancelled);
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if files.len() >= opts.max_files {
+            return Ok((files, true));
+        }
+        files.extend(found_from(root_text, &entry));
+    }
+    Ok((files, false))
+}
+
+fn is_hidden_item(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    path.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
+        || path
+            .metadata()
+            .is_ok_and(|meta| meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+}
+
+fn gitignore_in(dir: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(dir);
+    // A missing or partly invalid .gitignore simply contributes fewer rules.
+    let _ = builder.add(dir.join(".gitignore"));
+    builder.build().unwrap_or(Gitignore::empty())
+}
+
+/// Whether the walk of `root` would have listed the file `rel` (root-relative, `/` separated);
+/// used for single-path updates.
+fn is_included(root: &Path, rel: &str, opts: &IndexOptions) -> bool {
+    let components: Vec<&str> = rel.split('/').collect();
+    let mut dir = root.to_path_buf();
+    let mut matchers = vec![gitignore_in(&dir)];
+    for (index, component) in components.iter().enumerate() {
+        let child = dir.join(component);
+        let is_dir = index + 1 < components.len();
+        if *component == ".git" || (!opts.show_hidden && is_hidden_item(&child)) {
+            return false;
+        }
+        let ignored = matchers
+            .iter()
+            .rev()
+            .map(|matcher| matcher.matched(&child, is_dir))
+            .find(|verdict| !verdict.is_none())
+            .is_some_and(|verdict| verdict.is_ignore());
+        if ignored {
+            return false;
+        }
+        if is_dir {
+            matchers.push(gitignore_in(&child));
+            dir = child;
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------------------------
+// Database
+// ---------------------------------------------------------------------------------------------
+
+struct Root {
+    id: i64,
+    text: String,
+}
+
+fn root_identity(root: &Path) -> Result<(String, String), StoreError> {
+    let text = path_text(root)?.trim_end_matches(['\\', '/']).to_owned();
+    let key = key_of(&text);
+    Ok((text, key))
+}
+
+fn find_root(tx: &rusqlite::Connection, key: &str) -> Result<Option<Root>, StoreError> {
+    Ok(tx
+        .query_row(
+            "SELECT id, path FROM index_roots WHERE key = ?1",
+            [key],
+            |row| {
+                Ok(Root {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Delete the file `rel_key`; with `children` also everything below it (it was a folder).
+fn remove_path(
+    tx: &Transaction<'_>,
+    root_id: i64,
+    rel_key: &str,
+    children: bool,
+) -> Result<usize, StoreError> {
+    let mut removed = tx.execute(
+        "DELETE FROM index_files WHERE root_id = ?1 AND rel_key = ?2",
+        params![root_id, rel_key],
+    )?;
+    if children {
+        removed += tx.execute(
+            "DELETE FROM index_files WHERE root_id = ?1
+             AND substr(rel_key, 1, length(?2)) = ?2",
+            params![root_id, format!("{rel_key}\\")],
+        )?;
+    }
+    Ok(removed)
+}
+
+fn read_markdown(path: &Path) -> Option<String> {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| encoding_rs::UTF_8.decode(&bytes).0.into_owned())
+}
+
+fn store_file(
+    tx: &Transaction<'_>,
+    root_id: i64,
+    found: &Found,
+    placeholder: bool,
+) -> Result<bool, StoreError> {
+    let markdown = is_markdown_path(&found.rel);
+    let parsed = if markdown && !placeholder && (found.size as u64) <= MAX_PARSE_BYTES {
+        read_markdown(&found.path).map(|text| analyze(&text, &found.rel))
+    } else {
+        None
+    };
+    let did_parse = parsed.is_some();
+    let analysis = parsed.unwrap_or_default();
+    let file_id: i64 = tx
+        .prepare_cached(
+            "INSERT INTO index_files (root_id, rel, rel_key, size, mtime, markdown, placeholder)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(root_id, rel_key) DO UPDATE SET
+                 rel = excluded.rel, size = excluded.size, mtime = excluded.mtime,
+                 markdown = excluded.markdown, placeholder = excluded.placeholder
+             RETURNING id",
+        )?
+        .query_row(
+            params![
+                root_id,
+                found.rel,
+                key_of(&found.rel),
+                found.size,
+                found.mtime,
+                markdown,
+                placeholder
+            ],
+            |row| row.get(0),
+        )?;
+    tx.prepare_cached("DELETE FROM index_headings WHERE file_id = ?1")?
+        .execute([file_id])?;
+    tx.prepare_cached("DELETE FROM index_links WHERE file_id = ?1")?
+        .execute([file_id])?;
+    for (ord, heading) in analysis.headings.iter().enumerate() {
+        tx.prepare_cached(
+            "INSERT INTO index_headings (file_id, ord, level, text, pos) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute(params![
+            file_id,
+            ord as i64,
+            heading.level,
+            heading.text,
+            heading.offset as i64
+        ])?;
+    }
+    for (ord, link) in analysis.links.iter().enumerate() {
+        tx.prepare_cached(
+            "INSERT INTO index_links
+                 (file_id, ord, wiki, target, target_key, leaf_key, heading, range_start, range_end)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?
+        .execute(params![
+            file_id,
+            ord as i64,
+            link.wiki,
+            link.target,
+            link.target_key,
+            link.leaf_key,
+            link.heading,
+            link.range.start as i64,
+            link.range.end as i64
+        ])?;
+    }
+    Ok(did_parse)
+}
+
+fn count_files(tx: &Transaction<'_>, root_id: i64) -> Result<usize, StoreError> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM index_files WHERE root_id = ?1",
+        [root_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+fn file_keys(rel_key: &str) -> (String, String, String) {
+    let name = rel_key.rsplit('\\').next().unwrap_or(rel_key);
+    (
+        file_stem(name).to_owned(),
+        name.to_owned(),
+        strip_markdown_extension(rel_key).to_owned(),
+    )
+}
+
+impl Store {
+    /// Build or refresh the index of the workspace `root`.
+    ///
+    /// Files whose size and modification time are unchanged are not re-read; files that
+    /// disappeared (or are now ignored / hidden / beyond the limit) are dropped. All changes
+    /// are applied in one transaction, so a failure or cancellation leaves the previous index
+    /// intact.
+    ///
+    /// # Errors
+    /// [`StoreError::Cancelled`] when `cancel` was set, [`StoreError::NonUnicodePath`] and
+    /// [`StoreError::Sqlite`].
+    pub fn index_workspace(
+        &mut self,
+        root: &Path,
+        opts: &IndexOptions,
+        is_placeholder: &dyn Fn(&Path) -> bool,
+        cancel: &AtomicBool,
+        now: UnixSeconds,
+    ) -> Result<IndexStats, StoreError> {
+        let (root_text, root_key) = root_identity(root)?;
+        let (found, truncated) = walk(root, &root_text, opts, cancel)?;
+        let tx = self.conn.transaction()?;
+        let root_id: i64 = tx.query_row(
+            "INSERT INTO index_roots (key, path, indexed_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET path = excluded.path, indexed_at = excluded.indexed_at
+             RETURNING id",
+            params![root_key, root_text, now],
+            |row| row.get(0),
+        )?;
+        let mut existing: HashMap<String, (i64, i64, bool)> = HashMap::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT rel_key, size, mtime, placeholder FROM index_files WHERE root_id = ?1",
+            )?;
+            let rows = stmt.query_map([root_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ),
+                ))
+            })?;
+            for row in rows {
+                let (key, state) = row?;
+                existing.insert(key, state);
+            }
+        }
+        let mut stats = IndexStats {
+            truncated,
+            ..IndexStats::default()
+        };
+        let mut seen = HashSet::new();
+        for file in &found {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(StoreError::Cancelled);
+            }
+            let rel_key = key_of(&file.rel);
+            let placeholder = is_placeholder(&file.path);
+            stats.placeholders += usize::from(placeholder);
+            let unchanged = existing
+                .get(&rel_key)
+                .is_some_and(|state| *state == (file.size, file.mtime, placeholder));
+            if !unchanged && store_file(&tx, root_id, file, placeholder)? {
+                stats.parsed += 1;
+            }
+            seen.insert(rel_key);
+        }
+        for key in existing.keys().filter(|key| !seen.contains(*key)) {
+            stats.removed += remove_path(&tx, root_id, key, false)?;
+        }
+        stats.files = count_files(&tx, root_id)?;
+        tx.commit()?;
+        Ok(stats)
+    }
+
+    /// Apply file-system events to the index of `root` (see [`IndexChange`]). Does nothing
+    /// when `root` has not been indexed yet.
+    ///
+    /// # Errors
+    /// [`StoreError::NonUnicodePath`] and [`StoreError::Sqlite`].
+    pub fn index_apply_changes(
+        &mut self,
+        root: &Path,
+        changes: &[IndexChange],
+        opts: &IndexOptions,
+        is_placeholder: &dyn Fn(&Path) -> bool,
+    ) -> Result<IndexStats, StoreError> {
+        let (_, root_key) = root_identity(root)?;
+        let tx = self.conn.transaction()?;
+        let Some(found_root) = find_root(&tx, &root_key)? else {
+            return Ok(IndexStats::default());
+        };
+        let mut stats = IndexStats::default();
+        let mut count = count_files(&tx, found_root.id)?;
+        for change in changes {
+            let (path, removed) = match change {
+                IndexChange::Changed(path) => (path, false),
+                IndexChange::Removed(path) => (path, true),
+            };
+            let Some(rel) = relative_path(&found_root.text, path_text(path)?) else {
+                continue;
+            };
+            let metadata = match std::fs::metadata(path) {
+                Ok(metadata) if !removed => metadata,
+                _ => {
+                    stats.removed += remove_path(&tx, found_root.id, &key_of(&rel), true)?;
+                    continue;
+                }
+            };
+            let mut candidates = Vec::new();
+            if metadata.is_dir() {
+                for entry in WalkBuilder::new(path)
+                    .standard_filters(false)
+                    .build()
+                    .flatten()
+                {
+                    if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                        candidates.extend(found_from(&found_root.text, &entry));
+                    }
+                }
+            } else {
+                candidates.push(Found {
+                    rel: rel.clone(),
+                    path: path.clone(),
+                    size: metadata.len() as i64,
+                    mtime: modified_millis(&metadata),
+                });
+            }
+            for candidate in candidates {
+                let rel_key = key_of(&candidate.rel);
+                if !is_included(Path::new(&found_root.text), &candidate.rel, opts) {
+                    stats.removed += remove_path(&tx, found_root.id, &rel_key, false)?;
+                    continue;
+                }
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM index_files WHERE root_id = ?1 AND rel_key = ?2)",
+                    params![found_root.id, rel_key],
+                    |row| row.get(0),
+                )?;
+                if !known && count >= opts.max_files {
+                    stats.truncated = true;
+                    continue;
+                }
+                count += usize::from(!known);
+                let placeholder = is_placeholder(&candidate.path);
+                stats.placeholders += usize::from(placeholder);
+                if store_file(&tx, found_root.id, &candidate, placeholder)? {
+                    stats.parsed += 1;
+                }
+            }
+        }
+        stats.files = count_files(&tx, found_root.id)?;
+        tx.commit()?;
+        Ok(stats)
+    }
+
+    /// Drop the index of `root`.
+    ///
+    /// # Errors
+    /// [`StoreError::NonUnicodePath`] and [`StoreError::Sqlite`].
+    pub fn index_forget(&self, root: &Path) -> Result<(), StoreError> {
+        let (_, root_key) = root_identity(root)?;
+        self.conn
+            .execute("DELETE FROM index_roots WHERE key = ?1", [root_key])?;
+        Ok(())
+    }
+
+    /// Every indexed file of `root` ordered by path (for Quick Open). Empty for an unknown root.
+    ///
+    /// # Errors
+    /// [`StoreError::NonUnicodePath`] and [`StoreError::Sqlite`].
+    pub fn index_files(&self, root: &Path) -> Result<Vec<IndexedFile>, StoreError> {
+        let (_, root_key) = root_identity(root)?;
+        let Some(found_root) = find_root(&self.conn, &root_key)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT rel, size, mtime, markdown, placeholder FROM index_files
+             WHERE root_id = ?1 ORDER BY rel_key",
+        )?;
+        let files = stmt
+            .query_map([found_root.id], |row| {
+                let rel: String = row.get(0)?;
+                Ok(IndexedFile {
+                    path: PathBuf::from(format!("{}\\{}", found_root.text, rel.replace('/', "\\"))),
+                    rel,
+                    size: row.get::<_, i64>(1)? as u64,
+                    modified_ms: row.get(2)?,
+                    markdown: row.get(3)?,
+                    placeholder: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(files)
+    }
+
+    /// Headings of `file` in document order. Empty when the file is unknown or not parsed.
+    ///
+    /// # Errors
+    /// [`StoreError::NonUnicodePath`] and [`StoreError::Sqlite`].
+    pub fn index_headings(
+        &self,
+        root: &Path,
+        file: &Path,
+    ) -> Result<Vec<IndexedHeading>, StoreError> {
+        let (_, root_key) = root_identity(root)?;
+        let Some(found_root) = find_root(&self.conn, &root_key)? else {
+            return Ok(Vec::new());
+        };
+        let Some(rel) = relative_path(&found_root.text, path_text(file)?) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT h.level, h.text, h.pos FROM index_headings h
+             JOIN index_files f ON f.id = h.file_id
+             WHERE f.root_id = ?1 AND f.rel_key = ?2 ORDER BY h.ord",
+        )?;
+        let headings = stmt
+            .query_map(params![found_root.id, key_of(&rel)], |row| {
+                Ok(IndexedHeading {
+                    level: row.get(0)?,
+                    text: row.get(1)?,
+                    offset: row.get::<_, i64>(2)? as usize,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(headings)
+    }
+
+    /// Every link site in `root` that points at `target`: wikilinks, relative Markdown links,
+    /// reference definitions and images (for rename updates). Sorted by source path and
+    /// position.
+    ///
+    /// # Errors
+    /// [`StoreError::NonUnicodePath`] and [`StoreError::Sqlite`].
+    pub fn index_links_to(&self, root: &Path, target: &Path) -> Result<Vec<LinkSite>, StoreError> {
+        let (_, root_key) = root_identity(root)?;
+        let Some(found_root) = find_root(&self.conn, &root_key)? else {
+            return Ok(Vec::new());
+        };
+        let Some(rel) = relative_path(&found_root.text, path_text(target)?) else {
+            return Ok(Vec::new());
+        };
+        let target_key = key_of(&rel);
+        let (stem_key, name_key, wiki_key) = file_keys(&target_key);
+        let mut stmt = self.conn.prepare(
+            "SELECT f.rel, l.wiki, l.target, l.target_key, l.heading, l.range_start, l.range_end
+             FROM index_links l JOIN index_files f ON f.id = l.file_id
+             WHERE f.root_id = ?1 AND l.leaf_key IN (?2, ?3)
+             ORDER BY f.rel_key, l.ord",
+        )?;
+        let rows = stmt
+            .query_map(params![found_root.id, stem_key, name_key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)? as usize,
+                    row.get::<_, i64>(6)? as usize,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let wiki_suffix = format!("\\{wiki_key}");
+        Ok(rows
+            .into_iter()
+            .filter(|(_, wiki, _, link_key, ..)| {
+                if *wiki {
+                    *link_key == wiki_key || wiki_suffix.ends_with(&format!("\\{link_key}"))
+                } else {
+                    *link_key == target_key
+                }
+            })
+            .map(|(rel, wiki, target, _, heading, start, end)| LinkSite {
+                source: PathBuf::from(format!("{}\\{}", found_root.text, rel.replace('/', "\\"))),
+                wiki,
+                target,
+                heading,
+                range: TextRange::new(start, end),
+            })
+            .collect())
+    }
+
+    /// The files that link to `file`, without duplicates and without `file` itself, sorted by
+    /// path (the Inspector's backlinks).
+    ///
+    /// # Errors
+    /// [`StoreError::NonUnicodePath`] and [`StoreError::Sqlite`].
+    pub fn index_backlinks(&self, root: &Path, file: &Path) -> Result<Vec<PathBuf>, StoreError> {
+        let own = key_of(path_text(file)?);
+        let mut sources: Vec<PathBuf> = Vec::new();
+        for site in self.index_links_to(root, file)? {
+            let is_own = path_text(&site.source).is_ok_and(|text| key_of(text) == own);
+            if !is_own && !sources.contains(&site.source) {
+                sources.push(site.source);
+            }
+        }
+        Ok(sources)
+    }
+}

@@ -27,8 +27,6 @@ pub struct TabStrings {
     pub new_tab: String,
     /// Announced for tabs with unsaved changes.
     pub unsaved: String,
-    /// Title of a document that has no file yet; a number is appended for the second and later.
-    pub untitled: String,
 }
 
 impl TabStrings {
@@ -39,7 +37,6 @@ impl TabStrings {
             strip_label: localizer.text("tabs-label"),
             new_tab: localizer.text("tabs-new"),
             unsaved: localizer.text("tabs-unsaved"),
-            untitled: localizer.text("tabs-untitled"),
         }
     }
 }
@@ -133,7 +130,6 @@ struct TabMeta {
 #[derive(Debug, Clone)]
 pub struct DocumentTabs {
     strip: TabStrip,
-    untitled: String,
     meta: Vec<TabMeta>,
     last_pointer: Point,
     events: Vec<TabsEvent>,
@@ -145,7 +141,6 @@ impl DocumentTabs {
     pub fn new(strings: &TabStrings) -> Self {
         Self {
             strip: TabStrip::new(&strings.strip_label, &strings.new_tab, &strings.unsaved),
-            untitled: strings.untitled.clone(),
             meta: Vec::new(),
             last_pointer: Point::ZERO,
             events: Vec::new(),
@@ -179,20 +174,12 @@ impl DocumentTabs {
         self.strip.add_tab(key, title_for_path(path))
     }
 
-    /// Appends the tab of a document without a file; `number` 1 is plain "Untitled", later ones
-    /// get the number appended.
-    pub fn add_untitled(&mut self, key: u64, number: u32) -> usize {
+    /// Appends the tab of a document without a file, titled `title`: the localized name the
+    /// owner of the document gives it ("Untitled", "Untitled 2", …), so the tab and the rest of
+    /// the app never disagree about it.
+    pub fn add_untitled(&mut self, key: u64, title: &str) -> usize {
         self.meta.push(TabMeta { key, path: None });
-        let title = self.untitled_title(number);
         self.strip.add_tab(key, title)
-    }
-
-    fn untitled_title(&self, number: u32) -> String {
-        if number <= 1 {
-            self.untitled.clone()
-        } else {
-            format!("{} {number}", self.untitled)
-        }
     }
 
     /// The index of the tab with `key`.
@@ -460,7 +447,6 @@ mod tests {
             strip_label: "Open documents".into(),
             new_tab: "New tab".into(),
             unsaved: "Unsaved changes".into(),
-            untitled: "Untitled".into(),
         }
     }
 
@@ -470,7 +456,7 @@ mod tests {
         let mut tabs = DocumentTabs::new(&strings()).with_motion(Motion::reduced());
         tabs.add_file(10, "C:\\notes\\todo.md");
         tabs.add_file(20, "C:\\notes\\data.csv");
-        tabs.add_untitled(30, 1);
+        tabs.add_untitled(30, "Untitled");
         harness.arrange(&mut tabs, Rect::new(0.0, 0.0, 700.0, TAB_HEIGHT));
         (harness, tabs)
     }
@@ -494,25 +480,24 @@ mod tests {
             "en",
             &[(
                 "en",
-                "tabs-label = Docs\ntabs-new = New\ntabs-unsaved = Dirty\ntabs-untitled = Unnamed\n",
+                "tabs-label = Docs\ntabs-new = New\ntabs-unsaved = Dirty\n",
             )],
         );
         let strings = TabStrings::from_localizer(&localizer);
         assert_eq!(strings.strip_label, "Docs");
         assert_eq!(strings.new_tab, "New");
         assert_eq!(strings.unsaved, "Dirty");
-        assert_eq!(strings.untitled, "Unnamed");
     }
 
     #[test]
-    fn untitled_documents_are_numbered_after_the_first() {
+    fn untitled_documents_show_the_title_their_owner_gives_them() {
         let mut tabs = DocumentTabs::new(&strings());
-        tabs.add_untitled(1, 1);
-        tabs.add_untitled(2, 2);
-        tabs.add_untitled(3, 0);
+        tabs.add_untitled(1, "Untitled");
+        tabs.add_untitled(2, "Untitled 2");
+        tabs.add_untitled(3, "Sans titre 3");
         assert_eq!(tabs.title_of(1), Some("Untitled"));
         assert_eq!(tabs.title_of(2), Some("Untitled 2"));
-        assert_eq!(tabs.title_of(3), Some("Untitled"));
+        assert_eq!(tabs.title_of(3), Some("Sans titre 3"));
         assert_eq!(tabs.path_of(1), None);
         assert_eq!(tabs.title_of(99), None);
     }
@@ -579,7 +564,7 @@ mod tests {
         assert!(!last.allows(TabAction::RevealInExplorer));
 
         let mut single = DocumentTabs::new(&strings());
-        single.add_untitled(1, 1);
+        single.add_untitled(1, "Untitled");
         let menu = single.menu_for(1);
         assert!(!menu.can_close_others && !menu.can_close_to_right && !menu.has_path);
         assert!(!single.menu_for(99).can_close_to_right);

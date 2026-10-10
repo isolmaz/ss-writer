@@ -251,6 +251,25 @@ impl HistoryPanel {
         self.motion
     }
 
+    /// The control that takes the keyboard focus when the panel opens (the list of versions).
+    #[must_use]
+    pub fn focus_id(&self) -> WidgetId {
+        self.list.id()
+    }
+
+    /// Whether `id` is the panel or one of its controls (for focus and pointer capture checks).
+    #[must_use]
+    pub fn owns(&self, id: WidgetId) -> bool {
+        [
+            self.id,
+            self.list.id(),
+            self.restore.id(),
+            self.close.id(),
+            self.bar.id(),
+        ]
+        .contains(&id)
+    }
+
     /// Replaces the list of versions, newest first. The selection stays when its version is
     /// still listed and is cleared otherwise.
     pub fn set_entries(&mut self, entries: Vec<HistoryEntry>) {

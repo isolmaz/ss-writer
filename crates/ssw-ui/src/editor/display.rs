@@ -73,6 +73,14 @@ impl DisplayMap {
         }
     }
 
+    /// A map over `segments` (in source order), for blocks that build their display text from
+    /// non-contiguous source lines (code and math inside quotes and lists). `src` is the source
+    /// range covered and `len` the length of the display text.
+    #[must_use]
+    pub fn from_segments(segments: Vec<Segment>, src: TextRange, len: usize) -> Self {
+        Self { segments, src, len }
+    }
+
     /// The source range the map covers.
     #[must_use]
     pub fn source_range(&self) -> TextRange {
@@ -954,7 +962,7 @@ impl Builder<'_> {
                     visual: info.visual,
                 });
             }
-            ObjectState::Pending => {
+            ObjectState::Pending | ObjectState::Blocked => {
                 let style = self.style(&Fmt {
                     color: Some(self.p.tokens.text_muted),
                     ..source_fmt

@@ -41,6 +41,8 @@ pub enum BannerKind {
     RemoteImages,
     /// Unsaved work from a previous session was recovered.
     Recovery,
+    /// A newer release of the application exists.
+    Update,
 }
 
 /// A banner button the app has to act on.
@@ -60,6 +62,8 @@ pub enum BannerAction {
     Restore,
     /// Delete the recovered text.
     Discard,
+    /// Open the page of the newer release.
+    Download,
 }
 
 /// What the user did to the stack.
@@ -343,6 +347,21 @@ impl BannerHost {
         self.insert(entry);
     }
 
+    /// Shows "a newer release exists" with a Download button. The app supplies the texts: the
+    /// message names the release version, which only it knows.
+    pub fn show_update(&mut self, title: &str, message: &str, download: &str) {
+        let download = download.to_owned();
+        let entry = self.build(
+            BannerKind::Update,
+            Severity::Info,
+            title,
+            message,
+            &[(&download, Slot::Emit(BannerAction::Download))],
+            true,
+        );
+        self.insert(entry);
+    }
+
     /// Removes the banner of `kind`. Returns whether there was one.
     pub fn dismiss(&mut self, kind: BannerKind) -> bool {
         let before = self.entries.len();
@@ -577,8 +596,16 @@ impl Widget for BannerHost {
         );
     }
 
-    fn perform(&mut self, _cx: &mut EventCx, _a: &AccessAction) -> bool {
-        false
+    /// Carries out `a` on the action or close button of a banner (the node with id `cx.id`):
+    /// Invoke reports the same [`HostEvent`]s as a click, including expanding the import
+    /// details and dismissing a closable banner.
+    fn perform(&mut self, cx: &mut EventCx, a: &AccessAction) -> bool {
+        let performed = self
+            .entries
+            .iter_mut()
+            .any(|entry| entry.banner.perform(cx, a));
+        self.collect();
+        performed
     }
 }
 
@@ -857,6 +884,79 @@ mod tests {
     }
 
     #[test]
+    fn access_invoke_on_banner_buttons_does_what_clicking_does() {
+        let localizer = localizer();
+        let (mut harness, mut host) = host();
+        host.show_conflict();
+        host.show_read_only();
+        host.show_import_loss(items(2), &localizer);
+        host.take_events();
+        layout(&mut harness, &mut host);
+        // Tab order: Keep mine, Load theirs, Compare, Allow editing, its Close, Details, Close.
+        let order = harness.focus.tab_order().to_vec();
+        assert_eq!(order.len(), 7);
+        let tree = harness.tree(&host);
+        for id in &order {
+            assert!(
+                tree.nodes()
+                    .iter()
+                    .any(|node| node.id == *id && node.patterns.invoke),
+                "{id:?} is an invokable node"
+            );
+        }
+        for id in &order[..4] {
+            let mut cx = harness.event_cx(*id);
+            assert!(host.perform(&mut cx, &AccessAction::Invoke));
+        }
+        assert_eq!(
+            host.take_events(),
+            vec![
+                HostEvent::Action {
+                    kind: BannerKind::Conflict,
+                    action: BannerAction::KeepMine
+                },
+                HostEvent::Action {
+                    kind: BannerKind::Conflict,
+                    action: BannerAction::LoadTheirs
+                },
+                HostEvent::Action {
+                    kind: BannerKind::Conflict,
+                    action: BannerAction::Compare
+                },
+                HostEvent::Action {
+                    kind: BannerKind::ReadOnly,
+                    action: BannerAction::AllowEditing
+                },
+            ]
+        );
+        // Details expands the list.
+        let mut cx = harness.event_cx(order[5]);
+        assert!(host.perform(&mut cx, &AccessAction::Invoke));
+        assert_eq!(host.take_events(), vec![HostEvent::Resized]);
+        assert!(host.details_expanded());
+        // Close dismisses the read-only banner.
+        let mut cx = harness.event_cx(order[4]);
+        assert!(host.perform(&mut cx, &AccessAction::Invoke));
+        assert_eq!(
+            host.take_events(),
+            vec![
+                HostEvent::Dismissed(BannerKind::ReadOnly),
+                HostEvent::Resized
+            ]
+        );
+        assert_eq!(
+            host.kinds(),
+            vec![BannerKind::Conflict, BannerKind::ImportLoss]
+        );
+        // The dismissed banner's buttons are gone and unsupported actions are refused.
+        let mut cx = harness.event_cx(order[4]);
+        assert!(!host.perform(&mut cx, &AccessAction::Invoke));
+        let mut cx = harness.event_cx(order[0]);
+        assert!(!host.perform(&mut cx, &AccessAction::Toggle));
+        assert!(host.take_events().is_empty());
+    }
+
+    #[test]
     fn painting_draws_titles_messages_and_buttons() {
         let (mut harness, mut host) = host();
         host.show_recovery();
@@ -872,6 +972,42 @@ mod tests {
             op,
             DrawOp::FillRoundedRect { color, .. } if *color == warning.background
         )));
+    }
+
+    #[test]
+    fn the_update_banner_offers_download_and_can_be_closed() {
+        let (mut harness, mut host) = host();
+        host.show_update("Update available", "Version 1.2.0 is out.", "Download");
+        host.take_events();
+        assert_eq!(host.kinds(), vec![BannerKind::Update]);
+        layout(&mut harness, &mut host);
+        let canvas = harness.paint(&host);
+        let texts = canvas.texts();
+        for expected in ["Update available", "Version 1.2.0 is out.", "Download"] {
+            assert!(texts.contains(&expected), "missing {expected}: {texts:?}");
+        }
+        // The Download button and the close button.
+        let order = harness.focus.tab_order();
+        assert_eq!(order.len(), 2);
+        harness.focus.focus(order[0]);
+        assert!(harness.key(&mut host, vk::SPACE).handled);
+        assert_eq!(
+            host.take_events(),
+            vec![HostEvent::Action {
+                kind: BannerKind::Update,
+                action: BannerAction::Download
+            }]
+        );
+        let rect = host.banner_rect(BannerKind::Update).expect("rect");
+        harness.click(
+            &mut host,
+            Point::new(rect.right() - 8.0 - 16.0, rect.center().y),
+        );
+        assert_eq!(
+            host.take_events(),
+            vec![HostEvent::Dismissed(BannerKind::Update), HostEvent::Resized]
+        );
+        assert!(host.kinds().is_empty());
     }
 
     #[test]

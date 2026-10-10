@@ -1,6 +1,7 @@
 //! Drives an [`EditorView`] the way the window host does: layout pass, paint pass on a
 //! [`RecordingCanvas`], events routed with focus and pointer capture.
 
+// Every test crate uses a different subset of the helpers.
 #![allow(dead_code)]
 
 use std::cell::RefCell;
@@ -39,8 +40,9 @@ pub const COLUMN_LEFT: f32 = 24.0;
 pub const TOP: f32 = 24.0;
 /// Advance of one grapheme of the test engine.
 pub const ADVANCE: f32 = 8.0;
-/// Line height of the test engine at the 16 DIP body size.
-pub const LINE: f32 = 19.2;
+/// Line height of the test engine at the 16 DIP body size: the default 1.75 line height setting
+/// makes every line exactly 28 DIPs.
+pub const LINE: f32 = 28.0;
 
 pub struct Harness {
     pub theme: Theme,

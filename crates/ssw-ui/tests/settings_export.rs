@@ -11,24 +11,39 @@ use ssw_core::settings::{ExportFormat, ExportSettings, PageSize};
 use ssw_ui::access::{AccessAction, Role};
 use ssw_ui::canvas::DrawOp;
 use ssw_ui::geometry::{Color, Point, Rect};
-use ssw_ui::input::{Event, Modifiers, TextInput, vk};
+use ssw_ui::input::{
+    Event, Modifiers, PointerButton, PointerEvent, PointerEventKind, TextInput, vk,
+};
 use ssw_ui::services::MemoryClipboard;
 use ssw_ui::shell::export_dialog::{ExportDialog, ExportEvent, ExportOptions, ExportRequest};
 use ssw_ui::shell::settings::FieldId;
 use ssw_ui::widgets::anim::Motion;
 
 const WINDOW: Rect = Rect::new(0.0, 0.0, 900.0, 700.0);
+/// A window too short for the options: the panel (window minus 24 DIPs margin on each side) leaves
+/// the scrolling options column 204 DIPs.
+const SHORT: Rect = Rect::new(0.0, 0.0, 900.0, 400.0);
+/// Height of the panel above the options column (title and captions) and below it (buttons).
+const BODY_TOP: f32 = 84.0;
+const FOOTER: f32 = 64.0;
+/// Where the options column starts inside the panel and how wide it is.
+const COLUMN_X: f32 = 240.0;
+const COLUMN_WIDTH: f32 = 520.0;
 
-fn dialog(settings: &ExportSettings) -> (ExportDialog, Host) {
+fn dialog_in(settings: &ExportSettings, window: Rect) -> (ExportDialog, Host) {
     let mut dialog = ExportDialog::new(
         settings,
         localizer(),
         Rc::new(RefCell::new(MemoryClipboard::default())),
         Motion::reduced(),
     );
-    let mut host = Host::new(WINDOW);
+    let mut host = Host::new(window);
     host.layout(&mut dialog);
     (dialog, host)
+}
+
+fn dialog(settings: &ExportSettings) -> (ExportDialog, Host) {
+    dialog_in(settings, WINDOW)
 }
 
 fn defaults() -> (ExportDialog, Host) {
@@ -354,4 +369,214 @@ fn the_dialog_paints_a_scrim_the_title_and_both_columns() {
     for expected in ["Export", "Format", "Options", "PDF", "Cancel", "Page size"] {
         assert!(texts.contains(&expected), "{expected:?} is drawn");
     }
+}
+
+const OPTIONS: [&str; 7] = [
+    "Page size",
+    "Margins",
+    "Base font size",
+    "Page numbers",
+    "Black text",
+    "Light theme",
+    "Include the title",
+];
+
+/// The panel and the column the options show in.
+fn panel_and_column(dialog: &ExportDialog, host: &Host) -> (Rect, Rect) {
+    let tree = host.tree(dialog);
+    let panel = tree
+        .root()
+        .map(|root| root.bounds)
+        .unwrap_or_else(|| panic!("no root"));
+    let column = Rect::new(
+        panel.x + COLUMN_X,
+        panel.y + BODY_TOP,
+        COLUMN_WIDTH,
+        panel.height - BODY_TOP - FOOTER,
+    );
+    (panel, column)
+}
+
+/// How far the options are scrolled and how far they can be.
+fn scrolled(dialog: &ExportDialog, host: &Host) -> (f64, f64) {
+    let bar = host.node(dialog, Role::ScrollBar, "Options scroll bar");
+    let range = bar
+        .patterns
+        .range_value
+        .unwrap_or_else(|| panic!("the scroll bar has no range"));
+    (range.value, range.max)
+}
+
+#[test]
+fn a_tall_window_shows_every_option_without_a_scroll_bar() {
+    let (mut dialog, mut host) = defaults();
+    let (_, column) = panel_and_column(&dialog, &host);
+    for name in OPTIONS {
+        let node = host.control(&dialog, name);
+        assert!(!node.state.offscreen, "{name}");
+        assert!(
+            column.contains_rect(node.bounds),
+            "{name}: {:?}",
+            node.bounds
+        );
+    }
+    assert!(!host.has_node(&dialog, Role::ScrollBar, "Options scroll bar"));
+    // A wheel over the options has nothing to scroll.
+    let before = host.control(&dialog, "Margins").bounds;
+    let over = Point::new(column.x + 100.0, column.y + 50.0);
+    assert!(host.wheel(&mut dialog, over, -100.0).handled);
+    assert_eq!(host.control(&dialog, "Margins").bounds, before);
+}
+
+#[test]
+fn a_short_window_scrolls_the_options_and_keyboard_focus_scrolls_into_view() {
+    let (mut dialog, mut host) = dialog_in(&ExportSettings::default(), SHORT);
+    let (panel, column) = panel_and_column(&dialog, &host);
+    // The panel fits the window; the title, captions, formats and buttons keep their place.
+    assert!(SHORT.contains_rect(panel), "{panel:?}");
+    assert_eq!(panel.height, SHORT.height - 48.0);
+    let export = host.node(&dialog, Role::Button, "Export");
+    assert!(panel.contains_rect(export.bounds), "{:?}", export.bounds);
+    // At the top the first option is shown and the last one is below the column.
+    let first = host.control(&dialog, "Page size");
+    assert!(column.contains_rect(first.bounds), "{:?}", first.bounds);
+    let last = host.control(&dialog, "Include the title");
+    assert!(last.state.offscreen && last.bounds.y >= column.bottom());
+    let (value, max) = scrolled(&dialog, &host);
+    assert_eq!(value, 0.0);
+    assert!(max > 0.0);
+    let bar = host.node(&dialog, Role::ScrollBar, "Options scroll bar");
+    assert!(!bar.state.offscreen);
+    let tree = host.tree(&dialog);
+    assert!(
+        tree.root()
+            .is_some_and(|root| root.children.contains(&bar.id))
+    );
+    assert_eq!(tree.walk().len(), tree.len());
+
+    // Moving keyboard focus to the last option scrolls it into view.
+    let last = host.focus_control(&mut dialog, "Include the title");
+    assert!(last.state.focused && !last.state.offscreen);
+    assert!(column.contains_rect(last.bounds), "{:?}", last.bounds);
+    assert!(scrolled(&dialog, &host).0 > 0.0);
+    // And back to the first one.
+    let first = host.focus_control(&mut dialog, "Page size");
+    assert!(column.contains_rect(first.bounds), "{:?}", first.bounds);
+    assert_eq!(scrolled(&dialog, &host).0, 0.0);
+    // Every option can be reached.
+    for name in OPTIONS {
+        let node = host.focus_control(&mut dialog, name);
+        assert!(
+            column.contains_rect(node.bounds),
+            "{name}: {:?}",
+            node.bounds
+        );
+    }
+}
+
+#[test]
+fn the_wheel_scrolls_the_options_and_clicks_land_on_what_is_drawn() {
+    let (mut dialog, mut host) = dialog_in(&ExportSettings::default(), SHORT);
+    let (panel, column) = panel_and_column(&dialog, &host);
+    let over = Point::new(column.x + 100.0, column.y + 50.0);
+    let before = host.control(&dialog, "Black text").bounds;
+    assert!(host.wheel(&mut dialog, over, -100.0).handled);
+    assert_eq!(
+        host.control(&dialog, "Black text").bounds.y,
+        before.y - 100.0
+    );
+    assert_eq!(scrolled(&dialog, &host).0, 100.0);
+    // A wheel over the title row leaves the options alone; one over them goes back and forth
+    // and stops at both ends.
+    host.wheel(&mut dialog, Point::new(over.x, panel.y + 20.0), -50.0);
+    assert_eq!(scrolled(&dialog, &host).0, 100.0);
+    host.wheel(&mut dialog, over, 30.0);
+    assert_eq!(scrolled(&dialog, &host).0, 70.0);
+    host.wheel(&mut dialog, over, 10_000.0);
+    assert_eq!(scrolled(&dialog, &host).0, 0.0);
+    host.wheel(&mut dialog, over, -10_000.0);
+    let (value, max) = scrolled(&dialog, &host);
+    assert_eq!(value, max);
+
+    // Clicking where the access tree puts a control toggles that control.
+    let toggle = host.control(&dialog, "Include the title");
+    assert!(column.contains_rect(toggle.bounds), "{:?}", toggle.bounds);
+    host.click(&mut dialog, toggle.bounds.center());
+    assert!(!dialog.options().include_title);
+    // A control half under the caption takes clicks on its visible half only.
+    let numbers = host.control(&dialog, "Page numbers").bounds;
+    assert!(
+        numbers.y < column.y && numbers.bottom() > column.y,
+        "{numbers:?} straddles the top of {column:?}"
+    );
+    let x = numbers.center().x;
+    host.click(&mut dialog, Point::new(x, column.y - 1.0));
+    assert!(dialog.options().page_numbers);
+    host.click(&mut dialog, Point::new(x, column.y + 1.0));
+    assert!(!dialog.options().page_numbers);
+}
+
+#[test]
+fn the_scroll_bar_follows_a_drag_and_assistive_technology() {
+    let (mut dialog, mut host) = dialog_in(&ExportSettings::default(), SHORT);
+    let (_, column) = panel_and_column(&dialog, &host);
+    let bar = host.node(&dialog, Role::ScrollBar, "Options scroll bar");
+    let x = bar.bounds.center().x;
+    let pointer = |kind: PointerEventKind, y: f32| {
+        Event::Pointer(PointerEvent {
+            click_count: 1,
+            ..PointerEvent::mouse(kind, Some(PointerButton::Left), Point::new(x, y))
+        })
+    };
+    let grab = bar.bounds.y + 4.0;
+    assert!(
+        host.event(&mut dialog, pointer(PointerEventKind::Down, grab))
+            .handled
+    );
+    host.event(&mut dialog, pointer(PointerEventKind::Move, grab + 56.0));
+    host.event(&mut dialog, pointer(PointerEventKind::Up, grab + 56.0));
+    let (value, max) = scrolled(&dialog, &host);
+    assert!(value > 0.0 && value < max, "{value} of {max}");
+    assert!(
+        host.control(&dialog, "Page size").bounds.y < column.y,
+        "the first option scrolled up with the drag"
+    );
+
+    assert!(host.perform(&mut dialog, bar.id, AccessAction::SetRangeValue(max)));
+    assert_eq!(scrolled(&dialog, &host).0, max);
+    let last = host.control(&dialog, "Include the title");
+    assert!(column.contains_rect(last.bounds), "{:?}", last.bounds);
+    assert!(host.perform(&mut dialog, bar.id, AccessAction::SetRangeValue(0.0)));
+    let first = host.control(&dialog, "Page size");
+    assert!(column.contains_rect(first.bounds), "{:?}", first.bounds);
+    assert!(!host.perform(&mut dialog, bar.id, AccessAction::Invoke));
+}
+
+#[test]
+fn the_options_are_clipped_to_their_column_and_the_bar_is_drawn_over_them() {
+    let (mut dialog, mut host) = dialog_in(&ExportSettings::default(), SHORT);
+    let (_, column) = panel_and_column(&dialog, &host);
+    host.focus_control(&mut dialog, "Include the title");
+    let canvas = host.paint(&dialog);
+    assert!(
+        canvas
+            .ops()
+            .any(|op| matches!(op, DrawOp::PushClipRect(rect) if *rect == column))
+    );
+    let drawn = canvas
+        .recorded()
+        .iter()
+        .find_map(|recorded| match &recorded.op {
+            DrawOp::Text { text, .. } if text == "Include the title" => recorded.bounds,
+            _ => None,
+        });
+    assert!(
+        drawn.is_some_and(|bounds| column.contains_rect(bounds)),
+        "{drawn:?} is inside {column:?}"
+    );
+    let thumb = host.theme.tokens.scrollbar;
+    assert!(canvas.ops().any(|op| matches!(
+        op,
+        DrawOp::FillRoundedRect { color, .. } if *color == thumb
+    )));
 }

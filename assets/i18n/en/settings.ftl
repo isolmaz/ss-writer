@@ -183,5 +183,6 @@ history-line-context = { $text }
 export-dialog-title = Export
 export-dialog-formats = Format
 export-dialog-options = Options
+export-dialog-scroll = Options scroll bar
 export-dialog-export = Export
 export-dialog-cancel = Cancel

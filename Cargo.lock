@@ -1654,7 +1654,7 @@ dependencies = [
  "flate2",
  "fontdb 0.23.0",
  "krilla",
- "resvg",
+ "resvg 0.47.0",
  "skrifa 0.42.1",
  "smallvec",
  "tiny-skia",
@@ -2638,6 +2638,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "resvg"
+version = "0.48.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67e3803f97b999e80cbf7c6ecdd07a8102204d92e1633cf48783720c521196bd"
+dependencies = [
+ "bytemuck",
+ "log",
+ "pico-args",
+ "rgb",
+ "svgtypes",
+ "tiny-skia",
+ "usvg 0.48.1",
+]
+
+[[package]]
 name = "rgb"
 version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3051,13 +3066,16 @@ name = "ssw-app"
 version = "0.1.0"
 dependencies = [
  "embed-manifest",
+ "serde_json",
  "ssw-convert",
  "ssw-core",
  "ssw-io",
+ "ssw-render",
  "ssw-ui",
  "ssw-win",
  "tempfile",
  "thiserror",
+ "windows",
 ]
 
 [[package]]
@@ -3121,6 +3139,15 @@ dependencies = [
 [[package]]
 name = "ssw-preview"
 version = "0.1.0"
+dependencies = [
+ "ssw-core",
+ "ssw-render",
+ "ssw-ui",
+ "ssw-win",
+ "thiserror",
+ "windows",
+ "windows-core",
+]
 
 [[package]]
 name = "ssw-render"
@@ -3160,7 +3187,9 @@ dependencies = [
  "ssw-render",
  "ssw-ui",
  "thiserror",
+ "typst-render",
  "windows",
+ "windows-collections",
  "windows-core",
  "windows-numerics",
  "zip",
@@ -3804,7 +3833,7 @@ dependencies = [
  "image",
  "libm",
  "pixglyph",
- "resvg",
+ "resvg 0.47.0",
  "tiny-skia",
  "ttf-parser",
  "typst-assets",
@@ -4692,6 +4721,7 @@ version = "0.1.0"
 dependencies = [
  "fluent-syntax",
  "regex",
+ "resvg 0.48.1",
  "serde",
  "serde_json",
  "sha2",

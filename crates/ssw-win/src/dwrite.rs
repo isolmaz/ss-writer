@@ -16,7 +16,8 @@ use std::sync::Arc;
 use ssw_core::text::Utf16Map;
 use ssw_ui::geometry::{Color, Point, Rect, Size};
 use ssw_ui::text::{
-    HitTest, InlineObject, LineMetrics, StyledRange, TextLayout, TextLayoutEngine, TextStyle,
+    HitTest, InlineObject, LineHeight, LineMetrics, StyledRange, TextLayout, TextLayoutEngine,
+    TextStyle,
 };
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
@@ -28,11 +29,11 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_BREAK_CONDITION, DWRITE_BREAK_CONDITION_NEUTRAL, DWRITE_CLUSTER_METRICS,
     DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_HIT_TEST_METRICS,
-    DWRITE_INLINE_OBJECT_METRICS, DWRITE_LINE_METRICS, DWRITE_OVERHANG_METRICS,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
-    IDWriteFactory3, IDWriteFactory5, IDWriteFontCollection, IDWriteInMemoryFontFileLoader,
-    IDWriteInlineObject, IDWriteInlineObject_Impl, IDWriteTextFormat, IDWriteTextLayout,
-    IDWriteTextRenderer,
+    DWRITE_INLINE_OBJECT_METRICS, DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM,
+    DWRITE_OVERHANG_METRICS, DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory3, IDWriteFactory5, IDWriteFontCollection,
+    IDWriteInMemoryFontFileLoader, IDWriteInlineObject, IDWriteInlineObject_Impl,
+    IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer,
 };
 use windows::core::{BOOL, HRESULT, HSTRING, IUnknown, Interface, implement};
 use windows_numerics::Vector2;
@@ -409,6 +410,15 @@ impl IDWriteInlineObject_Impl for InlineSlot_Impl {
     }
 }
 
+/// An inline object whose placeholder is a cluster of the text.
+#[derive(Debug, Clone, Copy)]
+struct AcceptedObject {
+    object: InlineObject,
+    /// UTF-16 range of the placeholder cluster.
+    at16: usize,
+    end16: usize,
+}
+
 /// A run of text with the paint properties applied at draw time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct RunPaint {
@@ -533,7 +543,7 @@ impl DWriteLayout {
             }
 
             let cluster_starts = cluster_starts(&layout, total)?;
-            let mut accepted = Vec::new();
+            let mut accepted: Vec<AcceptedObject> = Vec::new();
             for object in objects {
                 let Some(at16) = map.byte_to_utf16(object.at) else {
                     continue;
@@ -545,16 +555,27 @@ impl DWriteLayout {
                     continue;
                 }
                 let end16 = cluster_starts.get(index + 1).copied().unwrap_or(total);
+                accepted.push(AcceptedObject {
+                    object: *object,
+                    at16,
+                    end16,
+                });
+            }
+            // The natural line metrics are read before the objects are set, so that objects
+            // do not inflate them.
+            if let Some(line_height) = base.line_height {
+                set_uniform_line_height(&layout, base.size, line_height, &accepted)?;
+            }
+            for placed in &accepted {
                 let slot: IDWriteInlineObject = InlineSlot {
-                    width: object.size.width,
-                    height: object.size.height,
-                    baseline: object.baseline,
+                    width: placed.object.size.width,
+                    height: placed.object.size.height,
+                    baseline: placed.object.baseline,
                 }
                 .into();
                 layout
-                    .SetInlineObject(&slot, range16(at16, end16))
+                    .SetInlineObject(&slot, range16(placed.at16, placed.end16))
                     .ctx("set inline object")?;
-                accepted.push((*object, at16));
             }
 
             let mut metrics = DWRITE_TEXT_METRICS::default();
@@ -634,8 +655,8 @@ impl DWriteLayout {
         }
     }
 
-    fn place_objects(&mut self, accepted: &[(InlineObject, usize)]) {
-        for (object, at16) in accepted {
+    fn place_objects(&mut self, accepted: &[AcceptedObject]) {
+        for AcceptedObject { object, at16, .. } in accepted {
             let Some((x, y, _)) = self.position16(*at16, false) else {
                 continue;
             };
@@ -805,10 +826,21 @@ impl DWriteLayout {
         }
     }
 
-    fn rect_line(&self, top: f32) -> Option<usize> {
+    /// The line whose box contains the vertical position `y`.
+    fn line_containing(&self, y: f32) -> Option<usize> {
         self.lines
             .iter()
-            .position(|line| (line.top - top).abs() <= LINE_EPSILON)
+            .position(|line| y >= line.top - LINE_EPSILON && y < line.top + line.height)
+    }
+
+    /// The caret rectangle of a UTF-16 position: its x from DirectWrite, its vertical extent the
+    /// box of the line it is on (the full, uniform line height).
+    fn caret_at16(&self, position: usize, trailing: bool) -> Option<Rect> {
+        let (x, y, height) = self.position16(position, trailing)?;
+        Some(self.line_containing(y + height / 2.0).map_or_else(
+            || Rect::new(x, y, 0.0, height),
+            |index| Rect::new(x, self.lines[index].top, 0.0, self.lines[index].height),
+        ))
     }
 }
 
@@ -839,16 +871,11 @@ unsafe fn cluster_starts(layout: &IDWriteTextLayout, total: usize) -> Result<Vec
     Ok(starts)
 }
 
-/// Converts DirectWrite line metrics, adding the empty last line after a trailing hard break.
+/// The raw DirectWrite metrics of every line of `layout`.
 ///
 /// # Safety
-/// `layout` must be a valid layout of `total` UTF-16 units.
-unsafe fn read_lines(
-    layout: &IDWriteTextLayout,
-    map: &Utf16Map,
-    total: usize,
-    layout_height: f32,
-) -> Result<Vec<LineMetrics>, WinError> {
+/// `layout` must be a valid layout.
+unsafe fn raw_lines(layout: &IDWriteTextLayout) -> Result<Vec<DWRITE_LINE_METRICS>, WinError> {
     let mut count = 0u32;
     // SAFETY: see the function contract; a null buffer asks only for the count.
     let probe = unsafe { layout.GetLineMetrics(None, &mut count) };
@@ -860,9 +887,64 @@ unsafe fn read_lines(
     let mut raw = vec![DWRITE_LINE_METRICS::default(); count as usize];
     // SAFETY: the buffer holds `count` entries.
     unsafe { layout.GetLineMetrics(Some(&mut raw), &mut count) }.ctx("line metrics")?;
+    raw.truncate(count as usize);
+    Ok(raw)
+}
+
+/// Makes every line of `layout` exactly `line_height` tall (`DWRITE_LINE_SPACING_METHOD_UNIFORM`).
+///
+/// The font's own ascent and descent (the largest over the layout's lines, read before any
+/// inline object is set) sit centred in the line: half of the extra space goes above and half
+/// below, like CSS `line-height`. The baseline is therefore `ascent + (height − ascent −
+/// descent) / 2` from the top of the line. Uniform spacing never grows a line, so when an
+/// inline object needs more room above or below the baseline than that, the spacing grows to
+/// the object's extent instead (see [`LineHeight`]).
+///
+/// # Safety
+/// `layout` must be a valid layout without inline objects.
+unsafe fn set_uniform_line_height(
+    layout: &IDWriteTextLayout,
+    size: f32,
+    line_height: LineHeight,
+    objects: &[AcceptedObject],
+) -> Result<(), WinError> {
+    let height = line_height.resolve(size);
+    // SAFETY: see the function contract.
+    let natural = unsafe { raw_lines(layout) }?;
+    let (ascent, descent) = natural
+        .iter()
+        .fold((0.0f32, 0.0f32), |(ascent, descent), line| {
+            (
+                ascent.max(line.baseline),
+                descent.max(line.height - line.baseline),
+            )
+        });
+    let leading = (height - ascent - descent) / 2.0;
+    let (mut above, mut below) = (ascent + leading, descent + leading);
+    for placed in objects {
+        above = above.max(placed.object.baseline);
+        below = below.max(placed.object.size.height - placed.object.baseline);
+    }
+    // SAFETY: a valid layout; the method and sizes are plain values.
+    unsafe { layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, above + below, above) }
+        .ctx("set line spacing")
+}
+
+/// Converts DirectWrite line metrics, adding the empty last line after a trailing hard break.
+///
+/// # Safety
+/// `layout` must be a valid layout of `total` UTF-16 units.
+unsafe fn read_lines(
+    layout: &IDWriteTextLayout,
+    map: &Utf16Map,
+    total: usize,
+    layout_height: f32,
+) -> Result<Vec<LineMetrics>, WinError> {
+    // SAFETY: see the function contract.
+    let raw = unsafe { raw_lines(layout) }?;
     let mut lines = Vec::with_capacity(raw.len() + 1);
     let (mut top, mut start16) = (0.0f32, 0usize);
-    for line in raw.iter().take(count as usize) {
+    for line in &raw {
         let end16 = start16 + line.length as usize;
         let start = map.utf16_to_byte_floor(start16);
         let end = map.utf16_to_byte_floor(end16);
@@ -981,16 +1063,16 @@ impl TextLayout for DWriteLayout {
                 .map_or(0, |(index, _)| index);
             let position = self.map.byte_to_utf16_floor(tail);
             return self
-                .position16(position, true)
-                .map_or_else(|| at_end(last), |(x, y, h)| Rect::new(x, y, 0.0, h));
+                .caret_at16(position, true)
+                .unwrap_or_else(|| at_end(last));
         }
         let position = self.map.byte_to_utf16_floor(offset);
         if trailing && is_hard_break(&self.text[offset..]) {
             let line = self.line_for_offset(offset);
             return at_end((line + 1).min(last));
         }
-        self.position16(position, trailing)
-            .map_or_else(|| at_end(0), |(x, y, h)| Rect::new(x, y, 0.0, h))
+        self.caret_at16(position, trailing)
+            .unwrap_or_else(|| at_end(0))
     }
 
     fn range_rects(&self, range: Range<usize>) -> Vec<Rect> {
@@ -1039,7 +1121,7 @@ impl TextLayout for DWriteLayout {
         let mut per_line: Vec<(usize, Rect)> = Vec::new();
         for metric in metrics.iter().take(count as usize) {
             let rect = Rect::new(metric.left, metric.top, metric.width, metric.height);
-            let Some(line) = self.rect_line(metric.top) else {
+            let Some(line) = self.line_containing(metric.top + metric.height / 2.0) else {
                 continue;
             };
             match per_line.iter_mut().find(|(index, _)| *index == line) {
@@ -1050,8 +1132,9 @@ impl TextLayout for DWriteLayout {
         per_line.sort_by_key(|(line, _)| *line);
         per_line
             .into_iter()
-            .map(|(line, mut rect)| {
+            .map(|(line, rect)| {
                 let metrics = self.lines[line];
+                let mut rect = Rect::new(rect.x, metrics.top, rect.width, metrics.height);
                 if metrics.newline_len > 0 && end > metrics.content_end() && start < metrics.end {
                     rect.width += self.newline_pad;
                 }
@@ -1385,6 +1468,65 @@ mod tests {
                 .create_layout("x", &style(-1.0), &[], &[], 10.0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn uniform_line_height_is_exact_and_centres_the_text() {
+        let (_com, engine) = engine();
+        let natural = lay(&engine, "a\nb\nc", f32::INFINITY);
+        let natural_line = natural.line_metrics(0).unwrap();
+        let tall = engine.layout(
+            "a\nb\nc",
+            &style(16.0).with_line_height(LineHeight::Multiple(1.75)),
+            &[],
+            &[],
+            f32::INFINITY,
+        );
+        assert_eq!(tall.line_count(), 3);
+        for index in 0..3 {
+            let line = tall.line_metrics(index).unwrap();
+            assert!((line.height - 28.0).abs() < 0.05, "{line:?}");
+            assert!((line.top - 28.0 * index as f32).abs() < 0.2, "{line:?}");
+        }
+        assert!((tall.size().height - 84.0).abs() < 0.2, "{:?}", tall.size());
+        // Half of the extra space goes above the text.
+        let expected = natural_line.baseline + (28.0 - natural_line.height) / 2.0;
+        let line = tall.line_metrics(0).unwrap();
+        assert!(
+            (line.baseline - expected).abs() < 0.2,
+            "{line:?} {expected}"
+        );
+        // Carets and selections span the whole line box.
+        let caret = tall.caret_rect(2, false);
+        assert!((caret.height - 28.0).abs() < 0.05 && (caret.y - 28.0).abs() < 0.2);
+        let rects = tall.range_rects(0..5);
+        assert_eq!(rects.len(), 3);
+        assert!(rects.iter().all(|rect| (rect.height - 28.0).abs() < 0.05));
+        // An absolute height.
+        let fixed = engine.layout(
+            "a\nb",
+            &style(16.0).with_line_height(LineHeight::Absolute(40.0)),
+            &[],
+            &[],
+            f32::INFINITY,
+        );
+        assert!((fixed.size().height - 80.0).abs() < 0.2);
+        // An inline object taller than the line makes every line grow to it.
+        let object = InlineObject {
+            at: 1,
+            size: Size::new(10.0, 50.0),
+            baseline: 40.0,
+            id: 1,
+        };
+        let grown = engine.layout(
+            "a\u{FFFC}b\nc",
+            &style(16.0).with_line_height(LineHeight::Multiple(1.75)),
+            &[],
+            &[object],
+            f32::INFINITY,
+        );
+        assert!((grown.line_metrics(0).unwrap().height - 50.0).abs() < 0.2);
+        assert!((grown.line_metrics(1).unwrap().height - 50.0).abs() < 0.2);
     }
 
     #[test]

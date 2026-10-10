@@ -45,6 +45,36 @@ pub fn reveal_scroll(caret: Rect, scroll_y: f32, viewport_height: f32, margin: f
     }
 }
 
+/// Width of the band inside each viewport edge where a drag already scrolls, in DIPs.
+pub const AUTOSCROLL_ZONE: f32 = 12.0;
+/// Auto-scroll speed in DIPs per second for each DIP the pointer is past the inner edge of the
+/// zone.
+pub const AUTOSCROLL_GAIN: f32 = 20.0;
+/// Fastest auto-scroll, in DIPs per second.
+pub const AUTOSCROLL_MAX_SPEED: f32 = 4_000.0;
+
+/// How fast, and in which direction, the view scrolls while a drag holds the pointer at window
+/// height `pointer_y` over a viewport spanning `top..bottom`: negative scrolls up, positive
+/// down, in DIPs per second; `0.0` in the middle of the viewport.
+///
+/// The speed grows linearly with the distance beyond the inner edge of the [`AUTOSCROLL_ZONE`]
+/// band (so it is slow at the edge itself and fast far outside the window) and is capped at
+/// [`AUTOSCROLL_MAX_SPEED`]. The band shrinks to a quarter of the viewport height for tiny
+/// viewports.
+#[must_use]
+pub fn autoscroll_speed(pointer_y: f32, top: f32, bottom: f32) -> f32 {
+    let zone = AUTOSCROLL_ZONE.min((bottom - top) / 4.0);
+    let above = top + zone - pointer_y;
+    let below = pointer_y - (bottom - zone);
+    if above > 0.0 {
+        -(above * AUTOSCROLL_GAIN).min(AUTOSCROLL_MAX_SPEED)
+    } else if below > 0.0 {
+        (below * AUTOSCROLL_GAIN).min(AUTOSCROLL_MAX_SPEED)
+    } else {
+        0.0
+    }
+}
+
 /// The zoom after one step up (`direction > 0`) or down, clamped to the supported range.
 #[must_use]
 pub fn step_zoom(percent: u32, direction: i32) -> u32 {
@@ -101,6 +131,32 @@ mod tests {
             70.0,
             "margin is capped at half"
         );
+    }
+
+    #[test]
+    fn autoscroll_speed_grows_with_the_distance_beyond_the_zone() {
+        // Viewport 100..500, zone 12: scrolling starts at 112 (up) and 488 (down).
+        assert_eq!(autoscroll_speed(300.0, 100.0, 500.0), 0.0);
+        assert_eq!(autoscroll_speed(112.0, 100.0, 500.0), 0.0);
+        assert_eq!(autoscroll_speed(488.0, 100.0, 500.0), 0.0);
+        // At the very edge: 12 DIPs into the zone × 20.
+        assert_eq!(autoscroll_speed(100.0, 100.0, 500.0), -240.0);
+        assert_eq!(autoscroll_speed(500.0, 100.0, 500.0), 240.0);
+        // 50 DIPs beyond the edge: 62 × 20.
+        assert_eq!(autoscroll_speed(50.0, 100.0, 500.0), -1_240.0);
+        assert_eq!(autoscroll_speed(550.0, 100.0, 500.0), 1_240.0);
+        // Capped.
+        assert_eq!(
+            autoscroll_speed(-10_000.0, 100.0, 500.0),
+            -AUTOSCROLL_MAX_SPEED
+        );
+        assert_eq!(
+            autoscroll_speed(10_000.0, 100.0, 500.0),
+            AUTOSCROLL_MAX_SPEED
+        );
+        // A tiny viewport shrinks the zone to a quarter of its height (4 DIPs of 16).
+        assert_eq!(autoscroll_speed(8.0, 0.0, 16.0), 0.0);
+        assert_eq!(autoscroll_speed(0.0, 0.0, 16.0), -80.0);
     }
 
     #[test]

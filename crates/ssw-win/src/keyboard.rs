@@ -118,6 +118,15 @@ impl CharProbe for ToUnicodeCharProbe {
     }
 }
 
+/// Whether the Caps Lock toggle is on (the layout needs it to decide what a key types).
+#[must_use]
+pub fn caps_lock_on() -> bool {
+    // SAFETY: a pure query of the calling thread's key state.
+    let state =
+        unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(VK_CAPITAL as i32) };
+    state & 1 != 0
+}
+
 fn current_layout() -> HKL {
     // SAFETY: GetKeyboardLayout has no preconditions; thread id 0 means the calling thread.
     unsafe { GetKeyboardLayout(0) }

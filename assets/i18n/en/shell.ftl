@@ -16,7 +16,6 @@ titlebar-underline-face = U
 tabs-label = Open documents
 tabs-new = New tab
 tabs-unsaved = Unsaved changes
-tabs-untitled = Untitled
 
 ## Status bar
 

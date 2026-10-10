@@ -17,9 +17,14 @@ ssw-core = { path = "../ssw-core" }
 ssw-ui = { path = "../ssw-ui" }
 ssw-render = { path = "../ssw-render" }
 thiserror = "2"
+# `IIterable` for the storage items of the share sheet's `DataPackage`.
+windows-collections = "0.3"
 windows-core = "0.62"
 windows-numerics = "0.3"
 windows = { version = "0.62", features = [
+    "ApplicationModel_DataTransfer",
+    "Storage",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Direct2D",
@@ -41,6 +46,7 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_Storage_EnhancedStorage",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Opc",
     "Win32_Storage_Xps",
     "Win32_Storage_Xps_Printing",
     "Win32_System_Com",
@@ -79,3 +85,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_TextServices",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+# Reads the XPS packages (OPC zip files) the print tests produce.
+zip = { version = "9", default-features = false, features = ["deflate"] }
+# Rasterizes the Typst page a formula scene was made from: the reference of the scene renderer
+# pixel tests (same version as ssw-render's).
+typst-render = "=0.15.1"

@@ -40,8 +40,10 @@ macro_rules! toggles {
     };
 }
 
-#[allow(clippy::type_complexity)]
-fn toggle_table() -> Vec<(FieldId, fn(&Settings) -> bool, fn(&mut Settings, bool))> {
+/// A toggle option: its field, how to read it from the settings and how to set it.
+type ToggleEntry = (FieldId, fn(&Settings) -> bool, fn(&mut Settings, bool));
+
+fn toggle_table() -> Vec<ToggleEntry> {
     toggles![
         (Autosave, general.autosave),
         (SyncFileName, general.sync_file_name_with_heading),

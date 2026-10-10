@@ -11,6 +11,7 @@ use ssw_core::edit::Selection;
 use ssw_core::text::TextRange;
 use ssw_ui::access::Role;
 use ssw_ui::canvas::{DrawOp, SceneId};
+use ssw_ui::editor::block::HEADING_LINE_HEIGHT;
 use ssw_ui::editor::object::{
     InlineObjectProvider, ObjectInfo, ObjectKind, ObjectRequest, ObjectState, ObjectVisual,
 };
@@ -86,9 +87,14 @@ fn headings_are_laid_out_at_their_scale() {
         .find(|entry| matches!(&entry.op, DrawOp::Text { text, .. } if text == "# Big"))
         .and_then(|entry| entry.bounds)
         .expect("heading text");
-    // Body 16 × 1.75 = 28 DIP font, mono line 28 × 1.2 = 33.6, padded above by 0.35 em.
-    assert!(close(text.height, 33.6), "{text:?}");
-    assert!(close(text.y, TOP + 28.0 * 0.35), "{text:?}");
+    // Body 16 × 1.75 = 28 DIP font. The line is the body line (LINE) or 1.3 × the font size,
+    // whichever is taller (36.4), padded above by 0.35 em.
+    let size = 28.0;
+    assert!(
+        close(text.height, LINE.max(size * HEADING_LINE_HEIGHT)),
+        "{text:?}"
+    );
+    assert!(close(text.y, TOP + size * 0.35), "{text:?}");
 }
 
 #[test]
@@ -370,7 +376,9 @@ impl InlineObjectProvider for MathProvider {
                 baseline: 15.0,
             }),
             (ObjectKind::Math, _) => ObjectState::Failed,
-            (ObjectKind::Image, _) => ObjectState::Pending,
+            (ObjectKind::Image | ObjectKind::DisplayMath | ObjectKind::Mermaid, _) => {
+                ObjectState::Pending
+            }
         }
     }
 }

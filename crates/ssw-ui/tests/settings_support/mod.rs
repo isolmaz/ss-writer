@@ -1,6 +1,7 @@
 //! Shared harness of the settings, history and export tests: a minimal window host that lays a
 //! root control out, routes events, performs accessibility actions and records paint.
 
+// Every test crate uses a different subset of the helpers.
 #![allow(dead_code)]
 
 use std::cell::RefCell;

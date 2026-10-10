@@ -9,25 +9,26 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ssw_core::document::Document;
-use ssw_core::edit::Selection;
+use ssw_core::edit::{Edit, Selection, Transaction};
 use ssw_core::text::TextRange;
 
 use crate::access::{
     AccessAction, AccessNode, AccessState, AccessTree, Patterns, Role, ScrollInfo, TextPatternInfo,
 };
 use crate::canvas::Canvas;
-use crate::geometry::{Point, Rect, Size};
+use crate::geometry::{CornerRadii, Point, Rect, Size};
 use crate::input::Event;
+use crate::scroll_physics::Extent;
 use crate::services::{Clock, TimerId};
 use crate::text::{TextLayoutEngine, TextStyle};
 use crate::theme::Theme;
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
 use crate::widgets::{Control, SharedClipboard};
 
-use super::block::{BlockCx, BlockLayout, BlockPaintCx, BlockRegistry, GapLayout};
-use super::config::{Composition, EditorConfig, EditorEvent, EditorStrings};
+use super::block::{BlockCx, BlockDrag, BlockLayout, BlockPaintCx, BlockRegistry, GapLayout};
+use super::config::{Composition, DocumentKind, EditorConfig, EditorEvent, EditorStrings};
 use super::display::Reveal;
-use super::layout::{HeightIndex, Item, ItemKind, build_items, item_at};
+use super::layout::{HeightIndex, Item, ItemKind, build_document_items, document_block, item_at};
 use super::modes::{reveal_scroll, typewriter_scroll};
 use super::object::{InlineObjectProvider, NoObjects};
 
@@ -41,6 +42,12 @@ pub(super) const MIN_MARGIN: f32 = 24.0;
 pub(super) const MIN_COLUMN: f32 = 80.0;
 /// Caret blink period (half cycle).
 pub(super) const BLINK: Duration = Duration::from_millis(530);
+/// Period of the auto-scroll timer while a drag holds the pointer near an edge.
+pub(super) const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(16);
+/// Longest time one auto-scroll tick accounts for (a stalled UI thread must not fling the view).
+pub(super) const AUTOSCROLL_MAX_STEP: Duration = Duration::from_millis(100);
+/// Travel of the pointer, in DIPs, before a press on the selected text becomes a drag.
+pub(super) const TEXT_DRAG_THRESHOLD: f32 = 4.0;
 /// Distance kept between the caret and the viewport edge when scrolling it into view.
 const REVEAL_MARGIN: f32 = 24.0;
 
@@ -86,6 +93,55 @@ pub(super) struct Drag {
     pub unit: DragUnit,
     /// The unit under the press (empty at the press offset for [`DragUnit::Char`]).
     pub anchor: TextRange,
+}
+
+/// A drag of the selected text in progress (spec §2.4): the text moves (Ctrl: copies) to where
+/// the pointer is released.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct TextDrag {
+    /// The dragged range: the selection at the press.
+    pub source: TextRange,
+    /// Where the pointer went down (window DIPs); the drag starts after a few DIPs of travel.
+    pub press: Point,
+    /// The source offset under the press: where a plain click puts the caret.
+    pub click: usize,
+    /// The pointer moved far enough for a drag.
+    pub started: bool,
+    /// Ctrl is held: the text is copied.
+    pub copy: bool,
+}
+
+/// The auto-scroll timer of a running drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct AutoScroll {
+    pub timer: TimerId,
+    /// Clock time of the previous tick.
+    pub last_tick: Duration,
+    /// The pointer in window DIPs.
+    pub pointer: Point,
+}
+
+/// Search results to paint ([`EditorView::set_search_highlights`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct SearchHighlights {
+    pub matches: Vec<TextRange>,
+    pub current: Option<usize>,
+}
+
+impl SearchHighlights {
+    /// The current match.
+    pub fn current_range(&self) -> Option<TextRange> {
+        self.current
+            .and_then(|index| self.matches.get(index))
+            .copied()
+    }
+}
+
+/// A drag owned by a block (an image resize handle) in progress.
+pub(super) struct BlockDragState {
+    /// The layout item that started it.
+    pub item: usize,
+    pub drag: Box<dyn BlockDrag>,
 }
 
 /// A point mapped into the document.
@@ -136,9 +192,19 @@ pub struct EditorView {
     pub(super) focused: bool,
     pub(super) caret_on: bool,
     pub(super) blink_enabled: bool,
+    /// Text never changes (Explorer preview): every edit path is refused in `apply`/`undo_redo`.
+    pub(super) read_only: bool,
+    /// Horizontal scroll of an unwrapped plain-text document, in DIPs; shifts the column.
+    pub(super) scroll_x: std::cell::Cell<f32>,
     pub(super) blink_timer: Option<TimerId>,
     pub(super) goal_x: Option<f32>,
     pub(super) drag: Option<Drag>,
+    pub(super) block_drag: Option<BlockDragState>,
+    pub(super) text_drag: Option<TextDrag>,
+    pub(super) autoscroll: Option<AutoScroll>,
+    /// Where dropped text would land (source offset), drawn as a caret.
+    pub(super) drop_caret: Option<usize>,
+    pub(super) search: SearchHighlights,
     pub(super) composition: Option<Composition>,
     pub(super) hovered_item: Option<usize>,
     pub(super) typewriter: bool,
@@ -185,9 +251,16 @@ impl EditorView {
             focused: false,
             caret_on: true,
             blink_enabled: true,
+            read_only: false,
+            scroll_x: std::cell::Cell::new(0.0),
             blink_timer: None,
             goal_x: None,
             drag: None,
+            block_drag: None,
+            text_drag: None,
+            autoscroll: None,
+            drop_caret: None,
+            search: SearchHighlights::default(),
             composition: None,
             hovered_item: None,
             typewriter: false,
@@ -211,6 +284,13 @@ impl EditorView {
     /// Replaces the configuration (fonts, sizes, spacing, modes' parameters, zoom).
     pub fn set_config(&mut self, config: EditorConfig) {
         if config != self.config {
+            if config.document_kind != self.config.document_kind {
+                self.folds_epoch += 1;
+            }
+            if config.document_kind != self.config.document_kind || config.wrap != self.config.wrap
+            {
+                self.scroll_x.set(0.0);
+            }
             self.config = config;
             self.epoch += 1;
             self.cache.get_mut().heights_dirty = true;
@@ -277,6 +357,22 @@ impl EditorView {
         self.caret_on = true;
     }
 
+    /// Read-only mode (the Explorer preview): selection, navigation, copy, zoom and scrolling
+    /// work, but no command, key or drop changes the document, the caret is not drawn and
+    /// Markdown markers stay hidden whatever the selection.
+    pub fn set_read_only(&mut self, read_only: bool) {
+        if self.read_only != read_only {
+            self.read_only = read_only;
+            self.epoch += 1;
+        }
+    }
+
+    /// Whether the view refuses to change the document.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// Typewriter mode: keeps the caret line at the configured position while typing and
     /// navigating, with overscroll past the end.
     pub fn set_typewriter(&mut self, on: bool) {
@@ -332,6 +428,17 @@ impl EditorView {
         self.cache.get_mut().scroll_y = y.max(0.0);
     }
 
+    /// The vertical scrollable range for a scroll driver (DirectManipulation): the viewport
+    /// height and the content height, with the typewriter overscroll past the end counted as
+    /// content, so [`Extent::max_offset`] is exactly the largest offset the editor accepts.
+    /// Blocks that are not laid out yet count with their estimated height; the range is
+    /// refined as they are measured.
+    #[must_use]
+    pub fn scroll_extent(&self) -> Extent {
+        let content = self.content_height(&self.cache.borrow());
+        Extent::new(f64::from(self.bounds.height), f64::from(content))
+    }
+
     /// The primary selection.
     #[must_use]
     pub fn selection(&self) -> Selection {
@@ -359,6 +466,15 @@ impl EditorView {
     /// when it is scrolled out of view or the layout is stale.
     #[must_use]
     pub fn caret_rect(&self) -> Option<Rect> {
+        let head = self.doc.borrow().primary_selection().head;
+        self.rect_at(head)
+    }
+
+    /// The point the source offset `offset` is at, as a zero-width rectangle in window DIPs
+    /// ([`EditorView::caret_rect`] for any offset); `None` when it is scrolled out of view or the
+    /// layout is stale.
+    #[must_use]
+    pub fn rect_at(&self, offset: usize) -> Option<Rect> {
         let doc = self.doc.borrow();
         let cache = self.cache.borrow();
         if cache
@@ -368,9 +484,8 @@ impl EditorView {
         {
             return None;
         }
-        let head = doc.primary_selection().head;
-        let index = item_at(&cache.items, head);
-        let local = cache.layouts.get(&index)?.caret_rect(head);
+        let index = item_at(&cache.items, offset);
+        let local = cache.layouts.get(&index)?.caret_rect(offset);
         let (left, _) = self.column();
         let top = self.bounds.y + TOP_PAD + cache.heights.prefix(index) as f32 - cache.scroll_y;
         let rect = Rect::new(
@@ -380,6 +495,76 @@ impl EditorView {
             local.height,
         );
         self.bounds.intersects(rect).then_some(rect)
+    }
+
+    /// The source offset under the window point `position`, from the blocks that are laid out
+    /// (the visible ones); `None` outside the editor, over a block that is not laid out, or when
+    /// the layout is stale.
+    #[must_use]
+    pub fn offset_at(&self, position: Point) -> Option<usize> {
+        let doc = self.doc.borrow();
+        let cache = self.cache.borrow();
+        if !self.bounds.contains(position)
+            || cache
+                .layout_key
+                .as_ref()
+                .is_none_or(|key| key.version != doc.version())
+        {
+            return None;
+        }
+        let (left, _) = self.column();
+        let content_y = position.y - self.bounds.y + cache.scroll_y;
+        let index = cache.heights.find(f64::from(content_y - TOP_PAD));
+        let local = Point::new(
+            position.x - left,
+            content_y - TOP_PAD - cache.heights.prefix(index) as f32,
+        );
+        Some(cache.layouts.get(&index)?.hit_test(local))
+    }
+
+    /// Shows (or with `None` hides) a drop caret where text dropped at the window point
+    /// `position` would land, for drags that arrive from outside the editor (another tab, the
+    /// file tree, Explorer). Returns whether a drop is possible there (the view is editable and
+    /// the point is over text).
+    pub fn set_drop_caret(&mut self, position: Option<Point>) -> bool {
+        self.drop_caret = position
+            .and_then(|point| self.offset_at(point))
+            .filter(|_| !self.read_only);
+        self.drop_caret.is_some()
+    }
+
+    /// Inserts `text` at the window point `position` as one undo step and selects it: the drop
+    /// of text that comes from outside the editor. Returns whether the text was inserted
+    /// (`false` when the point is not over text, `text` is empty or the view is read-only).
+    pub fn drop_text(&mut self, position: Point, text: &str) -> bool {
+        self.drop_caret = None;
+        let Some(target) = self.offset_at(position) else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+        let before = self.selection();
+        let after = Selection::new(target, target + text.len());
+        self.apply(
+            Transaction::single(Edit::insert(target, text), before, after),
+            false,
+        )
+    }
+
+    /// Deletes `range` as one undo step: the source side of a move to another tab once the
+    /// target accepted the text of an [`EditorEvent::TextDroppedOutside`]. Returns whether the
+    /// range was removed (`false` when it is empty, outside the text or the view is read-only).
+    pub fn remove_range(&mut self, range: TextRange) -> bool {
+        if range.is_empty() || range.end > self.doc.borrow().buffer().len() {
+            return false;
+        }
+        let before = self.selection();
+        let after = Selection::caret(range.start);
+        self.apply(
+            Transaction::single(Edit::delete(range), before, after),
+            false,
+        )
     }
 
     /// The source range currently visible in the viewport.
@@ -402,17 +587,43 @@ impl EditorView {
     pub(super) fn column(&self) -> (f32, f32) {
         let available = (self.bounds.width - 2.0 * MIN_MARGIN).max(MIN_COLUMN);
         let width = self.config.column_width().min(available).max(MIN_COLUMN);
-        (self.bounds.x + (self.bounds.width - width) / 2.0, width)
+        (
+            self.bounds.x + (self.bounds.width - width) / 2.0 - self.scroll_x.get(),
+            width,
+        )
     }
 
-    fn max_scroll(&self, cache: &Cache) -> f32 {
+    /// Plain-text lines are not wrapped and the view scrolls horizontally.
+    pub(super) fn is_unwrapped(&self) -> bool {
+        self.config.document_kind == DocumentKind::PlainText && !self.config.wrap
+    }
+
+    /// The largest horizontal scroll: the widest laid-out line minus the visible text width.
+    pub(super) fn max_scroll_x(&self) -> f32 {
+        let widest = self
+            .cache
+            .borrow()
+            .layouts
+            .values()
+            .map(|layout| layout.content_width())
+            .fold(0.0, f32::max);
+        (widest - (self.bounds.width - 2.0 * MIN_MARGIN)).max(0.0)
+    }
+
+    /// The scrollable content height: the blocks with their padding and, in typewriter mode, the
+    /// room past the end that lets the last line reach the caret position.
+    fn content_height(&self, cache: &Cache) -> f32 {
         let content = TOP_PAD + cache.heights.total() as f32 + BOTTOM_PAD;
         let overscroll = if self.typewriter {
             self.bounds.height * (1.0 - self.config.typewriter_position)
         } else {
             0.0
         };
-        (content + overscroll - self.bounds.height).max(0.0)
+        content + overscroll
+    }
+
+    fn max_scroll(&self, cache: &Cache) -> f32 {
+        (self.content_height(cache) - self.bounds.height).max(0.0)
     }
 
     fn estimate(&self, item: &Item, line_px: f32) -> f32 {
@@ -427,10 +638,69 @@ impl EditorView {
     }
 
     pub(super) fn reveal(&self, doc: &Document) -> Reveal {
-        Reveal::new(
-            !self.config.auto_hide_markdown,
-            doc.selections().iter().map(|s| s.range()).collect(),
-        )
+        Reveal::new(!self.config.auto_hide_markdown, self.reveal_ranges(doc))
+    }
+
+    /// The selections and the current search match: elements they touch show their markers. A
+    /// read-only view shows the rendered document only: nothing is ever revealed, so selecting
+    /// text to copy does not shift the layout.
+    fn reveal_ranges(&self, doc: &Document) -> Vec<TextRange> {
+        if self.read_only {
+            return Vec::new();
+        }
+        let mut ranges: Vec<TextRange> = doc.selections().iter().map(|s| s.range()).collect();
+        ranges.extend(self.search.current_range());
+        ranges
+    }
+
+    /// Sets the search results to paint: every match in the match color and the `current` one
+    /// (an index into `matches`, which are sorted and do not overlap) in the current-match color
+    /// with an outline. The current match also reveals the hidden Markdown markers it touches
+    /// (spec §7), and when it lies inside a folded section an
+    /// [`EditorEvent::UnfoldRequested`] asks the app to unfold it. Scrolling to the match is the
+    /// caller's job ([`EditorView::go_to`]).
+    pub fn set_search_highlights(&mut self, matches: Vec<TextRange>, current: Option<usize>) {
+        let current = current.filter(|&index| index < matches.len());
+        let highlights = SearchHighlights { matches, current };
+        if highlights == self.search {
+            return;
+        }
+        self.search = highlights;
+        if let Some(range) = self.search.current_range()
+            && self.hidden.iter().any(|hidden| hidden.intersects(range))
+        {
+            self.events.push(EditorEvent::UnfoldRequested { range });
+        }
+    }
+
+    /// Removes the search highlights.
+    pub fn clear_search_highlights(&mut self) {
+        self.set_search_highlights(Vec::new(), None);
+    }
+
+    /// The rectangles of the search matches inside `range` (the source range of one layout
+    /// item), block-local, each flagged when it belongs to the current match.
+    fn search_rects(&self, layout: &dyn BlockLayout, range: TextRange) -> Vec<(Rect, bool)> {
+        let search = &self.search;
+        let first = search
+            .matches
+            .partition_point(|found| found.end <= range.start);
+        let mut rects = Vec::new();
+        for (index, found) in search.matches.iter().enumerate().skip(first) {
+            if found.start >= range.end {
+                break;
+            }
+            if let Some(shared) = found.intersection(range) {
+                let current = search.current == Some(index);
+                rects.extend(
+                    layout
+                        .selection_rects(shared)
+                        .into_iter()
+                        .map(|rect| (rect, current)),
+                );
+            }
+        }
+        rects
     }
 
     /// Asks the next layout pass to scroll the caret into view.
@@ -451,7 +721,14 @@ impl EditorView {
     ) -> Rc<dyn BlockLayout> {
         match item.kind {
             ItemKind::Block(index) => {
-                let block = &doc.ast().blocks[index];
+                let kind = self.config.document_kind;
+                let synthesized;
+                let block = if kind == DocumentKind::Markdown {
+                    &doc.ast().blocks[index]
+                } else {
+                    synthesized = document_block(doc, item, kind);
+                    &synthesized
+                };
                 let cx = BlockCx {
                     text: env.text,
                     theme: env.theme,
@@ -467,8 +744,13 @@ impl EditorView {
                         .binary_search(&block.range.start)
                         .is_ok(),
                     strings: &self.strings,
+                    registry: &self.registry,
                 };
-                Rc::from(self.registry.measure(&cx, block))
+                if kind == DocumentKind::Markdown {
+                    Rc::from(self.registry.measure(&cx, block))
+                } else {
+                    Rc::from(self.registry.measure_document(kind, &cx, block))
+                }
             }
             ItemKind::Gap { separator } => {
                 let touched = reveal.selection_touches(item.content);
@@ -514,7 +796,8 @@ impl EditorView {
         let width = self.column().1;
         let line_key = (self.epoch, env.scale.to_bits());
         if c.line_key != Some(line_key) {
-            let style = TextStyle::new(self.config.text_font.clone(), self.config.body_size());
+            let style = TextStyle::new(self.config.text_font.clone(), self.config.body_size())
+                .with_line_height(self.config.line_height());
             let measured = env
                 .text
                 .layout("A", &style, &[], &[], f32::INFINITY)
@@ -530,7 +813,7 @@ impl EditorView {
         let line_px = c.line_px;
         let items_key = (doc.version(), self.folds_epoch);
         if c.items_key != Some(items_key) {
-            let items = build_items(&doc, &self.hidden);
+            let items = build_document_items(&doc, &self.hidden, self.config.document_kind);
             let estimate = |item: &Item| self.estimate(item, line_px);
             c.heights = if c.items.is_empty() || c.heights_dirty {
                 HeightIndex::new(items.iter().map(estimate).collect())
@@ -562,7 +845,7 @@ impl EditorView {
             c.layouts.clear();
             c.layout_key = Some(key);
         }
-        let ranges: Vec<TextRange> = doc.selections().iter().map(|s| s.range()).collect();
+        let ranges = self.reveal_ranges(&doc);
         if c.selection_ranges != ranges {
             let old = std::mem::replace(&mut c.selection_ranges, ranges.clone());
             let touched = |range: TextRange| {
@@ -653,6 +936,15 @@ impl EditorView {
         let Some(caret) = self.caret_content_rect(env) else {
             return false;
         };
+        if self.is_unwrapped() {
+            let shown = self.bounds.width - 2.0 * MIN_MARGIN;
+            let scroll = self.scroll_x.get();
+            if caret.x < scroll {
+                self.scroll_x.set((caret.x - MIN_MARGIN).max(0.0));
+            } else if caret.x + 2.0 > scroll + shown {
+                self.scroll_x.set(caret.x + 2.0 - shown + MIN_MARGIN);
+            }
+        }
         let mut cache = self.cache.borrow_mut();
         let viewport = self.bounds.height.max(1.0);
         let old = cache.scroll_y;
@@ -689,6 +981,12 @@ impl EditorView {
                 break;
             }
         }
+        let max_x = if self.is_unwrapped() {
+            self.max_scroll_x()
+        } else {
+            0.0
+        };
+        self.scroll_x.set(self.scroll_x.get().clamp(0.0, max_x));
     }
 
     /// The document position under window point `point`.
@@ -783,6 +1081,23 @@ impl Widget for EditorView {
                 }
                 canvas.save();
                 canvas.translate(left, top);
+                let paint_cx = BlockPaintCx {
+                    theme: cx.theme,
+                    config: &self.config,
+                    strings: &self.strings,
+                    text: cx.text,
+                    hovered: self.hovered_item == Some(index),
+                };
+                layout.paint_backdrop(&paint_cx, canvas);
+                let found = self.search_rects(&**layout, item.range);
+                for &(rect, is_current) in &found {
+                    let fill = if is_current {
+                        tokens.highlight.orange.background
+                    } else {
+                        tokens.highlight.yellow.background
+                    };
+                    canvas.fill_rounded_rect(rect, CornerRadii::uniform(2.0), fill);
+                }
                 for selection in &selections {
                     let Some(shared) = selection.intersection(item.range) else {
                         continue;
@@ -791,18 +1106,14 @@ impl Widget for EditorView {
                         canvas.fill_rect(rect, selection_color);
                     }
                 }
+                for &(rect, _) in found.iter().filter(|(_, is_current)| *is_current) {
+                    canvas.stroke_rounded_rect(rect, CornerRadii::uniform(2.0), tokens.accent, 1.5);
+                }
                 let dim =
                     self.focus_mode && index != current && matches!(item.kind, ItemKind::Block(_));
                 if dim {
                     canvas.push_layer(0.35);
                 }
-                let paint_cx = BlockPaintCx {
-                    theme: cx.theme,
-                    config: &self.config,
-                    strings: &self.strings,
-                    text: cx.text,
-                    hovered: self.hovered_item == Some(index),
-                };
                 layout.paint(&paint_cx, canvas);
                 if dim {
                     canvas.pop_layer();
@@ -812,9 +1123,13 @@ impl Widget for EditorView {
         }
         if self.focused
             && self.caret_on
+            && !self.read_only
             && let Some(rect) = self.caret_rect()
         {
             canvas.fill_rect(Rect::new(rect.x, rect.y, 1.5, rect.height), tokens.caret);
+        }
+        if let Some(rect) = self.drop_caret.and_then(|offset| self.rect_at(offset)) {
+            canvas.fill_rect(Rect::new(rect.x, rect.y, 2.0, rect.height), tokens.accent);
         }
         canvas.pop_clip();
     }

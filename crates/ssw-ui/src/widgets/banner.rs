@@ -304,8 +304,25 @@ impl Widget for Banner {
         out.insert(node);
     }
 
-    fn perform(&mut self, _cx: &mut EventCx, _a: &AccessAction) -> bool {
-        false
+    /// Carries out `a` on the action or close button whose access node has id `cx.id`: Invoke
+    /// has the effect of a click (the same [`BannerEvent`]), Focus moves keyboard focus to it.
+    /// The banner's own node supports no action.
+    fn perform(&mut self, cx: &mut EventCx, a: &AccessAction) -> bool {
+        if !self.open {
+            return false;
+        }
+        let target = cx.id;
+        let Some(button) = self
+            .actions
+            .iter_mut()
+            .chain(self.close.as_mut())
+            .find(|button| button.id() == target)
+        else {
+            return false;
+        };
+        let performed = button.perform(cx, a);
+        self.collect(cx);
+        performed
     }
 }
 
@@ -464,6 +481,42 @@ mod tests {
                 )
                 .handled
         );
+    }
+
+    #[test]
+    fn kit_banner_access_invoke_on_a_button_is_a_click() {
+        let (mut harness, mut banner, _) = setup();
+        let ids: Vec<WidgetId> = harness
+            .tree(&banner)
+            .children(banner.id())
+            .map(|node| node.id)
+            .collect();
+        for index in [1, 0] {
+            let mut cx = harness.event_cx(ids[index]);
+            assert!(banner.perform(&mut cx, &AccessAction::Invoke));
+            assert_eq!(banner.take_events(), vec![BannerEvent::Action(index)]);
+        }
+        assert!(banner.is_open());
+        // Focus moves keyboard focus to the button without activating it.
+        let mut cx = harness.event_cx(ids[1]);
+        assert!(banner.perform(&mut cx, &AccessAction::Focus));
+        assert!(harness.focus.is_focused(ids[1]));
+        assert!(banner.take_events().is_empty());
+        // Actions a button does not support, and nodes that are not buttons, are refused.
+        let mut cx = harness.event_cx(ids[0]);
+        assert!(!banner.perform(&mut cx, &AccessAction::Toggle));
+        let mut cx = harness.event_cx(WidgetId::allocate());
+        assert!(!banner.perform(&mut cx, &AccessAction::Invoke));
+        assert!(banner.take_events().is_empty());
+        // Invoke on the close button closes the banner like clicking it.
+        let mut cx = harness.event_cx(ids[2]);
+        assert!(banner.perform(&mut cx, &AccessAction::Invoke));
+        assert_eq!(banner.take_events(), vec![BannerEvent::Closed]);
+        assert!(!banner.is_open());
+        // A closed banner has no buttons to invoke.
+        let mut cx = harness.event_cx(ids[0]);
+        assert!(!banner.perform(&mut cx, &AccessAction::Invoke));
+        assert!(banner.take_events().is_empty());
     }
 
     #[test]

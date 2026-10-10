@@ -23,6 +23,34 @@ impl FontWeight {
     pub const BOLD: FontWeight = FontWeight(700);
 }
 
+/// How tall every line of a layout is (spec §1: editor line height 1.75).
+///
+/// Lines are *uniform*: each is exactly this tall and the font's own ascent + descent sit
+/// centred in it (half of the extra space above, half below, as CSS `line-height` does), so a
+/// line's caret and selection rectangles are this tall. When a layout holds an inline object
+/// that does not fit, every line grows just enough for the tallest object (the baseline moves
+/// down to the object's baseline and the line gets as much room below as the object needs), so
+/// objects never overlap neighbouring lines and the lines of one layout keep equal heights.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeight {
+    /// A multiple of the base font size (`1.75` for a 16 DIP font is 28 DIPs).
+    Multiple(f32),
+    /// A fixed height in DIPs.
+    Absolute(f32),
+}
+
+impl LineHeight {
+    /// The line height in DIPs for text whose base font size is `font_size` (never negative).
+    #[must_use]
+    pub fn resolve(self, font_size: f32) -> f32 {
+        let height = match self {
+            LineHeight::Multiple(factor) => factor * font_size,
+            LineHeight::Absolute(height) => height,
+        };
+        height.max(0.0)
+    }
+}
+
 /// The style of a run of text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextStyle {
@@ -42,10 +70,14 @@ pub struct TextStyle {
     /// Vertical offset of the glyphs from the baseline in DIPs; positive moves up
     /// (superscript), negative moves down.
     pub baseline_shift: f32,
+    /// Uniform line height of the whole layout; `None` uses the font's natural line height.
+    /// Only the *base* style of a layout carries it: the line height of a
+    /// [`StyledRange`] style is ignored.
+    pub line_height: Option<LineHeight>,
 }
 
 impl TextStyle {
-    /// A regular, upright, undecorated style.
+    /// A regular, upright, undecorated style with the font's natural line height.
     #[must_use]
     pub fn new(family: impl Into<Arc<str>>, size: f32) -> Self {
         Self {
@@ -58,7 +90,15 @@ impl TextStyle {
             strikethrough: false,
             background: None,
             baseline_shift: 0.0,
+            line_height: None,
         }
+    }
+
+    /// This style with a uniform line height (see [`LineHeight`]).
+    #[must_use]
+    pub fn with_line_height(mut self, line_height: LineHeight) -> Self {
+        self.line_height = Some(line_height);
+        self
     }
 
     #[must_use]
@@ -217,7 +257,9 @@ pub trait TextLayout {
 /// Creates [`TextLayout`]s.
 pub trait TextLayoutEngine {
     /// Lays out `text` with `base` style and `ranges` overrides, wrapping at `max_width`
-    /// (`f32::INFINITY` for no wrapping). `objects` reserve inline space.
+    /// (`f32::INFINITY` for no wrapping). `objects` reserve inline space. The line height of
+    /// `base` ([`TextStyle::line_height`]) makes every line uniformly that tall (see
+    /// [`LineHeight`]); every [`LineMetrics`] and caret rectangle reports it.
     fn layout(
         &self,
         text: &str,
@@ -234,8 +276,9 @@ const MONO_LINE_HEIGHT_FACTOR: f32 = 1.2;
 /// A deterministic engine for tests: every grapheme cluster advances by the same width
 /// regardless of script or style, lines break after spaces (words longer than the available
 /// width break by grapheme), and a line is `size * 1.2` tall with the baseline `size` below its
-/// top. Only the size of the base style and inline objects affect metrics; `ranges` are
-/// ignored.
+/// top. A base [`LineHeight`] makes every line exactly that tall with the `size * 1.2` text
+/// block centred in it (half-leading above and below). Only the size and line height of the
+/// base style and inline objects affect metrics; `ranges` are ignored.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MonoTextEngine {
     advance: f32,
@@ -267,6 +310,7 @@ impl TextLayoutEngine for MonoTextEngine {
         Box::new(MonoLayout::build(
             text,
             base.size,
+            base.line_height.map(|height| height.resolve(base.size)),
             self.advance,
             objects,
             max_width,
@@ -333,13 +377,16 @@ impl MonoLayout {
     fn build(
         text: &str,
         font_size: f32,
+        uniform_height: Option<f32>,
         advance: f32,
         objects: &[InlineObject],
         max_width: f32,
     ) -> Self {
-        let line_height = font_size * MONO_LINE_HEIGHT_FACTOR;
-        let base_ascent = font_size;
-        let base_descent = line_height - font_size;
+        let natural = font_size * MONO_LINE_HEIGHT_FACTOR;
+        // Half-leading: the extra (or missing) space is split above and below the text.
+        let half_leading = uniform_height.map_or(0.0, |height| (height - natural) / 2.0);
+        let mut base_ascent = font_size + half_leading;
+        let mut base_descent = natural - font_size + half_leading;
 
         let mut clusters: Vec<Cluster> = text
             .grapheme_indices(true)
@@ -366,6 +413,14 @@ impl MonoLayout {
                 }
             })
             .collect();
+
+        if uniform_height.is_some() {
+            // Uniform lines: the tallest inline object sets the room of every line.
+            for object in clusters.iter().filter_map(|cluster| cluster.object) {
+                base_ascent = base_ascent.max(object.baseline);
+                base_descent = base_descent.max(object.size.height - object.baseline);
+            }
+        }
 
         // Break into lines: cluster index ranges `first..last`.
         let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -657,6 +712,7 @@ mod tests {
             (base.color, base.background, base.baseline_shift),
             (None, None, 0.0)
         );
+        assert_eq!(base.line_height, None);
 
         let red = Color::from_rgb_u32(0xFF0000);
         let styled = base
@@ -1109,5 +1165,127 @@ mod tests {
         let l = layout("x", 10.0);
         assert!(l.as_any().downcast_ref::<MonoLayout>().is_some());
         assert!(l.as_any().downcast_ref::<String>().is_none());
+    }
+
+    fn uniform(
+        text: &str,
+        line_height: LineHeight,
+        objects: &[InlineObject],
+        max_width: f32,
+    ) -> Box<dyn TextLayout> {
+        engine().layout(
+            text,
+            &style().with_line_height(line_height),
+            &[],
+            objects,
+            max_width,
+        )
+    }
+
+    #[test]
+    fn line_height_resolves_against_the_font_size_and_never_goes_negative() {
+        assert!(close(LineHeight::Multiple(1.75).resolve(16.0), 28.0));
+        assert!(close(LineHeight::Absolute(21.0).resolve(16.0), 21.0));
+        assert_eq!(LineHeight::Multiple(-2.0).resolve(16.0), 0.0);
+        assert_eq!(LineHeight::Absolute(-1.0).resolve(16.0), 0.0);
+        assert_eq!(style().line_height, None);
+        let styled = style().with_line_height(LineHeight::Multiple(1.5));
+        assert_eq!(styled.line_height, Some(LineHeight::Multiple(1.5)));
+    }
+
+    #[test]
+    fn uniform_line_height_scales_every_line_exactly() {
+        for (factor, per_line) in [(1.0_f32, 10.0_f32), (1.75, 17.5), (2.5, 25.0)] {
+            let l = uniform("a\nb\nc", LineHeight::Multiple(factor), &[], f32::INFINITY);
+            assert_eq!(l.line_count(), 3);
+            assert!(
+                close(l.size().height, 3.0 * per_line),
+                "factor {factor}: {:?}",
+                l.size()
+            );
+            for index in 0..3 {
+                let line = l.line_metrics(index).expect("line");
+                assert!(close(line.height, per_line), "{line:?}");
+                assert!(close(line.top, index as f32 * per_line), "{line:?}");
+            }
+        }
+        let absolute = uniform("a\nb", LineHeight::Absolute(20.0), &[], f32::INFINITY);
+        assert!(close(absolute.size().height, 40.0));
+        // Without a line height the natural 1.2 × size is kept.
+        assert!(close(layout("a\nb", f32::INFINITY).size().height, 24.0));
+    }
+
+    #[test]
+    fn text_is_centred_in_the_uniform_line() {
+        // Natural: ascent 10 + descent 2. A 17.5 line adds 2.75 above and below.
+        let l = uniform("ab", LineHeight::Multiple(1.75), &[], f32::INFINITY);
+        let line = l.line_metrics(0).expect("line 0");
+        assert!(close(line.baseline, 12.75), "{line:?}");
+        assert!(rect_close(
+            l.caret_rect(1, false),
+            Rect::new(10.0, 0.0, 0.0, 17.5)
+        ));
+        let rects = l.range_rects(0..2);
+        assert_eq!(rects.len(), 1);
+        assert!(rect_close(rects[0], Rect::new(0.0, 0.0, 20.0, 17.5)));
+        // A line shorter than the text takes the space from both sides.
+        let tight = uniform("ab", LineHeight::Multiple(1.0), &[], f32::INFINITY);
+        let line = tight.line_metrics(0).expect("line 0");
+        assert!(
+            close(line.height, 10.0) && close(line.baseline, 9.0),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_lines_and_hit_tests_follow_the_uniform_height() {
+        let l = uniform("aaaa bbbb", LineHeight::Multiple(1.75), &[], 50.0);
+        assert_eq!(l.line_count(), 2);
+        let second = l.line_metrics(1).expect("line 1");
+        assert!(close(second.top, 17.5) && close(second.height, 17.5));
+        let hit = l.hit_test_point(Point::new(2.0, 20.0));
+        assert_eq!((hit.offset, hit.trailing), (5, false));
+        assert!(rect_close(
+            l.caret_rect(5, false),
+            Rect::new(0.0, 17.5, 0.0, 17.5)
+        ));
+    }
+
+    #[test]
+    fn tall_inline_objects_grow_every_uniform_line_and_small_ones_do_not() {
+        let text = "a\u{FFFC}b\nc";
+        let tall = InlineObject {
+            at: 1,
+            size: Size::new(20.0, 30.0),
+            baseline: 25.0,
+            id: 7,
+        };
+        // Ascent 25 and descent 5 beat the 12.75 / 4.75 of a 17.5 line: both lines are 30.
+        let l = uniform(text, LineHeight::Multiple(1.75), &[tall], f32::INFINITY);
+        let (first, second) = (
+            l.line_metrics(0).expect("line 0"),
+            l.line_metrics(1).expect("line 1"),
+        );
+        assert!(close(first.height, 30.0) && close(first.baseline, 25.0));
+        assert!(close(second.top, 30.0) && close(second.height, 30.0));
+        assert!(close(second.baseline, 55.0), "{second:?}");
+        assert_eq!(
+            l.inline_object_rect(7),
+            Some(Rect::new(10.0, 0.0, 20.0, 30.0))
+        );
+
+        let small = InlineObject {
+            at: 1,
+            size: Size::new(10.0, 8.0),
+            baseline: 6.0,
+            id: 1,
+        };
+        let l = uniform(text, LineHeight::Multiple(1.75), &[small], f32::INFINITY);
+        let line = l.line_metrics(0).expect("line 0");
+        assert!(close(line.height, 17.5) && close(line.baseline, 12.75));
+        assert!(rect_close(
+            l.inline_object_rect(1).expect("object"),
+            Rect::new(10.0, 6.75, 10.0, 8.0)
+        ));
     }
 }

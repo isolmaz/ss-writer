@@ -266,7 +266,9 @@ impl Drop for Open {
     }
 }
 
-fn register(name: &str) -> u32 {
+/// The id of the registered clipboard format `name` (also the format id of drag-and-drop data
+/// objects).
+pub(crate) fn register(name: &str) -> u32 {
     // SAFETY: valid NUL-terminated name.
     unsafe { RegisterClipboardFormatW(&HSTRING::from(name)) }
 }

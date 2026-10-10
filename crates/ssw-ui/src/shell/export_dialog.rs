@@ -28,7 +28,7 @@ use crate::widgets::{
 };
 
 use super::settings::fields::{FieldId, display_number};
-use super::settings::form::{Change, Form, Input, Row, forward};
+use super::settings::form::{Change, Form, FormScroll, Input, Row, forward};
 
 /// Widest panel.
 const PANEL_WIDTH: f32 = 760.0;
@@ -44,6 +44,8 @@ const TITLE_HEIGHT: f32 = 56.0;
 const CAPTION_HEIGHT: f32 = 28.0;
 /// Height of the button row.
 const FOOTER_HEIGHT: f32 = 64.0;
+/// Height of everything in the panel but the two columns' bodies.
+const CHROME_HEIGHT: f32 = TITLE_HEIGHT + CAPTION_HEIGHT + FOOTER_HEIGHT;
 /// Padding at the panel's edges.
 const PAD: f32 = 16.0;
 /// Width of the format column.
@@ -147,6 +149,8 @@ pub struct ExportDialog {
     loc: Rc<Localizer>,
     formats: ListView,
     form: Form<OptionKey>,
+    /// The options column: scrolls when the window is shorter than the options.
+    scroll: FormScroll,
     export: Button,
     cancel: Button,
     format: ExportFormat,
@@ -200,7 +204,7 @@ impl ExportDialog {
                 .with_motion(motion),
             )
         };
-        let page_size = Input::Choice(
+        let page_size = Input::Choice(Box::new(
             ComboBox::new(
                 loc.text("settings-export-page-size"),
                 PAGE_SIZES.iter().map(|(_, id)| loc.text(id)).collect(),
@@ -209,7 +213,7 @@ impl ExportDialog {
                     .position(|(size, _)| *size == options.page_size),
             )
             .with_motion(motion),
-        );
+        ));
         let form = Form::new(vec![
             row(
                 OptionKey::PageSize,
@@ -258,11 +262,13 @@ impl ExportDialog {
             Button::new(ButtonKind::Accent, loc.text("export-dialog-export")).with_motion(motion);
         let cancel =
             Button::new(ButtonKind::Standard, loc.text("export-dialog-cancel")).with_motion(motion);
+        let scroll = FormScroll::new(loc.text("export-dialog-scroll"), motion);
         let mut dialog = Self {
             id: WidgetId::allocate(),
             loc,
             formats,
             form,
+            scroll,
             export,
             cancel,
             format: defaults.default_format,
@@ -397,6 +403,7 @@ impl ExportDialog {
         } else if submit || pressed {
             self.request(cx);
         }
+        self.scroll.reveal(cx, &self.form);
     }
 
     /// Validates a typed number with the range of the matching Export setting.
@@ -448,10 +455,13 @@ impl Widget for ExportDialog {
         }
         let width = (bounds.width - 2.0 * PANEL_MARGIN).clamp(MIN_WIDTH, PANEL_WIDTH);
         let form_width = width - LIST_WIDTH;
-        let wanted = self.form.layout(cx, Rect::new(0.0, 0.0, form_width, 0.0));
-        let height = (TITLE_HEIGHT + CAPTION_HEIGHT + wanted + FOOTER_HEIGHT)
-            .min(bounds.height - 2.0 * PANEL_MARGIN)
-            .max(MIN_HEIGHT);
+        let wanted = self.form.height(cx, form_width);
+        // The columns' bodies are as tall as the options need, or as the window leaves room
+        // for: the options scroll when they need more.
+        let body_height = wanted
+            .min(bounds.height - 2.0 * PANEL_MARGIN - CHROME_HEIGHT)
+            .max(MIN_HEIGHT - CHROME_HEIGHT);
+        let height = CHROME_HEIGHT + body_height;
         self.panel = Rect::new(
             bounds.x + (bounds.width - width) / 2.0,
             bounds.y + (bounds.height - height) / 2.0,
@@ -466,13 +476,12 @@ impl Widget for ExportDialog {
                 self.panel.x + PAD,
                 body_top,
                 LIST_WIDTH - 2.0 * PAD,
-                (self.panel.bottom() - FOOTER_HEIGHT - body_top).max(0.0),
+                body_height,
             ),
         );
-        self.form.layout(
-            cx,
-            Rect::new(self.panel.x + LIST_WIDTH, body_top, form_width, 0.0),
-        );
+        let viewport = Rect::new(self.panel.x + LIST_WIDTH, body_top, form_width, body_height);
+        let content = self.form.layout(cx, viewport);
+        self.scroll.arrange(cx, viewport, content);
         let mut right = self.panel.right() - PAD;
         let top = self.panel.bottom() - (FOOTER_HEIGHT + CONTROL_HEIGHT) / 2.0;
         // Laid out from the right edge: the accent button ends up rightmost.
@@ -540,7 +549,7 @@ impl Widget for ExportDialog {
         );
         self.formats
             .paint(&cx.for_widget(self.formats.id()), canvas);
-        self.form.paint(cx, canvas);
+        self.scroll.paint(cx, canvas, &self.form);
         for button in [&self.cancel, &self.export] {
             button.paint(&cx.for_widget(button.id()), canvas);
         }
@@ -551,7 +560,7 @@ impl Widget for ExportDialog {
             return EventResult::ignored();
         }
         let mut result = forward(&mut self.formats, cx, e);
-        result = result.or(self.form.event(cx, e));
+        result = result.or(self.scroll.event(cx, &mut self.form, e));
         for button in self.buttons_mut() {
             result = result.or(forward(button, cx, e));
         }
@@ -577,7 +586,7 @@ impl Widget for ExportDialog {
         if self.open {
             self.formats.access(&cx.for_widget(self.formats.id()), out);
             children.push(self.formats.id());
-            children.extend(self.form.access(cx, out, Point::ZERO, self.bounds));
+            children.extend(self.scroll.access(cx, out, &self.form));
             for button in [&self.cancel, &self.export] {
                 button.access(&cx.for_widget(button.id()), out);
                 children.push(button.id());
@@ -606,7 +615,7 @@ impl Widget for ExportDialog {
             self.export.perform(&mut cx.for_widget(target), a)
         } else if target == self.cancel.id() {
             self.cancel.perform(&mut cx.for_widget(target), a)
-        } else if self.form.perform(cx, a) {
+        } else if self.scroll.perform(cx, &mut self.form, a) {
             true
         } else {
             self.formats

@@ -2,7 +2,7 @@
 //!
 //! The title row holds the sidebar toggle and the document tabs ([`DocumentTabs`]); the area at
 //! its right end is reserved for the caption buttons that `ssw-win` draws. The command row holds
-//! the File / Edit / Format / View menu buttons (they request native popup menus through
+//! the File / Edit / Format / View / Help menu buttons (they request native popup menus through
 //! [`TitleEvent::MenuRequested`]), the B I U pill and the inspector toggle.
 //!
 //! [`TitleBar`] answers the window-chrome hit test ([`TitleBar::chrome_hit`]): caption
@@ -62,6 +62,7 @@ pub struct TitleStrings {
     pub edit: String,
     pub format: String,
     pub view: String,
+    pub help: String,
     pub bold: String,
     pub italic: String,
     pub underline: String,
@@ -87,6 +88,7 @@ impl TitleStrings {
             edit: localizer.text("cmd-group-edit"),
             format: localizer.text("cmd-group-format"),
             view: localizer.text("cmd-group-view"),
+            help: localizer.text("cmd-group-help"),
             bold: localizer.text("cmd-format-bold"),
             italic: localizer.text("cmd-format-italic"),
             underline: localizer.text("cmd-format-underline"),
@@ -105,15 +107,17 @@ pub enum MenuKind {
     Edit,
     Format,
     View,
+    Help,
 }
 
 impl MenuKind {
     /// Left-to-right order in the command row.
-    pub const ALL: [MenuKind; 4] = [
+    pub const ALL: [MenuKind; 5] = [
         MenuKind::File,
         MenuKind::Edit,
         MenuKind::Format,
         MenuKind::View,
+        MenuKind::Help,
     ];
 }
 
@@ -370,6 +374,7 @@ impl TitleBar {
                     MenuKind::Edit => &strings.edit,
                     MenuKind::Format => &strings.format,
                     MenuKind::View => &strings.view,
+                    MenuKind::Help => &strings.help,
                 };
                 (menu, Button::new(ButtonKind::Subtle, label))
             })
@@ -856,6 +861,7 @@ mod tests {
         assert_eq!(strings.edit, "Edit");
         assert_eq!(strings.format, "Format");
         assert_eq!(strings.view, "View");
+        assert_eq!(strings.help, "Help");
         assert_eq!(strings.bold, "Bold");
         assert_eq!(strings.sidebar_toggle, "Sidebar");
         assert_eq!(strings.inspector_toggle, "Inspector");
@@ -866,7 +872,7 @@ mod tests {
         assert!(!strings.title_row.starts_with("titlebar-"));
         assert!(!strings.command_row.starts_with("titlebar-"));
         assert!(!strings.format_pill.starts_with("titlebar-"));
-        assert_eq!(strings.tabs.untitled, "Untitled");
+        assert_eq!(strings.tabs.unsaved, "Unsaved changes");
     }
 
     #[test]
@@ -896,6 +902,10 @@ mod tests {
         assert_eq!(
             bar.menu_rect(MenuKind::View),
             Rect::new(192.0, 44.0, 54.0, 32.0)
+        );
+        assert_eq!(
+            bar.menu_rect(MenuKind::Help),
+            Rect::new(248.0, 44.0, 54.0, 32.0)
         );
         assert_eq!(
             bar.inspector_toggle_rect(),
@@ -941,8 +951,8 @@ mod tests {
     fn tab_order_follows_the_visual_order() {
         let (harness, bar, _) = setup();
         let order = harness.focus.tab_order();
-        // toggle, tabs, 4 menus, 3 pill items, inspector toggle, and the strip's new-tab button.
-        assert_eq!(order.len(), 11);
+        // toggle, tabs, 5 menus, 3 pill items, inspector toggle, and the strip's new-tab button.
+        assert_eq!(order.len(), 12);
         assert_eq!(order[0], bar.sidebar.id);
         assert_eq!(order[1], bar.tabs().id());
         assert_eq!(order[order.len() - 1], bar.inspector.id);
@@ -1167,7 +1177,7 @@ mod tests {
         harness.arrange(&mut bar, Rect::new(0.0, 0.0, 1000.0, 80.0));
         assert_eq!(bar.pill_rect(), Rect::ZERO);
         assert_eq!(bar.pill_item_rect(FormatToggle::Bold), Rect::ZERO);
-        assert_eq!(harness.focus.tab_order().len(), 8);
+        assert_eq!(harness.focus.tab_order().len(), 9);
         // A click where the pill used to be does nothing.
         harness.click(&mut bar, Point::new(870.0, 60.0));
         assert!(bar.take_events().is_empty());
@@ -1194,10 +1204,10 @@ mod tests {
         assert_eq!(title_children, vec![Role::ToggleButton, Role::Tab]);
         let command_children: Vec<_> = tree.children(rows[1].id).collect();
         let names: Vec<&str> = command_children.iter().map(|n| n.name.as_str()).collect();
-        assert_eq!(names[..4], ["File", "Edit", "Format", "View"]);
-        assert_eq!(command_children[4].role, Role::Group);
-        assert_eq!(tree.children(command_children[4].id).count(), 3);
-        assert_eq!(command_children[5].name, "Inspector");
+        assert_eq!(names[..5], ["File", "Edit", "Format", "View", "Help"]);
+        assert_eq!(command_children[5].role, Role::Group);
+        assert_eq!(tree.children(command_children[5].id).count(), 3);
+        assert_eq!(command_children[6].name, "Inspector");
         // Every node is reachable from the root.
         assert_eq!(tree.walk().len(), tree.len());
     }
@@ -1213,7 +1223,7 @@ mod tests {
         let canvas = harness.paint(&bar);
         let texts = canvas.texts();
         for expected in [
-            "todo", "data.csv", "File", "Edit", "Format", "View", "B", "I", "U",
+            "todo", "data.csv", "File", "Edit", "Format", "View", "Help", "B", "I", "U",
         ] {
             assert!(texts.contains(&expected), "missing {expected}: {texts:?}");
         }

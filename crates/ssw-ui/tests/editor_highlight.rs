@@ -1,0 +1,400 @@
+//! Syntax highlighting: token tables per language, incremental caching, language names and
+//! theme colors.
+
+use ssw_ui::editor::highlight::{Highlighter, Language, SyntaxColors, TokenKind, tokenize};
+use ssw_ui::theme::{DEFAULT_ACCENT, Theme};
+
+use TokenKind::{
+    Added, Attribute, Comment, Constant, Escape, Function, Heading, Keyword, Number, Property,
+    Removed, String as Str, Tag, Type, Variable,
+};
+
+fn toks(language: Language, text: &str) -> Vec<(&str, TokenKind)> {
+    tokenize(language, text)
+        .into_iter()
+        .map(|token| (&text[token.start..token.end], token.kind))
+        .collect()
+}
+
+#[test]
+fn rust_tokens() {
+    assert_eq!(
+        toks(Language::Rust, "let x: u32 = 42; // note\n"),
+        [
+            ("let", Keyword),
+            ("u32", Type),
+            ("42", Number),
+            ("// note", Comment)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Rust, r#""a\n""#),
+        [("\"a", Str), ("\\n", Escape), ("\"", Str)]
+    );
+    assert_eq!(
+        toks(Language::Rust, "'a' 'static"),
+        [("'a'", Str), ("'static", Type)]
+    );
+    assert_eq!(
+        toks(Language::Rust, r#"println!("x")"#),
+        [("println", Function), ("\"x\"", Str)]
+    );
+    assert_eq!(
+        toks(Language::Rust, "#[derive(Debug)] struct Foo;"),
+        [
+            ("#[derive(Debug)]", Attribute),
+            ("struct", Keyword),
+            ("Foo", Type)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Rust, "/* a /* b */ c */ x"),
+        [("/* a /* b */ c */", Comment)]
+    );
+    assert_eq!(
+        toks(Language::Rust, r##"r#"a"b"#"##),
+        [(r##"r#"a"b"#"##, Str)]
+    );
+}
+
+#[test]
+fn block_comments_continue_on_the_next_line() {
+    let text = "/* a\n b */ x";
+    assert_eq!(
+        toks(Language::C, text),
+        [("/* a", Comment), (" b */", Comment)]
+    );
+}
+
+#[test]
+fn c_and_cpp_tokens() {
+    assert_eq!(
+        toks(Language::C, "#include <stdio.h>"),
+        [("#include", Keyword), ("<stdio.h>", Str)]
+    );
+    assert_eq!(
+        toks(Language::C, "int main(void) { return 0; }"),
+        [
+            ("int", Type),
+            ("main", Function),
+            ("void", Type),
+            ("return", Keyword),
+            ("0", Number)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Cpp, "std::string s = nullptr;"),
+        [("string", Type), ("nullptr", Constant)]
+    );
+}
+
+#[test]
+fn csharp_and_java_tokens() {
+    assert_eq!(
+        toks(Language::CSharp, r#"var s = $"hi {x}";"#),
+        [("var", Keyword), ("$\"hi {x}\"", Str)]
+    );
+    assert_eq!(
+        toks(Language::CSharp, r#"@"a""b""#),
+        [("@\"a", Str), ("\"\"", Escape), ("b\"", Str)]
+    );
+    assert_eq!(
+        toks(Language::Java, "@Override public void run() {}"),
+        [
+            ("@Override", Attribute),
+            ("public", Keyword),
+            ("void", Type),
+            ("run", Function)
+        ]
+    );
+}
+
+#[test]
+fn javascript_and_typescript_tokens() {
+    assert_eq!(
+        toks(Language::JavaScript, "const s = `a${b}c`;"),
+        [
+            ("const", Keyword),
+            ("`a", Str),
+            ("${", Escape),
+            ("}", Escape),
+            ("c`", Str)
+        ]
+    );
+    assert_eq!(
+        toks(Language::TypeScript, "interface Foo { x: string }"),
+        [("interface", Keyword), ("Foo", Type), ("string", Type)]
+    );
+}
+
+#[test]
+fn json_keys_are_properties() {
+    assert_eq!(
+        toks(Language::Json, r#"{"a": [1, true, null], "b": "x\n"}"#),
+        [
+            ("\"a\"", Property),
+            ("1", Number),
+            ("true", Constant),
+            ("null", Constant),
+            ("\"b\"", Property),
+            ("\"x", Str),
+            ("\\n", Escape),
+            ("\"", Str)
+        ]
+    );
+}
+
+#[test]
+fn python_and_go_tokens() {
+    assert_eq!(
+        toks(Language::Python, "def go(n=0x1F):"),
+        [("def", Keyword), ("go", Function), ("0x1F", Number)]
+    );
+    assert_eq!(
+        toks(Language::Python, "print(\"hi\")  # c"),
+        [("print", Function), ("\"hi\"", Str), ("# c", Comment)]
+    );
+    assert_eq!(
+        toks(Language::Python, "\"\"\"a\nb\"\"\""),
+        [("\"\"\"a", Str), ("b\"\"\"", Str)]
+    );
+    assert_eq!(toks(Language::Python, r#"rb"\d""#), [(r#"rb"\d""#, Str)]);
+    assert_eq!(
+        toks(Language::Go, "package main\nx := nil"),
+        [("package", Keyword), ("nil", Constant)]
+    );
+}
+
+#[test]
+fn shell_tokens() {
+    assert_eq!(
+        toks(Language::Bash, "echo \"$HOME\" -n # c"),
+        [
+            ("echo", Function),
+            ("\"", Str),
+            ("$HOME", Variable),
+            ("\"", Str),
+            ("-n", Attribute),
+            ("# c", Comment)
+        ]
+    );
+    assert_eq!(
+        toks(Language::PowerShell, "Get-ChildItem -Path $env:TEMP # c"),
+        [
+            ("Get-ChildItem", Function),
+            ("-Path", Attribute),
+            ("$env:TEMP", Variable),
+            ("# c", Comment)
+        ]
+    );
+}
+
+#[test]
+fn sql_tokens_ignore_case() {
+    assert_eq!(
+        toks(
+            Language::Sql,
+            "select count(*) from t where a = 'it''s' -- c"
+        ),
+        [
+            ("select", Keyword),
+            ("count", Function),
+            ("from", Keyword),
+            ("where", Keyword),
+            ("'it", Str),
+            ("''", Escape),
+            ("s'", Str),
+            ("-- c", Comment)
+        ]
+    );
+}
+
+#[test]
+fn markup_tokens() {
+    assert_eq!(
+        toks(Language::Html, "<a href=\"x\">t &amp; u</a><!-- c -->"),
+        [
+            ("<a", Tag),
+            ("href", Attribute),
+            ("\"x\"", Str),
+            ("&amp;", Escape),
+            ("</a", Tag),
+            ("<!-- c -->", Comment)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Xml, "<?xml version=\"1.0\"?>"),
+        [("<?xml version=\"1.0\"?>", Keyword)]
+    );
+    assert_eq!(
+        toks(
+            Language::Css,
+            "a:hover { color: #fff; margin: 10px; } /* c */"
+        ),
+        [
+            ("a", Tag),
+            ("hover", Attribute),
+            ("color", Property),
+            ("#fff", Number),
+            ("margin", Property),
+            ("10px", Number),
+            ("/* c */", Comment)
+        ]
+    );
+}
+
+#[test]
+fn data_language_tokens() {
+    assert_eq!(
+        toks(Language::Yaml, "key: 'v' # c\n- name: true\n"),
+        [
+            ("key", Property),
+            ("'v'", Str),
+            ("# c", Comment),
+            ("name", Property),
+            ("true", Constant)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Toml, "[server]\nport = 8080 # p\nname = \"x\"\n"),
+        [
+            ("[server]", Type),
+            ("port", Property),
+            ("8080", Number),
+            ("# p", Comment),
+            ("name", Property),
+            ("\"x\"", Str)
+        ]
+    );
+}
+
+#[test]
+fn markdown_and_diff_tokens() {
+    assert_eq!(
+        toks(
+            Language::Markdown,
+            "# Title\n- item `code` [a](b)\n```rs\nlet x\n```\n"
+        ),
+        [
+            ("# Title", Heading),
+            ("- ", Keyword),
+            ("`code`", Str),
+            ("[a]", Function),
+            ("(b)", Constant),
+            ("```", Comment),
+            ("rs", Type),
+            ("let x", Str),
+            ("```", Comment)
+        ]
+    );
+    assert_eq!(
+        toks(
+            Language::Diff,
+            "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n ctx\n"
+        ),
+        [
+            ("--- a", Keyword),
+            ("+++ b", Keyword),
+            ("@@ -1 +1 @@", Type),
+            ("-old", Removed),
+            ("+new", Added)
+        ]
+    );
+}
+
+#[test]
+fn tokens_are_ordered_disjoint_and_on_char_boundaries() {
+    let sample = "fn é() { let s = \"ü\\n\"; /* ö */ } // ñ\n<p a='é'>&amp;</p>\n$x = 'ß' # ü\n";
+    for language in Language::ALL {
+        let tokens = tokenize(language, sample);
+        let mut end = 0;
+        for token in tokens {
+            assert!(
+                token.start >= end && token.start < token.end,
+                "{language:?}"
+            );
+            assert!(sample.is_char_boundary(token.start) && sample.is_char_boundary(token.end));
+            end = token.end;
+        }
+    }
+}
+
+#[test]
+fn highlighter_rescans_only_changed_lines() {
+    let mut highlighter = Highlighter::new();
+    let first = highlighter.highlight(7, Language::Rust, "let a = 1;\nlet b = 2;\nlet c = 3;\n");
+    assert_eq!(highlighter.last_scanned_lines(), 3);
+    let again = highlighter.highlight(7, Language::Rust, "let a = 1;\nlet b = 2;\nlet c = 3;\n");
+    assert_eq!(highlighter.last_scanned_lines(), 0);
+    assert_eq!(first, again);
+    let edited = highlighter.highlight(7, Language::Rust, "let a = 1;\nlet b = 22;\nlet c = 3;\n");
+    assert_eq!(highlighter.last_scanned_lines(), 1);
+    assert_eq!(
+        edited,
+        tokenize(Language::Rust, "let a = 1;\nlet b = 22;\nlet c = 3;\n")
+    );
+}
+
+#[test]
+fn closing_a_comment_rescans_the_lines_it_covered() {
+    let mut highlighter = Highlighter::new();
+    highlighter.highlight(1, Language::C, "x\n/* c\ny\nz\n");
+    assert_eq!(highlighter.last_scanned_lines(), 4);
+    let tokens = highlighter.highlight(1, Language::C, "x\n/* c */\ny\nz\n");
+    assert_eq!(highlighter.last_scanned_lines(), 3);
+    assert_eq!(tokens, tokenize(Language::C, "x\n/* c */\ny\nz\n"));
+    highlighter.highlight(1, Language::Python, "x\n");
+    assert_eq!(highlighter.last_scanned_lines(), 1);
+}
+
+#[test]
+fn the_cache_is_bounded() {
+    let mut highlighter = Highlighter::new();
+    for key in 0..300 {
+        highlighter.highlight(key, Language::C, "int x;\n");
+    }
+    assert_eq!(highlighter.cached_blocks(), 256);
+}
+
+#[test]
+fn language_names_and_aliases() {
+    for language in Language::ALL {
+        assert_eq!(Language::from_name(language.name()), Some(language));
+    }
+    for (name, language) in [
+        ("rs", Language::Rust),
+        ("C++", Language::Cpp),
+        ("c#", Language::CSharp),
+        ("JS", Language::JavaScript),
+        ("tsx", Language::TypeScript),
+        ("py", Language::Python),
+        ("sh", Language::Bash),
+        ("ps1", Language::PowerShell),
+        ("yml", Language::Yaml),
+        ("md", Language::Markdown),
+        ("patch", Language::Diff),
+        ("{.rust}", Language::Rust),
+        ("rust,ignore", Language::Rust),
+    ] {
+        assert_eq!(Language::from_name(name), Some(language), "{name}");
+    }
+    assert_eq!(Language::from_name("brainfuck"), None);
+    assert_eq!(Language::from_name(""), None);
+}
+
+#[test]
+fn syntax_colors_come_from_the_theme() {
+    let theme = Theme::light(DEFAULT_ACCENT);
+    let colors = SyntaxColors::from_theme(&theme);
+    let tokens = &theme.tokens;
+    assert_eq!(colors.color(TokenKind::Plain), tokens.text);
+    assert_eq!(colors.color(Comment), tokens.text_muted);
+    assert_eq!(colors.color(Keyword), tokens.callout.important.bar);
+    assert_eq!(colors.color(Str), tokens.callout.tip.bar);
+    assert_eq!(colors.color(Removed), tokens.error);
+    let dark = Theme::dark(DEFAULT_ACCENT);
+    assert_ne!(
+        SyntaxColors::from_theme(&dark).color(Keyword),
+        colors.color(Keyword)
+    );
+}

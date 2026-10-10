@@ -13,6 +13,13 @@ use ssw_core::text::TextRange;
 pub enum ObjectKind {
     /// `$x$`: `source` is the TeX between the dollar signs.
     Math,
+    /// `$$ … $$` block: `source` is the TeX between the delimiters, typeset in display style;
+    /// `max_width` is the text column.
+    DisplayMath,
+    /// A Mermaid diagram (`mermaid` fence or `.mmd` document): `source` is the diagram source;
+    /// the scene must fit `max_width`. [`ObjectState::Failed`] means the diagram is unsupported
+    /// or failed to render.
+    Mermaid,
     /// `![alt](dest)`, a reference image or `<img>`: `source` is the destination.
     Image,
 }
@@ -65,9 +72,13 @@ pub struct ObjectInfo {
 pub enum ObjectState {
     /// The object can be drawn.
     Ready(ObjectInfo),
-    /// Still being produced (decoding, typesetting): the source text is shown muted until the
-    /// app asks the view to relayout.
+    /// Still being produced (decoding, typesetting, downloading): the source text is shown muted
+    /// until the app asks the view to relayout.
     Pending,
+    /// A remote image that is not loaded until the user asks (`http`, or remote images turned
+    /// off): shown like [`ObjectState::Pending`]; image blocks offer "Click to load", which
+    /// raises a media event the app answers by loading the image and relayouting.
+    Blocked,
     /// The object cannot be produced (math error, unsupported or missing image): the source is
     /// shown in the `error` color.
     Failed,

@@ -11,12 +11,14 @@
 use crate::access::{AccessAction, AccessNode, AccessTree, Role};
 use crate::canvas::{Canvas, Dash};
 use crate::geometry::{Point, Rect, Size};
-use crate::input::Event;
+use crate::input::{Event, PointerEvent, PointerEventKind, WheelEvent};
 use crate::widget::{
     AccessCx, EventCx, EventResult, FocusManager, LayoutCx, PaintCx, Widget, WidgetId,
 };
+use crate::widgets::anim::Motion;
 use crate::widgets::button::Button;
 use crate::widgets::combo::ComboBox;
+use crate::widgets::scroll::{Axis, BAR_WIDTH, ScrollBar};
 use crate::widgets::slider::Slider;
 use crate::widgets::textbox::TextBox;
 use crate::widgets::toggle::ToggleSwitch;
@@ -45,13 +47,12 @@ const ACCESSORY_GAP: f32 = 8.0;
 /// Width reserved for the value shown beside a slider.
 const SLIDER_LABEL_WIDTH: f32 = 56.0;
 
-/// The control of a row. Rows are few and built once per page, so the size difference between
-/// the variants (a combo box carries its popup list) costs nothing worth a heap allocation.
+/// The control of a row. The combo box is boxed: it carries its popup list and would make every
+/// other row as large as itself.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum Input {
     Toggle(ToggleSwitch),
-    Choice(ComboBox),
+    Choice(Box<ComboBox>),
     Text(TextBox),
     /// A slider whose value is shown as `labels[value]` (one entry per integer value).
     Slider {
@@ -65,7 +66,7 @@ impl Input {
     fn control(&self) -> &dyn Control {
         match self {
             Input::Toggle(control) => control,
-            Input::Choice(control) => control,
+            Input::Choice(control) => control.as_ref(),
             Input::Text(control) => control,
             Input::Slider { slider, .. } => slider,
             Input::Button(control) => control,
@@ -75,7 +76,7 @@ impl Input {
     fn control_mut(&mut self) -> &mut dyn Control {
         match self {
             Input::Toggle(control) => control,
-            Input::Choice(control) => control,
+            Input::Choice(control) => control.as_mut(),
             Input::Text(control) => control,
             Input::Slider { slider, .. } => slider,
             Input::Button(control) => control,
@@ -155,6 +156,58 @@ impl<K> Row<K> {
     fn is_toggle(&self) -> bool {
         matches!(self.input, Input::Toggle(_))
     }
+
+    /// True for a row whose control can show a validation message under it.
+    fn can_error(&self) -> bool {
+        matches!(self.input, Input::Text(_))
+    }
+}
+
+/// The horizontal split of a form `width` wide: the width inside the padding, the control
+/// column and the label column.
+fn columns(width: f32) -> (f32, f32, f32) {
+    let inner_width = (width - 2.0 * PAD).max(0.0);
+    let column_width = CONTROL_WIDTH.min(inner_width / 2.0);
+    let label_width = (inner_width - column_width - COLUMN_GAP).max(0.0);
+    (inner_width, column_width, label_width)
+}
+
+/// How tall a row is and how its texts stack. Depends only on the static texts, never on a
+/// validation message.
+#[derive(Debug, Clone, Copy)]
+struct RowMetrics {
+    height: f32,
+    text_height: f32,
+    label_height: f32,
+    /// Width the label and hint wrap at.
+    text_width: f32,
+}
+
+impl RowMetrics {
+    fn of<K>(cx: &LayoutCx, row: &Row<K>, inner_width: f32, label_width: f32) -> Self {
+        let toggle = row.is_toggle();
+        let text_width = if toggle { inner_width } else { label_width };
+        let label_height = if toggle {
+            CONTROL_HEIGHT
+        } else {
+            text_size(cx, &row.label, FONT_SIZE, text_width).height
+        };
+        let hint_height = row.hint.as_ref().map_or(0.0, |hint| {
+            text_size(cx, hint, HINT_SIZE, text_width).height
+        });
+        let text_height = label_height + hint_height;
+        let control_block = if row.can_error() {
+            CONTROL_HEIGHT + ERROR_GAP + ERROR_LINE
+        } else {
+            CONTROL_HEIGHT
+        };
+        Self {
+            height: (2.0 * ROW_PAD + text_height.max(control_block)).max(ROW_MIN_HEIGHT),
+            text_height,
+            label_height,
+            text_width,
+        }
+    }
 }
 
 /// A column of rows keyed by `K`.
@@ -188,30 +241,19 @@ impl<K: Copy + PartialEq> Form<K> {
     /// the form needs.
     pub(crate) fn layout(&mut self, cx: &mut LayoutCx, bounds: Rect) -> f32 {
         let inner_x = bounds.x + PAD;
-        let inner_width = (bounds.width - 2.0 * PAD).max(0.0);
-        let column_width = CONTROL_WIDTH.min(inner_width / 2.0);
-        let label_width = (inner_width - column_width - COLUMN_GAP).max(0.0);
+        let (inner_width, column_width, label_width) = columns(bounds.width);
         let column_x = inner_x + inner_width - column_width;
         let mut y = bounds.y;
+        let mut total = 0.0;
         for row in &mut self.rows {
             let toggle = row.is_toggle();
-            let text_width = if toggle { inner_width } else { label_width };
-            let label_height = if toggle {
-                CONTROL_HEIGHT
-            } else {
-                text_size(cx, &row.label, FONT_SIZE, text_width).height
-            };
-            let hint_height = row.hint.as_ref().map_or(0.0, |hint| {
-                text_size(cx, hint, HINT_SIZE, text_width).height
-            });
-            let text_height = label_height + hint_height;
-            let can_error = matches!(row.input, Input::Text(_));
-            let control_block = if can_error {
-                CONTROL_HEIGHT + ERROR_GAP + ERROR_LINE
-            } else {
-                CONTROL_HEIGHT
-            };
-            let height = (2.0 * ROW_PAD + text_height.max(control_block)).max(ROW_MIN_HEIGHT);
+            let can_error = row.can_error();
+            let RowMetrics {
+                height,
+                text_height,
+                label_height,
+                text_width,
+            } = RowMetrics::of(cx, row, inner_width, label_width);
             let text_top = y + (height - text_height) / 2.0;
             row.label_origin = Point::new(inner_x, text_top);
             row.hint_origin = Point::new(inner_x, text_top + label_height);
@@ -258,8 +300,31 @@ impl<K: Copy + PartialEq> Form<K> {
             }
             row.rect = Rect::new(bounds.x, y, bounds.width, height);
             y += height;
+            total += height;
         }
-        y - bounds.y + PAD
+        total + PAD
+    }
+
+    /// The height [`layout`](Self::layout) returns for a form `width` wide, without arranging
+    /// anything.
+    pub(crate) fn height(&self, cx: &LayoutCx, width: f32) -> f32 {
+        let (inner_width, _, label_width) = columns(width);
+        self.rows
+            .iter()
+            .map(|row| RowMetrics::of(cx, row, inner_width, label_width).height)
+            .sum::<f32>()
+            + PAD
+    }
+
+    /// True when `id` is the id of a row's control or of its Browse button.
+    pub(crate) fn owns(&self, id: WidgetId) -> bool {
+        self.rows.iter().any(|row| {
+            row.input.control().id() == id
+                || row
+                    .accessory
+                    .as_ref()
+                    .is_some_and(|button| button.id() == id)
+        })
     }
 
     /// Draws the rows (content coordinates).
@@ -548,6 +613,203 @@ impl<K: Copy + PartialEq> Form<K> {
         }
         self.collect();
         handled
+    }
+}
+
+/// A [`Form`] shown through a viewport that scrolls vertically: the Settings pages and the
+/// export options.
+///
+/// The form is laid out in content coordinates that start at the viewport's origin. This type
+/// clips painting to the viewport, translates painting, pointer and wheel input and access
+/// bounds by the scroll offset, and scrolls the focused row and an open drop-down into view.
+#[derive(Debug)]
+pub(crate) struct FormScroll {
+    bar: ScrollBar,
+    viewport: Rect,
+    /// The control focus was last revealed for.
+    revealed_focus: Option<WidgetId>,
+    popup_revealed: bool,
+}
+
+impl FormScroll {
+    /// A scroller whose bar has the accessible name `name`.
+    pub(crate) fn new(name: impl Into<String>, motion: Motion) -> Self {
+        Self {
+            bar: ScrollBar::new(Axis::Vertical, name).with_motion(motion),
+            viewport: Rect::ZERO,
+            revealed_focus: None,
+            popup_revealed: false,
+        }
+    }
+
+    /// Shows the top of the content again and forgets what was revealed (another page).
+    pub(crate) fn reset(&mut self) {
+        self.bar.model_mut().jump(0.0);
+        self.revealed_focus = None;
+        self.popup_revealed = false;
+    }
+
+    /// Places the viewport over content `content` tall and the bar along its right edge.
+    pub(crate) fn arrange(&mut self, cx: &mut LayoutCx, viewport: Rect, content: f32) {
+        self.viewport = viewport;
+        self.bar.model_mut().set_extent(viewport.height, content);
+        let id = self.bar.id();
+        self.bar.arrange(
+            &mut cx.for_widget(id),
+            Rect::new(
+                viewport.right() - BAR_WIDTH,
+                viewport.y,
+                BAR_WIDTH,
+                viewport.height,
+            ),
+        );
+    }
+
+    /// Draws `form` clipped to the viewport and the bar over it.
+    pub(crate) fn paint<K: Copy + PartialEq>(
+        &self,
+        cx: &PaintCx,
+        canvas: &mut dyn Canvas,
+        form: &Form<K>,
+    ) {
+        let offset = self.bar.offset();
+        canvas.push_clip_rect(self.viewport);
+        canvas.save();
+        canvas.translate(0.0, -offset);
+        let mut content = *cx;
+        content.damage = cx.damage.map(|damage| damage.translate(0.0, offset));
+        form.paint(&content, canvas);
+        canvas.restore();
+        canvas.pop_clip();
+        self.bar.paint(&cx.for_widget(self.bar.id()), canvas);
+    }
+
+    /// A position of the window in content coordinates.
+    fn content_point(&self, position: Point) -> Point {
+        Point::new(position.x, position.y + self.bar.offset())
+    }
+
+    /// Routes `e` to the bar and the controls of `form`: pointer and wheel positions are
+    /// translated into content coordinates, pointer events outside the viewport reach the
+    /// controls only while one holds the pointer, a drop-down is open or the pointer leaves,
+    /// and a wheel the controls do not use scrolls the content.
+    pub(crate) fn event<K: Copy + PartialEq>(
+        &mut self,
+        cx: &mut EventCx,
+        form: &mut Form<K>,
+        e: &Event,
+    ) -> EventResult {
+        let bar_id = self.bar.id();
+        match e {
+            Event::Pointer(pointer) => {
+                let bar = self.bar.event(&mut cx.for_widget(bar_id), e);
+                if self.bar.take_changed() {
+                    cx.invalidate(self.viewport);
+                }
+                if bar.handled {
+                    return bar;
+                }
+                let captured = cx.capture.owner().is_some_and(|owner| form.owns(owner));
+                let inside = self.viewport.contains(pointer.position);
+                let leaving = pointer.kind == PointerEventKind::Leave;
+                if !(inside || captured || leaving || form.open_popup().is_some()) {
+                    return EventResult::ignored();
+                }
+                let moved = Event::Pointer(PointerEvent {
+                    position: self.content_point(pointer.position),
+                    ..*pointer
+                });
+                form.event(cx, &moved)
+            }
+            Event::Wheel(wheel) => {
+                if !self.viewport.contains(wheel.position) {
+                    return EventResult::ignored();
+                }
+                let moved = Event::Wheel(WheelEvent {
+                    position: self.content_point(wheel.position),
+                    ..*wheel
+                });
+                let inner = form.event(cx, &moved);
+                if inner.handled {
+                    return inner;
+                }
+                if self.bar.wheel(&mut cx.for_widget(bar_id), wheel) {
+                    self.bar.take_changed();
+                    cx.invalidate(self.viewport);
+                    EventResult::handled()
+                } else {
+                    EventResult::ignored()
+                }
+            }
+            Event::AnimationFrame(now) => {
+                if self.bar.animate(&mut cx.for_widget(bar_id), *now) {
+                    cx.invalidate(self.viewport);
+                }
+                form.event(cx, e)
+            }
+            _ => form.event(cx, e),
+        }
+    }
+
+    /// Scrolls so the focused control and an open drop-down are visible, once per change of
+    /// focus or popup (so the user's own scrolling is never undone).
+    pub(crate) fn reveal<K: Copy + PartialEq>(&mut self, cx: &mut EventCx, form: &Form<K>) {
+        let focused = cx.focus.focused();
+        let focus_row = if focused == self.revealed_focus {
+            None
+        } else {
+            form.focused_row(cx.focus)
+        };
+        let popup = form.open_popup();
+        let reveal_popup = popup.is_some() != self.popup_revealed;
+        self.revealed_focus = focused;
+        self.popup_revealed = popup.is_some();
+        for rect in focus_row.into_iter().chain(popup.filter(|_| reveal_popup)) {
+            let top = rect.top() - self.viewport.y;
+            let bottom = rect.bottom() - self.viewport.y;
+            if self.bar.model_mut().ensure_visible(top, bottom) {
+                cx.invalidate(self.viewport);
+            }
+        }
+    }
+
+    /// Describes `form` (translated by the scroll offset, flagged off-screen outside the
+    /// viewport) and, while the content is taller than the viewport, the bar. Returns the ids
+    /// to list as children of the owner's node.
+    pub(crate) fn access<K: Copy + PartialEq>(
+        &self,
+        cx: &AccessCx,
+        out: &mut AccessTree,
+        form: &Form<K>,
+    ) -> Vec<WidgetId> {
+        let offset = Point::new(0.0, self.bar.offset());
+        let mut ids = form.access(cx, out, offset, self.viewport);
+        if self.bar.model().is_scrollable() {
+            let id = self.bar.id();
+            self.bar.access(&cx.for_widget(id), out);
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Carries out `a` on the bar or the control of `form` with id `cx.id`.
+    pub(crate) fn perform<K: Copy + PartialEq>(
+        &mut self,
+        cx: &mut EventCx,
+        form: &mut Form<K>,
+        a: &AccessAction,
+    ) -> bool {
+        let target = cx.id;
+        if target == self.bar.id() {
+            let performed = self.bar.perform(&mut cx.for_widget(target), a);
+            if performed {
+                self.bar.take_changed();
+                cx.invalidate(self.viewport);
+            }
+            performed
+        } else {
+            form.perform(cx, a)
+        }
     }
 }
 

@@ -7,7 +7,10 @@
 //! y are `O(log n)`, and scrolling a 60 000-line document touches only the visible items.
 
 use ssw_core::document::Document;
+use ssw_core::markdown::ast::{Block, BlockKind, CodeBlock, Markers, VerbatimLine};
 use ssw_core::text::{Buffer, TextRange};
+
+use super::config::DocumentKind;
 
 /// What an item is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +111,69 @@ pub(crate) fn build_items(doc: &Document, hidden: &[TextRange]) -> Vec<Item> {
         }
     }
     items
+}
+
+/// The items of `doc` presented as `kind`: the Markdown blocks, one raw item per source line
+/// (plain text), or a single item holding the whole document (Mermaid). Plain and Mermaid
+/// documents have no folds.
+pub(crate) fn build_document_items(
+    doc: &Document,
+    hidden: &[TextRange],
+    kind: DocumentKind,
+) -> Vec<Item> {
+    let buffer = doc.buffer();
+    match kind {
+        DocumentKind::Markdown => build_items(doc, hidden),
+        DocumentKind::PlainText => (0..buffer.line_count())
+            .map(|line| Item {
+                range: buffer.line_range_with_terminator(line),
+                content: buffer.line_range(line),
+                kind: ItemKind::Block(line),
+                lines: 1,
+                hidden: false,
+            })
+            .collect(),
+        DocumentKind::Mermaid => {
+            let whole = TextRange::new(0, buffer.len());
+            vec![Item {
+                range: whole,
+                content: whole,
+                kind: ItemKind::Block(0),
+                lines: u32::try_from(buffer.line_count()).unwrap_or(u32::MAX),
+                hidden: false,
+            }]
+        }
+    }
+}
+
+/// The block a non-Markdown item stands for: a plain line (a paragraph without inlines) or the
+/// whole document as one unfenced code block of verbatim lines (Mermaid source).
+pub(crate) fn document_block(doc: &Document, item: &Item, kind: DocumentKind) -> Block {
+    let buffer = doc.buffer();
+    let (block_kind, range) = match kind {
+        DocumentKind::Mermaid => (
+            BlockKind::CodeBlock(CodeBlock {
+                fence: None,
+                info: None,
+                lines: (0..buffer.line_count())
+                    .map(|line| VerbatimLine {
+                        range: buffer.line_range(line),
+                        pad: 0,
+                    })
+                    .collect(),
+            }),
+            item.range,
+        ),
+        _ => (BlockKind::Paragraph, item.content),
+    };
+    Block {
+        range,
+        content: range,
+        markers: Markers::new(),
+        kind: block_kind,
+        children: Vec::new(),
+        inlines: Vec::new(),
+    }
 }
 
 /// The item that owns source `offset`: the last item starting at or before it.

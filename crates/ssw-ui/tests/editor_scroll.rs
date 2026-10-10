@@ -2,7 +2,7 @@
 
 mod editor_common;
 
-use editor_common::{Harness, close};
+use editor_common::{Harness, LINE, close};
 use ssw_core::command::CommandId;
 use ssw_core::edit::{Edit, Selection, Transaction};
 use ssw_ui::access::AccessAction;
@@ -19,7 +19,8 @@ fn numbered_paragraphs(count: usize) -> String {
 
 #[test]
 fn only_the_visible_blocks_are_laid_out() {
-    let mut h = Harness::new(&numbered_paragraphs(10_000));
+    let text = numbered_paragraphs(10_000);
+    let mut h = Harness::new(&text);
     // 10 000 blocks and the 9 999 blank lines between them.
     assert_eq!(h.view.item_count(), 19_999);
     let laid_out = h.view.laid_out_items();
@@ -36,17 +37,22 @@ fn only_the_visible_blocks_are_laid_out() {
         .strip_prefix("paragraph ")
         .and_then(|n| n.parse().ok())
         .expect("a numbered paragraph");
-    // One paragraph and its blank line are 19.2 + 8 DIPs tall.
+    // One paragraph and its blank line (the 8 DIP paragraph spacing) are LINE + 8 DIPs tall.
+    let expected = (150_000.0 / (LINE + 8.0)) as usize;
     assert!(
-        (5510..=5516).contains(&first),
-        "first visible paragraph {first}"
+        (expected - 3..=expected + 3).contains(&first),
+        "first visible paragraph {first}, expected near {expected}"
     );
     assert!(h.view.laid_out_items() < 150, "{}", h.view.laid_out_items());
+    // The visible source range holds the first painted paragraph and spans only the handful
+    // of paragraphs (each "paragraph N" plus its separator is at most 20 bytes) that fit the
+    // 200 DIP viewport.
     let visible = h.view.visible_range().expect("a visible range");
-    assert!(
-        visible.start > 80_000 && visible.end < 100_000,
-        "{visible:?}"
-    );
+    let at = text
+        .find(&format!("paragraph {first}\n"))
+        .expect("the painted paragraph is in the text");
+    assert!(visible.start <= at && at < visible.end, "{visible:?} {at}");
+    assert!(visible.end - visible.start < 12 * 20, "{visible:?}");
 }
 
 #[test]
@@ -117,7 +123,7 @@ fn zoom_scales_the_text_and_is_reported() {
     h.set_caret(1);
     h.paint();
     let caret = h.view.caret_rect().expect("caret");
-    assert!(close(caret.height, 16.0 * 1.1 * 1.2), "{caret:?}");
+    assert!(close(caret.height, LINE * 1.1), "{caret:?}");
     assert!(h.view.execute(CommandId::ViewZoomOut));
     assert_eq!(h.view.zoom_percent(), 100);
     h.view.execute(CommandId::ViewZoomIn);
@@ -161,6 +167,9 @@ fn caret_center(h: &Harness) -> f32 {
 fn typewriter_mode_keeps_the_caret_line_with_a_dead_zone() {
     let (text, long_start) = typewriter_document();
     let mut h = Harness::new(&text);
+    // A ±20 % dead zone of the 200 DIP viewport is ±40 DIPs: wider than one line (LINE), and
+    // narrower than two.
+    h.config(|config| config.typewriter_dead_zone = 0.2);
     h.view.set_typewriter(true);
     assert!(h.view.typewriter());
     h.set_caret(long_start);
@@ -172,16 +181,24 @@ fn typewriter_mode_keeps_the_caret_line_with_a_dead_zone() {
         scroll > 1000.0,
         "the caret was far below the first screen: {scroll}"
     );
-    // One 19.2 DIP line down stays inside the ±10 % (20 DIP) dead zone: the view does not move.
+    // One line down stays inside the dead zone: the view does not move.
     h.press(vk::DOWN);
-    assert!(close(caret_center(&h), 119.2), "{}", caret_center(&h));
+    assert!(
+        close(caret_center(&h), 100.0 + LINE),
+        "{}",
+        caret_center(&h)
+    );
     assert!(close(h.view.scroll_y(), scroll));
     // Two lines down leave the zone: the line is recentred.
     h.press(vk::DOWN);
     assert!(close(caret_center(&h), 100.0), "{}", caret_center(&h));
     // Moving up inside the zone keeps the view; Ctrl+L recentres anyway.
     h.press(vk::UP);
-    assert!(close(caret_center(&h), 80.8), "{}", caret_center(&h));
+    assert!(
+        close(caret_center(&h), 100.0 - LINE),
+        "{}",
+        caret_center(&h)
+    );
     assert!(h.view.execute(CommandId::ViewRecenterCaret));
     assert!(close(caret_center(&h), 100.0), "{}", caret_center(&h));
 }
@@ -256,4 +273,60 @@ fn changes_made_elsewhere_to_the_shared_document_are_laid_out() {
     assert_eq!(h.painted_texts(), ["NEW", "old"]);
     assert_eq!(h.view.item_count(), before + 2);
     assert_eq!(h.selection(), Selection::caret(5));
+}
+
+#[test]
+fn scroll_extent_is_the_range_the_editor_accepts() {
+    let text: String = (0..60).map(|i| format!("line {i}\n\n")).collect();
+    let mut h = Harness::new(&text);
+    let extent = h.view.scroll_extent();
+    assert_eq!(extent.viewport, 200.0, "the viewport is the editor height");
+    assert!(extent.content > 200.0, "{extent:?}");
+    assert_eq!(extent.end_overscroll, 0.0);
+    // Scrolling far past the end is clamped to the largest offset the extent reports.
+    h.view.set_scroll_y(1.0e9);
+    h.arrange();
+    h.arrange();
+    let extent = h.view.scroll_extent();
+    assert!(
+        close(h.view.scroll_y(), extent.max_offset() as f32),
+        "{} against {extent:?}",
+        h.view.scroll_y()
+    );
+    // Typewriter mode adds half a viewport of room past the end (typewriter position 0.5).
+    h.view.set_typewriter(true);
+    h.arrange();
+    h.view.set_scroll_y(1.0e9);
+    h.arrange();
+    h.arrange();
+    let typewriter = h.view.scroll_extent();
+    assert!(
+        close(h.view.scroll_y(), typewriter.max_offset() as f32),
+        "{} against {typewriter:?}",
+        h.view.scroll_y()
+    );
+    assert!(
+        close(
+            (typewriter.max_offset() - extent.max_offset()) as f32,
+            100.0
+        ),
+        "{extent:?} then {typewriter:?}"
+    );
+}
+
+#[test]
+fn scroll_extent_of_a_short_document_cannot_scroll() {
+    let mut h = Harness::new("abc\n");
+    h.view.set_typewriter(true);
+    h.arrange();
+    let extent = h.view.scroll_extent();
+    // 24 + one or two 28 DIP lines + 48 DIPs of padding, plus 100 DIPs of typewriter room,
+    // barely exceed the 200 DIP viewport: the overscroll is not added on top of the viewport.
+    assert!(
+        extent.max_offset() <= f64::from(LINE),
+        "a short document has next to nothing to scroll: {extent:?}"
+    );
+    h.view.set_scroll_y(1.0e9);
+    h.arrange();
+    assert!(close(h.view.scroll_y(), extent.max_offset() as f32));
 }

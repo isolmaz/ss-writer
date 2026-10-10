@@ -249,6 +249,7 @@ define_commands! {
     SettingsReset = Settings, "settings.reset", "cmd-settings-reset";
     HelpWelcome = Help, "help.welcome", "cmd-help-welcome";
     HelpKeyboardShortcuts = Help, "help.keyboard_shortcuts", "cmd-help-keyboard-shortcuts";
+    HelpReportIssue = Help, "help.report_issue", "cmd-help-report-issue";
     HelpCheckForUpdates = Help, "help.check_for_updates", "cmd-help-check-for-updates";
     HelpAbout = Help, "help.about", "cmd-help-about";
 }

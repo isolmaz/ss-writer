@@ -299,6 +299,18 @@ pub trait WindowHandler {
     }
     /// The window is being destroyed.
     fn on_destroy(&mut self, _info: &WindowInfo) {}
+    /// Sees every message before the window's own translation. `Some(result)` answers the
+    /// message (UIA's `WM_GETOBJECT`); `None` lets it continue (raw `WM_POINTER*` messages for
+    /// DirectManipulation are observed this way).
+    fn on_message(
+        &mut self,
+        _info: &WindowInfo,
+        _msg: u32,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> Option<LRESULT> {
+        None
+    }
 }
 
 /// Creation parameters.
@@ -337,6 +349,14 @@ pub struct WakeHandle {
 }
 
 impl WakeHandle {
+    /// A handle that wakes the thread of `hwnd` (any window or message-only window of it).
+    #[must_use]
+    pub fn new(hwnd: HWND) -> Self {
+        Self {
+            hwnd: hwnd.0 as isize,
+        }
+    }
+
     /// Wakes the UI thread; returns false when the window no longer exists.
     pub fn wake(&self) -> bool {
         // SAFETY: posting to a stale handle merely fails.
@@ -556,6 +576,24 @@ pub fn rethrow_pending_panic() {
     if let Some(payload) = payload {
         resume_unwind(payload);
     }
+}
+
+/// Sends a message to one of this thread's windows and returns the window procedure's result.
+/// A panic the procedure caught is raised here (see [`rethrow_pending_panic`]). Used by the
+/// close negotiation and by tests that drive their own window.
+pub fn send_message(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
+    // SAFETY: a plain send to a window of the calling thread; the arguments are values the
+    // receiving procedure interprets itself (callers pass no pointers).
+    let result = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+            hwnd,
+            msg,
+            Some(WPARAM(wparam)),
+            Some(LPARAM(lparam)),
+        )
+    };
+    rethrow_pending_panic();
+    result.0
 }
 
 unsafe extern "system" fn message_proc(
@@ -834,6 +872,10 @@ impl WindowState {
 
     fn handle(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> (Option<LRESULT>, After) {
         let hwnd = self.hwnd;
+        let info = self.info();
+        if let Some(result) = self.handler.on_message(&info, msg, wparam, lparam) {
+            return (Some(result), After::None);
+        }
         let point_lparam = |lparam: LPARAM| POINT {
             x: i32::from((lparam.0 & 0xFFFF) as i16),
             y: i32::from(((lparam.0 >> 16) & 0xFFFF) as i16),
@@ -1517,6 +1559,61 @@ impl WindowHost {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
+    }
+
+    /// The screen position of the client point (`x`, `y`) in pixels.
+    #[must_use]
+    pub fn client_to_screen(&self, x: i32, y: i32) -> (i32, i32) {
+        let mut point = POINT { x, y };
+        // SAFETY: converts using our own window handle; a failure leaves the point unchanged.
+        let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut point) };
+        (point.x, point.y)
+    }
+
+    /// Restores a minimized window and brings it to the foreground (a launch forwarded by a
+    /// later process asks for it).
+    pub fn bring_to_front(&self) {
+        // SAFETY: state queries and show / foreground requests for our own window; the system
+        // may refuse the foreground change, which is not an error.
+        unsafe {
+            if windows::Win32::UI::WindowsAndMessaging::IsIconic(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            }
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(self.hwnd);
+        }
+    }
+
+    /// Shows the window maximized (activating it).
+    pub fn show_maximized(&self) {
+        // SAFETY: shows our own window.
+        unsafe {
+            let _ = ShowWindow(
+                self.hwnd,
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWMAXIMIZED,
+            );
+        }
+    }
+
+    /// The restored position and size of the window in pixels (`x`, `y`, `width`, `height`),
+    /// also while it is maximized or minimized: what a session stores.
+    #[must_use]
+    pub fn normal_placement(&self) -> Option<(i32, i32, i32, i32)> {
+        let mut placement = windows::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT {
+            length: size_of::<windows::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a valid out structure with its length set, for our own window.
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowPlacement(self.hwnd, &mut placement)
+        }
+        .ok()?;
+        let rect = placement.rcNormalPosition;
+        Some((
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        ))
     }
 
     /// Shows the window normally (activating it).

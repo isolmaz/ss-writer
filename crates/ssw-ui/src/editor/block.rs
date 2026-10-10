@@ -23,15 +23,23 @@ use ssw_core::text::{Buffer, TextRange};
 
 use crate::canvas::{Canvas, IconFont};
 use crate::geometry::{Color, CornerRadii, Point, Rect};
+use crate::input::{Cursor, Modifiers};
 use crate::text::{FontWeight, TextLayout, TextLayoutEngine, TextStyle};
 use crate::theme::Theme;
 
-use super::config::{Composition, EditorConfig, EditorStrings, LinkTarget};
+use super::config::{
+    Composition, DocumentKind, EditorConfig, EditorEvent, EditorStrings, LinkTarget,
+};
 use super::display::{Display, DisplayParams, GapPolicy, Reveal, build, raw};
 use super::object::InlineObjectProvider;
 
 /// Heading sizes as multiples of the body size (spec §3).
 pub const HEADING_SCALE: [f32; 6] = [1.75, 1.45, 1.25, 1.1, 1.0, 1.0];
+
+/// Smallest line height of a heading as a multiple of its own size. Headings otherwise take
+/// the body line height (so the vertical rhythm of the page holds), but a large heading must
+/// not be cramped: 28 DIP text on a 28 DIP line would touch the lines around it.
+pub const HEADING_LINE_HEIGHT: f32 = 1.3;
 
 /// The kind of an AST block without its data: the key of the [`BlockRegistry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -114,6 +122,8 @@ pub struct BlockCx<'a> {
     pub folded: bool,
     /// Localized strings.
     pub strings: &'a EditorStrings,
+    /// Renderers of container blocks measure their children through it.
+    pub registry: &'a BlockRegistry,
 }
 
 impl fmt::Debug for BlockCx<'_> {
@@ -158,10 +168,65 @@ pub enum GutterAction {
     HeadingMenu,
 }
 
+/// A task checkbox reported by [`BlockLayout::task_box_at`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TaskBox {
+    /// The checkbox, block-local.
+    pub rect: Rect,
+    /// Source offset of the `[ ]` / `[x]` marker of the task item (any offset on the item's
+    /// first line selects the item; the start of the marker is conventional).
+    pub offset: usize,
+}
+
+/// A text replacement a block asks the editor to apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockEdit {
+    /// The source range to replace.
+    pub range: TextRange,
+    /// The replacement.
+    pub text: String,
+}
+
+/// A pointer drag owned by a block (an image resize handle). The editor captures the pointer
+/// while it runs and keeps the block's layout; the block previews the drag itself.
+pub trait BlockDrag: fmt::Debug {
+    /// The pointer moved to block-local `point`.
+    fn moved(&mut self, point: Point);
+
+    /// The button was released at block-local `point`; the edit to apply as one undo step.
+    fn finish(self: Box<Self>, point: Point) -> Option<BlockEdit>;
+
+    /// The cursor shown while the drag runs.
+    fn cursor(&self) -> Cursor;
+}
+
+/// What a left press on an interactive part of a block (a button, a handle, a placeholder) does
+/// instead of placing the caret.
+#[derive(Debug)]
+pub enum BlockPress {
+    /// Report an event to the host; the selection does not change.
+    Event(EditorEvent),
+    /// Replace a source range as one undo step; the selection is mapped through the edit.
+    Edit(BlockEdit),
+    /// Start a drag owned by the block.
+    Drag(Box<dyn BlockDrag>),
+}
+
 /// The retained layout of one measured block.
 pub trait BlockLayout {
     /// Total height of the block in DIPs.
     fn height(&self) -> f32;
+
+    /// Width of the widest line of the block in DIPs (0 when the layout does not know): bounds
+    /// the horizontal scroll of an unwrapped plain-text document.
+    fn content_width(&self) -> f32 {
+        0.0
+    }
+
+    /// Draws what lies behind the text of the block (card and code backgrounds, tints) with the
+    /// block's top-left corner at the canvas origin. The editor calls it before it paints search
+    /// matches and the selection, so those stay visible over the background.
+    fn paint_backdrop(&self, _cx: &BlockPaintCx<'_>, _canvas: &mut dyn Canvas) {}
 
     /// Draws the block with its top-left corner at the canvas origin. The editor paints the
     /// selection before and the caret after this call.
@@ -191,6 +256,32 @@ pub trait BlockLayout {
         None
     }
 
+    /// The task checkbox drawn at block-local `point`, if any. Layouts that draw task items
+    /// (lists, also nested in quotes) return the box under the point; a click on it toggles the
+    /// item through `ssw_core::ops::tasks` as one undo step without moving the selection.
+    fn task_box_at(&self, _point: Point) -> Option<TaskBox> {
+        None
+    }
+
+    /// The event a right click at block-local `point` raises (table cell menu, spelling
+    /// suggestions). `origin` is the top-left corner of the block in window DIPs, for anchors.
+    fn context_menu(&self, _point: Point, _origin: Point) -> Option<EditorEvent> {
+        None
+    }
+
+    /// What a left press at block-local `point` does when it hits an interactive part of the
+    /// block (copy button, resize handle, image placeholder). `origin` is the top-left corner of
+    /// the block in window DIPs, for event anchors. `None` lets the editor place the caret.
+    fn press(&self, _point: Point, _origin: Point, _mods: Modifiers) -> Option<BlockPress> {
+        None
+    }
+
+    /// The cursor to show over block-local `point` when it is not the text cursor (buttons,
+    /// handles); `None` keeps the editor's default.
+    fn cursor_at(&self, _point: Point) -> Option<Cursor> {
+        None
+    }
+
     /// Description of the block for assistive technology.
     fn access_label(&self, strings: &EditorStrings) -> String;
 }
@@ -201,9 +292,19 @@ pub trait BlockRenderer {
     fn measure(&self, cx: &BlockCx<'_>, block: &Block) -> Box<dyn BlockLayout>;
 }
 
+/// A renderer that takes over only some blocks of a class (a paragraph that is a lone image, an
+/// HTML block that is a lone `<img>`). It is tried before the renderer registered for the class
+/// with [`BlockRegistry::register`], whatever the registration order.
+pub trait SpecialRenderer {
+    /// The layout of `block`, or `None` when this renderer does not handle it.
+    fn try_measure(&self, cx: &BlockCx<'_>, block: &Block) -> Option<Box<dyn BlockLayout>>;
+}
+
 /// Renderers by block class, with a fallback for classes without one.
 pub struct BlockRegistry {
     renderers: HashMap<BlockClass, Rc<dyn BlockRenderer>>,
+    specials: HashMap<BlockClass, Vec<Rc<dyn SpecialRenderer>>>,
+    documents: HashMap<DocumentKind, Rc<dyn BlockRenderer>>,
     fallback: Rc<dyn BlockRenderer>,
 }
 
@@ -234,15 +335,46 @@ impl BlockRegistry {
         let mut renderers: HashMap<BlockClass, Rc<dyn BlockRenderer>> = HashMap::new();
         renderers.insert(BlockClass::Paragraph, Rc::new(ParagraphRenderer));
         renderers.insert(BlockClass::Heading, Rc::new(HeadingRenderer));
+        let mut documents: HashMap<DocumentKind, Rc<dyn BlockRenderer>> = HashMap::new();
+        documents.insert(DocumentKind::PlainText, Rc::new(PlainTextRenderer));
         Self {
             renderers,
+            specials: HashMap::new(),
+            documents,
             fallback: Rc::new(FallbackRenderer),
         }
+    }
+
+    /// Registers the renderer of the blocks of a document presented as `kind` (see
+    /// [`DocumentKind`]), replacing the previous one.
+    pub fn register_document(&mut self, kind: DocumentKind, renderer: Rc<dyn BlockRenderer>) {
+        self.documents.insert(kind, renderer);
+    }
+
+    /// Measures `block` of a document presented as `kind` with its document renderer, or the
+    /// fallback.
+    #[must_use]
+    pub fn measure_document(
+        &self,
+        kind: DocumentKind,
+        cx: &BlockCx<'_>,
+        block: &Block,
+    ) -> Box<dyn BlockLayout> {
+        self.documents
+            .get(&kind)
+            .map_or(&*self.fallback, |renderer| &**renderer)
+            .measure(cx, block)
     }
 
     /// Registers `renderer` for `class`, replacing the previous one.
     pub fn register(&mut self, class: BlockClass, renderer: Rc<dyn BlockRenderer>) {
         self.renderers.insert(class, renderer);
+    }
+
+    /// Adds `renderer` to the special renderers of `class`; they are tried in registration
+    /// order before the class renderer.
+    pub fn register_special(&mut self, class: BlockClass, renderer: Rc<dyn SpecialRenderer>) {
+        self.specials.entry(class).or_default().push(renderer);
     }
 
     /// The renderer for `class`, or the fallback.
@@ -253,11 +385,19 @@ impl BlockRegistry {
             .map_or(&*self.fallback, |renderer| &**renderer)
     }
 
-    /// Measures `block` with the renderer of its class.
+    /// Measures `block` with the first special renderer of its class that accepts it, else with
+    /// the renderer of its class.
     #[must_use]
     pub fn measure(&self, cx: &BlockCx<'_>, block: &Block) -> Box<dyn BlockLayout> {
-        self.renderer(BlockClass::of(&block.kind))
-            .measure(cx, block)
+        let class = BlockClass::of(&block.kind);
+        if let Some(layout) = self
+            .specials
+            .get(&class)
+            .and_then(|specials| specials.iter().find_map(|s| s.try_measure(cx, block)))
+        {
+            return layout;
+        }
+        self.renderer(class).measure(cx, block)
     }
 }
 
@@ -317,6 +457,10 @@ impl TextBlock {
 impl BlockLayout for TextBlock {
     fn height(&self) -> f32 {
         self.height
+    }
+
+    fn content_width(&self) -> f32 {
+        self.layout.size().width + self.origin.x
     }
 
     fn paint(&self, cx: &BlockPaintCx<'_>, canvas: &mut dyn Canvas) {
@@ -517,7 +661,8 @@ pub struct ParagraphRenderer;
 
 impl BlockRenderer for ParagraphRenderer {
     fn measure(&self, cx: &BlockCx<'_>, block: &Block) -> Box<dyn BlockLayout> {
-        let base = TextStyle::new(cx.config.text_font.clone(), cx.config.body_size());
+        let base = TextStyle::new(cx.config.text_font.clone(), cx.config.body_size())
+            .with_line_height(cx.config.line_height());
         measure_text(cx, block, &base, TextKind::Paragraph, 0.0, 0.0)
     }
 }
@@ -535,8 +680,9 @@ impl BlockRenderer for HeadingRenderer {
             _ => 1,
         };
         let size = cx.config.body_size() * HEADING_SCALE[usize::from(level - 1)];
-        let base =
-            TextStyle::new(cx.config.heading_font.clone(), size).with_weight(FontWeight::SEMIBOLD);
+        let base = TextStyle::new(cx.config.heading_font.clone(), size)
+            .with_weight(FontWeight::SEMIBOLD)
+            .with_line_height(cx.config.line_height_for(size, HEADING_LINE_HEIGHT));
         let kind = TextKind::Heading {
             level,
             folded: cx.folded,
@@ -554,7 +700,9 @@ pub struct FallbackRenderer;
 impl BlockRenderer for FallbackRenderer {
     fn measure(&self, cx: &BlockCx<'_>, block: &Block) -> Box<dyn BlockLayout> {
         let tokens = &cx.theme.tokens;
-        let base = TextStyle::new(cx.config.code_font.clone(), cx.config.body_size() * 0.95);
+        let size = cx.config.body_size() * 0.95;
+        let base = TextStyle::new(cx.config.code_font.clone(), size)
+            .with_line_height(cx.config.line_height_for(size, 1.2));
         let source = cx.buffer.slice(block.range);
         let composition = composition_in(cx, block.range);
         let display = raw(&source, block.range, composition);
@@ -568,6 +716,39 @@ impl BlockRenderer for FallbackRenderer {
             height,
             composition_at: composition.map(|comp| comp.at),
             color: tokens.text_muted,
+            size: base.size,
+        })
+    }
+}
+
+/// Shows the source text of a plain-text document line as written (monospace, wrapped, text
+/// color): the renderer of [`DocumentKind::PlainText`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlainTextRenderer;
+
+impl BlockRenderer for PlainTextRenderer {
+    fn measure(&self, cx: &BlockCx<'_>, block: &Block) -> Box<dyn BlockLayout> {
+        let size = cx.config.body_size() * 0.95;
+        let base = TextStyle::new(cx.config.code_font.clone(), size)
+            .with_line_height(cx.config.line_height_for(size, 1.2));
+        let source = cx.buffer.slice(block.range);
+        let composition = composition_in(cx, block.range);
+        let display = raw(&source, block.range, composition);
+        let width = if cx.config.wrap {
+            cx.width
+        } else {
+            f32::INFINITY
+        };
+        let layout = display.layout(cx.text, &base, width);
+        let height = layout.size().height;
+        Box::new(TextBlock {
+            layout,
+            display,
+            kind: TextKind::Raw,
+            origin: Point::ZERO,
+            height,
+            composition_at: composition.map(|comp| comp.at),
+            color: cx.theme.tokens.text,
             size: base.size,
         })
     }

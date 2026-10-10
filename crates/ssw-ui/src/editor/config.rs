@@ -4,11 +4,29 @@ use std::sync::Arc;
 
 use ssw_core::edit::Selection;
 use ssw_core::i18n::{Arg, Localizer};
+use ssw_core::markdown::ast::CalloutKind;
+use ssw_core::ops::table::CellPos;
 use ssw_core::settings::{ListIndent, Settings};
 use ssw_core::text::TextRange;
 
-use crate::geometry::Rect;
+use crate::geometry::{Point, Rect};
 use crate::input::ImeAttr;
+use crate::text::LineHeight;
+
+use super::blocks_media::MediaEvent;
+
+/// How the editor presents the whole document (spec §4.1). The host chooses it from the file
+/// type with [`EditorConfig::document_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DocumentKind {
+    /// `.md` and friends: live-rendered Markdown.
+    #[default]
+    Markdown,
+    /// `.txt`, source code, logs: every line is shown as written, nothing is rendered.
+    PlainText,
+    /// `.mmd`: the whole file is Mermaid source with the diagram always shown below it.
+    Mermaid,
+}
 
 /// Smallest zoom the view accepts, in percent.
 pub const MIN_ZOOM_PERCENT: u32 = 50;
@@ -49,6 +67,20 @@ pub struct EditorConfig {
     pub sort_completed_tasks: bool,
     /// Re-align table pipes when the caret leaves a table.
     pub format_tables_on_exit: bool,
+    /// Hide the front matter card unless the caret is inside it.
+    pub hide_front_matter: bool,
+    /// Color the tokens of fenced code blocks whose language is known.
+    pub syntax_highlighting: bool,
+    /// How the whole document is presented (spec §4.1). The host sets it from the file type;
+    /// "Render as Markdown" for a plain file is [`DocumentKind::Markdown`]. In
+    /// [`DocumentKind::PlainText`] and [`DocumentKind::Mermaid`] typing is plain: Enter inserts
+    /// a line break, Tab an indent, nothing is paired, and the Markdown formatting commands
+    /// return `false` from [`EditorView::execute`](super::EditorView::execute).
+    pub document_kind: DocumentKind,
+    /// Wrap long lines of a [`DocumentKind::PlainText`] document at the window edge; off, lines
+    /// stay on one row and the view scrolls horizontally (Shift+wheel, horizontal wheel, caret
+    /// reveal).
+    pub wrap: bool,
     /// Zoom in percent (100 = 1:1).
     pub zoom_percent: u32,
 }
@@ -72,6 +104,10 @@ impl EditorConfig {
             list_indent: editor.list_indent,
             sort_completed_tasks: editor.sort_completed_tasks,
             format_tables_on_exit: editor.format_tables_on_exit,
+            hide_front_matter: editor.hide_front_matter,
+            syntax_highlighting: editor.syntax_highlighting,
+            document_kind: DocumentKind::Markdown,
+            wrap: true,
             zoom_percent: settings
                 .appearance
                 .zoom_percent
@@ -95,6 +131,23 @@ impl EditorConfig {
     #[must_use]
     pub fn line_px(&self) -> f32 {
         self.body_size() * self.line_height
+    }
+
+    /// The uniform line height of text set at the body size: the `line_height` setting as a
+    /// multiple of the font size. Set it on the base style of every text layout of body text
+    /// (`TextStyle::with_line_height`), so that lines are exactly [`EditorConfig::line_px`]
+    /// tall.
+    #[must_use]
+    pub fn line_height(&self) -> LineHeight {
+        LineHeight::Multiple(self.line_height)
+    }
+
+    /// The uniform line height of text set at `size` (headings, code) that keeps the body
+    /// rhythm: never tighter than one body line, and at least `min_multiple` × `size` so
+    /// large text does not get cramped.
+    #[must_use]
+    pub fn line_height_for(&self, size: f32, min_multiple: f32) -> LineHeight {
+        LineHeight::Absolute(self.line_px().max(size * min_multiple))
     }
 
     /// Width of the text column with zoom applied.
@@ -235,4 +288,56 @@ pub enum EditorEvent {
     },
     /// The text changed through the view.
     Edited,
+    /// The user right-clicked a table: show the cell menu.
+    TableMenu {
+        /// The clicked cell in window DIPs.
+        anchor: Rect,
+        /// The clicked cell.
+        cell: CellPos,
+        /// The table is shown as raw Markdown.
+        raw: bool,
+    },
+    /// The user right-clicked a misspelled word: show suggestions.
+    SpellMenu {
+        /// Source range of the misspelled word.
+        range: TextRange,
+        /// The word.
+        word: String,
+        /// Replacement candidates, best first.
+        suggestions: Vec<String>,
+        /// The word in window DIPs.
+        anchor: Rect,
+    },
+    /// The user dragged the selected text out of the editor and released the pointer at
+    /// `position` (window DIPs, outside the editor): the app finds what is there (another tab,
+    /// another window, another widget). Nothing has changed in this document yet; when the
+    /// target accepted the text and `copy` is false the app calls
+    /// [`EditorView::remove_range`](super::EditorView::remove_range) with `source`.
+    TextDroppedOutside {
+        /// The dragged text.
+        text: String,
+        /// Where the text is in this document.
+        source: TextRange,
+        /// Ctrl was held: copy instead of move.
+        copy: bool,
+        /// The release position.
+        position: Point,
+    },
+    /// The user clicked the icon of a callout: show the type menu.
+    CalloutMenu {
+        /// Source range of the callout block.
+        range: TextRange,
+        /// The current type.
+        kind: CalloutKind,
+        /// The icon in window DIPs.
+        anchor: Rect,
+    },
+    /// The current search match lies inside a folded section: unfold the sections that contain
+    /// `range` and call [`EditorView::set_folds`](super::EditorView::set_folds) again.
+    UnfoldRequested {
+        /// The match.
+        range: TextRange,
+    },
+    /// The user used a code, image or diagram control.
+    Media(MediaEvent),
 }

@@ -25,17 +25,22 @@
 //! [`EditorView::caret_rect`].
 
 pub mod block;
+pub mod blocks_media;
+pub mod blocks_table;
+pub mod blocks_text;
 pub mod config;
 pub mod display;
+pub mod highlight;
 pub mod modes;
 pub mod object;
+pub mod spell;
 
 mod editing;
 mod layout;
 mod view;
 
 pub use config::{
-    Composition, EN_FTL, EditorConfig, EditorEvent, EditorStrings, LinkTarget, MAX_ZOOM_PERCENT,
-    MIN_ZOOM_PERCENT, ZOOM_STEP_PERCENT,
+    Composition, DocumentKind, EN_FTL, EditorConfig, EditorEvent, EditorStrings, LinkTarget,
+    MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, ZOOM_STEP_PERCENT,
 };
 pub use view::EditorView;

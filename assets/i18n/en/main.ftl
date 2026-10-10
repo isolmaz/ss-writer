@@ -195,5 +195,6 @@ cmd-settings-reset = Reset settings
 
 cmd-help-welcome = Welcome document
 cmd-help-keyboard-shortcuts = Keyboard shortcuts
+cmd-help-report-issue = Report an issue
 cmd-help-check-for-updates = Check for updates
 cmd-help-about = About SS Writer

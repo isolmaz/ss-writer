@@ -32,8 +32,15 @@
     <!-- Same UpgradeCode, newer Version: uninstall the old one first. -->
     <MajorUpgrade DowngradeErrorMessage="A newer version of SS Writer is already installed." />
 
-    <!-- Spec: Windows 11 22H2 (build 22621) or later. Uninstall and repair are always allowed. -->
-    <Launch Condition="Installed OR WindowsBuild &gt;= 22621"
+    <!-- Spec: Windows 11 22H2 (build 22621) or later. Uninstall and repair are always allowed.
+         The built-in WindowsBuild property stops at 9600 for compatibility, so the real build
+         number is read from the registry (a decimal string, compared as an integer). -->
+    <Property Id="WINDOWSBUILDNUMBER">
+      <RegistrySearch Id="CurrentBuildNumber" Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+                      Name="CurrentBuildNumber" Type="raw" Bitness="always64" />
+    </Property>
+    <Launch Condition="Installed OR WINDOWSBUILDNUMBER &gt;= 22621"
             Message="SS Writer requires Windows 11 version 22H2 (build 22621) or later." />
 
     <!-- The icon of the entry in Settings > Apps (same picture as the one linked into the exe). -->

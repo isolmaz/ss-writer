@@ -527,4 +527,17 @@ mod tests {
         assert!(harness.node(&plain).children.is_empty());
         assert!(harness.focus.tab_order().is_empty());
     }
+
+    #[test]
+    fn kit_banner_with_id_names_the_control_and_measure_uses_the_available_width() {
+        let id = WidgetId::allocate();
+        let mut banner = Banner::new(Severity::Info, "Title", "Message").with_id(id);
+        assert_eq!(banner.id(), id);
+        let mut harness = crate::widgets::testkit::Harness::new();
+        assert_eq!(harness.node(&banner).id, id);
+        assert_eq!(
+            harness.measure(&mut banner, Size::new(640.0, 100.0)),
+            Size::new(640.0, BANNER_HEIGHT)
+        );
+    }
 }

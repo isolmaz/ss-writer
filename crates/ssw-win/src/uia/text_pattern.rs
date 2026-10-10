@@ -112,10 +112,11 @@ impl Document {
     /// UTF-16 offsets where a unit starts, ascending, all `< len16` (or `[0]` for no text).
     fn unit_starts(&self, unit: Unit, source: &dyn TextSource) -> Vec<usize> {
         let len = self.len16();
-        if len == 0 || unit == Unit::Document {
+        if len == 0 {
             return vec![0];
         }
-        let chars: Vec<(usize, char)> = {
+        // Every char with its UTF-16 offset; only the char-based units need it.
+        let chars = || -> Vec<(usize, char)> {
             let mut units = 0;
             self.text
                 .chars()
@@ -127,24 +128,28 @@ impl Document {
                 .collect()
         };
         match unit {
-            Unit::Character => chars.iter().map(|(at, _)| *at).collect(),
-            Unit::Word => chars
-                .iter()
-                .enumerate()
-                .filter(|(index, (_, c))| {
-                    *index == 0 || {
-                        let previous = chars[*index - 1].1;
-                        !c.is_whitespace()
-                            && (previous.is_whitespace()
-                                || is_word_char(previous) != is_word_char(*c))
-                    }
-                })
-                .map(|(_, (at, _))| *at)
-                .collect(),
+            Unit::Document => vec![0],
+            Unit::Character => chars().iter().map(|(at, _)| *at).collect(),
+            Unit::Word => {
+                let chars = chars();
+                chars
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, (_, c))| {
+                        *index == 0 || {
+                            let previous = chars[*index - 1].1;
+                            !c.is_whitespace()
+                                && (previous.is_whitespace()
+                                    || is_word_char(previous) != is_word_char(*c))
+                        }
+                    })
+                    .map(|(_, (at, _))| *at)
+                    .collect()
+            }
             Unit::Paragraph => {
                 let mut starts = vec![0];
                 starts.extend(
-                    chars
+                    chars()
                         .iter()
                         .filter(|(_, c)| *c == '\n')
                         .map(|(at, _)| at + 1)
@@ -167,7 +172,6 @@ impl Document {
                 }
                 starts
             }
-            Unit::Document => vec![0],
         }
     }
 
@@ -243,15 +247,23 @@ impl Document {
 pub(crate) struct TextRangeProvider {
     shared: Arc<Shared>,
     id: WidgetId,
+    /// The text source of the document node, looked up once when the range is created.
+    source: Arc<dyn TextSource>,
     start: AtomicUsize,
     end: AtomicUsize,
 }
 
 impl TextRangeProvider {
-    fn create(shared: &Arc<Shared>, id: WidgetId, range: Range<usize>) -> ITextRangeProvider {
+    fn create(
+        shared: &Arc<Shared>,
+        id: WidgetId,
+        source: &Arc<dyn TextSource>,
+        range: Range<usize>,
+    ) -> ITextRangeProvider {
         ComObject::new(Self {
             shared: shared.clone(),
             id,
+            source: source.clone(),
             start: AtomicUsize::new(range.start),
             end: AtomicUsize::new(range.end),
         })
@@ -269,9 +281,9 @@ impl TextRangeProvider {
 }
 
 impl TextRangeProvider_Impl {
-    fn context(&self) -> windows::core::Result<(Document, Arc<dyn TextSource>)> {
-        let source = self.shared.text_source(self.id)?;
-        Ok((Document::new(source.text()), source))
+    /// The current document text and the source it came from.
+    fn context(&self) -> (Document, Arc<dyn TextSource>) {
+        (Document::new(self.source.text()), self.source.clone())
     }
 
     fn byte_range(&self, document: &Document) -> Range<usize> {
@@ -301,6 +313,7 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
         Ok(TextRangeProvider::create(
             &self.shared,
             self.id,
+            &self.source,
             self.range(),
         ))
     }
@@ -325,7 +338,7 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
     }
 
     fn ExpandToEnclosingUnit(&self, unit: TextUnit) -> windows::core::Result<()> {
-        let (document, source) = self.context()?;
+        let (document, source) = self.context();
         let range = document.enclosing(Unit::from_uia(unit), source.as_ref(), self.range());
         self.set(range);
         Ok(())
@@ -346,7 +359,7 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
         backward: BOOL,
         ignore_case: BOOL,
     ) -> windows::core::Result<ITextRangeProvider> {
-        let (document, _) = self.context()?;
+        let (document, _) = self.context();
         let needle = text.to_string();
         if needle.is_empty() {
             return Err(Error::from(E_INVALIDARG));
@@ -378,7 +391,12 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
                 let base = self.range().start;
                 let start = base + haystack[..byte].encode_utf16().count();
                 let end = start + needle.encode_utf16().count();
-                Ok(TextRangeProvider::create(&self.shared, self.id, start..end))
+                Ok(TextRangeProvider::create(
+                    &self.shared,
+                    self.id,
+                    &self.source,
+                    start..end,
+                ))
             }
             None => Err(none()),
         }
@@ -392,7 +410,7 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
     }
 
     fn GetBoundingRectangles(&self) -> windows::core::Result<*mut SAFEARRAY> {
-        let (document, source) = self.context()?;
+        let (document, source) = self.context();
         let mut values = Vec::new();
         for rect in source.bounding_rects(self.byte_range(&document)) {
             let (left, top, width, height) = self.shared.to_screen(rect);
@@ -407,7 +425,7 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
     }
 
     fn GetText(&self, max_length: i32) -> windows::core::Result<BSTR> {
-        let (document, _) = self.context()?;
+        let (document, _) = self.context();
         let text = document.slice16(self.range());
         let limit = match max_length {
             -1 => usize::MAX,
@@ -426,7 +444,7 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
     }
 
     fn Move(&self, unit: TextUnit, count: i32) -> windows::core::Result<i32> {
-        let (document, source) = self.context()?;
+        let (document, source) = self.context();
         let unit = Unit::from_uia(unit);
         let current = document.enclosing(unit, source.as_ref(), self.range());
         let (start, moved) = if count == 0 {
@@ -457,7 +475,7 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
         unit: TextUnit,
         count: i32,
     ) -> windows::core::Result<i32> {
-        let (document, source) = self.context()?;
+        let (document, source) = self.context();
         let range = self.range();
         let from = endpoint_value(&range, endpoint);
         let (to, moved) = document.step(Unit::from_uia(unit), source.as_ref(), from, count);
@@ -488,7 +506,7 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
     }
 
     fn Select(&self) -> windows::core::Result<()> {
-        let (document, source) = self.context()?;
+        let (document, source) = self.context();
         source.select(self.byte_range(&document));
         Ok(())
     }
@@ -502,7 +520,7 @@ impl ITextRangeProvider_Impl for TextRangeProvider_Impl {
     }
 
     fn ScrollIntoView(&self, align_to_top: BOOL) -> windows::core::Result<()> {
-        let (document, source) = self.context()?;
+        let (document, source) = self.context();
         source.scroll_into_view(self.byte_range(&document), align_to_top.as_bool());
         Ok(())
     }
@@ -519,13 +537,14 @@ impl ElementProvider_Impl {
     }
 
     fn text_ranges(&self, ranges: &[Range<usize>]) -> windows::core::Result<*mut SAFEARRAY> {
-        let (document, _) = self.text_document()?;
+        let (document, source) = self.text_document()?;
         let providers: Vec<ITextRangeProvider> = ranges
             .iter()
             .map(|range| {
                 TextRangeProvider::create(
                     &self.shared,
                     self.id,
+                    &source,
                     document.to16(range.start)..document.to16(range.end),
                 )
             })
@@ -561,140 +580,25 @@ impl ITextProvider_Impl for ElementProvider_Impl {
             .offset_from_point(Point::new(window.x, window.y))
             .ok_or_else(none)?;
         let at = document.to16(byte);
-        Ok(TextRangeProvider::create(&self.shared, self.id, at..at))
-    }
-
-    fn DocumentRange(&self) -> windows::core::Result<ITextRangeProvider> {
-        let (document, _) = self.text_document()?;
         Ok(TextRangeProvider::create(
             &self.shared,
             self.id,
+            &source,
+            at..at,
+        ))
+    }
+
+    fn DocumentRange(&self) -> windows::core::Result<ITextRangeProvider> {
+        let (document, source) = self.text_document()?;
+        Ok(TextRangeProvider::create(
+            &self.shared,
+            self.id,
+            &source,
             0..document.len16(),
         ))
     }
 
     fn SupportedTextSelection(&self) -> windows::core::Result<SupportedTextSelection> {
         Ok(SupportedTextSelection_Single)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ssw_ui::geometry::Rect;
-
-    /// A source with hard line breaks as its only lines.
-    struct Lines;
-
-    impl TextSource for Lines {
-        fn text(&self) -> String {
-            String::new()
-        }
-        fn bounding_rects(&self, _: Range<usize>) -> Vec<Rect> {
-            Vec::new()
-        }
-        fn offset_from_point(&self, _: Point) -> Option<usize> {
-            None
-        }
-        fn line_range(&self, offset: usize) -> Range<usize> {
-            // Fixed 8-byte "visual lines" for the tests below.
-            let start = offset / 8 * 8;
-            start..start + 8
-        }
-        fn select(&self, _: Range<usize>) {}
-        fn scroll_into_view(&self, _: Range<usize>, _: bool) {}
-    }
-
-    #[test]
-    fn uia_document_converts_between_utf8_and_utf16() {
-        // 'a', 'é' (2 bytes), '😀' (4 bytes, 2 units), 'b'.
-        let document = Document::new("a\u{e9}\u{1F600}b".to_owned());
-        assert_eq!(document.len16(), 5);
-        assert_eq!(document.to16(0), 0);
-        assert_eq!(document.to16(1), 1);
-        assert_eq!(document.to16(3), 2);
-        assert_eq!(document.to16(7), 4);
-        assert_eq!(document.to16(8), 5);
-        // A byte offset inside a char rounds down.
-        assert_eq!(document.to16(2), 1);
-        assert_eq!(document.to_byte(0), 0);
-        assert_eq!(document.to_byte(2), 3);
-        // Inside the surrogate pair rounds down to the char.
-        assert_eq!(document.to_byte(3), 3);
-        assert_eq!(document.to_byte(4), 7);
-        assert_eq!(document.to_byte(99), 8);
-        assert_eq!(document.slice16(1..4), "\u{e9}\u{1F600}");
-        // A reversed range (end before start) is empty, not a panic.
-        let (start, end) = (4, 1);
-        assert_eq!(document.slice16(Range { start, end }), "");
-    }
-
-    #[test]
-    fn uia_document_enclosing_units() {
-        let document = Document::new("Hello, world.\nSecond line".to_owned());
-        let source = Lines;
-        let table = [
-            (Unit::Character, 1..1, 1..2),
-            (Unit::Character, 1..3, 1..3),
-            (Unit::Word, 1..1, 0..5),
-            (Unit::Word, 5..5, 5..7),
-            // Punctuation is its own word: "world" ends where "." starts, and the "." word
-            // takes the line break up to the next word.
-            (Unit::Word, 7..7, 7..12),
-            (Unit::Word, 12..12, 12..14),
-            (Unit::Paragraph, 3..3, 0..14),
-            (Unit::Paragraph, 20..20, 14..25),
-            (Unit::Document, 3..4, 0..25),
-            (Unit::Line, 3..3, 0..8),
-            (Unit::Line, 9..9, 8..16),
-        ];
-        for (unit, range, expected) in table {
-            assert_eq!(
-                document.enclosing(unit, &source, range.clone()),
-                expected,
-                "{unit:?} {range:?}"
-            );
-        }
-        // The empty document has one empty unit.
-        let empty = Document::new(String::new());
-        assert_eq!(empty.enclosing(Unit::Word, &source, 0..0), 0..0);
-        assert_eq!(empty.step(Unit::Word, &source, 0, 3), (0, 0));
-    }
-
-    #[test]
-    fn uia_document_steps_by_units() {
-        let document = Document::new("ab cd\nef".to_owned());
-        let source = Lines;
-        assert_eq!(document.step(Unit::Character, &source, 0, 3), (3, 3));
-        assert_eq!(document.step(Unit::Character, &source, 3, -2), (1, -2));
-        assert_eq!(document.step(Unit::Character, &source, 6, 10), (8, 2));
-        assert_eq!(document.step(Unit::Character, &source, 2, -10), (0, -2));
-        assert_eq!(document.step(Unit::Word, &source, 0, 1), (3, 1));
-        assert_eq!(document.step(Unit::Word, &source, 0, 2), (6, 2));
-        assert_eq!(document.step(Unit::Paragraph, &source, 0, 1), (6, 1));
-        assert_eq!(document.step(Unit::Paragraph, &source, 8, -1), (6, -1));
-        assert_eq!(document.step(Unit::Document, &source, 0, 1), (8, 1));
-        assert_eq!(document.step(Unit::Line, &source, 0, 1), (8, 1));
-        assert_eq!(document.step(Unit::Character, &source, 2, 0), (2, 0));
-    }
-
-    #[test]
-    fn uia_unit_mapping() {
-        assert_eq!(Unit::from_uia(TextUnit_Character), Unit::Character);
-        assert_eq!(Unit::from_uia(TextUnit_Word), Unit::Word);
-        assert_eq!(Unit::from_uia(TextUnit_Line), Unit::Line);
-        assert_eq!(Unit::from_uia(TextUnit_Paragraph), Unit::Paragraph);
-        assert_eq!(
-            Unit::from_uia(windows::Win32::UI::Accessibility::TextUnit_Page),
-            Unit::Document
-        );
-        assert_eq!(
-            Unit::from_uia(windows::Win32::UI::Accessibility::TextUnit_Format),
-            Unit::Document
-        );
-        assert_eq!(
-            Unit::from_uia(windows::Win32::UI::Accessibility::TextUnit_Document),
-            Unit::Document
-        );
     }
 }

@@ -702,6 +702,13 @@ mod tests {
         close(a.x, b.x) && close(a.y, b.y) && close(a.width, b.width) && close(a.height, b.height)
     }
 
+    fn assert_rect_close(actual: Rect, expected: Rect) {
+        assert!(
+            rect_close(actual, expected),
+            "{actual:?} is not {expected:?}"
+        );
+    }
+
     #[test]
     fn style_builders_set_every_field() {
         let base = TextStyle::new("Segoe UI", 16.0);
@@ -874,16 +881,8 @@ mod tests {
         // "lo wor": "lo " on line 0, "wor" on line 1.
         let rects = l.range_rects(3..9);
         assert_eq!(rects.len(), 2);
-        assert!(
-            rect_close(rects[0], Rect::new(30.0, 0.0, 30.0, 12.0)),
-            "{:?}",
-            rects[0]
-        );
-        assert!(
-            rect_close(rects[1], Rect::new(0.0, 12.0, 30.0, 12.0)),
-            "{:?}",
-            rects[1]
-        );
+        assert_rect_close(rects[0], Rect::new(30.0, 0.0, 30.0, 12.0));
+        assert_rect_close(rects[1], Rect::new(0.0, 12.0, 30.0, 12.0));
         // A range on the second line only skips the first.
         let second = l.range_rects(7..9);
         assert_eq!(second.len(), 1);
@@ -1046,16 +1045,8 @@ mod tests {
         // Selecting across the breaks: the break itself is visible as one extra advance.
         let rects = l.range_rects(1..5);
         assert_eq!(rects.len(), 2);
-        assert!(
-            rect_close(rects[0], Rect::new(10.0, 0.0, 20.0, 12.0)),
-            "{:?}",
-            rects[0]
-        );
-        assert!(
-            rect_close(rects[1], Rect::new(0.0, 12.0, 20.0, 12.0)),
-            "{:?}",
-            rects[1]
-        );
+        assert_rect_close(rects[0], Rect::new(10.0, 0.0, 20.0, 12.0));
+        assert_rect_close(rects[1], Rect::new(0.0, 12.0, 20.0, 12.0));
         // An empty line in the middle is selectable through its break.
         let blank = layout("a\n\nb", f32::INFINITY);
         assert_eq!(blank.line_count(), 3);
@@ -1198,10 +1189,10 @@ mod tests {
         for (factor, per_line) in [(1.0_f32, 10.0_f32), (1.75, 17.5), (2.5, 25.0)] {
             let l = uniform("a\nb\nc", LineHeight::Multiple(factor), &[], f32::INFINITY);
             assert_eq!(l.line_count(), 3);
+            let size = l.size();
             assert!(
-                close(l.size().height, 3.0 * per_line),
-                "factor {factor}: {:?}",
-                l.size()
+                close(size.height, 3.0 * per_line),
+                "factor {factor}: {size:?}"
             );
             for index in 0..3 {
                 let line = l.line_metrics(index).expect("line");

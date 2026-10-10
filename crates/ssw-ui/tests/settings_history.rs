@@ -6,11 +6,15 @@ mod settings_support;
 use settings_support::{Host, localizer};
 use ssw_ui::access::{AccessAction, Role};
 use ssw_ui::canvas::DrawOp;
-use ssw_ui::geometry::{Point, Rect};
-use ssw_ui::input::{Modifiers, vk};
+use ssw_ui::geometry::{Point, Rect, Size};
+use ssw_ui::input::{
+    Event, Modifiers, PointerButton, PointerEvent, PointerEventKind, WheelEvent, vk,
+};
 use ssw_ui::shell::history::{
     DiffHunk, DiffLine, DiffLineKind, HistoryEntry, HistoryEvent, HistoryPanel,
 };
+use ssw_ui::widget::WidgetId;
+use ssw_ui::widgets::Control;
 use ssw_ui::widgets::anim::Motion;
 
 const PANEL: Rect = Rect::new(0.0, 0.0, 420.0, 640.0);
@@ -362,4 +366,180 @@ fn the_panel_is_one_access_tree() {
     assert_eq!(tree.walk().len(), tree.len());
     let canvas = host.paint(&panel);
     assert!(canvas.is_balanced());
+}
+
+/// 300 unchanged lines: taller than the panel.
+fn long_hunk() -> DiffHunk {
+    let lines = (0..300)
+        .map(|n| {
+            line(
+                DiffLineKind::Context,
+                Some(n),
+                Some(n),
+                &format!("line {n}"),
+            )
+        })
+        .collect();
+    DiffHunk {
+        old_start: 0,
+        old_count: 300,
+        new_start: 0,
+        new_count: 300,
+        lines,
+    }
+}
+
+/// Selects version 3 and gives it the long diff.
+fn open_with_a_long_diff(motion: Motion) -> (HistoryPanel, Host) {
+    let mut panel = HistoryPanel::new(localizer(), motion);
+    let mut host = Host::new(PANEL);
+    panel.set_entries(entries());
+    host.layout(&mut panel);
+    select_first(&mut panel, &mut host);
+    assert!(panel.set_diff(3, vec![long_hunk()]));
+    host.layout(&mut panel);
+    (panel, host)
+}
+
+#[test]
+fn the_panel_reports_its_motion_focus_target_and_controls() {
+    let (panel, host) = open();
+    assert_eq!(panel.motion(), Motion::reduced());
+    let list = host.node(&panel, Role::List, "Saved versions");
+    assert_eq!(panel.focus_id(), list.id);
+    let restore = host.node(&panel, Role::Button, "Restore this version");
+    let close = host.node(&panel, Role::Button, "Close");
+    for id in [panel.id(), list.id, restore.id, close.id] {
+        assert!(panel.owns(id));
+    }
+    assert!(!panel.owns(WidgetId::allocate()));
+    let debug = format!("{panel:?}");
+    assert!(debug.starts_with("HistoryPanel {"), "{debug}");
+    assert!(debug.contains("entries: 3"), "{debug}");
+    assert!(debug.contains("selected: None"), "{debug}");
+}
+
+#[test]
+fn the_debug_form_follows_the_selection() {
+    let (mut panel, mut host) = open();
+    select_first(&mut panel, &mut host);
+    let debug = format!("{panel:?}");
+    assert!(debug.contains("selected: Some(3)"), "{debug}");
+    assert!(debug.contains("Loading"), "{debug}");
+}
+
+#[test]
+fn the_panel_measures_as_the_area_it_is_given_or_a_default_size() {
+    let (mut panel, mut host) = open();
+    assert_eq!(
+        host.measure(&mut panel, Size::new(500.0, 700.0)),
+        Size::new(500.0, 700.0)
+    );
+    assert_eq!(
+        host.measure(&mut panel, Size::UNBOUNDED),
+        Size::new(420.0, 560.0)
+    );
+    assert_eq!(
+        host.measure(&mut panel, Size::new(f32::INFINITY, 700.0)),
+        Size::new(420.0, 700.0)
+    );
+    assert_eq!(
+        host.measure(&mut panel, Size::new(500.0, f32::INFINITY)),
+        Size::new(500.0, 560.0)
+    );
+}
+
+#[test]
+fn nothing_is_painted_outside_the_damaged_area() {
+    let (panel, host) = open();
+    let away = Rect::new(600.0, 0.0, 50.0, 50.0);
+    assert_eq!(host.paint_damaged(&panel, Some(away)).ops().count(), 0);
+    assert!(host.paint_damaged(&panel, Some(PANEL)).ops().count() > 0);
+}
+
+#[test]
+fn rows_are_not_described_before_the_panel_is_laid_out_for_them() {
+    let (mut panel, mut host) = open();
+    select_first(&mut panel, &mut host);
+    // The geometry still describes the empty diff: no row can be placed yet.
+    assert!(panel.set_diff(3, vec![hunk()]));
+    assert!(!host.has_node(&panel, Role::ListItem, "unchanged before"));
+    assert!(
+        host.paint(&panel)
+            .texts()
+            .iter()
+            .all(|t| *t != "unchanged before")
+    );
+    host.layout(&mut panel);
+    assert!(host.has_node(&panel, Role::ListItem, "unchanged before"));
+}
+
+#[test]
+fn dragging_the_diff_scroll_bar_scrolls_the_changes() {
+    let (mut panel, mut host) = open_with_a_long_diff(Motion::reduced());
+    let bar = host.node(&panel, Role::ScrollBar, "Changes since this version");
+    let x = bar.bounds.center().x;
+    let pointer = |kind: PointerEventKind, y: f32| {
+        Event::Pointer(PointerEvent {
+            click_count: 1,
+            ..PointerEvent::mouse(kind, Some(PointerButton::Left), Point::new(x, y))
+        })
+    };
+    let grab = bar.bounds.y + 4.0;
+    assert!(
+        host.event(&mut panel, pointer(PointerEventKind::Down, grab))
+            .handled
+    );
+    host.requests.take_invalidation();
+    host.event(&mut panel, pointer(PointerEventKind::Move, grab + 120.0));
+    assert!(!host.requests.take_invalidation().is_clean());
+    host.event(&mut panel, pointer(PointerEventKind::Up, grab + 120.0));
+    let rows = row_names(&host, &panel);
+    assert!(!rows.contains(&"line 0".to_owned()));
+}
+
+#[test]
+fn a_notched_wheel_eases_the_diff_to_its_target_frame_by_frame() {
+    let (mut panel, mut host) = open_with_a_long_diff(Motion::full());
+    let inside = Point::new(200.0, 400.0);
+    let notch = Event::Wheel(WheelEvent {
+        delta: Point::new(0.0, -20.0),
+        precise: false,
+        position: inside,
+        mods: Modifiers::NONE,
+    });
+    assert!(host.event(&mut panel, notch).handled);
+    assert!(host.requests.animation_frame_requested());
+    // Nothing has moved until the first frame fixes the start of the easing.
+    assert!(row_names(&host, &panel).contains(&"line 0".to_owned()));
+    host.requests.take_invalidation();
+    for millis in [100, 200, 5_000] {
+        host.event(
+            &mut panel,
+            Event::AnimationFrame(std::time::Duration::from_millis(millis)),
+        );
+    }
+    assert!(!host.requests.take_invalidation().is_clean());
+    assert!(!row_names(&host, &panel).contains(&"line 0".to_owned()));
+}
+
+#[test]
+fn assistive_technology_selects_versions_and_scrolls_the_changes() {
+    let (mut panel, mut host) = open_with_a_long_diff(Motion::reduced());
+    // The list takes focus; a version row is selected like a click would.
+    let list = host.node(&panel, Role::List, "Saved versions");
+    assert!(host.perform(&mut panel, list.id, AccessAction::Focus));
+    let second = host.node(&panel, Role::ListItem, "Today 14:00 — 200 bytes");
+    panel.take_events();
+    assert!(host.perform(&mut panel, second.id, AccessAction::Select));
+    assert_eq!(panel.selected(), Some(2));
+    assert_eq!(panel.take_events(), [HistoryEvent::Selected(2)]);
+    // The new version has no diff yet; answer it with the long one and scroll the bar.
+    assert!(panel.set_diff(2, vec![long_hunk()]));
+    host.layout(&mut panel);
+    let bar = host.node(&panel, Role::ScrollBar, "Changes since this version");
+    let max = bar.patterns.range_value.expect("range").max;
+    assert!(host.perform(&mut panel, bar.id, AccessAction::SetRangeValue(max)));
+    assert!(row_names(&host, &panel).contains(&"line 299".to_owned()));
+    assert!(!host.perform(&mut panel, bar.id, AccessAction::Invoke));
 }

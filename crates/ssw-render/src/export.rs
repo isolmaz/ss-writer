@@ -21,7 +21,7 @@ use typst_pdf::PdfOptions;
 use typst_render::RenderOptions;
 
 use crate::fonts::FontError;
-use crate::frame_to_scene::frame_to_scene;
+use crate::frame_to_scene::{convert_paint, frame_to_scene};
 use crate::scene::{Color, Fill, FillRule, Paint, Rect, Scene, SceneItem};
 use crate::typst_markup::{DiagramSvg, TypstDocument, markdown_to_typst};
 use crate::world::{CompileError, InvalidPath, TypstWorld, lock};
@@ -48,8 +48,13 @@ pub struct ExportOptions {
     pub base_font_pt: f32,
     /// Print the page number at the bottom of every page.
     pub page_numbers: bool,
-    /// Black text and no accent colors (links are underlined instead).
+    /// Black text and no accent colors (links are underlined instead). Black ink needs light
+    /// paper, so it wins over `light_theme: false`.
     pub black_text: bool,
+    /// Light theme: dark ink on white paper. Without it the pages are filled with the dark
+    /// surface color of the editor's dark theme and the text, code, quote, table and callout
+    /// colors follow it (ignored with `black_text`).
+    pub light_theme: bool,
     /// Print [`ExportOptions::title`] at the top of the first page.
     pub include_title: bool,
     /// Document title: the PDF title and, with `include_title`, a heading.
@@ -71,9 +76,16 @@ impl ExportOptions {
             base_font_pt: settings.base_font_size_pt,
             page_numbers: settings.page_numbers,
             black_text: settings.black_text,
+            light_theme: settings.light_theme,
             include_title: settings.include_title,
             title,
         }
+    }
+
+    /// Whether the pages get the dark palette: the dark theme was asked for and black text
+    /// (which needs light paper) was not.
+    pub(crate) fn dark(&self) -> bool {
+        !self.light_theme && !self.black_text
     }
 
     /// [`ExportOptions::margin_mm`] made usable.
@@ -331,13 +343,21 @@ fn check_resolution(dpi: f32) -> Result<(), ExportError> {
     }
 }
 
-/// The page as a scene: white paper under the page content.
+/// The page as a scene: paper under the page content. The paper is what the page is filled
+/// with (the dark theme's surface; Typst keeps it beside the frame, not in it), white
+/// otherwise.
 fn page_scene(page: &Page) -> Scene {
     let mut scene = frame_to_scene(&page.frame);
+    let bounds = Rect::new(0.0, 0.0, scene.size.width, scene.size.height);
+    let paint = page
+        .fill_or_white()
+        .map_or(Paint::Solid(Color::WHITE), |fill| {
+            convert_paint(&fill, bounds)
+        });
     let paper = Fill {
-        path: Rect::new(0.0, 0.0, scene.size.width, scene.size.height).to_path(),
+        path: bounds.to_path(),
         rule: FillRule::NonZero,
-        paint: Paint::Solid(Color::WHITE),
+        paint,
     };
     scene.items.insert(0, SceneItem::Fill(paper));
     scene
@@ -403,6 +423,7 @@ mod tests {
         assert_eq!(options.margin_mm, 20.0);
         assert_eq!(options.base_font_pt, 11.0);
         assert!(options.page_numbers && options.include_title && !options.black_text);
+        assert!(options.light_theme);
         assert_eq!(options.title, None);
 
         let settings = ExportSettings {
@@ -411,6 +432,7 @@ mod tests {
             base_font_size_pt: 12.0,
             page_numbers: false,
             black_text: true,
+            light_theme: false,
             include_title: false,
             ..ExportSettings::default()
         };
@@ -423,10 +445,27 @@ mod tests {
                 base_font_pt: 12.0,
                 page_numbers: false,
                 black_text: true,
+                light_theme: false,
                 include_title: false,
                 title: Some("Doc".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn the_dark_palette_needs_the_dark_theme_and_no_black_text() {
+        let dark = |light_theme, black_text| {
+            ExportOptions {
+                light_theme,
+                black_text,
+                ..ExportOptions::default()
+            }
+            .dark()
+        };
+        assert!(dark(false, false));
+        assert!(!dark(true, false));
+        assert!(!dark(false, true), "black ink needs light paper");
+        assert!(!dark(true, true));
     }
 
     #[test]

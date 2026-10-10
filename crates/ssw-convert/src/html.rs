@@ -24,10 +24,12 @@ pub struct HtmlOptions {
     pub title: Option<String>,
     /// Value of `<html lang>`; omitted when `None`.
     pub lang: Option<String>,
+    /// The style sheet to embed.
+    pub theme: css::Theme,
 }
 
-/// Standalone HTML5 document: embedded light-theme CSS, images as base64 data URIs, math and
-/// Mermaid as inline SVG.
+/// Standalone HTML5 document: embedded CSS (the light theme unless `opts.theme` says
+/// otherwise), images as base64 data URIs, math and Mermaid as inline SVG.
 pub fn render_document(src: &str, provider: &dyn AssetProvider, opts: &HtmlOptions) -> String {
     let doc = parse_document(src);
     let mut r = Renderer::new(
@@ -62,7 +64,7 @@ pub fn render_document(src: &str, provider: &dyn AssetProvider, opts: &HtmlOptio
     );
     push_escaped(&mut out, &title, false);
     out.push_str("</title>\n<style>\n");
-    out.push_str(css::light_theme_css());
+    out.push_str(css::theme_css(opts.theme));
     out.push_str("</style>\n</head>\n<body>\n<main>\n");
     out.push_str(&body);
     out.push_str("</main>\n</body>\n</html>\n");
@@ -937,6 +939,7 @@ mod tests {
         let opts = HtmlOptions {
             title: Some("A & B".into()),
             lang: Some("tr\"".into()),
+            ..HtmlOptions::default()
         };
         let doc = render_document("# Other", &NoAssets, &opts);
         assert!(doc.contains("<html lang=\"tr&quot;\">"));

@@ -106,10 +106,7 @@ mod tests {
         assert_eq!(icon_family(IconFont::SegoeFluent), "Segoe Fluent Icons");
         assert_eq!(icon_family(IconFont::SegoeMdl2), "Segoe MDL2 Assets");
         // A TrueType font starts with 0x00010000 or `true`; OpenType CFF with `OTTO`.
-        assert!(
-            CASCADIA_MONO.starts_with(&[0, 1, 0, 0])
-                || CASCADIA_MONO.starts_with(b"OTTO")
-                || CASCADIA_MONO.starts_with(b"true")
-        );
+        let magics: [&[u8]; 3] = [&[0, 1, 0, 0], b"OTTO", b"true"];
+        assert!(magics.iter().any(|magic| CASCADIA_MONO.starts_with(magic)));
     }
 }

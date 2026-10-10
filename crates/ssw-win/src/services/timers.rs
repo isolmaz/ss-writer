@@ -140,8 +140,14 @@ pub fn refresh_interval() -> Duration {
     // timing of the primary display.
     let ok = unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info) }.is_ok();
     let ratio = info.rateRefresh;
-    if ok && ratio.uiNumerator > 0 && ratio.uiDenominator > 0 {
-        Duration::from_secs_f64(f64::from(ratio.uiDenominator) / f64::from(ratio.uiNumerator))
+    interval_from_rate(ok, ratio.uiNumerator, ratio.uiDenominator)
+}
+
+/// The frame interval of a refresh rate of `numerator / denominator` Hz that DWM reported
+/// (`known`); 60 Hz when DWM failed or reported no usable rate.
+fn interval_from_rate(known: bool, numerator: u32, denominator: u32) -> Duration {
+    if known && numerator > 0 && denominator > 0 {
+        Duration::from_secs_f64(f64::from(denominator) / f64::from(numerator))
     } else {
         Duration::from_nanos(16_666_667)
     }
@@ -264,5 +270,21 @@ mod tests {
         let ms = Duration::from_millis;
         assert_eq!(time_until_next_frame(ms(10), ms(0), ms(16)), ms(6));
         assert_eq!(time_until_next_frame(ms(20), ms(0), ms(16)), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_missing_or_unusable_refresh_rate_means_sixty_hertz() {
+        let sixty = Duration::from_nanos(16_666_667);
+        assert_eq!(
+            interval_from_rate(true, 120, 1),
+            Duration::from_secs_f64(1.0 / 120.0)
+        );
+        assert_eq!(
+            interval_from_rate(true, 144_000, 1001),
+            Duration::from_secs_f64(1001.0 / 144_000.0)
+        );
+        assert_eq!(interval_from_rate(false, 120, 1), sixty, "DWM failed");
+        assert_eq!(interval_from_rate(true, 0, 1), sixty, "no numerator");
+        assert_eq!(interval_from_rate(true, 60, 0), sixty, "no denominator");
     }
 }

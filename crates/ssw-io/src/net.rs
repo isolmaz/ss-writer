@@ -1024,6 +1024,38 @@ mod tests {
     }
 
     #[test]
+    fn a_read_that_fails_ends_the_body_with_its_error() {
+        let url = Url::parse("https://example.com/a.png").unwrap();
+        let request = HttpRequest {
+            url: &url,
+            timeout: Duration::from_secs(30),
+            max_body: 1000,
+            accept: Accept::Any,
+        };
+        let failure = NetError::Os {
+            call: "WinHttpReadData",
+            code: 12030,
+        };
+        let mut reads = 0;
+        let result = complete(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n",
+            &request,
+            Instant::now(),
+            |buffer| {
+                reads += 1;
+                if reads == 1 {
+                    buffer[..3].copy_from_slice(b"abc");
+                    Ok(3)
+                } else {
+                    Err(failure.clone())
+                }
+            },
+        );
+        assert_eq!(result, Err(failure));
+        assert_eq!(reads, 2, "the first chunk was taken, the second failed");
+    }
+
+    #[test]
     fn null_handle_with_timeout_code_is_a_timeout() {
         // SAFETY: writes only the calling thread's last-error value.
         unsafe { SetLastError(WIN32_ERROR(ERROR_WINHTTP_TIMEOUT)) };

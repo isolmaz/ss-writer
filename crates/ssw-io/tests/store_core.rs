@@ -387,3 +387,29 @@ fn store_errors_describe_themselves() {
         );
     }
 }
+
+#[test]
+fn a_database_below_a_regular_file_cannot_be_created() {
+    let tmp = tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    std::fs::write(&plain, b"x").unwrap();
+    let parent = plain.join("sub");
+    let error = Store::open(&parent.join("state.db")).unwrap_err();
+    assert!(
+        matches!(&error, StoreError::Io { path, .. } if *path == parent),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn key_value_writes_report_a_missing_table() {
+    let tmp = tempdir().unwrap();
+    let db = tmp.path().join("state.db");
+    let store = Store::open(&db).unwrap();
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE kv")
+        .unwrap();
+    let error = store.kv_set("k", "v").unwrap_err();
+    assert!(matches!(error, StoreError::Sqlite(_)), "{error:?}");
+}

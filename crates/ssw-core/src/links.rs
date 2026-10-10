@@ -1672,6 +1672,18 @@ mod tests {
         ));
         assert!(!is_inside_root("\\\\srv\\share\\ws", "\\\\srv\\.\\ws"));
         assert!(!is_inside_root("\\\\srv\\share\\ws", "\\\\srv\\..\\ws"));
+        // A UNC path needs a real server name, plain or verbatim.
+        for server_less in [
+            "\\\\\\share\\ws\\a.md",
+            "\\\\.\\share\\ws\\a.md",
+            "\\\\..\\share\\ws\\a.md",
+            "\\\\?\\UNC\\\\share\\ws\\a.md",
+        ] {
+            assert!(
+                !is_inside_root("\\\\srv\\share\\ws", server_less),
+                "{server_less:?}"
+            );
+        }
         assert!(!is_inside_root("\\\\srv\\share\\ws", "\\\\?\\UNC\\srv"));
         assert!(!is_inside_root(
             "\\\\srv\\share\\ws",

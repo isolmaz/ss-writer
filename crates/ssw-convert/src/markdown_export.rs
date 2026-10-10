@@ -44,7 +44,9 @@ pub struct ExportPlan {
     pub missing: Vec<String>,
 }
 
-fn percent_decode(s: &str) -> String {
+/// `s` with its `%XX` escapes decoded (invalid escapes stay as they are; the bytes are read as
+/// UTF-8, lossily).
+pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -98,8 +100,16 @@ fn html_src_range(tag: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Plans the export of `src` (a document living in `source_dir`).
+/// Plans the export of `src` (a document living in `source_dir`); copies go to
+/// [`ATTACHMENTS_DIR`].
 pub fn plan(src: &str, source_dir: &Path) -> ExportPlan {
+    plan_with_folder(src, source_dir, ATTACHMENTS_DIR)
+}
+
+/// Plans like [`plan`], but the copies go to `folder` (relative to the exported document, `/`
+/// separated, no trailing slash) instead of [`ATTACHMENTS_DIR`]: a TextBundle keeps its files
+/// in `assets`.
+pub fn plan_with_folder(src: &str, source_dir: &Path, folder: &str) -> ExportPlan {
     let doc = parse_document(src);
     // (start, end, destination as resolved by the parser)
     let mut refs: Vec<(usize, usize, String)> = Vec::new();
@@ -175,7 +185,7 @@ pub fn plan(src: &str, source_dir: &Path) -> ExportPlan {
                     .unwrap_or_default();
                 let unique = unique_name(&name, &used_names);
                 used_names.push(unique.to_lowercase());
-                let rel = format!("{ATTACHMENTS_DIR}/{unique}");
+                let rel = format!("{folder}/{unique}");
                 targets.insert(full.clone(), rel.clone());
                 copies.push((full, rel.clone()));
                 rel
@@ -287,6 +297,32 @@ mod tests {
     }
 
     #[test]
+    fn a_textbundle_plan_puts_the_copies_in_assets() {
+        let tmp = source_tree();
+        let md = "![a](img/a%20b.png) [pdf](report.pdf) ![c](img/c.png) ![c2](other/c.png)";
+        let plan = plan_with_folder(md, tmp.path(), "assets");
+        assert_eq!(
+            plan.markdown,
+            "![a](assets/a%20b.png) [pdf](assets/report.pdf) ![c](assets/c.png) ![c2](assets/c-2.png)"
+        );
+        let rels: Vec<&str> = plan.copies.iter().map(|(_, rel)| rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            [
+                "assets/a b.png",
+                "assets/report.pdf",
+                "assets/c.png",
+                "assets/c-2.png"
+            ]
+        );
+        // The default plan is the same plan with the attachments folder.
+        assert_eq!(
+            plan_with_folder(md, tmp.path(), ATTACHMENTS_DIR),
+            super::plan(md, tmp.path())
+        );
+    }
+
+    #[test]
     fn leaves_untouched_what_is_not_a_local_attachment() {
         let tmp = source_tree();
         let md = "[web](https://x.y/a.png) [note](other.md) [anchor](#top) [empty]() ![gone](nope.png) ![gone2](nope.png) <img alt=\"x\"> <img src=gone.png>";
@@ -331,7 +367,7 @@ mod tests {
     #[test]
     fn invalid_file_names_are_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        for bad in ["", ".", "..", "a/b.md", "a\\b.md", "c:x.md"] {
+        for bad in ["", ".", "..", "a/b.md", "a\\b.md", "c:x.md", "a\0b.md"] {
             assert!(
                 matches!(
                     export_to_folder("x", tmp.path(), tmp.path(), bad),

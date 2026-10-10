@@ -128,6 +128,20 @@ pub(crate) mod testkit {
             bounds
         }
 
+        /// The size `widget` wants within `available`.
+        pub fn measure(&mut self, widget: &mut dyn Control, available: Size) -> Size {
+            let id = widget.id();
+            let mut cx = LayoutCx::new(
+                id,
+                &self.theme,
+                1.0,
+                &self.engine,
+                &mut self.focus,
+                &mut self.requests,
+            );
+            widget.measure(&mut cx, available)
+        }
+
         /// Arranges at exactly `bounds` and commits the tab order.
         pub fn arrange(&mut self, widget: &mut dyn Control, bounds: Rect) {
             let id = widget.id();
@@ -220,17 +234,28 @@ pub(crate) mod testkit {
         /// Delivers 16 ms animation frames until none is requested; fails when the animation
         /// never settles.
         pub fn run_animations(&mut self, widget: &mut dyn Control) {
+            let mut settled = false;
             for _ in 0..240 {
                 if !self.requests.animation_frame_requested() {
-                    return;
+                    settled = true;
+                    break;
                 }
                 self.requests.flush_timers(&mut NoTimers);
                 self.frame(widget, 16);
             }
-            panic!("animation did not settle");
+            assert!(settled, "animation did not settle");
         }
 
         pub fn paint(&mut self, widget: &dyn Control) -> RecordingCanvas {
+            self.paint_damaged(widget, None)
+        }
+
+        /// Paints while only `damage` is being repainted (`None`: the whole window).
+        pub fn paint_damaged(
+            &mut self,
+            widget: &dyn Control,
+            damage: Option<Rect>,
+        ) -> RecordingCanvas {
             let mut canvas = RecordingCanvas::new();
             let cx = PaintCx::new(
                 widget.id(),
@@ -239,7 +264,7 @@ pub(crate) mod testkit {
                 &self.engine,
                 &self.focus,
                 &self.capture,
-                None,
+                damage,
             );
             widget.paint(&cx, &mut canvas);
             assert!(canvas.is_balanced(), "unbalanced canvas stack");
@@ -884,6 +909,23 @@ mod tests {
         }
         assert_eq!(interaction.press_amount(), 1.0);
         assert_eq!(interaction.blend(base, hover, pressed), pressed);
+    }
+
+    #[test]
+    fn kit_run_animations_applies_pending_timer_requests() {
+        let mut harness = Harness::new();
+        let mut button = button::Button::new(button::ButtonKind::Standard, "OK");
+        harness.requests.set_timer(
+            TimerId::allocate(),
+            std::time::Duration::from_millis(500),
+            true,
+        );
+        harness.requests.kill_timer(TimerId::allocate());
+        harness.requests.request_animation_frame();
+        assert_eq!(harness.requests.timers().len(), 2);
+        harness.run_animations(&mut button);
+        assert!(harness.requests.timers().is_empty());
+        assert!(!harness.requests.animation_frame_requested());
     }
 
     #[test]

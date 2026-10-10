@@ -25,7 +25,7 @@ use ssw_io::remote_images::{
 use ssw_io::store::{Store, StoreError};
 use ssw_io::update::{
     CHECK_INTERVAL_SECS, RELEASES_URL, Release, UpdateError, UpdateStatus, Version,
-    check_for_updates, is_due, last_check, parse_release,
+    check_for_updates, is_due, last_check, latest_release, parse_release,
 };
 use tempfile::{TempDir, tempdir};
 
@@ -997,6 +997,55 @@ fn urls_are_normalized() {
     );
 }
 
+/// A text sink that takes `room` pieces and then refuses.
+struct Refusing {
+    room: usize,
+    text: String,
+}
+
+impl std::fmt::Write for Refusing {
+    fn write_str(&mut self, piece: &str) -> std::fmt::Result {
+        if self.room == 0 {
+            return Err(std::fmt::Error);
+        }
+        self.room -= 1;
+        self.text.push_str(piece);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_sink_that_refuses_text_fails_the_url_at_whichever_piece_it_stops() {
+    // A default port, an explicit port and an IPv6 literal take different paths through the
+    // formatting.
+    for text in [
+        "https://example.com/a?b=c",
+        "https://example.com:8443/a",
+        "https://[::1]:8080/p",
+    ] {
+        let url = Url::parse(text).unwrap();
+        let mut written = None;
+        for room in 0..16 {
+            let mut sink = Refusing {
+                room,
+                text: String::new(),
+            };
+            if std::fmt::write(&mut sink, format_args!("{url}")).is_ok() {
+                written = Some((room, sink.text));
+                break;
+            }
+            assert!(
+                text.starts_with(&sink.text) && sink.text.len() < text.len(),
+                "{text}: only a prefix was written, got {:?}",
+                sink.text
+            );
+        }
+        let (room, full) = written.expect("a big enough sink takes the whole URL");
+        assert_eq!(full, text);
+        assert!(room > 3, "{text} is written in several pieces, not {room}");
+    }
+}
+
 #[test]
 fn invalid_urls_are_rejected_with_a_reason() {
     let cases = [
@@ -1250,6 +1299,35 @@ fn versions_parse_in_the_common_spellings() {
 }
 
 #[test]
+fn a_sink_that_refuses_text_fails_the_version_at_whichever_piece_it_stops() {
+    // Numeric and text pre-release identifiers are written by different arms.
+    let text = "1.2.3-alpha.7.beta";
+    let parsed = version(text);
+    let mut written = None;
+    for room in 0..32 {
+        let mut sink = Refusing {
+            room,
+            text: String::new(),
+        };
+        if std::fmt::write(&mut sink, format_args!("{parsed}")).is_ok() {
+            written = Some((room, sink.text));
+            break;
+        }
+        assert!(
+            text.starts_with(&sink.text) && sink.text.len() < text.len(),
+            "only a prefix was written, got {:?}",
+            sink.text
+        );
+    }
+    let (room, full) = written.expect("a big enough sink takes the whole version");
+    assert_eq!(full, text);
+    assert!(
+        room > 6,
+        "the version is written in several pieces, not {room}"
+    );
+}
+
+#[test]
 fn malformed_versions_are_rejected() {
     for text in [
         "",
@@ -1430,6 +1508,33 @@ fn a_disabled_check_does_nothing() {
     assert_eq!(status, UpdateStatus::Disabled);
     assert!(http.requests().is_empty());
     assert_eq!(last_check(&store).unwrap(), None);
+}
+
+#[test]
+fn the_latest_release_is_asked_for_without_schedule_or_record() {
+    let (_tmp, store) = store();
+    let http = ScriptedHttp::new();
+    for _ in 0..2 {
+        http.respond(
+            RELEASES_URL,
+            &json_head(),
+            release_json("v0.2.0", PAGE).as_bytes(),
+        );
+    }
+    // Asking twice in a row works: there is no weekly gate, and nothing is recorded.
+    assert_eq!(latest_release(&http, RELEASES_URL).unwrap(), v020());
+    assert_eq!(latest_release(&http, RELEASES_URL).unwrap(), v020());
+    assert_eq!(last_check(&store).unwrap(), None);
+    assert_eq!(http.requests().len(), 2);
+    // Failures are reported as they are.
+    assert!(matches!(
+        latest_release(&http, RELEASES_URL).unwrap_err(),
+        UpdateError::Net(NetError::Os { .. })
+    ));
+    assert!(matches!(
+        latest_release(&http, "http://api.example.com/latest").unwrap_err(),
+        UpdateError::Net(NetError::InsecureScheme)
+    ));
 }
 
 #[test]

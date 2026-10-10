@@ -1826,3 +1826,149 @@ fn the_baseline_maps_into_the_destination() {
     assert_rgb(&image, 20, 127, WHITE, 2);
     assert_eq!(baseline_in(&scene(20.0, 10.0), dest), None);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Failing system calls (fault injection)
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(feature = "fault-injection")]
+mod faults {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use ssw_win::fault;
+
+    /// The operation an OS error names.
+    fn context(error: WinError) -> &'static str {
+        match error {
+            WinError::Os { context, .. } => context,
+            other => panic!("not an OS error: {other:?}"),
+        }
+    }
+
+    /// Draws `scene` once per system call it makes (on a new renderer, so that no cache hides
+    /// a call), with that call failing: the failure ends the drawing with an error, the frame
+    /// can still be ended, and what the failures named is returned in call order.
+    fn failed_calls(rig: &Rig, scene: &Scene) -> Vec<&'static str> {
+        let dest = Rect::new(0.0, 0.0, 120.0, 80.0);
+        let mut named = Vec::new();
+        let mut n = 0;
+        loop {
+            let renderer = D2dSceneRenderer::new(rig.wic.clone()).unwrap();
+            let target = rig.target(120, 80);
+            let mut reached = false;
+            let outcome = target.paint(Some(Color::WHITE), |render_target| {
+                fault::arm(n);
+                let drawn = renderer.draw(render_target, scene, dest);
+                reached = fault::tripped();
+                fault::disarm();
+                drawn
+            });
+            if !reached {
+                outcome.unwrap();
+                return named;
+            }
+            named.push(context(outcome.unwrap_err()));
+            n += 1;
+        }
+    }
+
+    #[test]
+    fn every_failing_system_call_ends_the_drawing_with_an_error_that_names_it() {
+        let rig = rig();
+        let (mut s, _) = h_scene(&[(10.0, 50.0)], solid(RED), 120.0, 80.0);
+        // A clip with an opacity: a mask geometry and a layer.
+        let mut faded = Group::new(vec![fill_rect(70.0, 5.0, 30.0, 30.0, solid(BLUE))]);
+        faded.clip = Some(rect_path(60.0, 0.0, 50.0, 40.0));
+        faded.opacity = 0.5;
+        s.push(SceneItem::Group(faded));
+        let gradient = Paint::Linear(linear((0.0, 0.0), (40.0, 0.0), SpreadMode::Pad));
+        s.push(fill_rect(0.0, 0.0, 40.0, 10.0, gradient.clone()));
+        s.push(fill_rect(
+            0.0,
+            10.0,
+            40.0,
+            10.0,
+            Paint::Radial(radial(20.0, 0.0)),
+        ));
+        let mut dashed = stroke(line(0.0, 30.0, 50.0, 30.0), 2.0);
+        dashed.dash = Some(Dash {
+            array: vec![4.0, 2.0],
+            phase: 0.0,
+        });
+        s.push(SceneItem::Stroke(dashed));
+        s.push(SceneItem::Stroke(Stroke {
+            paint: gradient,
+            ..stroke(line(0.0, 40.0, 50.0, 40.0), 3.0)
+        }));
+        s.push(image_item(
+            &four_colors(),
+            SceneRect::new(80.0, 50.0, 20.0, 20.0),
+        ));
+
+        let named: BTreeSet<&str> = failed_calls(&rig, &s).into_iter().collect();
+        let expected = BTreeSet::from([
+            "scene render target factory",
+            "create scene brush",
+            "create font file reference",
+            "analyze font file",
+            "create font face",
+            "create glyph geometry",
+            "open glyph geometry",
+            "get glyph outline",
+            "close glyph geometry",
+            "create path geometry",
+            "open geometry sink",
+            "close geometry sink",
+            "create clip geometry",
+            "create layer",
+            "create gradient stops",
+            "create linear gradient",
+            "create radial gradient",
+            "create stroke style",
+            "create scene bitmap",
+        ]);
+        assert_eq!(named, expected);
+        // The renderer of the rig was not affected.
+        assert!(count(&rig.render(&s, 120, 80), is_ink) > 50);
+    }
+
+    #[test]
+    fn a_renderer_whose_font_cache_cannot_be_created_is_an_error() {
+        let rig = rig();
+        let mut named = Vec::new();
+        let mut n = 0;
+        loop {
+            fault::arm(n);
+            let outcome = D2dSceneRenderer::new(rig.wic.clone());
+            let reached = fault::tripped();
+            fault::disarm();
+            if !reached {
+                outcome.unwrap();
+                break;
+            }
+            named.push(context(outcome.unwrap_err()));
+            n += 1;
+        }
+        assert_eq!(
+            named,
+            [
+                "create DirectWrite factory",
+                "create in-memory font loader",
+                "register in-memory font loader",
+            ]
+        );
+        // The same error leaves the assets that install the renderer.
+        let engine = DWriteEngine::new().unwrap();
+        fault::arm(0);
+        let assets = CanvasAssets::with_scene_renderer(
+            ImageStore::new(rig.wic.clone()),
+            engine,
+            rig.wic.clone(),
+        );
+        let reached = fault::tripped();
+        fault::disarm();
+        assert!(reached);
+        assert_eq!(context(assets.unwrap_err()), "create DirectWrite factory");
+    }
+}

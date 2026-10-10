@@ -11,16 +11,17 @@ use ssw_core::links::RelPath;
 use ssw_core::toc::Toc;
 use ssw_ui::access::{AccessAction, Role, ToggleState};
 use ssw_ui::canvas::DrawOp;
-use ssw_ui::geometry::{Point, Rect};
+use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{Event, Modifiers, PointerEventKind, WheelEvent, vk};
 use ssw_ui::shell::popups::{
-    CommandMenuEvent, FormatPill, FormatPillEvent, FormatState, HeadingLevelMenu, LinkEditEvent,
-    LinkEditPopup, SelectionToolbar, ToolbarEvent, WikilinkAccept, WikilinkCompletion,
-    WikilinkEvent, format_state_at,
+    CommandMenu, CommandMenuEvent, FormatPill, FormatPillEvent, FormatState, HeadingLevelMenu,
+    LinkEditEvent, LinkEditPopup, SelectionToolbar, ToolbarEvent, WikilinkAccept,
+    WikilinkCompletion, WikilinkEvent, format_state_at,
 };
-use ssw_ui::widget::WidgetId;
+use ssw_ui::widget::{Widget, WidgetId};
 use ssw_ui::widgets::Control;
 use ssw_ui::widgets::anim::Motion;
+use ssw_ui::widgets::menu::{MenuEntry, MenuItem};
 
 const WINDOW: Rect = Rect::new(0.0, 0.0, 800.0, 600.0);
 /// Virtual-key code of the letter A (`ssw_ui::input::vk` only names the non-letter keys).
@@ -853,4 +854,170 @@ fn the_access_tree_lists_the_suggestions_and_rows_can_be_invoked() {
     assert!(list.perform_item(first, &AccessAction::Invoke));
     assert_eq!(list.take_events().len(), 1);
     assert!(!list.is_visible());
+}
+
+// ------------------------------------------------------------------------ measuring, painting, actions
+
+#[test]
+fn only_the_block_around_the_caret_decides_the_format_state() {
+    let text = "**bold** text\n\nplain words";
+    assert!(state_of(text, 4, 4).bold);
+    let second = text.find("plain").expect("second paragraph") + 2;
+    assert_eq!(state_of(text, second, second), FormatState::default());
+    assert_eq!(state_of(text, 4, second), FormatState::default());
+}
+
+#[test]
+fn the_command_menu_is_a_modal_flyout_that_reports_commands() {
+    let mut host = Host::new();
+    let mut menu = CommandMenu::new("Insert");
+    assert!(!menu.is_open());
+    let item = |command: CommandId, label: &str| {
+        MenuEntry::Item(MenuItem::new(CommandMenu::command_number(command), label))
+    };
+    let entries = vec![
+        item(CommandId::FormatBold, "Bold"),
+        item(CommandId::FormatItalic, "Italic"),
+    ];
+    let mut cx = host.cx(menu.id());
+    menu.open_at(&mut cx, Point::new(50.0, 60.0), entries);
+    assert!(menu.is_open());
+    assert_eq!(menu.highlighted(), None);
+    host.key(&mut menu, vk::DOWN);
+    assert_eq!(menu.highlighted(), Some((0, 0)));
+    host.key(&mut menu, vk::DOWN);
+    assert_eq!(menu.highlighted(), Some((0, 1)));
+    // The open menu is painted over the window, takes no layout space and takes no actions
+    // of its own.
+    assert!(host.paint(&menu).texts().contains(&"Italic"));
+    assert_eq!(host.measure(&mut menu, Size::new(300.0, 200.0)), Size::ZERO);
+    host.layout(&mut menu, WINDOW);
+    let id = menu.id();
+    let mut cx = host.cx(id);
+    assert!(!Widget::perform(&mut menu, &mut cx, &AccessAction::Invoke));
+    host.key(&mut menu, vk::RETURN);
+    assert_eq!(
+        menu.take_events(),
+        [CommandMenuEvent::Command(CommandId::FormatItalic)]
+    );
+    assert!(!menu.is_open());
+}
+
+#[test]
+fn the_heading_menu_takes_no_layout_space_and_no_actions_of_its_own() {
+    let (mut host, mut menu) = open_heading_menu(Some(1));
+    assert_eq!(host.measure(&mut menu, Size::new(300.0, 200.0)), Size::ZERO);
+    host.layout(&mut menu, WINDOW);
+    let id = menu.id();
+    let mut cx = host.cx(id);
+    assert!(!Widget::perform(&mut menu, &mut cx, &AccessAction::Invoke));
+    assert!(menu.is_open());
+}
+
+#[test]
+fn the_pill_measures_its_size_while_shown_and_nothing_while_hidden() {
+    let (mut host, mut pill) = pill();
+    assert_eq!(
+        host.measure(&mut pill, Size::new(800.0, 40.0)),
+        pill.bounds().size()
+    );
+    let id = pill.id();
+    let mut cx = host.cx(id);
+    assert!(!Widget::perform(&mut pill, &mut cx, &AccessAction::Toggle));
+    pill.set_visible(false);
+    assert_eq!(host.measure(&mut pill, Size::new(800.0, 40.0)), Size::ZERO);
+}
+
+#[test]
+fn the_toolbar_measures_itself_and_only_paints_what_is_damaged() {
+    let (mut host, mut toolbar) = toolbar();
+    assert_eq!(
+        host.measure(&mut toolbar, Size::new(800.0, 600.0)),
+        toolbar.bounds().size()
+    );
+    let away = Rect::new(0.0, 500.0, 50.0, 50.0);
+    assert_eq!(host.paint_damaged(&toolbar, Some(away)).ops().count(), 0);
+    let over = toolbar.bounds();
+    assert!(host.paint_damaged(&toolbar, Some(over)).ops().count() > 0);
+    let id = toolbar.id();
+    let mut cx = host.cx(id);
+    assert!(!Widget::perform(
+        &mut toolbar,
+        &mut cx,
+        &AccessAction::Invoke
+    ));
+    toolbar.hide();
+    assert_eq!(
+        host.measure(&mut toolbar, Size::new(800.0, 600.0)),
+        Size::ZERO
+    );
+}
+
+#[test]
+fn the_link_popup_measures_itself_and_takes_no_actions_of_its_own() {
+    let (mut host, mut popup) = link_popup(Rect::new(300.0, 100.0, 60.0, 20.0));
+    assert_eq!(
+        host.measure(&mut popup, Size::new(800.0, 600.0)),
+        popup.bounds().size()
+    );
+    let id = popup.id();
+    let mut cx = host.cx(id);
+    assert!(!Widget::perform(&mut popup, &mut cx, &AccessAction::Invoke));
+    host.key(&mut popup, vk::ESCAPE);
+    assert!(!popup.is_visible());
+    assert_eq!(
+        host.measure(&mut popup, Size::new(800.0, 600.0)),
+        Size::ZERO
+    );
+}
+
+#[test]
+fn the_completion_measures_paints_and_takes_no_actions_of_its_own() {
+    let (mut host, mut list) = completion("");
+    assert_eq!(
+        host.measure(&mut list, Size::new(800.0, 600.0)),
+        list.bounds().size()
+    );
+    // Visible, the rows are drawn; outside the damaged area nothing is.
+    let canvas = host.paint(&list);
+    assert!(canvas.texts().contains(&"README.md"));
+    let away = Rect::new(0.0, 500.0, 50.0, 50.0);
+    assert_eq!(host.paint_damaged(&list, Some(away)).ops().count(), 0);
+    let id = list.id();
+    let mut cx = host.cx(id);
+    assert!(!Widget::perform(&mut list, &mut cx, &AccessAction::Invoke));
+    // Releasing the button over the list is not a choice.
+    let at = list.list().row_rect(1).expect("row").center();
+    assert!(!host.pointer(&mut list, PointerEventKind::Up, at).handled);
+    assert!(list.take_events().is_empty());
+    list.close();
+    assert_eq!(host.measure(&mut list, Size::new(800.0, 600.0)), Size::ZERO);
+}
+
+#[test]
+fn the_wheel_scrolls_a_long_list_of_suggestions() {
+    let mut host = Host::new();
+    let mut list = WikilinkCompletion::new(localizer());
+    let files: Vec<RelPath> = (0..12)
+        .map(|n| RelPath::parse(&format!("note-{n:02}.md")).expect("path"))
+        .collect();
+    list.set_files(files, Vec::new());
+    list.open(Rect::new(100.0, 100.0, 2.0, 20.0), "");
+    host.layout(&mut list, WINDOW);
+    assert_eq!(list.list().first_visible(), 0);
+    let inside = list.bounds().center();
+    let wheel = |dy: f32| {
+        Event::Wheel(WheelEvent {
+            delta: Point::new(0.0, dy),
+            precise: false,
+            position: inside,
+            mods: Modifiers::NONE,
+        })
+    };
+    assert!(host.send(&mut list, wheel(-1.0)).handled);
+    assert!(list.list().first_visible() > 0);
+    // Wheeling back to the top and past it leaves the editor to scroll.
+    assert!(host.send(&mut list, wheel(10.0)).handled);
+    assert_eq!(list.list().first_visible(), 0);
+    assert!(!host.send(&mut list, wheel(10.0)).handled);
 }

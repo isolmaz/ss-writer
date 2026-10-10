@@ -33,6 +33,7 @@ use windows::Win32::UI::Shell::{
 use windows::core::{HSTRING, IUnknown, Interface};
 
 use crate::com::{OsResultExt, WinError, from_wide};
+use crate::fault::check;
 use crate::instance::NEW_WINDOW_ARG;
 
 /// Room for the text of one shell link property (arguments, path, tooltip).
@@ -113,7 +114,7 @@ fn read_text(
     context: &'static str,
 ) -> Result<String, WinError> {
     let mut buffer = vec![0_u16; TEXT_CAPACITY];
-    get(buffer.as_mut_slice()).ctx(context)?;
+    check(get(buffer.as_mut_slice())).ctx(context)?;
     Ok(from_wide(&buffer))
 }
 
@@ -127,41 +128,34 @@ fn shell_link(
 ) -> Result<IShellLinkW, WinError> {
     // SAFETY: `ShellLink` is the registered class of `IShellLinkW`.
     let link: IShellLinkW =
-        unsafe { CoCreateInstance(&ShellLink, None::<&IUnknown>, CLSCTX_INPROC_SERVER) }
+        check(unsafe { CoCreateInstance(&ShellLink, None::<&IUnknown>, CLSCTX_INPROC_SERVER) })
             .ctx("create IShellLinkW")?;
     // SAFETY: `link` is a valid object; every string is NUL-terminated and outlives its call.
     unsafe {
-        link.SetPath(&HSTRING::from(exe.as_os_str()))
-            .ctx("IShellLink::SetPath")?;
-        link.SetArguments(&HSTRING::from(arguments))
-            .ctx("IShellLink::SetArguments")?;
-        link.SetIconLocation(&HSTRING::from(exe.as_os_str()), 0)
+        check(link.SetPath(&HSTRING::from(exe.as_os_str()))).ctx("IShellLink::SetPath")?;
+        check(link.SetArguments(&HSTRING::from(arguments))).ctx("IShellLink::SetArguments")?;
+        check(link.SetIconLocation(&HSTRING::from(exe.as_os_str()), 0))
             .ctx("IShellLink::SetIconLocation")?;
-        link.SetDescription(&HSTRING::from(tooltip))
-            .ctx("IShellLink::SetDescription")?;
+        check(link.SetDescription(&HSTRING::from(tooltip))).ctx("IShellLink::SetDescription")?;
     }
-    let store = link
-        .cast::<IPropertyStore>()
-        .ctx("IShellLink as IPropertyStore")?;
+    let store = check(link.cast::<IPropertyStore>()).ctx("IShellLink as IPropertyStore")?;
     // The text constructor makes a BSTR; `System.Title` is a string property.
     let text = PROPVARIANT::from(title);
     let mut value = PROPVARIANT::default();
     // SAFETY: both variants are valid and live for the call.
-    unsafe {
+    check(unsafe {
         PropVariantChangeType(
             &raw mut value,
             &raw const text,
             PROPVAR_CHANGE_FLAGS(0),
             VT_LPWSTR,
         )
-    }
+    })
     .ctx("PropVariantChangeType")?;
     // SAFETY: `store` is valid; the key and the value outlive the calls.
     unsafe {
-        store
-            .SetValue(&PKEY_Title, &value)
-            .ctx("IPropertyStore::SetValue(System.Title)")?;
-        store.Commit().ctx("IPropertyStore::Commit")?;
+        check(store.SetValue(&PKEY_Title, &value)).ctx("IPropertyStore::SetValue(System.Title)")?;
+        check(store.Commit()).ctx("IPropertyStore::Commit")?;
     }
     Ok(link)
 }
@@ -169,31 +163,29 @@ fn shell_link(
 /// An `IObjectArray` holding `links`.
 fn object_array(links: &[IShellLinkW]) -> Result<IObjectArray, WinError> {
     // SAFETY: `EnumerableObjectCollection` is the registered class of `IObjectCollection`.
-    let collection: IObjectCollection = unsafe {
+    let collection: IObjectCollection = check(unsafe {
         CoCreateInstance(
             &EnumerableObjectCollection,
             None::<&IUnknown>,
             CLSCTX_INPROC_SERVER,
         )
-    }
+    })
     .ctx("create IObjectCollection")?;
     for link in links {
         // SAFETY: `collection` and `link` are valid objects.
-        unsafe { collection.AddObject(link) }.ctx("IObjectCollection::AddObject")?;
+        check(unsafe { collection.AddObject(link) }).ctx("IObjectCollection::AddObject")?;
     }
-    collection
-        .cast::<IObjectArray>()
-        .ctx("IObjectCollection as IObjectArray")
+    check(collection.cast::<IObjectArray>()).ctx("IObjectCollection as IObjectArray")
 }
 
 /// Every object of `array`.
 fn objects(array: &IObjectArray) -> Result<Vec<IUnknown>, WinError> {
     // SAFETY: `array` is a valid object.
-    let count = unsafe { array.GetCount() }.ctx("IObjectArray::GetCount")?;
+    let count = check(unsafe { array.GetCount() }).ctx("IObjectArray::GetCount")?;
     let mut found = Vec::new();
     for index in 0..count {
         // SAFETY: `index` is below the count just read.
-        let object = unsafe { array.GetAt::<IUnknown>(index) }.ctx("IObjectArray::GetAt")?;
+        let object = check(unsafe { array.GetAt::<IUnknown>(index) }).ctx("IObjectArray::GetAt")?;
         found.push(object);
     }
     Ok(found)
@@ -213,7 +205,7 @@ fn destination_key(object: &IUnknown) -> Option<String> {
     let item = object.cast::<IShellItem>().ok()?;
     // SAFETY: `item` is a valid object; the name is a CoTaskMem string copied and freed here.
     let path = unsafe {
-        let name = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let name = check(item.GetDisplayName(SIGDN_FILESYSPATH)).ok()?;
         let text = from_wide(name.as_wide());
         CoTaskMemFree(Some(name.0.cast_const().cast()));
         text
@@ -314,15 +306,16 @@ impl JumpList {
     /// The shell refused the list; the previous list stays as it was.
     pub fn update(&self, recent: &[PathBuf]) -> Result<usize, WinError> {
         // SAFETY: `DestinationList` is the registered class of `ICustomDestinationList`.
-        let list: ICustomDestinationList =
-            unsafe { CoCreateInstance(&DestinationList, None::<&IUnknown>, CLSCTX_INPROC_SERVER) }
-                .ctx("create ICustomDestinationList")?;
+        let list: ICustomDestinationList = check(unsafe {
+            CoCreateInstance(&DestinationList, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        })
+        .ctx("create ICustomDestinationList")?;
         // SAFETY: `list` is a valid object; the ID is NUL-terminated.
-        unsafe { list.SetAppID(&HSTRING::from(self.app_id.as_str())) }
+        check(unsafe { list.SetAppID(&HSTRING::from(self.app_id.as_str())) })
             .ctx("ICustomDestinationList::SetAppID")?;
         let mut slots = 0_u32;
         // SAFETY: `slots` is a valid out value.
-        let removed = unsafe { list.BeginList::<IObjectArray>(&raw mut slots) }
+        let removed = check(unsafe { list.BeginList::<IObjectArray>(&raw mut slots) })
             .ctx("ICustomDestinationList::BeginList")?;
         let shown = match self.fill(&list, recent, &removed, slots) {
             Ok(shown) => shown,
@@ -334,7 +327,7 @@ impl JumpList {
             }
         };
         // SAFETY: `list` is a valid object with a list in progress.
-        unsafe { list.CommitList() }.ctx("ICustomDestinationList::CommitList")?;
+        check(unsafe { list.CommitList() }).ctx("ICustomDestinationList::CommitList")?;
         Ok(shown)
     }
 
@@ -350,12 +343,14 @@ impl JumpList {
         if !visible.is_empty() {
             let links = self.recent_links(&visible)?;
             // SAFETY: `list` has a list in progress; the title is NUL-terminated.
-            unsafe { list.AppendCategory(&HSTRING::from(self.recent_title.as_str()), &links) }
-                .ctx("ICustomDestinationList::AppendCategory")?;
+            check(unsafe {
+                list.AppendCategory(&HSTRING::from(self.recent_title.as_str()), &links)
+            })
+            .ctx("ICustomDestinationList::AppendCategory")?;
         }
         let tasks = self.task_links()?;
         // SAFETY: `list` has a list in progress.
-        unsafe { list.AddUserTasks(&tasks) }.ctx("ICustomDestinationList::AddUserTasks")?;
+        check(unsafe { list.AddUserTasks(&tasks) }).ctx("ICustomDestinationList::AddUserTasks")?;
         Ok(visible.len())
     }
 
@@ -365,11 +360,12 @@ impl JumpList {
     /// The shell refused to delete it.
     pub fn delete(&self) -> Result<(), WinError> {
         // SAFETY: `DestinationList` is the registered class of `ICustomDestinationList`.
-        let list: ICustomDestinationList =
-            unsafe { CoCreateInstance(&DestinationList, None::<&IUnknown>, CLSCTX_INPROC_SERVER) }
-                .ctx("create ICustomDestinationList")?;
+        let list: ICustomDestinationList = check(unsafe {
+            CoCreateInstance(&DestinationList, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        })
+        .ctx("create ICustomDestinationList")?;
         // SAFETY: `list` is a valid object; the ID is NUL-terminated.
-        unsafe { list.DeleteList(&HSTRING::from(self.app_id.as_str())) }
+        check(unsafe { list.DeleteList(&HSTRING::from(self.app_id.as_str())) })
             .ctx("ICustomDestinationList::DeleteList")
     }
 }

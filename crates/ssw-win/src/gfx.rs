@@ -50,7 +50,8 @@ use windows::Win32::Graphics::Imaging::{
 };
 use windows::core::{HRESULT, Interface};
 
-use crate::com::{ComGuard, OsResultExt, WinError, is_device_lost};
+use crate::com::{ComGuard, OsResultExt, WinError, delivered};
+use crate::fault::check;
 use crate::wic::{DecodedImage, Wic};
 
 /// Which D3D11 driver to create the device on.
@@ -81,7 +82,7 @@ pub fn d2d_factory(multi_threaded: bool) -> Result<ID2D1Factory1, WinError> {
         D2D1_FACTORY_TYPE_SINGLE_THREADED
     };
     // SAFETY: plain factory creation without options.
-    unsafe { D2D1CreateFactory::<ID2D1Factory1>(kind, None) }.ctx("create D2D factory")
+    check(unsafe { D2D1CreateFactory::<ID2D1Factory1>(kind, None) }).ctx("create D2D factory")
 }
 
 /// The shared graphics devices of one generation.
@@ -113,7 +114,7 @@ impl GfxDevices {
         let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
         let mut device: Option<ID3D11Device> = None;
         // SAFETY: valid out pointer and feature level list; BGRA support is required by D2D.
-        unsafe {
+        let created = check(unsafe {
             D3D11CreateDevice(
                 None::<&IDXGIAdapter>,
                 driver.raw(),
@@ -125,19 +126,18 @@ impl GfxDevices {
                 None,
                 None,
             )
-        }
-        .ctx("D3D11CreateDevice")?;
-        let d3d = device.ok_or(WinError::Invalid("D3D11CreateDevice returned no device"))?;
-        let dxgi: IDXGIDevice = d3d.cast().ctx("query IDXGIDevice")?;
+        });
+        let d3d = delivered(created, device).ctx("D3D11CreateDevice")?;
+        let dxgi: IDXGIDevice = check(d3d.cast()).ctx("query IDXGIDevice")?;
         let factory = d2d_factory(true)?;
         // SAFETY: valid DXGI device; the latency hint is best effort.
         unsafe {
-            if let Ok(device1) = dxgi.cast::<IDXGIDevice1>() {
+            if let Ok(device1) = check(dxgi.cast::<IDXGIDevice1>()) {
                 let _ = device1.SetMaximumFrameLatency(1);
             }
         }
         // SAFETY: valid factory and DXGI device.
-        let device = unsafe { factory.CreateDevice(&dxgi) }.ctx("create D2D device")?;
+        let device = check(unsafe { factory.CreateDevice(&dxgi) }).ctx("create D2D device")?;
         Ok(Self {
             generation,
             driver,
@@ -187,10 +187,16 @@ impl GfxDevices {
     /// Why the device was removed, or `S_OK` while it is healthy.
     pub fn removed_reason(&self) -> HRESULT {
         // SAFETY: plain getter on a live device.
-        match unsafe { self.d3d.GetDeviceRemovedReason() } {
-            Ok(()) => HRESULT(0),
-            Err(error) => error.code(),
-        }
+        removal_code(unsafe { self.d3d.GetDeviceRemovedReason() })
+    }
+}
+
+/// The `HRESULT` behind the outcome of `GetDeviceRemovedReason`: the reason when the device was
+/// removed, `S_OK` while it is healthy.
+fn removal_code(outcome: windows::core::Result<()>) -> HRESULT {
+    match outcome {
+        Ok(()) => HRESULT(0),
+        Err(error) => error.code(),
     }
 }
 
@@ -207,12 +213,6 @@ unsafe impl Send for Handoff {}
 pub struct DeviceStartup {
     receiver: Receiver<Handoff>,
     worker: JoinHandle<()>,
-}
-
-impl std::fmt::Debug for Handoff {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Handoff")
-    }
 }
 
 impl DeviceStartup {
@@ -234,6 +234,7 @@ impl DeviceStartup {
                     GfxDevices::create_on(driver, 1)
                 }
             });
+            crate::perf::mark(crate::perf::MARK_DEVICE_READY);
             // The receiver may be gone when the process shuts down early.
             let _ = sender.send(Handoff(result));
         });
@@ -295,8 +296,8 @@ impl WindowSurface {
         // SAFETY: all objects are created from the live devices; descriptors are fully
         // initialized; `hwnd` is only used as a composition target.
         unsafe {
-            let adapter = devices.dxgi.GetAdapter().ctx("DXGI adapter")?;
-            let factory: IDXGIFactory2 = adapter.GetParent().ctx("DXGI factory")?;
+            let adapter = check(devices.dxgi.GetAdapter()).ctx("DXGI adapter")?;
+            let factory: IDXGIFactory2 = check(adapter.GetParent()).ctx("DXGI factory")?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -314,22 +315,26 @@ impl WindowSurface {
                 AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
                 Flags: 0,
             };
-            let swap = factory
-                .CreateSwapChainForComposition(&devices.d3d, &desc, None::<&IDXGIOutput>)
-                .ctx("create composition swap chain")?;
-            let dcomp: IDCompositionDevice =
-                DCompositionCreateDevice(&devices.dxgi).ctx("create DirectComposition device")?;
-            let target = dcomp
-                .CreateTargetForHwnd(hwnd, true)
-                .ctx("create composition target")?;
-            let visual = dcomp.CreateVisual().ctx("create composition visual")?;
-            visual.SetContent(&swap).ctx("set visual content")?;
-            target.SetRoot(&visual).ctx("set composition root")?;
-            dcomp.Commit().ctx("commit composition")?;
-            let context = devices
-                .device
-                .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
-                .ctx("create D2D device context")?;
+            let swap = check(factory.CreateSwapChainForComposition(
+                &devices.d3d,
+                &desc,
+                None::<&IDXGIOutput>,
+            ))
+            .ctx("create composition swap chain")?;
+            let dcomp: IDCompositionDevice = check(DCompositionCreateDevice(&devices.dxgi))
+                .ctx("create DirectComposition device")?;
+            let target =
+                check(dcomp.CreateTargetForHwnd(hwnd, true)).ctx("create composition target")?;
+            let visual = check(dcomp.CreateVisual()).ctx("create composition visual")?;
+            check(visual.SetContent(&swap)).ctx("set visual content")?;
+            check(target.SetRoot(&visual)).ctx("set composition root")?;
+            check(dcomp.Commit()).ctx("commit composition")?;
+            let context = check(
+                devices
+                    .device
+                    .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE),
+            )
+            .ctx("create D2D device context")?;
             context.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             Ok(Self {
                 generation: devices.generation,
@@ -375,15 +380,14 @@ impl WindowSurface {
         // before resizing, as DXGI requires.
         unsafe {
             self.context.SetTarget(None::<&ID2D1Image>);
-            self.swap
-                .ResizeBuffers(
-                    0,
-                    width,
-                    height,
-                    DXGI_FORMAT_UNKNOWN,
-                    DXGI_SWAP_CHAIN_FLAG(0),
-                )
-                .ctx("resize swap chain")?;
+            check(self.swap.ResizeBuffers(
+                0,
+                width,
+                height,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            ))
+            .ctx("resize swap chain")?;
         }
         self.width = width;
         self.height = height;
@@ -406,13 +410,15 @@ impl WindowSurface {
         &mut self,
         draw: impl FnOnce(&ID2D1RenderTarget) -> Result<R, WinError>,
     ) -> Result<R, WinError> {
+        let mut timer = crate::perf::FrameTimer::begin();
         // SAFETY: the back buffer is wrapped for the duration of the frame only: `BackBuffer`
         // resets the target before `Present` (or when the drawing code unwinds), and
         // `DrawScope` always pairs `BeginDraw` with `EndDraw`.
         unsafe {
             // Fallible lookups first, so no error can leave the context half set up.
-            let target: ID2D1RenderTarget = self.context.cast().ctx("query render target")?;
-            let surface: IDXGISurface = self.swap.GetBuffer(0).ctx("get back buffer")?;
+            let target: ID2D1RenderTarget =
+                check(self.context.cast()).ctx("query render target")?;
+            let surface: IDXGISurface = check(self.swap.GetBuffer(0)).ctx("get back buffer")?;
             let properties = D2D1_BITMAP_PROPERTIES1 {
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -423,10 +429,11 @@ impl WindowSurface {
                 bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                 colorContext: ManuallyDrop::new(None),
             };
-            let bitmap = self
-                .context
-                .CreateBitmapFromDxgiSurface(&surface, Some(&properties))
-                .ctx("wrap back buffer")?;
+            let bitmap = check(
+                self.context
+                    .CreateBitmapFromDxgiSurface(&surface, Some(&properties)),
+            )
+            .ctx("wrap back buffer")?;
             self.context.SetTarget(&bitmap);
             let back_buffer = BackBuffer(&self.context);
             self.context.SetDpi(self.dpi, self.dpi);
@@ -435,10 +442,12 @@ impl WindowSurface {
             let drawn = draw(&target);
             let ended = scope.end();
             drop(back_buffer);
+            timer.drawn();
             let value = drawn?;
             ended.ctx("EndDraw")?;
             let status = self.swap.Present(1, DXGI_PRESENT(0));
             classify_present(status)?;
+            timer.presented();
             Ok(value)
         }
     }
@@ -465,7 +474,7 @@ impl<'a> DrawScope<'a> {
     fn end(mut self) -> windows::core::Result<()> {
         self.ended = true;
         // SAFETY: pairs the `BeginDraw` of `begin`.
-        unsafe { self.target.EndDraw(None, None) }
+        check(unsafe { self.target.EndDraw(None, None) })
     }
 }
 
@@ -495,13 +504,7 @@ impl Drop for BackBuffer<'_> {
 /// # Errors
 /// See above.
 pub fn classify_present(status: HRESULT) -> Result<(), WinError> {
-    if status.is_ok() {
-        Ok(())
-    } else if is_device_lost(status) {
-        Err(WinError::DeviceLost { context: "Present" })
-    } else {
-        Err(WinError::from_os("Present", status.into()))
-    }
+    check(status.ok()).ctx("Present")
 }
 
 /// A WIC bitmap with a software D2D render target; the same `Canvas` implementation draws
@@ -531,15 +534,13 @@ impl WicTarget {
         }
         // SAFETY: the render target keeps its own reference to the bitmap.
         unsafe {
-            let bitmap = wic
-                .factory()
-                .CreateBitmap(
-                    width,
-                    height,
-                    &GUID_WICPixelFormat32bppPBGRA,
-                    WICBitmapCacheOnDemand,
-                )
-                .ctx("create WIC bitmap")?;
+            let bitmap = check(wic.factory().CreateBitmap(
+                width,
+                height,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapCacheOnDemand,
+            ))
+            .ctx("create WIC bitmap")?;
             let properties = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                 pixelFormat: D2D1_PIXEL_FORMAT {
@@ -551,8 +552,7 @@ impl WicTarget {
                 usage: D2D1_RENDER_TARGET_USAGE_NONE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
-            let target = factory
-                .CreateWicBitmapRenderTarget(&bitmap, &properties)
+            let target = check(factory.CreateWicBitmapRenderTarget(&bitmap, &properties))
                 .ctx("create WIC render target")?;
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             Ok(Self {
@@ -604,9 +604,11 @@ impl WicTarget {
         let mut bgra = vec![0u8; (self.width as usize) * (self.height as usize) * 4];
         // SAFETY: the buffer holds `stride * height` bytes.
         unsafe {
-            self.bitmap
-                .CopyPixels(std::ptr::null(), self.width * 4, &mut bgra)
-                .ctx("copy pixels")?;
+            check(
+                self.bitmap
+                    .CopyPixels(std::ptr::null(), self.width * 4, &mut bgra),
+            )
+            .ctx("copy pixels")?;
         }
         Ok(DecodedImage {
             width: self.width,
@@ -628,8 +630,14 @@ impl WicTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "fault-injection")]
+    use crate::fault::{all_failed, failed_step};
     use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+    use windows::core::w;
 
     #[test]
     fn present_status_is_classified() {
@@ -655,6 +663,89 @@ mod tests {
         assert_eq!(next.generation(), 2);
         assert_eq!(next.driver(), devices.driver());
         let _ = (next.d2d_factory(), next.d2d_device(), next.d3d_device());
+    }
+
+    #[test]
+    fn the_reason_of_a_removed_device_is_its_error_code() {
+        assert_eq!(removal_code(Ok(())), HRESULT(0));
+        assert_eq!(
+            removal_code(Err(DXGI_ERROR_DEVICE_REMOVED.into())),
+            DXGI_ERROR_DEVICE_REMOVED
+        );
+    }
+
+    #[test]
+    fn waiting_for_a_worker_that_ended_without_a_result_is_an_error() {
+        let (sender, receiver) = channel::<Handoff>();
+        drop(sender);
+        let startup = DeviceStartup {
+            receiver,
+            worker: std::thread::spawn(|| {}),
+        };
+        let error = startup.wait().unwrap_err();
+        assert_eq!(error.to_string(), "device thread ended without a result");
+    }
+
+    /// A top-level window of the system `STATIC` class that is never shown or activated.
+    struct HiddenWindow(HWND);
+
+    impl HiddenWindow {
+        fn new() -> Self {
+            // SAFETY: creates a window of a system class without `WS_VISIBLE`.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    w!("STATIC"),
+                    w!("ssw-win surface test"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .unwrap();
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for HiddenWindow {
+        fn drop(&mut self) {
+            // SAFETY: destroys the window created in `new` on its own thread.
+            let _ = unsafe { DestroyWindow(self.0) };
+        }
+    }
+
+    #[test]
+    fn a_window_surface_tracks_its_size_and_dpi_and_paints_a_frame() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let devices = GfxDevices::create(5).unwrap();
+        let window = HiddenWindow::new();
+        let mut surface = WindowSurface::new(&devices, window.0, 64, 48, 96.0).unwrap();
+        assert_eq!(surface.generation(), 5);
+        assert_eq!(surface.size_px(), (64, 48));
+        // The same size changes nothing.
+        surface.resize(64, 48).unwrap();
+        assert_eq!(surface.size_px(), (64, 48));
+        // A swap chain is never empty: zero becomes one pixel.
+        surface.resize(80, 0).unwrap();
+        assert_eq!(surface.size_px(), (80, 1));
+
+        surface.set_dpi(144.0);
+        let dpi = surface
+            .paint(|target| {
+                let (mut x, mut y) = (0.0, 0.0);
+                // SAFETY: valid out values on the live render target.
+                unsafe { target.GetDpi(&mut x, &mut y) };
+                Ok((x, y))
+            })
+            .unwrap();
+        assert_eq!(dpi, (144.0, 144.0));
+        assert!(surface.context().cast::<ID2D1RenderTarget>().is_ok());
     }
 
     #[test]
@@ -711,5 +802,154 @@ mod tests {
             target.pixels().unwrap().pixel(0, 0),
             Some([0x00, 0xFF, 0x00, 0xFF])
         );
+    }
+
+    #[test]
+    fn a_drawing_error_of_a_window_surface_frame_is_the_result_of_the_frame() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let devices = GfxDevices::create(1).unwrap();
+        let window = HiddenWindow::new();
+        let mut surface = WindowSurface::new(&devices, window.0, 32, 32, 96.0).unwrap();
+        let error = surface
+            .paint(|_| -> Result<(), WinError> { Err(WinError::Invalid("draw failed")) })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "draw failed");
+        // The frame was ended all the same: the next one is drawn and presented.
+        assert_eq!(surface.paint(|_| Ok(3)).unwrap(), 3);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn every_failing_step_of_creating_devices_is_reported_under_its_own_name() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let steps = crate::fault::sweep(|| failed_step(d2d_factory(false)));
+        assert_eq!(steps, all_failed(&["create D2D factory"]));
+        let steps = crate::fault::sweep(|| failed_step(GfxDevices::create_on(Driver::Warp, 1)));
+        // The frame latency hint is best effort: its failure does not fail the creation.
+        assert_eq!(
+            steps,
+            [
+                Some("D3D11CreateDevice"),
+                Some("query IDXGIDevice"),
+                Some("create D2D factory"),
+                None,
+                Some("create D2D device"),
+            ]
+            .map(|step| step.map(str::to_owned))
+        );
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn a_failing_hardware_device_falls_back_to_warp_and_both_failing_is_an_error() {
+        use crate::fault;
+
+        let _com = ComGuard::apartment_threaded().unwrap();
+        fault::arm(0);
+        let devices = GfxDevices::create(7).unwrap();
+        assert!(fault::tripped());
+        assert_eq!((devices.generation(), devices.driver()), (7, Driver::Warp));
+
+        fault::arm(0);
+        let next = devices.recreate().unwrap();
+        assert!(fault::tripped());
+        assert_eq!((next.generation(), next.driver()), (8, Driver::Warp));
+
+        fault::arm_from(0);
+        assert_eq!(
+            failed_step(GfxDevices::create(9)).as_deref(),
+            Some("D3D11CreateDevice")
+        );
+        assert_eq!(
+            failed_step(devices.recreate()).as_deref(),
+            Some("D3D11CreateDevice")
+        );
+        fault::disarm();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn every_failing_step_of_building_a_window_surface_is_reported() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let devices = GfxDevices::create(5).unwrap();
+        let window = HiddenWindow::new();
+        let steps = crate::fault::sweep(|| {
+            failed_step(WindowSurface::new(&devices, window.0, 64, 48, 96.0))
+        });
+        assert_eq!(
+            steps,
+            all_failed(&[
+                "DXGI adapter",
+                "DXGI factory",
+                "create composition swap chain",
+                "create DirectComposition device",
+                "create composition target",
+                "create composition visual",
+                "set visual content",
+                "set composition root",
+                "commit composition",
+                "create D2D device context",
+            ])
+        );
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn a_surface_that_fails_to_resize_keeps_its_size_and_reports_a_lost_device() {
+        use crate::fault;
+
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let devices = GfxDevices::create(1).unwrap();
+        let window = HiddenWindow::new();
+        let mut surface = WindowSurface::new(&devices, window.0, 64, 48, 96.0).unwrap();
+        fault::arm(0);
+        let error = surface.resize(80, 60).unwrap_err();
+        assert!(error.to_string().starts_with("resize swap chain failed"));
+        assert!(!error.is_device_lost());
+        assert_eq!(surface.size_px(), (64, 48));
+        fault::arm_with(0, DXGI_ERROR_DEVICE_REMOVED);
+        assert!(surface.resize(80, 60).unwrap_err().is_device_lost());
+        assert_eq!(surface.size_px(), (64, 48));
+        surface.resize(80, 60).unwrap();
+        assert_eq!(surface.size_px(), (80, 60));
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn every_failing_step_of_a_frame_is_reported_and_the_surface_keeps_working() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let devices = GfxDevices::create(1).unwrap();
+        let window = HiddenWindow::new();
+        let mut surface = WindowSurface::new(&devices, window.0, 64, 48, 96.0).unwrap();
+        let steps = crate::fault::sweep(|| failed_step(surface.paint(|_| Ok(()))));
+        assert_eq!(
+            steps,
+            all_failed(&[
+                "query render target",
+                "get back buffer",
+                "wrap back buffer",
+                "EndDraw",
+                "Present",
+            ])
+        );
+        assert_eq!(surface.paint(|_| Ok(1)).unwrap(), 1);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn every_failing_step_of_a_wic_target_is_reported() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let wic = Wic::new().unwrap();
+        let factory = d2d_factory(false).unwrap();
+        let steps = crate::fault::sweep(|| failed_step(WicTarget::new(&factory, &wic, 4, 3, 96.0)));
+        assert_eq!(
+            steps,
+            all_failed(&["create WIC bitmap", "create WIC render target"])
+        );
+        let target = WicTarget::new(&factory, &wic, 4, 3, 96.0).unwrap();
+        let steps = crate::fault::sweep(|| failed_step(target.paint(None, |_| Ok(()))));
+        assert_eq!(steps, all_failed(&["EndDraw"]));
+        let steps = crate::fault::sweep(|| failed_step(target.pixels()));
+        assert_eq!(steps, all_failed(&["copy pixels"]));
     }
 }

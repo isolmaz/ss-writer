@@ -1186,6 +1186,20 @@ mod tests {
             Point::new(bounds.x + 6.0, 900.0),
         );
         assert_eq!(bar.offset(), 600.0);
+        assert!(bar.take_changed());
+        // Dragging further past the end changes nothing.
+        assert!(
+            harness
+                .pointer(
+                    &mut bar,
+                    PointerEventKind::Move,
+                    None,
+                    Point::new(bounds.x + 6.0, 950.0),
+                )
+                .handled
+        );
+        assert_eq!(bar.offset(), 600.0);
+        assert!(!bar.take_changed());
         harness.pointer(
             &mut bar,
             PointerEventKind::Up,
@@ -1411,6 +1425,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct BlockState {
         bounds: Rect,
+        /// The damage rectangle of the last paint, in the block's own coordinates.
+        damage: Option<Rect>,
         clicks: Vec<Point>,
         eats_wheel: bool,
         keys: u32,
@@ -1455,10 +1471,9 @@ mod tests {
             cx.add_tab_stop();
         }
         fn paint(&self, cx: &PaintCx, canvas: &mut dyn Canvas) {
-            let bounds = self.state.borrow().bounds;
-            if cx.needs_paint(bounds) {
-                canvas.fill_rect(bounds, cx.theme.tokens.accent);
-            }
+            let mut state = self.state.borrow_mut();
+            state.damage = cx.damage;
+            canvas.fill_rect(state.bounds, cx.theme.tokens.accent);
         }
         fn event(&mut self, _cx: &mut EventCx, e: &Event) -> EventResult {
             let mut state = self.state.borrow_mut();
@@ -1641,12 +1656,13 @@ mod tests {
     #[test]
     fn kit_scrollview_paints_clipped_and_translated() {
         let viewport = Rect::new(10.0, 20.0, 200.0, 100.0);
-        let (mut harness, mut view, _) = view(200.0, 500.0, viewport);
+        let (mut harness, mut view, state) = view(200.0, 500.0, viewport);
         view.scroll_to(Point::new(0.0, 100.0));
         let canvas = harness.paint(&view);
+        assert_eq!(state.borrow().damage, None, "a full paint has no damage");
         let ops: Vec<&DrawOp> = canvas.ops().collect();
-        assert!(matches!(ops[0], DrawOp::PushClipRect(rect) if *rect == viewport));
-        assert!(matches!(ops[1], DrawOp::Save));
+        assert_eq!(*ops[0], DrawOp::PushClipRect(viewport));
+        assert_eq!(*ops[1], DrawOp::Save);
         assert!(matches!(ops[2], DrawOp::Transform(t) if t.dy == -100.0 && t.dx == 0.0));
         assert!(
             matches!(ops[3], DrawOp::FillRect { rect, .. } if *rect == Rect::new(10.0, 20.0, 200.0, 500.0))
@@ -1681,6 +1697,11 @@ mod tests {
             partial
                 .ops()
                 .any(|op| matches!(op, DrawOp::FillRect { .. }))
+        );
+        // The child sees the damage in its own coordinates: scrolled by the offset.
+        assert_eq!(
+            state.borrow().damage,
+            Some(Rect::new(20.0, 130.0, 5.0, 5.0))
         );
     }
 
@@ -1740,5 +1761,56 @@ mod tests {
     fn kit_scrollview_debug_names_the_view() {
         let (_, view, _) = view(10.0, 10.0, Rect::new(0.0, 0.0, 10.0, 10.0));
         assert!(format!("{view:?}").starts_with("ScrollView"));
+    }
+
+    #[test]
+    fn kit_scrollbar_with_id_and_animated_paging() {
+        let id = WidgetId::allocate();
+        let mut harness = Harness::new();
+        let mut bar = ScrollBar::new(Axis::Vertical, "Scroll")
+            .with_id(id)
+            .with_motion(Motion::full());
+        assert_eq!(bar.id(), id);
+        assert_eq!(harness.node(&bar).id, id);
+        bar.model_mut().set_extent(100.0, 1000.0);
+        harness.arrange(&mut bar, Rect::new(0.0, 0.0, BAR_WIDTH, 100.0));
+        // A press on the track below the thumb pages down by easing.
+        let below = Point::new(BAR_WIDTH / 2.0, 90.0);
+        let left = Some(PointerButton::Left);
+        assert!(
+            harness
+                .pointer(&mut bar, PointerEventKind::Down, left, below)
+                .handled
+        );
+        assert!(harness.requests.animation_frame_requested());
+    }
+
+    #[test]
+    fn kit_scrollview_with_id_exposes_its_child_and_measures_the_width() {
+        let id = WidgetId::allocate();
+        let viewport = Rect::new(10.0, 20.0, 200.0, 100.0);
+        let (mut harness, view, _) = view(300.0, 500.0, viewport);
+        let mut view = view.with_id(id);
+        assert_eq!(view.id(), id);
+        let child = view.child().id();
+        let mut cx = harness.event_cx(child);
+        assert_eq!(view.child_mut().id(), child);
+        assert!(!view.child_mut().perform(&mut cx, &AccessAction::Invoke));
+        let measured = harness.measure(&mut view, Size::new(200.0, 100.0));
+        assert_eq!(measured.width, 200.0);
+    }
+
+    #[test]
+    fn kit_scrollview_pointer_over_the_horizontal_bar_belongs_to_the_bar() {
+        let mut harness = Harness::new();
+        let (block, _) = Block::new(600.0, 500.0);
+        let mut view = ScrollView::new(Box::new(block), "c")
+            .horizontal()
+            .with_motion(Motion::reduced());
+        harness.arrange(&mut view, Rect::new(10.0, 20.0, 200.0, 100.0));
+        assert!(view.horizontal_bar().model().is_scrollable());
+        let on_bar = view.horizontal_bar().bounds().center();
+        assert!(view.bar_contains(on_bar));
+        assert!(!view.bar_contains(Point::new(11.0, 21.0)));
     }
 }

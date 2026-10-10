@@ -181,13 +181,10 @@ fn exit_bare_item(ctx: Ctx<'_>, sel: TextRange) -> Option<Transaction> {
 /// Enter in the text of a list item: a new item with the next marker.
 fn enter_in_item(ctx: Ctx<'_>, sel: TextRange) -> Option<Transaction> {
     let item = item_around(ctx, sel.start)?;
-    let in_text = match item.item.children.first() {
-        None => true,
-        Some(first) => {
-            matches!(first.kind, BlockKind::Paragraph | BlockKind::Heading { .. })
-                && sel.start <= first.range.end
-        }
-    };
+    let in_text = item.item.children.first().is_none_or(|first| {
+        matches!(first.kind, BlockKind::Paragraph | BlockKind::Heading { .. })
+            && sel.start <= first.range.end
+    });
     if !in_text {
         return None;
     }

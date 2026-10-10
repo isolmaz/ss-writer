@@ -807,6 +807,14 @@ mod tests {
             ),
             (
                 format!(
+                    r#"<m:d><m:dPr><m:sepChr m:val="/"/></m:dPr><m:e>{}</m:e><m:e>{}</m:e></m:d>"#,
+                    r("a"),
+                    r("b")
+                ),
+                r"\left( a / b \right)",
+            ),
+            (
+                format!(
                     r#"<m:d><m:dPr><m:begChr m:val="["/><m:endChr m:val="]"/><m:sepChr m:val=","/></m:dPr><m:e>{}</m:e><m:e>{}</m:e></m:d>"#,
                     r("a"),
                     r("b")
@@ -887,6 +895,13 @@ mod tests {
             r("x")
         );
         assert_eq!(math(&sin).unwrap(), r"\sin x");
+        // run properties inside the name do not make it more than plain text
+        let with_properties = format!(
+            "<m:func><m:fName><m:ctrlPr/>{}</m:fName><m:e>{}</m:e></m:func>",
+            r("sin"),
+            r("x")
+        );
+        assert_eq!(math(&with_properties).unwrap(), r"\sin x");
         let custom = format!(
             "<m:func><m:fName>{}</m:fName><m:e>{}</m:e></m:func>",
             r("sgn"),

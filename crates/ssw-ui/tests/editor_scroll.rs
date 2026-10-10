@@ -218,6 +218,17 @@ fn typewriter_mode_allows_overscroll_past_the_end() {
         close(h.view.scroll_y() - normal, 100.0),
         "half a viewport of overscroll"
     );
+    // Turning the mode off again takes the overscroll away.
+    h.view.set_typewriter(false);
+    assert!(!h.view.typewriter());
+    h.arrange();
+    h.view.set_scroll_y(1.0e9);
+    h.arrange();
+    assert!(
+        close(h.view.scroll_y(), normal),
+        "{} against {normal}",
+        h.view.scroll_y()
+    );
 }
 
 #[test]

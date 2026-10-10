@@ -287,7 +287,8 @@ impl IncrementalParser {
 /// change from a text of `old_len` bytes to one of `new_len` bytes.
 fn edit_span(edits: &[Edit], old_len: usize, new_len: usize) -> Option<(usize, usize)> {
     let start = edits.iter().map(|e| e.range.start).min()?;
-    let end = edits.iter().map(|e| e.range.end).max()?;
+    // Every edit ends at or after its own start, so the largest end is at least `start`.
+    let end = edits.iter().map(|e| e.range.end).fold(start, usize::max);
     (end <= old_len && end + new_len >= start + old_len).then_some((start, end))
 }
 
@@ -865,4 +866,61 @@ fn shift_inline(inline: &mut Inline, delta: isize) {
         | InlineKind::RawHtml => {}
     }
     shift_inlines(&mut inline.children, delta);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replace(start: usize, end: usize, text: &str) -> Edit {
+        Edit::replace(TextRange::new(start, end), text)
+    }
+
+    #[test]
+    fn edit_span_is_the_outer_range_of_edits_that_explain_the_length_change() {
+        assert_eq!(edit_span(&[], 5, 5), None, "no edits");
+        // Two edits (+1 and -1 bytes) leave the length alone; the span covers both.
+        let both = [replace(1, 2, "xy"), replace(4, 5, "")];
+        assert_eq!(edit_span(&both, 10, 10), Some((1, 5)));
+        assert_eq!(
+            edit_span(&both, 10, 3),
+            None,
+            "the length change is unexplained"
+        );
+        assert_eq!(
+            edit_span(&[replace(8, 12, "")], 10, 6),
+            None,
+            "past the old text"
+        );
+    }
+
+    #[test]
+    fn label_uses_belong_to_their_block_and_uses_past_the_blocks_are_dropped() {
+        let doc = parse_document("[x]\n\n[y]\n");
+        assert_eq!(doc.blocks.len(), 2);
+        let uses = doc.definitions.uses();
+        assert_eq!(uses.len(), 2);
+
+        let labels = |infos: &[BlockInfo]| -> Vec<Vec<String>> {
+            infos
+                .iter()
+                .map(|info| info.uses.iter().map(|u| u.label.clone()).collect())
+                .collect()
+        };
+        let all = collect_infos(&doc.blocks, uses);
+        assert_eq!(labels(&all), [["x"], ["y"]]);
+        assert_eq!(all[1].uses[0].kind, LabelKind::Link);
+        assert_eq!(
+            all[1].uses[0].range,
+            TextRange::new(0, 3),
+            "relative to its block"
+        );
+
+        let first = collect_infos(&doc.blocks[..1], uses);
+        assert_eq!(
+            labels(&first),
+            [["x"]],
+            "the lookup of the second block is dropped"
+        );
+    }
 }

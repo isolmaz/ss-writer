@@ -2,6 +2,7 @@
 
 pub mod crash;
 pub mod encoding;
+pub mod fault;
 pub mod fileops;
 pub mod fs;
 pub mod logging;

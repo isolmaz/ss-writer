@@ -1493,11 +1493,8 @@ mod tests {
             b"<office:document-content",
         ] {
             let result = import_odt(&damage(intact.clone(), needle), "x");
-            assert!(
-                matches!(result, Err(ImportError::Corrupt(_))),
-                "{}",
-                String::from_utf8_lossy(needle)
-            );
+            let label = String::from_utf8_lossy(needle);
+            assert!(matches!(result, Err(ImportError::Corrupt(_))), "{label}");
         }
         let result = import_odt(&damage(intact, b"<office:document-styles/>"), "x").unwrap();
         assert_eq!(losses_of(&result), [(LossKind::CorruptParts, 1)]);
@@ -1930,7 +1927,7 @@ mod tests {
             (
                 "quote merge",
                 r##"<style:style style:name="Quotations" style:family="paragraph"><style:text-properties fo:font-style="italic"/></style:style><style:style style:name="I" style:family="text"><style:text-properties fo:font-style="italic"/></style:style>"##,
-                r##"<text:p text:style-name="Quotations">one</text:p><text:p text:style-name="Quotations">two <text:span text:style-name="I">em</text:span></text:p><text:p>plain</text:p><text:p text:style-name="Quotations">three</text:p>"##,
+                r##"<text:p text:style-name="Quotations">one</text:p><text:p text:style-name="Quotations"></text:p><text:p text:style-name="Quotations">two <text:span text:style-name="I">em</text:span></text:p><text:p>plain</text:p><text:p text:style-name="Quotations">three</text:p>"##,
                 "> one\n>\n> two *em*\n\nplain\n\n> three\n",
                 &[],
             ),
@@ -2482,6 +2479,7 @@ mod tests {
     #[test]
     fn cases_with_package_parts() {
         let cases: &[PartCase<'_>] = &[
+            ("floating image", r##"<draw:frame><draw:image xlink:href="Pictures/a.png"/></draw:frame>"##, &[("Pictures/a.png", b"\x89PNG\x0d\x0a\x1a\x0a1234")], "![](doc_assets/image-1.png)\n", &[], 1),
             ("objects with parts", r##"<text:p><draw:frame><draw:object xlink:href="./Obj1/"/></draw:frame><draw:frame><draw:object xlink:href="Obj2"/></draw:frame>x</text:p>"##, &[("Obj1/content.xml", b"<x>MathML</x>"), ("Obj2/content.xml", b"<x>chart</x>")], "x\n", &[(LossKind::VectorShapes, 1), (LossKind::UnsupportedEquations, 1)], 0),
             ("image", r##"<text:p>a <draw:frame svg:width="2in"><draw:image xlink:href="Pictures/a.png"/><svg:desc>alt [x]</svg:desc><svg:title>t</svg:title></draw:frame> b</text:p>"##, &[("Pictures/a.png", b"\x89PNG\x0d\x0a\x1a\x0a1234")], "a ![alt \\[x\\]|192](doc_assets/image-1.png) b\n", &[], 1),
             ("title alt, jpeg by magic, twice", r##"<text:p><draw:frame svg:width="1cm"><draw:image xlink:href="Pictures/b.dat"/><svg:title>The  title</svg:title></draw:frame><draw:frame><draw:image xlink:href="Pictures/b.dat"/></draw:frame><draw:frame><draw:image xlink:href="./Pictures/c.jpeg"/></draw:frame></text:p>"##, &[("Pictures/b.dat", b"\xff\xd8\xff\xe0abcd"), ("Pictures/c.jpeg", b"plain bytes")], "![The title|38](doc_assets/image-1.jpg)![](doc_assets/image-1.jpg)![](doc_assets/image-2.jpg)\n", &[], 2),

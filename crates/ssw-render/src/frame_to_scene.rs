@@ -265,7 +265,7 @@ fn convert_stroke(stroke: &FixedStroke, path: Path, bounds: Rect) -> Option<Scen
 
 /// Typst paint → scene paint for an item occupying `bounds` (gradients are always resolved
 /// relative to the item itself).
-fn convert_paint(paint: &TPaint, bounds: Rect) -> Paint {
+pub(crate) fn convert_paint(paint: &TPaint, bounds: Rect) -> Paint {
     match paint {
         TPaint::Solid(c) => Paint::Solid(color(c)),
         TPaint::Gradient(gradient) => convert_gradient(gradient, bounds),

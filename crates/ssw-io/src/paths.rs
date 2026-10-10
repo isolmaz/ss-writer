@@ -58,8 +58,9 @@ impl Environment {
     /// [`PathsError::CurrentExe`] / [`PathsError::NoParent`] when the executable path is
     /// unavailable.
     pub fn from_process() -> Result<Self, PathsError> {
-        let exe = std::env::current_exe().map_err(PathsError::CurrentExe)?;
-        Self::from_vars(process_var, &exe)
+        std::env::current_exe()
+            .map_err(PathsError::CurrentExe)
+            .and_then(|exe| Self::from_vars(process_var, &exe))
     }
 
     /// An environment read through `get` (variable name → value) for the executable at `exe`.
@@ -124,7 +125,7 @@ impl AppPaths {
     /// # Errors
     /// See [`Environment::from_process`] and [`AppPaths::resolve`].
     pub fn from_process() -> Result<Self, PathsError> {
-        Self::resolve(&Environment::from_process()?)
+        Environment::from_process().and_then(|environment| Self::resolve(&environment))
     }
 
     /// True when the `portable` marker was found next to the executable.

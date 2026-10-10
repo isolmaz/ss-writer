@@ -376,7 +376,7 @@ impl Stack {
 
     pub(super) fn line_range(&self, offset: usize) -> TextRange {
         let Some(row) = self.row_for_offset(offset) else {
-            return TextRange::at(offset);
+            return self.range;
         };
         match &row.body {
             Body::Child(child) => child.line_range(offset.max(row.content_start)),

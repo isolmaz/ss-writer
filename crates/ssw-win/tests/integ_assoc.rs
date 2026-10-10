@@ -126,6 +126,15 @@ fn an_extension_nobody_handles_has_no_default_app() {
 }
 
 #[test]
+fn a_query_the_shell_refuses_has_no_default_app() {
+    // Strings that are no file type at all: no default app, however the shell refuses them.
+    for refused in ["", ".", "ssw-no-such-progid-7f3a", "<>|"] {
+        assert_eq!(default_app_for(refused), None, "{refused:?}");
+        assert!(!is_default_app(refused, "anything.exe"), "{refused:?}");
+    }
+}
+
+#[test]
 fn the_default_app_of_a_text_file_is_described_and_matched_by_file_name() {
     let Some(app) = default_app_for(".txt") else {
         // A machine without any app for .txt has nothing to describe.

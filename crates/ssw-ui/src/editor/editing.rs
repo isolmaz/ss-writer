@@ -3,7 +3,7 @@
 
 use ssw_core::command::CommandId as C;
 use ssw_core::edit::{Edit, Selection, Transaction};
-use ssw_core::markdown::ast::{Alignment, BlockKind, CalloutKind, HighlightColor};
+use ssw_core::markdown::ast::{Alignment, CalloutKind, HighlightColor};
 use ssw_core::ops::format::{InlineStyle, LinkInfo};
 use ssw_core::ops::lists::ListKind;
 use ssw_core::ops::movement::{self, Movement};
@@ -23,7 +23,6 @@ use super::block::{BlockEdit, BlockPress, GutterAction};
 use ssw_core::settings::ListIndent;
 
 use super::config::{Composition, DocumentKind, EditorEvent, LinkTarget};
-use super::layout::ItemKind;
 use super::modes::{autoscroll_speed, step_zoom};
 use super::view::{
     AUTOSCROLL_INTERVAL, AUTOSCROLL_MAX_STEP, AutoScroll, BLINK, BlockDragState, Drag, DragUnit,
@@ -157,15 +156,16 @@ impl EditorView {
     }
 
     fn on_timer(&mut self, env: &Env<'_>, id: TimerId) -> EventResult {
-        if self.autoscroll.is_some_and(|state| state.timer == id) {
-            return self.autoscroll_tick(env);
+        if let Some(state) = self.autoscroll
+            && state.timer == id
+        {
+            return self.autoscroll_tick(env, state);
         }
+        // The blink timer runs exactly while the view is focused (`on_focus` starts and kills it).
         if self.blink_timer != Some(id) {
             return EventResult::ignored();
         }
-        if self.focused {
-            self.caret_on = !self.caret_on;
-        }
+        self.caret_on = !self.caret_on;
         EventResult::handled()
     }
 
@@ -258,13 +258,12 @@ impl EditorView {
                         let doc = self.doc.borrow();
                         if self.is_markdown() {
                             typing::backspace(doc.ctx())
+                                .expect("backspace over a selection always deletes it")
                         } else {
-                            Some(plain_insert(doc.ctx(), ""))
+                            plain_insert(doc.ctx(), "")
                         }
                     };
-                    if let Some(tx) = tx {
-                        self.apply(tx, true);
-                    }
+                    self.apply(tx, true);
                 }
                 let at = self.doc.borrow().primary_selection().head;
                 self.composition = Some(Composition {
@@ -428,14 +427,15 @@ impl EditorView {
         if probe_y < TOP_PAD {
             return 0;
         }
+        let end = self.doc.borrow().buffer().len();
         if probe_y >= total {
-            return self.doc.borrow().buffer().len();
+            return end;
         }
         let (left, _) = self.column();
         let scroll = self.cache.borrow().scroll_y;
         let point = Point::new(left + goal, self.bounds.y + probe_y - scroll);
-        self.hit_window(env, point)
-            .map_or_else(|| self.doc.borrow().buffer().len(), |hit| hit.offset)
+        // Only a point that rounds past the last block misses a layout.
+        self.hit_window(env, point).map_or(end, |hit| hit.offset)
     }
 
     /// Up/Down by one visual line, or by a page.
@@ -593,13 +593,11 @@ impl EditorView {
                 self.context_click(cx, env, pointer)
             }
             PointerEventKind::Move => self.pointer_move(cx, env, pointer),
-            PointerEventKind::Up
-                if pointer.button == Some(PointerButton::Left) && self.block_drag.is_some() =>
-            {
-                self.block_drag_up(cx, pointer)
-            }
             PointerEventKind::Up if pointer.button == Some(PointerButton::Left) => {
-                self.pointer_up(cx, env, pointer)
+                match self.block_drag.take() {
+                    Some(state) => self.block_drag_up(cx, state, pointer),
+                    None => self.pointer_up(cx, env, pointer),
+                }
             }
             PointerEventKind::Leave => {
                 if self.hovered_item.take().is_some() {
@@ -742,36 +740,27 @@ impl EditorView {
     }
 
     /// The pointer was released while a block drag was running: finish it and apply its edit.
-    fn block_drag_up(&mut self, cx: &mut EventCx, pointer: &PointerEvent) -> EventResult {
-        if let Some(state) = self.block_drag.take() {
-            cx.release_pointer();
-            let local = self.block_local(state.item, pointer.position);
-            if let Some(edit) = state.drag.finish(local) {
-                self.block_edit(edit);
-            }
+    fn block_drag_up(
+        &mut self,
+        cx: &mut EventCx,
+        state: BlockDragState,
+        pointer: &PointerEvent,
+    ) -> EventResult {
+        cx.release_pointer();
+        let local = self.block_local(state.item, pointer.position);
+        if let Some(edit) = state.drag.finish(local) {
+            self.block_edit(edit);
         }
         EventResult::handled()
     }
 
     fn gutter_click(&mut self, hit: &Hit, action: GutterAction) {
-        let (range, level) = {
-            let cache = self.cache.borrow();
-            let doc = self.doc.borrow();
-            let item = cache.items[hit.item];
-            let level = match item.kind {
-                ItemKind::Block(index) => match &doc.ast().blocks[index].kind {
-                    BlockKind::Heading { level, .. } => *level,
-                    _ => 1,
-                },
-                ItemKind::Gap { .. } => 1,
-            };
-            (item.range, level)
-        };
+        let range = self.cache.borrow().items[hit.item].range;
         match action {
             GutterAction::ToggleFold => self.events.push(EditorEvent::ToggleFold {
                 heading_start: range.start,
             }),
-            GutterAction::HeadingMenu => {
+            GutterAction::HeadingMenu { level } => {
                 let (left, _) = self.column();
                 let top = self.bounds.y + self.item_top(hit.item) - self.cache.borrow().scroll_y;
                 self.events.push(EditorEvent::HeadingMenu {
@@ -797,8 +786,10 @@ impl EditorView {
             cx.invalidate(self.bounds);
             return EventResult::handled();
         }
-        if self.text_drag.is_some() && cx.has_pointer_capture() {
-            return self.text_drag_move(cx, env, pointer);
+        if let Some(drag) = self.text_drag
+            && cx.has_pointer_capture()
+        {
+            return self.text_drag_move(cx, env, pointer, drag);
         }
         if let Some(drag) = self.drag
             && cx.has_pointer_capture()
@@ -897,10 +888,7 @@ impl EditorView {
 
     /// One auto-scroll step: scrolls by speed × elapsed clock time and extends the drag to the
     /// pointer's last position.
-    fn autoscroll_tick(&mut self, env: &Env<'_>) -> EventResult {
-        let Some(state) = self.autoscroll else {
-            return EventResult::ignored();
-        };
+    fn autoscroll_tick(&mut self, env: &Env<'_>, state: AutoScroll) -> EventResult {
         let now = self.clock.now();
         let elapsed = now.saturating_sub(state.last_tick).min(AUTOSCROLL_MAX_STEP);
         self.autoscroll = Some(AutoScroll {
@@ -913,7 +901,11 @@ impl EditorView {
         cache.scroll_y = (cache.scroll_y + speed * elapsed.as_secs_f32()).max(0.0);
         if let Some(drag) = self.drag {
             self.extend_drag(env, drag, state.pointer);
-        } else if let Some(drag) = self.text_drag.filter(|drag| drag.started) {
+        } else {
+            // The timer starts with a started text drag and stops with every drag.
+            let drag = self
+                .text_drag
+                .expect("an auto-scroll runs only while a drag does");
             self.retarget_text_drag(env, drag, state.pointer, drag.copy);
         }
         EventResult::handled()
@@ -988,10 +980,8 @@ impl EditorView {
         cx: &mut EventCx,
         env: &Env<'_>,
         pointer: &PointerEvent,
+        drag: TextDrag,
     ) -> EventResult {
-        let Some(drag) = self.text_drag else {
-            return EventResult::ignored();
-        };
         let (dx, dy) = (
             pointer.position.x - drag.press.x,
             pointer.position.y - drag.press.y,
@@ -1031,10 +1021,8 @@ impl EditorView {
         cx: &mut EventCx,
         env: &Env<'_>,
         pointer: &PointerEvent,
+        drag: TextDrag,
     ) -> EventResult {
-        let Some(drag) = self.text_drag.take() else {
-            return EventResult::ignored();
-        };
         self.drop_caret = None;
         self.stop_autoscroll(cx);
         cx.release_pointer();
@@ -1163,8 +1151,8 @@ impl EditorView {
         env: &Env<'_>,
         pointer: &PointerEvent,
     ) -> EventResult {
-        if self.text_drag.is_some() {
-            return self.finish_text_drag(cx, env, pointer);
+        if let Some(drag) = self.text_drag.take() {
+            return self.finish_text_drag(cx, env, pointer, drag);
         }
         if self.drag.take().is_none() {
             return EventResult::ignored();

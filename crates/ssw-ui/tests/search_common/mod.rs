@@ -12,7 +12,7 @@ use ssw_core::command::CommandId;
 use ssw_core::i18n::Localizer;
 use ssw_ui::access::{AccessNode, AccessTree};
 use ssw_ui::canvas::RecordingCanvas;
-use ssw_ui::geometry::{Point, Rect};
+use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{
     Event, KeyEvent, Modifiers, PointerButton, PointerEvent, PointerEventKind, TextInput,
 };
@@ -105,6 +105,20 @@ impl Host {
         self.focus.commit_tab_order();
     }
 
+    /// The size `widget` wants within `available`.
+    pub fn measure(&mut self, widget: &mut dyn Control, available: Size) -> Size {
+        let id = widget.id();
+        let mut cx = LayoutCx::new(
+            id,
+            &self.theme,
+            1.0,
+            &self.engine,
+            &mut self.focus,
+            &mut self.requests,
+        );
+        widget.measure(&mut cx, available)
+    }
+
     /// Gives keyboard focus to `id`, which must be in the tab order.
     pub fn focus_on(&mut self, id: WidgetId) {
         self.focus.focus(id);
@@ -152,6 +166,11 @@ impl Host {
     }
 
     pub fn paint(&self, widget: &dyn Control) -> RecordingCanvas {
+        self.paint_damaged(widget, None)
+    }
+
+    /// Paints while only `damage` is being repainted (`None`: the whole window).
+    pub fn paint_damaged(&self, widget: &dyn Control, damage: Option<Rect>) -> RecordingCanvas {
         let mut canvas = RecordingCanvas::new();
         let cx = PaintCx::new(
             widget.id(),
@@ -160,7 +179,7 @@ impl Host {
             &self.engine,
             &self.focus,
             &self.capture,
-            None,
+            damage,
         );
         widget.paint(&cx, &mut canvas);
         assert!(canvas.is_balanced(), "unbalanced canvas stack");

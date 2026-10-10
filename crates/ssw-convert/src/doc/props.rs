@@ -774,6 +774,18 @@ mod tests {
         };
         let runs = read_runs(Kind::Papx, &src, 0, table.len() as u32, &mut bad).unwrap();
         assert_eq!((runs[0].istd, runs[0].grpprl.len()), (0, 0));
+        // a BX offset of 0 means the paragraph stores no PAPX at all: style 0, no properties
+        let mut page = papx_page(&[(0, 4, 1, &sprm(PAP_PILVL, &[1]))]);
+        page[(1 + 1) * 4] = 0;
+        let (word, table, pieces) = fkp_fixture(&page);
+        let src = FkpSource {
+            word: &word,
+            table: &table,
+            data: &[],
+            pieces: &pieces,
+        };
+        let runs = read_runs(Kind::Papx, &src, 0, table.len() as u32, &mut bad).unwrap();
+        assert_eq!((runs.len(), runs[0].istd, runs[0].grpprl.len()), (1, 0, 0));
     }
 
     #[test]

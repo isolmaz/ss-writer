@@ -266,16 +266,17 @@ pub fn detect(bytes: &[u8], tld: Option<&str>) -> TextEncoding {
         // GB18030 decodes the same bytes but can also encode the four-byte forms.
         guess = GB18030;
     }
+    lossless_legacy(guess, bytes)
+}
+
+/// `guess` when it decodes `bytes` without errors and encodes the text back to the same bytes;
+/// otherwise (malformed input or a many-to-one code page) Windows-1252, which maps every byte,
+/// so decoding and re-encoding is lossless.
+fn lossless_legacy(guess: &'static Encoding, bytes: &[u8]) -> TextEncoding {
     let exact = guess
         .decode_without_bom_handling_and_without_replacement(bytes)
         .is_some_and(|text| guess.encode(&text).0.as_ref() == bytes);
-    if exact {
-        TextEncoding::Legacy(guess)
-    } else {
-        // The guess cannot reproduce the file byte for byte (malformed input or a many-to-one
-        // code page). Windows-1252 maps every byte, so decoding and re-encoding is lossless.
-        TextEncoding::Legacy(WINDOWS_1252)
-    }
+    TextEncoding::Legacy(if exact { guess } else { WINDOWS_1252 })
 }
 
 /// Detects the encoding and decodes `bytes` (BOM stripped, line endings normalized).
@@ -557,5 +558,52 @@ fn unmappable(encoding: &'static Encoding, text: &str) -> EncodeError {
         encoding: encoding.name(),
         total,
         first,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use encoding_rs::SHIFT_JIS;
+
+    use super::*;
+
+    #[test]
+    fn a_guess_is_kept_only_when_it_reproduces_the_bytes() {
+        // 日本語: valid Shift_JIS that encodes back to itself.
+        let exact = b"\x93\xFA\x96\x7B\x8C\xEA";
+        assert_eq!(
+            lossless_legacy(SHIFT_JIS, exact),
+            TextEncoding::Legacy(SHIFT_JIS)
+        );
+        // A dangling lead byte cannot be decoded without replacement.
+        let dangling = b"\x93\xFA\x93";
+        assert_eq!(
+            lossless_legacy(SHIFT_JIS, dangling),
+            TextEncoding::Legacy(WINDOWS_1252)
+        );
+        // NEC row 13 holds a second code for U+2229: it decodes without errors but is written
+        // back as the JIS X 0208 one.
+        let duplicate = b"\x87\x9B";
+        assert_eq!(
+            SHIFT_JIS
+                .decode_without_bom_handling_and_without_replacement(duplicate)
+                .as_deref(),
+            Some("\u{2229}")
+        );
+        assert_eq!(
+            lossless_legacy(SHIFT_JIS, duplicate),
+            TextEncoding::Legacy(WINDOWS_1252)
+        );
+        // GB18030 reads 0x80 as the euro sign but writes that as two bytes.
+        assert_eq!(
+            GB18030
+                .decode_without_bom_handling_and_without_replacement(b"\x80")
+                .as_deref(),
+            Some("\u{20AC}")
+        );
+        assert_eq!(
+            lossless_legacy(GB18030, b"\x80"),
+            TextEncoding::Legacy(WINDOWS_1252)
+        );
     }
 }

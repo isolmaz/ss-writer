@@ -164,8 +164,11 @@ impl fmt::Debug for BlockPaintCx<'_> {
 pub enum GutterAction {
     /// Fold or unfold the heading's section.
     ToggleFold,
-    /// Open the heading level menu.
-    HeadingMenu,
+    /// Open the level menu of a heading of this `level` (1-6).
+    HeadingMenu {
+        /// The level of the heading the badge belongs to.
+        level: u8,
+    },
 }
 
 /// A task checkbox reported by [`BlockLayout::task_box_at`].
@@ -561,15 +564,14 @@ impl BlockLayout for TextBlock {
     fn line_range(&self, offset: usize) -> TextRange {
         let map = &self.display.map;
         let display = self.display_offset(offset);
-        let Some(line) = self
-            .layout
+        // `line_for_offset` always names an existing line; the default is the empty line.
+        self.layout
             .line_metrics(self.layout.line_for_offset(display))
-        else {
-            return TextRange::at(offset);
-        };
-        let start = map.display_to_source(line.start);
-        let end = map.display_to_source(line.content_end());
-        TextRange::new(start, end.max(start))
+            .map_or(TextRange::at(offset), |line| {
+                let start = map.display_to_source(line.start);
+                let end = map.display_to_source(line.content_end());
+                TextRange::new(start, end.max(start))
+            })
     }
 
     fn link_at(&self, point: Point) -> Option<LinkTarget> {
@@ -584,7 +586,7 @@ impl BlockLayout for TextBlock {
     }
 
     fn gutter_hit(&self, point: Point) -> Option<GutterAction> {
-        let TextKind::Heading { badge, .. } = self.kind else {
+        let TextKind::Heading { level, badge, .. } = self.kind else {
             return None;
         };
         let first_line = self.first_line_height();
@@ -592,7 +594,7 @@ impl BlockLayout for TextBlock {
             return Some(GutterAction::ToggleFold);
         }
         (badge && badge_rect(self.size, self.origin.y, first_line).contains(point))
-            .then_some(GutterAction::HeadingMenu)
+            .then_some(GutterAction::HeadingMenu { level })
     }
 
     fn access_label(&self, strings: &EditorStrings) -> String {

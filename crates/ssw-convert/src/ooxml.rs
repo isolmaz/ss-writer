@@ -333,10 +333,11 @@ fn parse_tree(bytes: &[u8], lenient: bool) -> Result<(Element, bool), XmlError> 
                 let element = start_to_element(ns, &start, reader.resolver());
                 attach(&mut stack, &mut root, element)
             }
-            Event::End(_) => match stack.pop() {
-                Some(element) => attach(&mut stack, &mut root, element),
-                None => Err(XmlError::Malformed("unbalanced end tag".into())),
-            },
+            // quick-xml itself rejects an end tag without a matching open element, so the stack is
+            // never empty here
+            Event::End(_) => stack
+                .pop()
+                .map_or(Ok(()), |element| attach(&mut stack, &mut root, element)),
             Event::Text(text) => {
                 push_text(&mut stack, &text.xml10_content());
                 Ok(())
@@ -1000,8 +1001,14 @@ mod tests {
         assert!(!damaged);
         assert!(root.child(Ns::None, "b").is_some());
 
-        // A syntax error mid-document, an end tag without start and a second root all stop the parse.
-        for input in [&b"<a><b/><c></d>tail</a>"[..], b"<a/></a>", b"<a/><b/>"] {
+        // A syntax error mid-document, an end tag without start and a second root (closed or
+        // left open at the end of the input) all stop the parse.
+        for input in [
+            &b"<a><b/><c></d>tail</a>"[..],
+            b"<a/></a>",
+            b"<a/><b/>",
+            b"<a/><b>",
+        ] {
             let (root, damaged) = parse_xml_salvage(input).unwrap();
             assert!(damaged, "{}", String::from_utf8_lossy(input));
             assert_eq!(root.name, "a");
@@ -1429,5 +1436,45 @@ mod tests {
             Package::open(&bytes),
             Err(PackageError::TooLarge(_))
         ));
+    }
+
+    #[test]
+    fn declared_and_actual_sizes_are_both_limited() {
+        let mut w = PackageWriter::new();
+        w.add("a.txt", b"abc");
+        let bytes = w.finish().unwrap();
+
+        // a central directory entry that declares 2 GiB for the part
+        let mut declared = bytes.clone();
+        let entry = declared
+            .windows(4)
+            .rposition(|signature| signature == b"PK\x01\x02")
+            .unwrap();
+        declared[entry + 24..entry + 28].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        assert!(matches!(
+            Package::open(&declared),
+            Err(PackageError::TooLarge(_))
+        ));
+
+        // the length that is really decompressed counts, whatever the declared sizes say
+        let mut package = Package::open(&bytes).unwrap();
+        assert_eq!(package.read_part("a.txt").unwrap(), Some(b"abc".to_vec()));
+        package.read_total = MAX_TOTAL_UNCOMPRESSED - 2;
+        assert!(matches!(
+            package.read_part("a.txt"),
+            Err(PackageError::TooLarge(_))
+        ));
+        package.read_total = MAX_TOTAL_UNCOMPRESSED - 3;
+        assert_eq!(package.read_part("a.txt").unwrap(), Some(b"abc".to_vec()));
+        assert_eq!(package.read_total, MAX_TOTAL_UNCOMPRESSED);
+    }
+
+    #[test]
+    fn empty_cdata_and_invalid_character_references_add_no_text() {
+        let root = parse_xml(b"<a><![CDATA[]]></a>").unwrap();
+        assert!(root.children.is_empty());
+        // `&#0;` is not a legal character: the reference is dropped, the text around it stays
+        let root = parse_xml(b"<a>x&#0;y&amp;</a>").unwrap();
+        assert_eq!(root.text(), "xy&");
     }
 }

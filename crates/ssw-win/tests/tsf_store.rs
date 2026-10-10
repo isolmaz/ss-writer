@@ -24,21 +24,31 @@ use ssw_win::com::ComGuard;
 use ssw_win::dpi;
 use ssw_win::tsf::{TextServices, TextStore, TextStoreHost};
 use windows::Win32::Foundation::{
-    E_INVALIDARG, E_NOTIMPL, E_POINTER, E_UNEXPECTED, HWND, POINT, RECT,
+    CLASS_E_NOAGGREGATION, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_POINTER, E_UNEXPECTED, HWND, POINT,
+    RECT,
 };
 use windows::Win32::Graphics::Gdi::ClientToScreen;
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, CoCreateInstance, CoRegisterClassObject, CoRevokeClassObject,
+    CoTaskMemFree, IClassFactory, IClassFactory_Impl, REGCLS_MULTIPLEUSE,
+};
 use windows::Win32::System::Ole::{
     CONNECT_E_ADVISELIMIT, CONNECT_E_CANNOTCONNECT, CONNECT_E_NOCONNECTION,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::TextServices::{
-    GUID_PROP_ATTRIBUTE, GUID_PROP_INPUTSCOPE, INSERT_TEXT_AT_SELECTION_FLAGS, IS_DEFAULT,
-    ITextStoreACP2, ITextStoreACPSink, ITextStoreACPSink_Impl, ITfComposition, ITfCompositionSink,
+    CLSID_TF_CategoryMgr, CLSID_TF_DisplayAttributeMgr, GUID_PROP_ATTRIBUTE, GUID_PROP_INPUTSCOPE,
+    IEnumTfDisplayAttributeInfo, INSERT_TEXT_AT_SELECTION_FLAGS, IS_DEFAULT, ITextStoreACP2,
+    ITextStoreACPSink, ITextStoreACPSink_Impl, ITfCategoryMgr, ITfComposition, ITfCompositionSink,
     ITfCompositionSink_Impl, ITfCompositionView, ITfContext, ITfContextComposition,
-    ITfContextOwnerCompositionSink, ITfInputScope, ITfInsertAtSelection, ITfRange, ITfRangeACP,
-    InputScope, TEXT_STORE_LOCK_FLAGS, TEXT_STORE_TEXT_CHANGE_FLAGS, TF_AE_END, TF_ANCHOR_END,
-    TF_ANCHOR_START, TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
-    TF_SELECTION, TF_SELECTIONSTYLE, TS_AE_END, TS_AE_START, TS_AS_LAYOUT_CHANGE, TS_AS_SEL_CHANGE,
+    ITfContextOwnerCompositionSink, ITfDisplayAttributeInfo, ITfDisplayAttributeInfo_Impl,
+    ITfDisplayAttributeMgr, ITfDisplayAttributeMgr_Impl, ITfEditRecord, ITfInputScope,
+    ITfInsertAtSelection, ITfRange, ITfRangeACP, ITfTextEditSink, InputScope,
+    TEXT_STORE_LOCK_FLAGS, TEXT_STORE_TEXT_CHANGE_FLAGS, TF_AE_END, TF_ANCHOR_END, TF_ANCHOR_START,
+    TF_ATTR_CONVERTED, TF_ATTR_FIXEDCONVERTED, TF_ATTR_INPUT, TF_ATTR_INPUT_ERROR,
+    TF_ATTR_TARGET_CONVERTED, TF_ATTR_TARGET_NOTCONVERTED, TF_CONTEXT_EDIT_CONTEXT_FLAGS,
+    TF_DA_ATTR_INFO, TF_DISPLAYATTRIBUTE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_SELECTION,
+    TF_SELECTIONSTYLE, TS_AE_END, TS_AE_START, TS_AS_LAYOUT_CHANGE, TS_AS_SEL_CHANGE,
     TS_AS_STATUS_CHANGE, TS_AS_TEXT_CHANGE, TS_ATTR_FIND_WANT_VALUE, TS_ATTRVAL,
     TS_DEFAULT_SELECTION, TS_E_INVALIDPOINT, TS_E_INVALIDPOS, TS_E_NOLAYOUT, TS_E_NOLOCK,
     TS_E_NOSELECTION, TS_E_READONLY, TS_E_SYNCHRONOUS, TS_IAS_QUERYONLY, TS_LF_READ,
@@ -49,7 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW,
     TranslateMessage, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
-use windows::core::{BOOL, BSTR, GUID, HRESULT, IUnknown, Interface, Ref, implement, w};
+use windows::core::{BOOL, BSTR, GUID, HRESULT, IUnknown, Interface, OutRef, Ref, implement, w};
 
 /// A COM call on a live interface owned by the test, with arguments that outlive the call.
 macro_rules! com {
@@ -1790,12 +1800,18 @@ impl Tip {
 
     /// Starts a composition over the ACP range `acp` and sets its text.
     fn start(&self, t: &Tsf, acp: (i32, i32), text: &str) {
+        self.start_styled(t, acp, text, &[]);
+    }
+
+    /// [`Tip::start`], and gives unit `i` of the string the display attribute whose GUID atom
+    /// is `atoms[i]` (`GUID_PROP_ATTRIBUTE`), all in the one edit session.
+    fn start_styled(&self, t: &Tsf, acp: (i32, i32), text: &str, atoms: &[u32]) {
         let (context, terminated, held) = (
             t.context(),
             self.terminated.clone(),
             self.composition.clone(),
         );
-        let text = units(text);
+        let (text, atoms) = (units(text), atoms.to_vec());
         let hr = t.session(TF_ES_READWRITE, move |ec| {
             let range = com!(context.GetStart(ec))?;
             let mut moved = 0i32;
@@ -1805,6 +1821,19 @@ impl Tip {
             let owner: ITfContextComposition = context.cast()?;
             let started = com!(owner.StartComposition(ec, &range, &sink))?;
             com!(range.SetText(ec, 0, &text))?;
+            if !atoms.is_empty() {
+                let property = com!(context.GetProperty(&GUID_PROP_ATTRIBUTE))?;
+                for (index, atom) in atoms.iter().enumerate() {
+                    // The one-unit range at `index` of the composition string.
+                    let unit = com!(range.Clone())?;
+                    let index = i32::try_from(index).expect("a short composition");
+                    com!(unit.Collapse(ec, TF_ANCHOR_START))?;
+                    com!(unit.ShiftEnd(ec, index + 1, &mut moved, std::ptr::null()))?;
+                    com!(unit.ShiftStart(ec, index, &mut moved, std::ptr::null()))?;
+                    let value = VARIANT::from(i32::try_from(*atom).expect("a small atom"));
+                    com!(property.SetValue(ec, &unit, &value))?;
+                }
+            }
             *held.borrow_mut() = Some(started);
             Ok(())
         });
@@ -2139,4 +2168,433 @@ fn tsf_teardown_and_recreation_on_one_thread_work() {
     }
     drop(window);
     drop(com);
+}
+
+#[test]
+fn tsf_activation_on_a_thread_without_com_fails_with_the_failed_call() {
+    let outcome = std::thread::spawn(|| {
+        let host = TestHost::new("abc");
+        TextServices::new(HWND::default(), host)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    })
+    .join()
+    .expect("the thread finishes");
+    let message = outcome.expect_err("TSF cannot activate without COM");
+    assert!(
+        message.starts_with("CoCreateInstance(TF_ThreadMgr) failed"),
+        "{message}"
+    );
+}
+
+#[test]
+fn tsf_debug_output_names_the_client_and_the_store() {
+    let t = Tsf::new("ab");
+    let text = format!("{:?}", t.services);
+    assert!(text.starts_with("TextServices { client_id: "), "{text}");
+    assert!(
+        text.ends_with(", store: TextStore { composing: false, .. }, .. }"),
+        "{text}"
+    );
+}
+
+// ---- edges of the COM shell --------------------------------------------------------------------
+
+#[test]
+fn direct_the_debug_output_reports_whether_a_composition_is_active() {
+    let d = Direct::new("ab");
+    assert_eq!(
+        format!("{:?}", d.store),
+        "TextStore { composing: false, .. }"
+    );
+    assert!(
+        com!(
+            d.composition_sink()
+                .OnStartComposition(None::<&ITfCompositionView>)
+        )
+        .expect("start")
+        .as_bool()
+    );
+    assert_eq!(
+        format!("{:?}", d.store),
+        "TextStore { composing: true, .. }"
+    );
+}
+
+#[test]
+fn direct_an_empty_replacement_deletes_and_empty_or_null_arguments_are_handled() {
+    let d = Direct::new("abcd");
+    let (p, log) = (d.proxy.clone(), d.log.clone());
+    d.locked_ok(RW_SYNC, move |_| {
+        let mut log = log.borrow_mut();
+        // An empty replacement text deletes the range.
+        log.push(format!(
+            "delete {:?}",
+            p.set_text(1, 3, "")
+                .map(|c| (c.acpStart, c.acpOldEnd, c.acpNewEnd))
+        ));
+        log.push(format!("text {:?}", p.text(0, -1, 16).map(|t| t.0).ok()));
+        // No selection at all is not one selection.
+        log.push(format!("none {:x}", code(com!(p.0.SetSelection(&[]))).0));
+        // The wrapper takes slices; a count with a null array needs the raw vtable.
+        let hr = com!((Interface::vtable(&p.0).SetSelection)(
+            Interface::as_raw(&p.0),
+            1,
+            std::ptr::null()
+        ));
+        log.push(format!("null array {:x}", hr.0));
+        // No place for the count of fetched selections.
+        let mut selection = [TS_SELECTION_ACP::default(); 1];
+        log.push(format!(
+            "null fetched {:x}",
+            code(com!(p.0.GetSelection(
+                TS_DEFAULT_SELECTION,
+                &mut selection,
+                std::ptr::null_mut()
+            )))
+            .0
+        ));
+    });
+    assert_eq!(
+        d.logged(),
+        vec![
+            "delete Ok((1, 3, 1))".to_owned(),
+            "text Some(\"ad\")".to_owned(),
+            format!("none {:x}", E_INVALIDARG.0),
+            format!("null array {:x}", E_POINTER.0),
+            format!("null fetched {:x}", E_POINTER.0),
+        ]
+    );
+    assert_eq!(d.host.doc(), "ad");
+    // Neither the attribute request nor the point query accept null out parameters.
+    let mut values = [TS_ATTRVAL::default()];
+    assert_eq!(
+        code(com!(
+            d.proxy
+                .0
+                .RetrieveRequestedAttrs(&mut values, std::ptr::null_mut())
+        )),
+        E_POINTER
+    );
+    assert_eq!(
+        code(com!(d.proxy.0.GetACPFromPoint(0, std::ptr::null(), 0))),
+        E_INVALIDARG
+    );
+}
+
+#[test]
+fn direct_the_input_scope_rejects_null_out_pointers() {
+    let d = Direct::new("abc");
+    com!(d.proxy.0.RequestSupportedAttrs(0, &[])).expect("request");
+    let mut values = [TS_ATTRVAL::default()];
+    let mut fetched = 0u32;
+    com!(d.proxy.0.RetrieveRequestedAttrs(&mut values, &mut fetched)).expect("Retrieve");
+    assert_eq!(fetched, 1);
+    let unknown = IUnknown::try_from(&values[0].varValue).expect("VT_UNKNOWN");
+    let scope: ITfInputScope = unknown.cast().expect("ITfInputScope");
+    let mut array: *mut InputScope = std::ptr::null_mut();
+    let mut count = 7u32;
+    assert_eq!(
+        code(com!(scope.GetInputScopes(std::ptr::null_mut(), &mut count))),
+        E_POINTER
+    );
+    assert_eq!(
+        code(com!(scope.GetInputScopes(&mut array, std::ptr::null_mut()))),
+        E_POINTER
+    );
+    assert!(array.is_null());
+    assert_eq!(count, 7);
+}
+
+#[test]
+fn direct_a_backward_composition_selection_is_a_reversed_host_selection_after_the_commit() {
+    let d = Direct::new("abcd");
+    d.host.move_caret(Selection::caret(2));
+    let sink = d.composition_sink();
+    assert!(
+        com!(sink.OnStartComposition(None::<&ITfCompositionView>))
+            .expect("start")
+            .as_bool()
+    );
+    let (p, log) = (d.proxy.clone(), d.log.clone());
+    d.locked_ok(RW_SYNC, move |_| {
+        let mut log = log.borrow_mut();
+        log.push(format!("set {:?}", p.set_text(2, 2, "かな").is_ok()));
+        // "な" backward: TSF's caret is at its start.
+        log.push(format!("select {:?}", p.set_selection(3, 4, true).is_ok()));
+    });
+    assert_eq!(
+        d.logged(),
+        vec!["set true".to_owned(), "select true".to_owned()]
+    );
+    com!(sink.OnEndComposition(None::<&ITfCompositionView>)).expect("end");
+    assert_eq!(d.host.doc(), "abかなcd");
+    // ACPs 3..4 are the bytes 5..8 of the committed text; the head is at the start.
+    assert_eq!(d.host.selection_now(), Selection::new(8, 5));
+}
+
+#[test]
+fn tsf_end_edit_without_a_context_or_with_a_bad_cookie_leaves_the_composition_alone() {
+    let t = Tsf::new("ab");
+    let tip = Tip::new();
+    t.host.move_caret(Selection::caret(1));
+    tip.start(&t, (1, 1), "k");
+    let before = t.host.events_now();
+    let sink: ITfTextEditSink = t
+        .services
+        .store()
+        .interface()
+        .cast()
+        .expect("the store is a text edit sink");
+    // No context: there is nothing to read the display attributes from.
+    com!(sink.OnEndEdit(None::<&ITfContext>, 0, None::<&ITfEditRecord>)).expect("ignored");
+    // A context but the cookie of no edit: reading fails and the composition stays as it was.
+    com!(sink.OnEndEdit(&t.context(), 0, None::<&ITfEditRecord>)).expect("ignored");
+    assert!(t.services.store().is_composing());
+    assert_eq!(t.host.events_now(), before);
+    // Without a composition the call returns before it touches TSF.
+    tip.end(&t);
+    com!(sink.OnEndEdit(&t.context(), 0, None::<&ITfEditRecord>)).expect("ignored");
+    assert_eq!(t.host.doc(), "akb");
+}
+
+// ---- display attributes through fake system managers -------------------------------------------
+
+/// The display attribute of each GUID a fake `ITfDisplayAttributeMgr` knows.
+type Attributes = Rc<Vec<(GUID, TF_DA_ATTR_INFO)>>;
+
+/// The `ITfDisplayAttributeInfo` of one GUID.
+#[implement(ITfDisplayAttributeInfo)]
+struct FakeAttributeInfo {
+    guid: GUID,
+    attribute: TF_DA_ATTR_INFO,
+}
+
+#[allow(non_snake_case)]
+impl ITfDisplayAttributeInfo_Impl for FakeAttributeInfo_Impl {
+    fn GetGUID(&self) -> windows::core::Result<GUID> {
+        Ok(self.guid)
+    }
+
+    fn GetDescription(&self) -> windows::core::Result<BSTR> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn GetAttributeInfo(&self, pda: *mut TF_DISPLAYATTRIBUTE) -> windows::core::Result<()> {
+        let info = TF_DISPLAYATTRIBUTE {
+            bAttr: self.attribute,
+            ..TF_DISPLAYATTRIBUTE::default()
+        };
+        // SAFETY: the caller passes a valid out pointer.
+        unsafe { pda.write(info) };
+        Ok(())
+    }
+
+    fn SetAttributeInfo(&self, _pda: *const TF_DISPLAYATTRIBUTE) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn Reset(&self) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+/// An `ITfDisplayAttributeMgr` that knows exactly the GUIDs of its table.
+#[implement(ITfDisplayAttributeMgr)]
+struct FakeDisplayMgr {
+    attributes: Attributes,
+}
+
+#[allow(non_snake_case)]
+impl ITfDisplayAttributeMgr_Impl for FakeDisplayMgr_Impl {
+    fn OnUpdateInfo(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn EnumDisplayAttributeInfo(&self) -> windows::core::Result<IEnumTfDisplayAttributeInfo> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn GetDisplayAttributeInfo(
+        &self,
+        guid: *const GUID,
+        ppinfo: OutRef<ITfDisplayAttributeInfo>,
+        pclsidowner: *mut GUID,
+    ) -> windows::core::Result<()> {
+        // SAFETY: the caller passes a valid GUID.
+        let guid = unsafe { *guid };
+        let attribute = self
+            .attributes
+            .iter()
+            .find(|(known, _)| *known == guid)
+            .map(|(_, attribute)| *attribute)
+            .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
+        if !pclsidowner.is_null() {
+            // SAFETY: a non-null owner pointer is valid for one write.
+            unsafe { pclsidowner.write(GUID::zeroed()) };
+        }
+        ppinfo.write(Some(FakeAttributeInfo { guid, attribute }.into()))
+    }
+}
+
+/// The class object of a fake system manager: creates a [`FakeDisplayMgr`], or fails when it
+/// has no table.
+#[implement(IClassFactory)]
+struct FakeFactory {
+    attributes: Option<Attributes>,
+}
+
+#[allow(non_snake_case)]
+impl IClassFactory_Impl for FakeFactory_Impl {
+    fn CreateInstance(
+        &self,
+        punkouter: Ref<IUnknown>,
+        riid: *const GUID,
+        ppvobject: *mut *mut c_void,
+    ) -> windows::core::Result<()> {
+        if !punkouter.is_null() {
+            return Err(CLASS_E_NOAGGREGATION.into());
+        }
+        let Some(attributes) = &self.attributes else {
+            return Err(E_FAIL.into());
+        };
+        let manager: IUnknown = FakeDisplayMgr {
+            attributes: attributes.clone(),
+        }
+        .into();
+        // SAFETY: COM passes a valid IID and out pointer.
+        unsafe { manager.query(riid, ppvobject) }.ok()
+    }
+
+    fn LockServer(&self, _lock: BOOL) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+/// A fake class object registered in this process for `clsid`, so that
+/// `CoCreateInstance(clsid, CLSCTX_INPROC_SERVER)` on this apartment creates the fake instead of
+/// the system object. Nothing is written to the registry; it is revoked on drop.
+struct RegisteredClass(u32);
+
+impl RegisteredClass {
+    fn new(clsid: GUID, attributes: Option<Attributes>) -> Self {
+        let factory: IClassFactory = FakeFactory { attributes }.into();
+        let unknown: IUnknown = factory.cast().expect("the factory is an IUnknown");
+        let cookie = com!(CoRegisterClassObject(
+            &clsid,
+            &unknown,
+            CLSCTX_INPROC_SERVER,
+            REGCLS_MULTIPLEUSE
+        ))
+        .expect("the class object is registered");
+        Self(cookie)
+    }
+}
+
+impl Drop for RegisteredClass {
+    fn drop(&mut self) {
+        let _ = com!(CoRevokeClassObject(self.0));
+    }
+}
+
+/// The attribute runs of the last `ImeEvent::Update` the host received.
+fn last_attributes(events: &[ImeEvent]) -> Vec<(Range<usize>, ImeAttrStyle)> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ImeEvent::Update { attrs, .. } => Some(
+                attrs
+                    .iter()
+                    .map(|attr| (attr.range.clone(), attr.style))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .expect("the host received a composition update")
+}
+
+#[test]
+fn tsf_display_attributes_of_the_text_service_reach_the_host_as_styled_runs() {
+    let t = Tsf::new("");
+    let known = [
+        (
+            GUID::from_u128(0x7a1c0001_5e5b_4f0c_9d3e_000000000001),
+            TF_ATTR_TARGET_CONVERTED,
+        ),
+        (
+            GUID::from_u128(0x7a1c0001_5e5b_4f0c_9d3e_000000000002),
+            TF_ATTR_CONVERTED,
+        ),
+        (
+            GUID::from_u128(0x7a1c0001_5e5b_4f0c_9d3e_000000000003),
+            TF_ATTR_TARGET_NOTCONVERTED,
+        ),
+        (
+            GUID::from_u128(0x7a1c0001_5e5b_4f0c_9d3e_000000000004),
+            TF_ATTR_INPUT_ERROR,
+        ),
+        (
+            GUID::from_u128(0x7a1c0001_5e5b_4f0c_9d3e_000000000005),
+            TF_ATTR_FIXEDCONVERTED,
+        ),
+        (
+            GUID::from_u128(0x7a1c0001_5e5b_4f0c_9d3e_000000000006),
+            TF_ATTR_INPUT,
+        ),
+    ];
+    // A GUID the manager does not know: its run carries no style.
+    let unknown = GUID::from_u128(0x7a1c0001_5e5b_4f0c_9d3e_000000000007);
+    let _manager =
+        RegisteredClass::new(CLSID_TF_DisplayAttributeMgr, Some(Rc::new(known.to_vec())));
+    let categories: ITfCategoryMgr = com!(CoCreateInstance(
+        &CLSID_TF_CategoryMgr,
+        None::<&IUnknown>,
+        CLSCTX_INPROC_SERVER
+    ))
+    .expect("the category manager");
+    let atoms: Vec<u32> = known
+        .iter()
+        .map(|(guid, _)| *guid)
+        .chain([unknown])
+        .map(|guid| com!(categories.RegisterGUID(&guid)).expect("a GUID atom"))
+        .collect();
+    let tip = Tip::new();
+    tip.start_styled(&t, (0, 0), "abcdefg", &atoms);
+    assert_eq!(
+        last_attributes(&t.host.events_now()),
+        vec![
+            (0..1, ImeAttrStyle::TargetConverted),
+            (1..2, ImeAttrStyle::Converted),
+            (2..3, ImeAttrStyle::TargetNotConverted),
+            (3..4, ImeAttrStyle::InputError),
+            (4..5, ImeAttrStyle::FixedConverted),
+            (5..6, ImeAttrStyle::Input),
+            // The unknown attribute leaves the last unit at the default.
+            (6..7, ImeAttrStyle::Input),
+        ]
+    );
+    assert_eq!(t.host.overlay_now(), Some("abcdefg".to_owned()));
+    tip.end(&t);
+    assert_eq!(t.host.doc(), "abcdefg");
+}
+
+#[test]
+fn tsf_attribute_managers_that_cannot_be_created_leave_the_default_attributes() {
+    // One initialization around both rounds: the rounds' own guards then only nest.
+    let _com = ComGuard::apartment_threaded().expect("COM initializes");
+    for failing in [CLSID_TF_CategoryMgr, CLSID_TF_DisplayAttributeMgr] {
+        let t = Tsf::new("ab");
+        let _manager = RegisteredClass::new(failing, None);
+        let tip = Tip::new();
+        t.host.move_caret(Selection::caret(1));
+        tip.start(&t, (1, 1), "か");
+        assert_eq!(
+            last_attributes(&t.host.events_now()),
+            vec![(0..3, ImeAttrStyle::Input)]
+        );
+        assert_eq!(t.host.overlay_now(), Some("か".to_owned()));
+        tip.end(&t);
+        assert_eq!(t.host.doc(), "aかb");
+    }
 }

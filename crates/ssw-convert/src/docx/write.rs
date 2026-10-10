@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use ssw_core::markdown::ast::{
-    Alignment, Block, BlockKind, CalloutKind, HighlightColor, Inline, InlineKind,
+    Alignment, Block, BlockKind, CalloutKind, HighlightColor, Inline, InlineKind, Table, Task,
 };
 use ssw_core::markdown::definitions::normalize_label;
 use ssw_core::markdown::{parse_document, unescape_markdown};
@@ -192,6 +192,14 @@ fn block_text(src: &str, block: &Block) -> String {
     out
 }
 
+/// The task checkbox of a list item; `None` for plain items and for blocks that are not items.
+pub(crate) fn item_task(item: &Block) -> Option<Task> {
+    match item.kind {
+        BlockKind::ListItem { task, .. } => task,
+        _ => None,
+    }
+}
+
 impl<'a, 'r> Writer<'a, 'r> {
     fn new(src: &'a str, options: &'a ExportOptions, resources: &'a mut Resources<'r>) -> Self {
         let (width, _) = options.page.twips();
@@ -353,9 +361,9 @@ impl<'a, 'r> Writer<'a, 'r> {
     }
 
     fn footnote_ref(&mut self, label: &str) -> String {
-        let Some(&definition) = self.footnote_defs.get(&normalize_label(label)) else {
-            return self.text_run(&RunFmt::default(), &format!("[^{label}]"));
-        };
+        // the parser only produces a `FootnoteRef` for a label that has a definition, and
+        // `export_docx` registers every definition block up front
+        let definition = self.footnote_defs[&normalize_label(label)];
         let id = self.footnotes.len() + 1;
         let mut paragraphs = String::new();
         let mut first = true;
@@ -533,17 +541,14 @@ impl<'a, 'r> Writer<'a, 'r> {
         match &block.kind {
             BlockKind::Heading { level, .. } => {
                 let inner = self.inlines(&block.inlines, &RunFmt::default());
-                let inner = match self.heading_bookmarks.get(&block.range.start).cloned() {
-                    Some(name) => {
-                        let id = self.bookmark_id;
-                        self.bookmark_id += 1;
-                        format!(
-                            r#"<w:bookmarkStart w:id="{id}" w:name="{}"/>{inner}<w:bookmarkEnd w:id="{id}"/>"#,
-                            escape_xml(&name)
-                        )
-                    }
-                    None => inner,
-                };
+                // `export_docx` registers a bookmark for every heading before any block is written
+                let name = self.heading_bookmarks[&block.range.start].clone();
+                let id = self.bookmark_id;
+                self.bookmark_id += 1;
+                let inner = format!(
+                    r#"<w:bookmarkStart w:id="{id}" w:name="{}"/>{inner}<w:bookmarkEnd w:id="{id}"/>"#,
+                    escape_xml(&name)
+                );
                 self.paragraph_xml(Some(&format!("Heading{level}")), "", &inner);
             }
             BlockKind::Paragraph => {
@@ -558,8 +563,7 @@ impl<'a, 'r> Writer<'a, 'r> {
                     self.paragraph_xml(None, "", &inner);
                 }
             }
-            BlockKind::List { .. } => self.list(block, ctx),
-            BlockKind::ListItem { .. } => self.blocks(&block.children, ctx),
+            BlockKind::List { ordered, start, .. } => self.list(block, *ordered, *start, ctx),
             BlockKind::BlockQuote => {
                 let inner = Ctx { quote: ctx.quote + 1, ..ctx };
                 self.blocks(&block.children, inner);
@@ -584,7 +588,7 @@ impl<'a, 'r> Writer<'a, 'r> {
                 let run = self.math_run(&tex, true);
                 self.paragraph_xml(None, r#"<w:jc w:val="center"/>"#, &run);
             }
-            BlockKind::Table(_) => self.table(block),
+            BlockKind::Table(table) => self.table(table),
             BlockKind::ThematicBreak => self.paragraph_xml(
                 None,
                 r#"<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="808080"/></w:pBdr>"#,
@@ -605,7 +609,9 @@ impl<'a, 'r> Writer<'a, 'r> {
                     self.paragraph_xml(None, "", &inner);
                 }
             }
-            BlockKind::FrontMatter { .. }
+            // list items are written by `list`; the rest is not part of the page
+            BlockKind::ListItem { .. }
+            | BlockKind::FrontMatter { .. }
             | BlockKind::FootnoteDefinition { .. }
             | BlockKind::LinkReferenceDefinition(_) => {}
         }
@@ -618,23 +624,18 @@ impl<'a, 'r> Writer<'a, 'r> {
         }
     }
 
-    fn list(&mut self, block: &'a Block, ctx: Ctx) {
-        let BlockKind::List { ordered, start, .. } = &block.kind else {
-            return;
-        };
+    fn list(&mut self, block: &'a Block, ordered: bool, start: u32, ctx: Ctx) {
         let level = if ctx.in_list {
             (ctx.level + 1).min(8)
         } else {
             0
         };
         let instance = ordered.then(|| {
-            self.ordered.push((*start, level));
+            self.ordered.push((start, level));
             u32::try_from(self.ordered.len() - 1).unwrap_or(u32::MAX)
         });
         for item in &block.children {
-            let BlockKind::ListItem { task, .. } = &item.kind else {
-                continue;
-            };
+            let task = item_task(item);
             let num_id = match (instance, task) {
                 (_, Some(t)) if t.checked => 4,
                 (_, Some(_)) => 3,
@@ -666,10 +667,7 @@ impl<'a, 'r> Writer<'a, 'r> {
         }
     }
 
-    fn table(&mut self, block: &Block) {
-        let BlockKind::Table(table) = &block.kind else {
-            return;
-        };
+    fn table(&mut self, table: &Table) {
         let columns = table.header.cells.len().max(1);
         let (page_width, _) = self.options.page.twips();
         let total = page_width.saturating_sub(self.options.margin_twips.saturating_mul(2));
@@ -1326,6 +1324,73 @@ mod tests {
         assert_eq!(
             targets,
             ["word/document.xml", "docProps/core.xml", "docProps/app.xml"]
+        );
+    }
+
+    #[test]
+    fn plain_text_of_inlines_skips_images_and_footnote_references() {
+        let src = "a \\* &amp; `c` $x$ [[Page]] ![i](pic.png) j[^1] *k*\nl\\\nm\n\n[^1]: note\n";
+        let document = parse_document(src);
+        let mut text = String::new();
+        inline_text(src, &document.blocks[0].inlines, &mut text);
+        assert_eq!(text, "a * & c x Page  j k l m");
+    }
+
+    #[test]
+    fn block_text_joins_nested_blocks_with_spaces() {
+        let src = "- one\n- two\n";
+        let document = parse_document(src);
+        assert_eq!(block_text(src, &document.blocks[0]), "one two");
+    }
+
+    #[test]
+    fn list_items_report_only_their_own_task_state() {
+        let document = parse_document("- [x] a\n- [ ] b\n- c\n\ntext\n");
+        let items = &document.blocks[0].children;
+        assert_eq!(item_task(&items[0]).map(|t| t.checked), Some(true));
+        assert_eq!(item_task(&items[1]).map(|t| t.checked), Some(false));
+        assert_eq!(item_task(&items[2]), None);
+        assert_eq!(item_task(&document.blocks[1]), None);
+    }
+
+    #[test]
+    fn footnotes_with_lists_and_without_content() {
+        let bytes = export("x[^1] y[^2]\n\n[^1]: first\n\n    - one\n    - two\n\n[^2]:\n");
+        let notes = part(&bytes, "word/footnotes.xml");
+        let real: Vec<&Element> = notes
+            .elements()
+            .filter(|n| n.attr_ns(Ns::W, "type").is_none())
+            .collect();
+        assert_eq!(real.len(), 2);
+        // a list inside a note is flattened to its text
+        assert_eq!(real[0].descendants(Ns::W, "p").len(), 2);
+        assert!(real[0].text().contains("one two"), "{}", real[0].text());
+        // an empty note keeps its reference mark
+        assert_eq!(real[1].descendants(Ns::W, "p").len(), 1);
+        assert_eq!(real[1].descendants(Ns::W, "footnoteRef").len(), 1);
+        assert_eq!(real[1].text().trim(), "");
+    }
+
+    #[test]
+    fn escapes_html_images_and_list_items_that_start_with_a_block() {
+        assert_eq!(doc("a \\* b &amp; c\n").text(), "a * b & c");
+
+        // a lone <img> tag with only a height keeps the aspect ratio of the 20x10 picture
+        let document = doc("<img src=\"pic.png\" height=\"30\">\n");
+        let extents: Vec<(&str, &str)> = document
+            .descendants(Ns::Wp, "extent")
+            .iter()
+            .map(|e| (e.attr("cx").unwrap(), e.attr("cy").unwrap()))
+            .collect();
+        assert_eq!(extents, [("571500", "285750")]);
+
+        // a list item that opens with a code block still gets its numbered paragraph first
+        let document = doc("- ```\n  code\n  ```\n");
+        let styles: Vec<Option<&str>> = paragraphs(&document).iter().map(|p| style_of(p)).collect();
+        assert_eq!(styles, [Some("ListParagraph"), Some("CodeBlock")]);
+        assert_eq!(
+            paragraphs(&document)[0].descendants(Ns::W, "numPr").len(),
+            1
         );
     }
 }

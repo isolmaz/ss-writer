@@ -621,11 +621,8 @@ mod tests {
 
     fn localizer() -> Localizer {
         let localizer = Localizer::new("en", &[("en", SHELL_FTL)]);
-        assert!(
-            localizer.diagnostics().is_empty(),
-            "{:?}",
-            localizer.diagnostics()
-        );
+        let diagnostics = localizer.diagnostics();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         localizer
     }
 
@@ -1008,6 +1005,25 @@ mod tests {
             vec![HostEvent::Dismissed(BannerKind::Update), HostEvent::Resized]
         );
         assert!(host.kinds().is_empty());
+    }
+
+    #[test]
+    fn a_custom_id_names_the_host_in_the_access_tree() {
+        let id = WidgetId::allocate();
+        let host = BannerHost::new(BannerStrings::from_localizer(&localizer())).with_id(id);
+        assert_eq!(host.id(), id);
+        assert_eq!(Harness::new().node(&host).id, id);
+    }
+
+    #[test]
+    fn painting_outside_the_damaged_area_draws_nothing() {
+        let (mut harness, mut host) = host();
+        host.show_read_only();
+        layout(&mut harness, &mut host);
+        let away = Rect::new(0.0, 400.0, 800.0, 100.0);
+        assert_eq!(harness.paint_damaged(&host, Some(away)).ops().count(), 0);
+        let over = host.bounds();
+        assert!(harness.paint_damaged(&host, Some(over)).ops().count() > 0);
     }
 
     #[test]

@@ -1,9 +1,15 @@
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ssw_io::fs::FsError;
+use ssw_io::fs::{Attributes, FileSystem, FsError, RealFs};
 use ssw_io::logging::{Level, LogOptions, Logger, format_timestamp};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::{
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
+};
+use windows::Win32::System::IO::OVERLAPPED;
 
 const MB: u64 = 1024 * 1024;
 
@@ -395,4 +401,121 @@ fn a_single_kept_file_starts_over_in_place_without_losing_records() {
         assert!(numbers.windows(2).all(|pair| pair[1] == pair[0] + 1));
         assert!(numbers[0] > 0, "older records were dropped");
     }
+}
+
+/// Locks the first `len` bytes of `file` against every other handle: reads and writes through
+/// them fail with `ERROR_LOCK_VIOLATION` until [`unlock_range`].
+fn lock_range(file: &std::fs::File, len: u32) {
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: the handle belongs to `file`, which outlives the call; `overlapped` is a valid
+    // `OVERLAPPED` (offset 0) of this synchronous call.
+    unsafe {
+        LockFileEx(
+            HANDLE(file.as_raw_handle()),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            None,
+            len,
+            0,
+            &mut overlapped,
+        )
+    }
+    .unwrap();
+}
+
+/// Releases the lock [`lock_range`] took, immediately (closing the handle would release it
+/// at a time the system chooses).
+fn unlock_range(file: &std::fs::File, len: u32) {
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: as in `lock_range`.
+    unsafe { UnlockFileEx(HANDLE(file.as_raw_handle()), None, len, 0, &mut overlapped) }.unwrap();
+}
+
+#[test]
+fn a_record_that_cannot_be_written_is_dropped_and_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = LogOptions {
+        max_bytes: 60,
+        files: 2,
+        level: Level::Info,
+    };
+    let logger = Logger::new(dir.path(), options).unwrap();
+    let path = dir.path().join("ssw.log");
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    lock_range(&holder, 4096);
+    logger.log(Level::Info, "t", "lost");
+    assert_eq!(size(&path), 0, "the locked file took nothing");
+    unlock_range(&holder, 4096);
+    logger.log(Level::Info, "t", "kept");
+    // Two records do not fit the limit: had the lost one been counted, this record would have
+    // started a new file.
+    assert_eq!(file_names(dir.path()), ["ssw.log"]);
+    let lines = read_lines(&path);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].ends_with("t: kept"), "{lines:?}");
+}
+
+#[test]
+fn a_log_that_cannot_start_over_keeps_every_record_until_it_can() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = LogOptions {
+        max_bytes: 200,
+        files: 1,
+        level: Level::Info,
+    };
+    let logger = Logger::new(dir.path(), options).unwrap();
+    let path = dir.path().join("ssw.log");
+    logger.log(Level::Info, "t", "record 00");
+    // Starting over opens a second write handle, which a read-only file refuses; the open
+    // handle goes on appending.
+    RealFs
+        .set_attributes(&path, Attributes(Attributes::READONLY))
+        .unwrap();
+    for sequence in 1..20 {
+        logger.log(Level::Info, "t", &format!("record {sequence:02}"));
+    }
+    assert_eq!(read_lines(&path).len(), 20, "no record was lost");
+    assert!(size(&path) > 200);
+
+    RealFs.set_attributes(&path, Attributes(0)).unwrap();
+    logger.log(Level::Info, "t", "record 20");
+    let lines = read_lines(&path);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].ends_with("record 20"));
+}
+
+#[test]
+fn a_log_that_cannot_be_rotated_keeps_writing_to_its_open_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = LogOptions {
+        max_bytes: 200,
+        files: 2,
+        level: Level::Info,
+    };
+    let logger = Logger::new(dir.path(), options).unwrap();
+    let path = dir.path().join("ssw.log");
+    let older = dir.path().join("ssw.1.log");
+    // A folder in the way: the current file can be neither renamed onto it nor removed over
+    // it, and the read-only file cannot be opened again for appending.
+    std::fs::create_dir(&older).unwrap();
+    logger.log(Level::Info, "t", "record 00");
+    RealFs
+        .set_attributes(&path, Attributes(Attributes::READONLY))
+        .unwrap();
+    for sequence in 1..20 {
+        logger.log(Level::Info, "t", &format!("record {sequence:02}"));
+    }
+    assert!(older.is_dir());
+    assert_eq!(read_lines(&path).len(), 20, "no record was lost");
+
+    RealFs.set_attributes(&path, Attributes(0)).unwrap();
+    std::fs::remove_dir(&older).unwrap();
+    logger.log(Level::Info, "t", "record 20");
+    assert_eq!(read_lines(&older).len(), 20);
+    let lines = read_lines(&path);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].ends_with("record 20"));
 }

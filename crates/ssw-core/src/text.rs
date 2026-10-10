@@ -211,12 +211,11 @@ impl Buffer {
     pub fn slice(&self, range: TextRange) -> Cow<'_, str> {
         let start = self.floor_char_boundary(range.start);
         let end = self.ceil_char_boundary(range.end).max(start);
-        match self.rope.get_byte_slice(start..end) {
-            Some(slice) => match slice.as_str() {
-                Some(s) => Cow::Borrowed(s),
-                None => Cow::Owned(slice.to_string()),
-            },
-            None => Cow::Borrowed(""),
+        // `start <= end <= len` and both ends are char boundaries, so the slice always exists.
+        let slice = self.rope.byte_slice(start..end);
+        match slice.as_str() {
+            Some(s) => Cow::Borrowed(s),
+            None => Cow::Owned(slice.to_string()),
         }
     }
 
@@ -311,13 +310,13 @@ impl Buffer {
         }
         let text = self.slice(content);
         let rel = offset - content.start;
-        for (i, g) in text.grapheme_indices(true) {
-            let end = i + g.len();
-            if end > rel {
-                return content.start + end;
-            }
-        }
-        content.end
+        // `rel < text.len()`, so the last cluster always ends past `rel`.
+        let end = text
+            .grapheme_indices(true)
+            .map(|(i, g)| i + g.len())
+            .find(|&end| end > rel)
+            .unwrap_or(text.len());
+        content.start + end
     }
 
     /// Start of the grapheme cluster ending at or before `offset`; crosses line terminators.
@@ -329,11 +328,8 @@ impl Buffer {
         let line = self.line_of(offset);
         let content = self.line_range(line);
         if offset <= content.start {
-            return if line == 0 {
-                0
-            } else {
-                self.line_range(line - 1).end
-            };
+            // `offset > 0` and line 0 starts at 0, so there is a previous line.
+            return self.line_range(line - 1).end;
         }
         if offset > content.end {
             return content.end;
@@ -571,5 +567,426 @@ impl Utf16Map {
         let start = self.utf16_to_byte(range.start)?;
         let end = self.utf16_to_byte(range.end)?;
         (start <= end).then_some(TextRange { start, end })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(start: usize, end: usize) -> TextRange {
+        TextRange::new(start, end)
+    }
+
+    fn units(start: usize, end: usize) -> Range<usize> {
+        start..end
+    }
+
+    #[test]
+    fn range_predicates_distinguish_open_and_closed_ends() {
+        let range = r(2, 5);
+        assert_eq!((range.len(), range.is_empty()), (3, false));
+        assert_eq!(
+            (TextRange::at(4).len(), TextRange::at(4).is_empty()),
+            (0, true)
+        );
+
+        assert!(!range.contains(1));
+        assert!(range.contains(2));
+        assert!(range.contains(4));
+        assert!(!range.contains(5));
+
+        assert!(!range.touches(1));
+        assert!(range.touches(2));
+        assert!(range.touches(5));
+        assert!(!range.touches(6));
+
+        assert!(range.contains_range(r(2, 5)));
+        assert!(range.contains_range(r(5, 5)));
+        assert!(!range.contains_range(r(1, 3)));
+        assert!(!range.contains_range(r(4, 6)));
+
+        assert!(range.intersects(r(4, 9)));
+        assert!(!range.intersects(r(5, 9)));
+        assert!(!range.intersects(r(0, 2)));
+    }
+
+    #[test]
+    fn range_set_operations_and_conversions() {
+        let range = r(2, 5);
+        assert_eq!(range.intersection(r(4, 9)), Some(r(4, 5)));
+        assert_eq!(range.intersection(r(5, 9)), None);
+        assert_eq!(range.cover(r(0, 3)), r(0, 5));
+        assert_eq!(range.cover(r(7, 8)), r(2, 8));
+
+        assert_eq!(range.shifted(3), Some(r(5, 8)));
+        assert_eq!(range.shifted(-2), Some(r(0, 3)));
+        assert_eq!(range.shifted(-3), None, "start would underflow");
+        assert_eq!(r(0, usize::MAX).shifted(1), None, "end would overflow");
+
+        assert_eq!(range.as_range(), 2..5);
+        assert_eq!(TextRange::from(2..5), range);
+        let back: Range<usize> = range.into();
+        assert_eq!(back, 2..5);
+
+        assert_eq!(r(0, 1).get("héllo"), Some("h"));
+        assert_eq!(r(0, 2).get("héllo"), None, "ends inside é");
+        assert_eq!(r(0, 99).get("héllo"), None, "past the end");
+    }
+
+    #[test]
+    fn empty_buffer_has_one_empty_line() {
+        let buffer = Buffer::new();
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.line_count(), 1);
+        assert_eq!(buffer.line_range(0), r(0, 0));
+        assert_eq!(buffer.to_string(), "");
+        assert!(!Buffer::from_text("x").is_empty());
+    }
+
+    #[test]
+    fn range_and_offset_validation_reports_the_failure_kind() {
+        let buffer = Buffer::from_text("aé");
+        assert_eq!(buffer.check_range(r(0, 3)), Ok(()));
+        assert_eq!(
+            buffer.check_range(TextRange { start: 3, end: 1 }),
+            Err(TextError::InvertedRange { start: 3, end: 1 })
+        );
+        assert_eq!(
+            buffer.check_range(r(0, 9)),
+            Err(TextError::OutOfBounds { offset: 9, len: 3 })
+        );
+        assert_eq!(
+            buffer.check_range(r(2, 3)),
+            Err(TextError::NotCharBoundary { offset: 2 })
+        );
+        assert_eq!(buffer.check_offset(1), Ok(()));
+        assert_eq!(buffer.check_offset(3), Ok(()));
+        assert_eq!(
+            buffer.check_offset(4),
+            Err(TextError::OutOfBounds { offset: 4, len: 3 })
+        );
+        assert_eq!(
+            buffer.check_offset(2),
+            Err(TextError::NotCharBoundary { offset: 2 })
+        );
+        assert!(buffer.is_char_boundary(0));
+        assert!(buffer.is_char_boundary(3));
+        assert!(!buffer.is_char_boundary(2));
+        assert!(!buffer.is_char_boundary(4));
+    }
+
+    #[test]
+    fn char_boundary_clamping_moves_in_both_directions() {
+        let buffer = Buffer::from_text("a😀");
+        assert_eq!(buffer.len(), 5);
+        assert_eq!(buffer.floor_char_boundary(3), 1);
+        assert_eq!(buffer.ceil_char_boundary(3), 5);
+        assert_eq!(buffer.floor_char_boundary(1), 1);
+        assert_eq!(buffer.ceil_char_boundary(1), 1);
+        assert_eq!(buffer.floor_char_boundary(99), 5);
+        assert_eq!(buffer.ceil_char_boundary(99), 5);
+    }
+
+    #[test]
+    fn slice_clamps_and_widens_to_char_boundaries() {
+        let buffer = Buffer::from_text("héllo");
+        assert_eq!(buffer.slice(r(0, 1)), "h");
+        assert!(matches!(buffer.slice(r(0, 1)), Cow::Borrowed(_)));
+        assert_eq!(buffer.slice(r(2, 4)), "él", "start moves back into é");
+        assert_eq!(buffer.slice(r(1, 2)), "é", "end moves forward past é");
+        assert_eq!(buffer.slice(r(3, 99)), "llo");
+        assert_eq!(buffer.slice(r(50, 99)), "");
+        assert_eq!(buffer.slice(TextRange { start: 4, end: 2 }), "");
+    }
+
+    #[test]
+    fn slice_across_rope_chunks_is_owned_and_complete() {
+        let text = "x".repeat(8000) + "é" + &"y".repeat(8000);
+        let buffer = Buffer::from_text(&text);
+        let whole = buffer.slice(r(0, buffer.len()));
+        assert!(matches!(whole, Cow::Owned(_)));
+        assert_eq!(whole, text);
+        let middle = buffer.slice(r(7990, 8020));
+        assert_eq!(middle, &text[7990..8020]);
+    }
+
+    #[test]
+    fn char_at_reads_whole_scalars() {
+        let buffer = Buffer::from_text("aé😀");
+        assert_eq!(buffer.char_at(0), Some('a'));
+        assert_eq!(buffer.char_at(1), Some('é'));
+        assert_eq!(buffer.char_at(3), Some('😀'));
+        assert_eq!(buffer.char_at(2), None, "inside é");
+        assert_eq!(buffer.char_at(7), None, "at the end");
+        assert_eq!(buffer.char_at(99), None, "past the end");
+    }
+
+    #[test]
+    fn lines_end_at_lf_and_crlf_only() {
+        let buffer = Buffer::from_text("ab\r\ncd\n");
+        assert_eq!(buffer.line_count(), 3);
+        assert_eq!(buffer.line_range(0), r(0, 2));
+        assert_eq!(buffer.line_range_with_terminator(0), r(0, 4));
+        assert_eq!(buffer.line_range(1), r(4, 6));
+        assert_eq!(buffer.line_range_with_terminator(1), r(4, 7));
+        assert_eq!(buffer.line_range(2), r(7, 7));
+        assert_eq!(
+            buffer.line_range(99),
+            r(7, 7),
+            "past the end resolves to the last line"
+        );
+        assert_eq!(buffer.line_range_with_terminator(99), r(7, 7));
+        assert_eq!(
+            [0, 2, 3, 4, 7, 100].map(|offset| buffer.line_of(offset)),
+            [0, 0, 0, 1, 2, 2]
+        );
+
+        let lone_cr = Buffer::from_text("a\rb");
+        assert_eq!(lone_cr.line_count(), 1);
+        assert_eq!(lone_cr.line_range(0), r(0, 3));
+    }
+
+    #[test]
+    fn insert_delete_and_replace_validate_before_mutating() {
+        let mut buffer = Buffer::from_text("héllo");
+        assert_eq!(buffer.insert(3, "XY"), Ok(()));
+        assert_eq!(buffer.to_string(), "héXYllo");
+        assert_eq!(
+            buffer.insert(2, ".."),
+            Err(TextError::NotCharBoundary { offset: 2 })
+        );
+        assert_eq!(
+            buffer.insert(9, "x"),
+            Err(TextError::OutOfBounds { offset: 9, len: 8 })
+        );
+        assert_eq!(buffer.to_string(), "héXYllo");
+
+        assert_eq!(buffer.delete(r(3, 5)), Ok(()));
+        assert_eq!(buffer.to_string(), "héllo");
+        assert_eq!(
+            buffer.delete(TextRange { start: 4, end: 2 }),
+            Err(TextError::InvertedRange { start: 4, end: 2 })
+        );
+        assert_eq!(
+            buffer.delete(r(0, 99)),
+            Err(TextError::OutOfBounds { offset: 99, len: 6 })
+        );
+        assert_eq!(buffer.to_string(), "héllo");
+
+        assert_eq!(buffer.replace(r(1, 3), "e"), Ok(()));
+        assert_eq!(buffer.to_string(), "hello");
+        assert_eq!(
+            buffer.replace(r(2, 9), "!"),
+            Err(TextError::OutOfBounds { offset: 9, len: 5 })
+        );
+        assert_eq!(buffer.to_string(), "hello");
+    }
+
+    #[test]
+    fn chunk_iterators_reassemble_the_text() {
+        let text = "ab".repeat(3000) + "é" + &"cd".repeat(3000);
+        let buffer = Buffer::from_text(&text);
+        assert!(
+            buffer.chunks().count() > 1,
+            "the text spans several rope chunks"
+        );
+        assert_eq!(buffer.chunks().collect::<String>(), text);
+
+        let range = r(5990, 6020);
+        assert_eq!(
+            buffer.chunks_in(range).collect::<String>(),
+            &text[5990..6020]
+        );
+        assert_eq!(
+            buffer.chunks_in(r(0, 99_999)).collect::<String>(),
+            text,
+            "an end past the buffer is clamped"
+        );
+        let accent = Buffer::from_text("aéb");
+        assert_eq!(
+            accent.chunks_in(r(2, 2)).collect::<String>(),
+            "é",
+            "an empty range inside é widens to the whole scalar"
+        );
+        assert_eq!(accent.chunks_in(r(3, 3)).collect::<String>(), "");
+        assert_eq!(accent.chunks_in(r(1, 3)).collect::<String>(), "é");
+    }
+
+    #[test]
+    fn grapheme_steps_cross_clusters_and_terminators() {
+        let buffer = Buffer::from_text("e\u{301}x\ny");
+        assert_eq!(
+            [0, 3, 4, 5, 6, 100].map(|offset| buffer.next_grapheme_boundary(offset)),
+            [3, 4, 5, 6, 6, 6]
+        );
+        assert_eq!(
+            [0, 3, 4, 5, 6, 100].map(|offset| buffer.prev_grapheme_boundary(offset)),
+            [0, 0, 3, 4, 5, 5]
+        );
+
+        let crlf = Buffer::from_text("a\r\nb");
+        assert_eq!(crlf.next_grapheme_boundary(1), 3, "CRLF is one step");
+        assert_eq!(crlf.next_grapheme_boundary(2), 3, "from inside CRLF");
+        assert_eq!(crlf.prev_grapheme_boundary(2), 1, "from inside CRLF");
+        assert_eq!(
+            crlf.prev_grapheme_boundary(3),
+            1,
+            "from the next line start"
+        );
+    }
+
+    #[test]
+    fn word_range_at_returns_the_segment_under_the_offset() {
+        let buffer = Buffer::from_text("hello world, foo");
+        assert_eq!(buffer.word_range_at(0), r(0, 5));
+        assert_eq!(buffer.word_range_at(3), r(0, 5));
+        assert_eq!(buffer.word_range_at(5), r(5, 6), "whitespace is a segment");
+        assert_eq!(buffer.word_range_at(6), r(6, 11));
+        assert_eq!(
+            buffer.word_range_at(11),
+            r(11, 12),
+            "punctuation is a segment"
+        );
+        assert_eq!(
+            buffer.word_range_at(16),
+            r(13, 16),
+            "line end gives the last segment"
+        );
+        assert_eq!(buffer.word_range_at(100), r(13, 16));
+
+        let lines = Buffer::from_text("ab cd\n\nef");
+        assert_eq!(
+            lines.word_range_at(6),
+            r(6, 6),
+            "an empty line yields an empty range"
+        );
+        assert_eq!(lines.word_range_at(8), r(7, 9));
+    }
+
+    #[test]
+    fn next_word_boundary_skips_to_the_next_word_start() {
+        let buffer = Buffer::from_text("hello world, foo");
+        assert_eq!(
+            [0, 3, 6, 11, 13].map(|offset| buffer.next_word_boundary(offset)),
+            [6, 6, 11, 13, 16]
+        );
+        assert_eq!(buffer.next_word_boundary(16), 16, "end of the document");
+        assert_eq!(buffer.next_word_boundary(100), 16);
+
+        let trailing = Buffer::from_text("hello   ");
+        assert_eq!(trailing.next_word_boundary(2), 8, "no later word: line end");
+
+        let blank = Buffer::from_text("ab\n\ncd");
+        assert_eq!(
+            blank.next_word_boundary(2),
+            3,
+            "next line is empty: stop at its end"
+        );
+        assert_eq!(
+            blank.next_word_boundary(3),
+            4,
+            "from the empty line to the next word"
+        );
+
+        let spaces = Buffer::from_text("ab\n  \ncd");
+        assert_eq!(spaces.next_word_boundary(2), 5, "whitespace-only next line");
+    }
+
+    #[test]
+    fn prev_word_boundary_skips_to_the_previous_word_start() {
+        let buffer = Buffer::from_text("hello world, foo");
+        assert_eq!(
+            [16, 13, 11, 6, 1, 0].map(|offset| buffer.prev_word_boundary(offset)),
+            [13, 11, 6, 0, 0, 0]
+        );
+
+        let indented = Buffer::from_text("  ab");
+        assert_eq!(
+            indented.prev_word_boundary(2),
+            0,
+            "no earlier word start on the line"
+        );
+        assert_eq!(indented.prev_word_boundary(1), 0);
+
+        let lines = Buffer::from_text("ab cd\nef");
+        assert_eq!(
+            lines.prev_word_boundary(6),
+            3,
+            "last word of the previous line"
+        );
+        let blank = Buffer::from_text("ab cd\n\nef");
+        assert_eq!(blank.prev_word_boundary(7), 6, "previous line has no words");
+        let spaces = Buffer::from_text("  \nab");
+        assert_eq!(
+            spaces.prev_word_boundary(3),
+            0,
+            "previous line is only whitespace"
+        );
+    }
+
+    #[test]
+    fn utf16_map_of_ascii_is_the_identity() {
+        let map = Utf16Map::new("abc");
+        assert_eq!((map.byte_len(), map.utf16_len()), (3, 3));
+        assert_eq!(map.byte_to_utf16(3), Some(3));
+        assert_eq!(map.byte_to_utf16(4), None);
+        assert_eq!(map.utf16_to_byte(3), Some(3));
+        assert_eq!(map.utf16_to_byte(4), None);
+        assert_eq!(map.byte_to_utf16_floor(9), 3);
+        assert_eq!(map.utf16_to_byte_floor(9), 3);
+    }
+
+    #[test]
+    fn utf16_map_converts_around_a_surrogate_pair() {
+        // a: byte 0 / unit 0; 😀: bytes 1..5 / units 1..3; b: byte 5 / unit 3.
+        let map = Utf16Map::new("a😀b");
+        assert_eq!((map.byte_len(), map.utf16_len()), (6, 4));
+        assert_eq!(
+            [0, 1, 2, 5, 6, 7].map(|byte| map.byte_to_utf16(byte)),
+            [Some(0), Some(1), None, Some(3), Some(4), None]
+        );
+        assert_eq!(
+            [0, 1, 2, 3, 4, 5].map(|unit| map.utf16_to_byte(unit)),
+            [Some(0), Some(1), None, Some(5), Some(6), None]
+        );
+        assert_eq!(
+            [0, 1, 2, 3, 5, 6, 100].map(|byte| map.byte_to_utf16_floor(byte)),
+            [0, 1, 1, 1, 3, 4, 4]
+        );
+        assert_eq!(
+            [0, 1, 2, 3, 4, 9].map(|unit| map.utf16_to_byte_floor(unit)),
+            [0, 1, 1, 5, 6, 6]
+        );
+    }
+
+    #[test]
+    fn utf16_map_handles_consecutive_wide_scalars() {
+        // é: bytes 0..2 / unit 0; 😀: bytes 2..6 / units 1..3; x: byte 6 / unit 3.
+        let map = Utf16Map::new("é😀x");
+        assert_eq!((map.byte_len(), map.utf16_len()), (7, 4));
+        assert_eq!(
+            [1, 2, 4, 6, 7].map(|byte| map.byte_to_utf16(byte)),
+            [None, Some(1), None, Some(3), Some(4)]
+        );
+        assert_eq!(
+            [1, 2, 3, 4].map(|unit| map.utf16_to_byte(unit)),
+            [Some(2), None, Some(6), Some(7)]
+        );
+        assert_eq!([1, 4].map(|byte| map.byte_to_utf16_floor(byte)), [0, 1]);
+    }
+
+    #[test]
+    fn utf16_ranges_convert_only_when_both_ends_do() {
+        let map = Utf16Map::new("a😀b");
+        assert_eq!(map.range_to_utf16(r(0, 5)), Some(0..3));
+        assert_eq!(map.range_to_utf16(r(2, 5)), None, "start inside the scalar");
+        assert_eq!(map.range_to_utf16(r(0, 2)), None, "end inside the scalar");
+
+        assert_eq!(map.range_to_bytes(0..3), Some(r(0, 5)));
+        assert_eq!(map.range_to_bytes(2..3), None, "start between surrogates");
+        assert_eq!(map.range_to_bytes(0..2), None, "end between surrogates");
+        assert_eq!(map.range_to_bytes(units(3, 1)), None, "reversed range");
     }
 }

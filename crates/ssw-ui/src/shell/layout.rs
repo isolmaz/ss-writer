@@ -754,6 +754,23 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_side_pane_shrinks_to_the_room_the_editor_leaves() {
+        // 550 - 320 = 230 room: the sidebar alone shrinks to it.
+        let mut layout = layout(550.0, 600.0, 1.0);
+        let rects = layout.rects();
+        assert_eq!(rects.inspector, None);
+        assert_eq!(rects.sidebar.map(|r| r.width), Some(230.0));
+        assert_eq!(rects.editor.width, 320.0);
+        // The inspector alone does the same.
+        layout.set_sidebar_visible(false);
+        layout.set_inspector_visible(true);
+        let rects = layout.rects();
+        assert_eq!(rects.sidebar, None);
+        assert_eq!(rects.inspector.map(|r| r.width), Some(230.0));
+        assert_eq!(rects.editor.width, 320.0);
+    }
+
+    #[test]
     fn tiny_windows_do_not_produce_negative_rects() {
         let mut layout = layout(100.0, 50.0, 1.0);
         layout.set_inspector_visible(true);

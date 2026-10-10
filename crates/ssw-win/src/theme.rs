@@ -18,6 +18,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, HSTRING};
 
+use crate::fault::check;
+
 /// The `WM_SETTINGCHANGE` string that announces an app theme / accent change.
 pub const THEME_CHANGE_MESSAGE: &str = "ImmersiveColorSet";
 
@@ -156,7 +158,7 @@ impl SystemSettings for Win32Settings {
         let mut color = 0u32;
         let mut opaque = BOOL(0);
         // SAFETY: valid out pointers.
-        unsafe { DwmGetColorizationColor(&mut color, &mut opaque) }.ok()?;
+        check(unsafe { DwmGetColorizationColor(&mut color, &mut opaque) }).ok()?;
         Some(color)
     }
 
@@ -344,11 +346,14 @@ mod tests {
     #[test]
     fn the_real_system_reports_a_consistent_theme() {
         let system = read_system_theme(&Win32Settings);
-        if system.high_contrast {
-            assert_eq!(system.theme.mode, ThemeMode::HighContrast);
-        } else {
-            assert_eq!(system.theme.mode == ThemeMode::Dark, system.dark);
-        }
+        assert_eq!(
+            system.theme.mode == ThemeMode::HighContrast,
+            system.high_contrast
+        );
+        assert_eq!(
+            system.theme.mode == ThemeMode::Dark,
+            system.dark && !system.high_contrast
+        );
         assert_eq!(Win32Settings.sys_color(COLOR_WINDOW.0) & 0xFF00_0000, 0);
         let _ = (
             Win32Settings.client_animations(),

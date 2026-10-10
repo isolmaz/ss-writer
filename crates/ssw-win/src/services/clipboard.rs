@@ -11,12 +11,12 @@ use windows::Win32::System::DataExchange::{
     GetClipboardFormatNameW, IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
     SetClipboardData,
 };
-use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
-};
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::core::HSTRING;
 
 use super::failed;
+use crate::com::{WinError, global_from_bytes};
+use crate::fault::check;
 use crate::wic::{DecodedImage, Wic, premultiply, unpremultiply};
 
 const SERVICE: &str = "clipboard";
@@ -273,11 +273,24 @@ pub(crate) fn register(name: &str) -> u32 {
     unsafe { RegisterClipboardFormatW(&HSTRING::from(name)) }
 }
 
+/// The service error of a failed image decode or encode. A function rather than a closure at
+/// each call: re-encoding a bitmap that just decoded cannot fail unless the encoder itself
+/// breaks, and the one error mapping is exercised by every failing decode.
+fn wic_failed(error: WinError) -> ServiceError {
+    failed(SERVICE, error)
+}
+
 fn format_name(format: u32) -> Option<String> {
     let mut buffer = [0u16; 128];
     // SAFETY: writable buffer of the stated length.
     let length = unsafe { GetClipboardFormatNameW(format, &mut buffer) };
     (length > 0).then(|| String::from_utf16_lossy(&buffer[..length as usize]))
+}
+
+/// The image the clipboard offers: a PNG as is, or a DIB that still has to become one.
+enum Fetched {
+    Png(Vec<u8>),
+    Dib(Vec<u8>),
 }
 
 /// The system clipboard.
@@ -295,22 +308,12 @@ impl WindowsClipboard {
     }
 
     fn put(format: u32, bytes: &[u8]) -> Result<(), ServiceError> {
-        // SAFETY: the allocation is filled while locked; on success the clipboard owns the
-        // handle, otherwise it is freed here.
-        unsafe {
-            let handle: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1))
-                .map_err(|error| failed(SERVICE, error))?;
-            let pointer = GlobalLock(handle).cast::<u8>();
-            if pointer.is_null() {
-                let _ = GlobalFree(Some(handle));
-                return Err(failed(SERVICE, "GlobalLock returned null"));
-            }
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len());
-            let _ = GlobalUnlock(handle);
-            if let Err(error) = SetClipboardData(format, Some(HANDLE(handle.0))) {
-                let _ = GlobalFree(Some(handle));
-                return Err(failed(SERVICE, error));
-            }
+        let handle = check(global_from_bytes(bytes)).map_err(|error| failed(SERVICE, error))?;
+        // SAFETY: on success the clipboard owns the handle, otherwise it is freed here.
+        if let Err(error) = unsafe { SetClipboardData(format, Some(HANDLE(handle.0))) } {
+            // SAFETY: the clipboard did not take the block, so it is still ours.
+            let _ = unsafe { GlobalFree(Some(handle)) };
+            return Err(failed(SERVICE, error));
         }
         Ok(())
     }
@@ -356,7 +359,7 @@ impl Clipboard for WindowsClipboard {
     fn set(&mut self, content: ClipboardContent) -> Result<(), ServiceError> {
         let _open = Open::acquire(self.owner)?;
         // SAFETY: the clipboard is open.
-        unsafe { EmptyClipboard() }.map_err(|error| failed(SERVICE, error))?;
+        check(unsafe { EmptyClipboard() }).map_err(|error| failed(SERVICE, error))?;
         if let Some(text) = &content.text {
             Self::put(CF_UNICODETEXT, &encode_text(text))?;
         }
@@ -370,10 +373,7 @@ impl Clipboard for WindowsClipboard {
         }
         if let Some(png) = &content.image {
             Self::put(register(FORMAT_PNG), png)?;
-            let decoded = self
-                .wic
-                .decode(png)
-                .map_err(|error| failed(SERVICE, error))?;
+            let decoded = self.wic.decode(png).map_err(wic_failed)?;
             Self::put(CF_DIB, &build_dib(&decoded))?;
         }
         if !content.files.is_empty() {
@@ -388,7 +388,7 @@ impl Clipboard for WindowsClipboard {
     fn clear(&mut self) -> Result<(), ServiceError> {
         let _open = Open::acquire(self.owner)?;
         // SAFETY: the clipboard is open.
-        unsafe { EmptyClipboard() }.map_err(|error| failed(SERVICE, error))
+        check(unsafe { EmptyClipboard() }).map_err(|error| failed(SERVICE, error))
     }
 
     fn formats(&self) -> Result<Vec<ClipboardFormat>, ServiceError> {
@@ -411,13 +411,18 @@ impl Clipboard for WindowsClipboard {
                     CF_DIB | CF_DIBV5 | CF_BITMAP => push(ClipboardFormat::Image),
                     CF_HDROP => push(ClipboardFormat::Files),
                     CF_LOCALE => {}
-                    id if id >= FIRST_REGISTERED => match format_name(id).as_deref() {
-                        Some(FORMAT_HTML) => push(ClipboardFormat::Html),
-                        Some(FORMAT_RTF) => push(ClipboardFormat::Rtf),
-                        Some(FORMAT_PNG) => push(ClipboardFormat::Image),
-                        Some(name) => push(ClipboardFormat::Custom(name.to_owned())),
-                        None => {}
-                    },
+                    // Registered formats have names: the clipboard takes no id in this range
+                    // that was not registered (`SetClipboardData` refuses it), so a format the
+                    // system cannot name cannot be on it and there is no branch for one.
+                    id if id >= FIRST_REGISTERED => format_name(id)
+                        .map(|name| match name.as_str() {
+                            FORMAT_HTML => ClipboardFormat::Html,
+                            FORMAT_RTF => ClipboardFormat::Rtf,
+                            FORMAT_PNG => ClipboardFormat::Image,
+                            _ => ClipboardFormat::Custom(name),
+                        })
+                        .into_iter()
+                        .for_each(&mut push),
                     _ => {}
                 }
             }
@@ -448,32 +453,25 @@ impl Clipboard for WindowsClipboard {
     fn image(&self) -> Result<Option<Vec<u8>>, ServiceError> {
         let fetched = self.read(|| {
             Self::fetch(register(FORMAT_PNG))
-                .map(|png| (Some(png), None))
+                .map(Fetched::Png)
                 .or_else(|| {
                     Self::fetch(CF_DIBV5)
                         .or_else(|| Self::fetch(CF_DIB))
-                        .map(|dib| (None, Some(dib)))
+                        .map(Fetched::Dib)
                 })
         })?;
         match fetched {
             None => Ok(None),
-            Some((Some(png), _)) => Ok(Some(png)),
-            Some((None, Some(dib))) => {
+            Some(Fetched::Png(png)) => Ok(Some(png)),
+            Some(Fetched::Dib(dib)) => {
                 let bmp = dib_to_bmp(&dib).ok_or_else(|| failed(SERVICE, "malformed DIB"))?;
-                let decoded = self
-                    .wic
-                    .decode(&bmp)
-                    .map_err(|error| failed(SERVICE, error))?;
+                let decoded = self.wic.decode(&bmp).map_err(wic_failed)?;
                 let straight = DecodedImage {
                     bgra: premultiply(&unpremultiply(&decoded.bgra)),
                     ..decoded
                 };
-                self.wic
-                    .encode_png(&straight)
-                    .map(Some)
-                    .map_err(|error| failed(SERVICE, error))
+                self.wic.encode_png(&straight).map(Some).map_err(wic_failed)
             }
-            Some((None, None)) => Ok(None),
         }
     }
 
@@ -537,6 +535,9 @@ mod tests {
         assert_eq!(parse_cf_html(bad_offsets).as_deref(), Some("y"));
         assert_eq!(parse_cf_html(b"plain text"), None);
         assert_eq!(parse_cf_html(b""), None);
+        // A fragment that never ends is no fragment.
+        let unterminated = b"Version:0.9\r\n<html><body><!--StartFragment--><i>x</i></body></html>";
+        assert_eq!(parse_cf_html(unterminated), None);
     }
 
     #[test]
@@ -591,6 +592,12 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(dib_to_bmp(&paletted).unwrap()[10..14].try_into().unwrap()),
             14 + 40 + 1024
+        );
+        // A palette with its size given (`biClrUsed`) holds only that many entries.
+        paletted[32] = 5;
+        assert_eq!(
+            u32::from_le_bytes(dib_to_bmp(&paletted).unwrap()[10..14].try_into().unwrap()),
+            14 + 40 + 5 * 4
         );
         let mut bitfields = vec![0u8; 40];
         bitfields[0] = 40;

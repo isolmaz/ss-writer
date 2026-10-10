@@ -497,8 +497,12 @@ impl TreeView {
     }
 
     fn key(&mut self, key: &KeyEvent) -> bool {
-        if self.drag.is_some() && key.vk == vk::ESCAPE {
-            self.cancel_drag();
+        if let Some(drag) = self.drag
+            && key.vk == vk::ESCAPE
+        {
+            self.drag = None;
+            self.press = None;
+            self.events.push(TreeEvent::DragCancelled(drag.source));
             return true;
         }
         if self.rows.is_empty() || !key.mods.is_empty() {
@@ -558,13 +562,6 @@ impl TreeView {
         };
         self.select_row(target);
         true
-    }
-
-    fn cancel_drag(&mut self) {
-        if let Some(drag) = self.drag.take() {
-            self.events.push(TreeEvent::DragCancelled(drag.source));
-        }
-        self.press = None;
     }
 
     fn valid_target(&self, source: u64, target: u64) -> bool {
@@ -832,9 +829,10 @@ impl Widget for TreeView {
             draw_left_centered(canvas, text.as_ref(), self.label_x(index), rect, color);
             let drop_here = self
                 .drag
-                .filter(|drag| drag.target.is_some_and(|(target, _)| target == row.key));
-            if let Some(drag) = drop_here {
-                self.paint_drop_indicator(canvas, rect, drag, cx);
+                .and_then(|drag| drag.target)
+                .filter(|&(target, _)| target == row.key);
+            if let Some((_, position)) = drop_here {
+                Self::paint_drop_indicator(canvas, rect, position, cx);
             }
             if cx.is_focused() && selected {
                 focus_ring::paint(canvas, pill, radius, cx.theme);
@@ -953,11 +951,13 @@ impl Widget for TreeView {
 }
 
 impl TreeView {
-    fn paint_drop_indicator(&self, canvas: &mut dyn Canvas, rect: Rect, drag: Drag, cx: &PaintCx) {
+    fn paint_drop_indicator(
+        canvas: &mut dyn Canvas,
+        rect: Rect,
+        position: DropPosition,
+        cx: &PaintCx,
+    ) {
         let tokens = &cx.theme.tokens;
-        let Some((_, position)) = drag.target else {
-            return;
-        };
         match position {
             DropPosition::Inside => canvas.stroke_rounded_rect(
                 rect.inset(Insets::symmetric(4.0, 2.0)),
@@ -1052,6 +1052,11 @@ mod tests {
         let (mut harness, mut tree) = setup();
         assert!(!harness.key(&mut tree, vk::DOWN).handled);
         harness.focus_widget(&mut tree);
+        // Right and Left without a selection are consumed and change nothing.
+        assert!(harness.key(&mut tree, vk::RIGHT).handled);
+        assert!(harness.key(&mut tree, vk::LEFT).handled);
+        assert_eq!(tree.selected_key(), None);
+        assert_eq!(keys(&tree), vec![1, 2, 5, 6]);
         harness.key(&mut tree, vk::DOWN);
         assert_eq!(tree.selected_key(), Some(1));
         harness.key(&mut tree, vk::DOWN);
@@ -1174,6 +1179,10 @@ mod tests {
         assert!(harness.text(&mut tree, "g").handled);
         assert_eq!(tree.selected_key(), Some(4));
         harness.send(&mut tree, Event::Timer(timer));
+        // A prefix that no label starts with is consumed and keeps the selection.
+        assert!(harness.text(&mut tree, "z").handled);
+        assert_eq!(tree.selected_key(), Some(4));
+        harness.send(&mut tree, Event::Timer(timer));
         assert!(!harness.text(&mut tree, " ").handled);
         assert!(
             !harness
@@ -1183,6 +1192,10 @@ mod tests {
                 )
                 .handled
         );
+        // A frame while nothing animates repaints nothing.
+        harness.requests.take_invalidation();
+        harness.frame(&mut tree, 16);
+        assert!(harness.requests.take_invalidation().is_clean());
     }
 
     #[test]
@@ -1225,8 +1238,20 @@ mod tests {
                 TreeEvent::Collapsed(2),
             ]
         );
-        // Hover and leave.
+        // Double-clicking a leaf activates it; there is nothing to expand.
         let readme = tree.row_rect(3).center();
+        click(&mut harness, &mut tree, readme, 2);
+        harness.pointer(
+            &mut tree,
+            PointerEventKind::Up,
+            Some(PointerButton::Left),
+            readme,
+        );
+        assert_eq!(
+            tree.take_events(),
+            vec![TreeEvent::Selected(6), TreeEvent::Activated(6)]
+        );
+        // Hover and leave.
         assert!(harness.hover(&mut tree, readme).handled);
         assert!(!harness.hover(&mut tree, readme).handled);
         assert!(
@@ -1437,10 +1462,18 @@ mod tests {
         tree.drag = None;
         tree.set_enabled(false);
         let canvas = harness.paint(&tree);
+        let text_colors: Vec<crate::geometry::Color> = canvas
+            .ops()
+            .filter_map(|op| match op {
+                DrawOp::Text { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_colors.len(), 4);
         assert!(
-            canvas
-                .ops()
-                .all(|op| !matches!(op, DrawOp::Text { color, .. } if *color == tokens.text))
+            text_colors
+                .iter()
+                .all(|color| *color == tokens.text_disabled)
         );
     }
 
@@ -1558,6 +1591,15 @@ mod tests {
         );
         tree.set_dimmed(6, false);
         assert!(!tree.rows[3].dimmed);
+        // Keys that are not in the tree change nothing.
+        tree.set_dimmed(99, true);
+        tree.set_label(99, "ghost");
+        assert_eq!(tree.row_count(), 4);
+        assert!(
+            tree.rows
+                .iter()
+                .all(|row| !row.dimmed && row.label != "ghost")
+        );
         assert_eq!(tree.row_key(99), None);
         tree.select_key(77);
         assert_eq!(tree.selected_key(), None);
@@ -1565,5 +1607,153 @@ mod tests {
         assert_eq!((leaf.key(), leaf.label()), (1, "x"));
         assert!(!leaf.clone().expanded().expanded);
         assert_eq!(tree.bounds(), Rect::new(0.0, 0.0, size.width, size.height));
+    }
+
+    fn long_nodes() -> Vec<TreeNode> {
+        vec![
+            TreeNode::branch(
+                1,
+                "root",
+                (10..60)
+                    .map(|key| TreeNode::leaf(key, format!("node {key}")))
+                    .collect(),
+            )
+            .expanded(),
+        ]
+    }
+
+    fn long_tree(motion: Motion) -> (Harness, TreeView) {
+        let mut harness = Harness::new();
+        let mut tree = TreeView::new("Explorer", long_nodes()).with_motion(motion);
+        harness.arrange(&mut tree, Rect::new(0.0, 0.0, 240.0, 128.0));
+        (harness, tree)
+    }
+
+    fn notch(dy: f32) -> Event {
+        Event::Wheel(crate::input::WheelEvent {
+            delta: Point::new(0.0, dy),
+            precise: false,
+            position: Point::new(100.0, 50.0),
+            mods: Modifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn kit_tree_with_id_names_the_control() {
+        let id = WidgetId::allocate();
+        let tree = TreeView::new("Explorer", nodes()).with_id(id);
+        assert_eq!(tree.id(), id);
+        assert_eq!(Harness::new().node(&tree).id, id);
+    }
+
+    #[test]
+    fn kit_tree_expanding_needs_a_known_expandable_node_that_changes() {
+        let (_, mut tree) = setup();
+        assert!(!tree.apply_expanded(99, true));
+        // A leaf cannot expand and an expanded node cannot expand again.
+        assert!(!tree.apply_expanded(3, true));
+        assert!(!tree.apply_expanded(1, true));
+        tree.user_expand(3, true);
+        tree.user_expand(1, true);
+        assert!(tree.take_events().is_empty());
+    }
+
+    #[test]
+    fn kit_tree_paints_only_where_damaged_and_fills_the_hovered_row() {
+        let (mut harness, mut tree) = setup();
+        let away = Rect::new(500.0, 500.0, 5.0, 5.0);
+        assert_eq!(harness.paint_damaged(&tree, Some(away)).ops().count(), 0);
+        let hover = harness.theme.tokens.hover_bg;
+        let fills = |harness: &mut Harness, tree: &TreeView| {
+            harness
+                .paint(tree)
+                .ops()
+                .filter(|op| matches!(op, DrawOp::FillRoundedRect { color, .. } if *color == hover))
+                .count()
+        };
+        assert_eq!(fills(&mut harness, &tree), 0);
+        let row = tree.row_rect(2).center();
+        harness.hover(&mut tree, row);
+        assert_eq!(fills(&mut harness, &tree), 1);
+    }
+
+    #[test]
+    fn kit_tree_leaving_while_a_press_is_pending_keeps_the_state() {
+        let (mut harness, mut tree) = setup();
+        let row = tree.row_rect(1).center();
+        click(&mut harness, &mut tree, row, 1);
+        let left = harness.pointer(
+            &mut tree,
+            PointerEventKind::Leave,
+            None,
+            Point::new(500.0, 500.0),
+        );
+        assert!(!left.handled);
+    }
+
+    #[test]
+    fn kit_tree_a_wheel_over_a_tree_that_fits_is_left_alone() {
+        let (mut harness, mut tree) = setup();
+        assert!(!harness.send(&mut tree, notch(-1.0)).handled);
+    }
+
+    #[test]
+    fn kit_tree_a_wheel_scrolls_a_long_tree_and_frames_ease_it() {
+        let (mut harness, mut tree) = long_tree(Motion::reduced());
+        assert!(harness.send(&mut tree, notch(-1.0)).handled);
+        assert!(tree.row_rect(0).y < 0.0);
+        let (mut harness, mut tree) = long_tree(Motion::full());
+        assert!(harness.send(&mut tree, notch(-3.0)).handled);
+        assert!(harness.requests.animation_frame_requested());
+        harness.frame(&mut tree, 16);
+        harness.requests.take_invalidation();
+        harness.frame(&mut tree, 100);
+        assert!(!harness.requests.take_invalidation().is_clean());
+        harness.run_animations(&mut tree);
+        assert!(tree.row_rect(0).y < 0.0);
+    }
+
+    #[test]
+    fn kit_tree_dragging_the_scroll_bar_scrolls_the_rows() {
+        let (mut harness, mut tree) = long_tree(Motion::reduced());
+        let grab = tree.bar.thumb_rect().center();
+        let left = Some(PointerButton::Left);
+        assert!(
+            harness
+                .pointer(&mut tree, PointerEventKind::Down, left, grab)
+                .handled
+        );
+        harness.requests.take_invalidation();
+        let to = Point::new(grab.x, grab.y + 40.0);
+        harness.pointer(&mut tree, PointerEventKind::Move, None, to);
+        assert!(tree.row_rect(0).y < 0.0);
+        assert!(!harness.requests.take_invalidation().is_clean());
+        harness.pointer(&mut tree, PointerEventKind::Up, left, to);
+    }
+
+    #[test]
+    fn kit_tree_a_drag_without_a_target_draws_no_drop_indicator() {
+        let (mut harness, mut tree) = setup();
+        let accent = harness.theme.tokens.accent;
+        let strokes = |harness: &mut Harness, tree: &TreeView| {
+            harness
+                .paint(tree)
+                .ops()
+                .filter(
+                    |op| matches!(op, DrawOp::StrokeRoundedRect { color, .. } if *color == accent),
+                )
+                .count()
+        };
+        // Dropping inside a row outlines it; without a target nothing is outlined.
+        tree.drag = Some(Drag {
+            source: 6,
+            target: Some((2, DropPosition::Inside)),
+        });
+        assert_eq!(strokes(&mut harness, &tree), 1);
+        tree.drag = Some(Drag {
+            source: 6,
+            target: None,
+        });
+        assert_eq!(strokes(&mut harness, &tree), 0);
     }
 }

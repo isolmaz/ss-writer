@@ -270,15 +270,12 @@ impl StatusBar {
                 continue;
             }
             let anchor = segment.bounds;
-            match segment.kind {
-                StatusSegment::Encoding => {
-                    self.events.push(StatusEvent::EncodingClicked { anchor })
-                }
-                StatusSegment::LineEnding => {
-                    self.events.push(StatusEvent::LineEndingClicked { anchor });
-                }
-                StatusSegment::Position | StatusSegment::Words | StatusSegment::Zoom => {}
-            }
+            // Only the encoding and the line ending are clickable (`is_active`), so only they are
+            // ever activated.
+            self.events.push(match segment.kind {
+                StatusSegment::Encoding => StatusEvent::EncodingClicked { anchor },
+                _ => StatusEvent::LineEndingClicked { anchor },
+            });
         }
     }
 
@@ -490,11 +487,8 @@ mod tests {
 
     fn localizer() -> Localizer {
         let localizer = Localizer::new("en", &[("en", SHELL_FTL)]);
-        assert!(
-            localizer.diagnostics().is_empty(),
-            "{:?}",
-            localizer.diagnostics()
-        );
+        let diagnostics = localizer.diagnostics();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         localizer
     }
 
@@ -745,5 +739,85 @@ mod tests {
         let (mut harness, mut bar) = setup(&info());
         let bounds = harness.place(&mut bar, Point::ZERO);
         assert_eq!(bounds.size(), Size::new(0.0, STATUS_BAR_HEIGHT));
+    }
+
+    #[test]
+    fn a_custom_id_names_the_bar() {
+        let id = WidgetId::allocate();
+        let bar = StatusBar::new(StatusStrings::from_localizer(&localizer())).with_id(id);
+        assert_eq!(bar.id(), id);
+        assert_eq!(Harness::new().node(&bar).id, id);
+    }
+
+    #[test]
+    fn the_bar_measures_the_width_it_is_given_and_zero_without_one() {
+        let (mut harness, mut bar) = setup(&info());
+        let id = bar.id();
+        let mut cx = LayoutCx::new(
+            id,
+            &harness.theme,
+            1.0,
+            &harness.engine,
+            &mut harness.focus,
+            &mut harness.requests,
+        );
+        assert_eq!(
+            bar.measure(&mut cx, Size::new(640.0, 100.0)),
+            Size::new(640.0, STATUS_BAR_HEIGHT)
+        );
+        assert_eq!(
+            bar.measure(&mut cx, Size::UNBOUNDED),
+            Size::new(0.0, STATUS_BAR_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn nothing_is_painted_outside_the_damaged_area() {
+        let (mut harness, bar) = setup(&info());
+        let away = Rect::new(0.0, 0.0, 100.0, 100.0);
+        assert_eq!(harness.paint_damaged(&bar, Some(away)).ops().count(), 0);
+        assert!(
+            harness
+                .paint_damaged(&bar, Some(bar.bounds()))
+                .ops()
+                .count()
+                > 0
+        );
+    }
+
+    #[test]
+    fn clicking_a_read_only_segment_reports_nothing() {
+        let (mut harness, mut bar) = setup(&info());
+        for kind in [
+            StatusSegment::Position,
+            StatusSegment::Words,
+            StatusSegment::Zoom,
+        ] {
+            let at = bar.segment_rect(kind).center();
+            assert!(!harness.click(&mut bar, at).handled, "{kind:?}");
+            assert!(bar.take_events().is_empty(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn hover_eases_in_frame_by_frame() {
+        let localizer = localizer();
+        let mut harness = Harness::new();
+        let mut bar = StatusBar::new(StatusStrings::from_localizer(&localizer));
+        bar.set_info(&info(), &localizer);
+        harness.arrange(&mut bar, Rect::new(0.0, 576.0, 800.0, 24.0));
+        let segment = bar.segment_rect(StatusSegment::Encoding);
+        harness.hover(&mut bar, segment.center());
+        assert!(harness.requests.animation_frame_requested());
+        harness.requests.take_invalidation();
+        // The first frame fixes the start of the easing; the next one moves it and repaints.
+        harness.frame(&mut bar, 16);
+        harness.requests.take_invalidation();
+        harness.frame(&mut bar, 50);
+        assert_eq!(
+            harness.requests.take_invalidation(),
+            crate::widget::Invalidation::Rect(segment)
+        );
+        harness.run_animations(&mut bar);
     }
 }

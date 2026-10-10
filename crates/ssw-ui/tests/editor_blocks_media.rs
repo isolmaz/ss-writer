@@ -7,20 +7,32 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ssw_core::command::CommandId;
+use ssw_core::document::Document;
 use ssw_core::edit::Selection;
+use ssw_core::text::TextRange;
 use ssw_ui::canvas::{DrawOp, ImageId, RecordingCanvas, SceneId};
+use ssw_ui::editor::block::{BlockClass, BlockCx, BlockLayout, BlockPaintCx, BlockRegistry};
 use ssw_ui::editor::blocks_media::{
     AttachmentInfo, AttachmentProvider, MediaEvent, MediaServices, MediaStrings, register,
     register_with,
 };
+use ssw_ui::editor::blocks_text;
+use ssw_ui::editor::display::Reveal;
+use ssw_ui::editor::object::NoObjects;
 use ssw_ui::editor::object::{
     InlineObjectProvider, ObjectInfo, ObjectKind, ObjectRequest, ObjectState, ObjectVisual,
 };
 use ssw_ui::editor::{DocumentKind, EditorEvent};
+use ssw_ui::editor::{EditorConfig, EditorStrings, LinkTarget};
 use ssw_ui::geometry::{Color, Point, Rect, Size};
+use ssw_ui::input::{
+    Cursor, ImeAttr, ImeAttrStyle, ImeEvent, PointerButton, PointerEvent, PointerType,
+};
 use ssw_ui::input::{Event, Modifiers, PointerEventKind, WheelEvent, vk};
+use ssw_ui::text::MonoTextEngine;
+use ssw_ui::theme::{DEFAULT_ACCENT, Theme};
 
-use editor_common::{Harness, KEY_Z, close};
+use editor_common::{ADVANCE, Harness, KEY_Z, close};
 
 struct Provider {
     math: ObjectState,
@@ -526,4 +538,654 @@ fn link_to_a_local_file_becomes_a_chip() {
             .ops()
             .any(|op| matches!(op, DrawOp::Image { image, .. } if *image == ImageId(5)))
     );
+}
+
+/// Rectangles filled with `FillRect` (selections) in `color`.
+fn rect_fills(canvas: &RecordingCanvas, color: Color) -> Vec<Rect> {
+    canvas
+        .recorded()
+        .iter()
+        .filter_map(|entry| match &entry.op {
+            DrawOp::FillRect { color: c, .. } if *c == color => entry.bounds,
+            _ => None,
+        })
+        .collect()
+}
+
+/// Answers every destination with a file.
+struct AnyFile;
+
+impl AttachmentProvider for AnyFile {
+    fn attachment(&self, dest: &str) -> Option<AttachmentInfo> {
+        Some(AttachmentInfo {
+            name: dest.to_owned(),
+            type_label: "FILE".to_owned(),
+            detail: "1 KB".to_owned(),
+            icon: None,
+        })
+    }
+}
+
+const CHIP: &str = "a\n\n[doc.pdf](doc.pdf)\n";
+
+fn chip_harness(text: &str, attachments: Rc<dyn AttachmentProvider>, read_only: bool) -> Harness {
+    let mut h = Harness::new(text);
+    register_with(
+        h.view.registry_mut(),
+        MediaServices {
+            strings: MediaStrings::default(),
+            attachments,
+        },
+    );
+    h.view.set_read_only(read_only);
+    h
+}
+
+#[test]
+fn attachment_chip_clicks_pick_the_nearest_edge_and_ctrl_click_opens_the_file() {
+    let end = CHIP.trim_end().len();
+    let chip_of = |h: &Harness| fills(&h.paint(), h.theme.tokens.code_bg)[0];
+
+    let mut h = chip_harness(CHIP, Rc::new(Files), false);
+    let chip = chip_of(&h);
+    h.click(
+        Point::new(chip.x + 10.0, chip.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(3));
+
+    let mut h = chip_harness(CHIP, Rc::new(Files), false);
+    let chip = chip_of(&h);
+    h.click(
+        Point::new(chip.right() - 10.0, chip.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(end));
+
+    let mut h = chip_harness(CHIP, Rc::new(Files), false);
+    let chip = chip_of(&h);
+    h.events();
+    h.click(chip.center(), 1, Modifiers::CTRL);
+    let events = h.events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EditorEvent::LinkActivated(LinkTarget::Url(dest)) if dest == "doc.pdf"
+        )),
+        "{events:?}"
+    );
+    let below = Point::new(chip.x + 10.0, chip.bottom() + 2.0);
+    h.click(below, 1, Modifiers::CTRL);
+    assert!(
+        !h.events()
+            .iter()
+            .any(|event| matches!(event, EditorEvent::LinkActivated(_))),
+        "only the chip itself is the link"
+    );
+}
+
+#[test]
+fn a_revealed_attachment_shows_its_source_below_the_chip() {
+    let end = CHIP.trim_end().len();
+    let mut h = chip_harness(CHIP, Rc::new(Files), false);
+    let chip = fills(&h.paint(), h.theme.tokens.code_bg)[0];
+    h.set_caret(7);
+    assert!(h.paint().texts().contains(&"[doc.pdf](doc.pdf)"));
+    assert_eq!(h.access().description, "Attachment: doc.pdf");
+    let caret = h.view.rect_at(7).expect("the caret is in the source");
+    assert!(caret.y > chip.bottom(), "{caret:?} below {chip:?}");
+
+    let target = h.view.rect_at(9).expect("inside the source");
+    h.click(
+        Point::new(target.x + 1.0, target.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(9));
+    h.press(vk::HOME);
+    assert_eq!(h.selection(), Selection::caret(3));
+    h.press(vk::END);
+    assert_eq!(h.selection(), Selection::caret(end));
+
+    h.view.set_selection(Selection::new(4, 9));
+    let selected = rect_fills(&h.paint(), h.theme.tokens.selection_bg);
+    assert_eq!(selected.len(), 1);
+    let (from, to) = (h.view.rect_at(4).unwrap(), h.view.rect_at(9).unwrap());
+    assert!(close(selected[0].x, from.x) && close(selected[0].width, to.x - from.x));
+    assert!(selected[0].y > chip.bottom());
+}
+
+#[test]
+fn a_hidden_attachment_chip_is_one_unit_for_carets_and_selections() {
+    let end = CHIP.trim_end().len();
+    let mut h = chip_harness(CHIP, Rc::new(Files), true);
+    let chip = fills(&h.paint(), h.theme.tokens.code_bg)[0];
+    let (start_rect, end_rect) = (h.view.rect_at(3).unwrap(), h.view.rect_at(end).unwrap());
+    assert!(close(start_rect.x, chip.x) && close(end_rect.x, chip.right()));
+
+    let selection_bg = h.theme.tokens.selection_bg;
+    h.view.set_selection(Selection::new(3, end));
+    let selected = rect_fills(&h.paint(), selection_bg);
+    assert_eq!(selected.len(), 1);
+    assert!(close(selected[0].x, chip.x) && close(selected[0].width, chip.width));
+    h.view.set_selection(Selection::caret(3));
+    assert!(rect_fills(&h.paint(), selection_bg).is_empty());
+
+    h.click(
+        Point::new(chip.x + 10.0, chip.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(3));
+    h.click(
+        Point::new(chip.right() - 10.0, chip.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(end));
+    h.press(vk::HOME);
+    assert_eq!(h.selection(), Selection::caret(3), "the chip is one line");
+    h.press(vk::END);
+    assert_eq!(h.selection(), Selection::caret(end));
+}
+
+#[test]
+fn only_inline_links_become_chips_and_without_a_provider_links_stay_links() {
+    let h = chip_harness(
+        "a\n\n<https://x.test/f.zip>\n\n[f](f.zip)\n",
+        Rc::new(AnyFile),
+        false,
+    );
+    let canvas = h.paint();
+    assert!(canvas.texts().contains(&"https://x.test/f.zip"));
+    assert_eq!(
+        canvas
+            .texts()
+            .iter()
+            .filter(|text| **text == "FILE")
+            .count(),
+        1,
+        "the autolink stays a link, the inline link is a chip"
+    );
+
+    let mut none = Harness::new("a\n\n[x](web.html)\n");
+    register(none.view.registry_mut());
+    assert_eq!(none.painted_texts(), ["a", "x"]);
+    assert!(format!("{:?}", MediaServices::default()).contains("AttachmentProvider"));
+}
+
+#[test]
+fn media_renderers_show_a_block_of_another_kind_as_its_source() {
+    let doc = Document::new("plain\n");
+    let theme = Theme::light(DEFAULT_ACCENT);
+    let config = EditorConfig::default();
+    let engine = MonoTextEngine::default();
+    let strings = EditorStrings::default();
+    let mut registry = BlockRegistry::with_defaults();
+    register(&mut registry);
+    let reveal = Reveal::new(false, Vec::new());
+    let cx = BlockCx {
+        text: &engine,
+        theme: &theme,
+        config: &config,
+        buffer: doc.buffer(),
+        ast: doc.ast(),
+        reveal: &reveal,
+        objects: &NoObjects,
+        composition: None,
+        width: 352.0,
+        folded: false,
+        strings: &strings,
+        registry: &registry,
+    };
+    let block = &doc.ast().blocks[0];
+    let layouts = [
+        registry.renderer(BlockClass::CodeBlock).measure(&cx, block),
+        registry.renderer(BlockClass::MathBlock).measure(&cx, block),
+        registry.measure_document(DocumentKind::Mermaid, &cx, block),
+    ];
+    let paint_cx = BlockPaintCx {
+        theme: &theme,
+        config: &config,
+        strings: &strings,
+        text: &engine,
+        hovered: false,
+    };
+    for layout in &layouts {
+        let mut canvas = RecordingCanvas::new();
+        layout.paint(&paint_cx, &mut canvas);
+        assert!(canvas.texts().contains(&"plain"), "{:?}", canvas.texts());
+    }
+}
+
+/// The layout of the last block of `text` with every media renderer and nothing revealed.
+fn hidden_layout(
+    text: &str,
+    provider: &dyn InlineObjectProvider,
+    attachments: Rc<dyn AttachmentProvider>,
+) -> Box<dyn BlockLayout> {
+    let doc = Document::new(text);
+    let theme = Theme::light(DEFAULT_ACCENT);
+    let config = EditorConfig::default();
+    let engine = MonoTextEngine::default();
+    let strings = EditorStrings::default();
+    let mut registry = BlockRegistry::with_defaults();
+    register_with(
+        &mut registry,
+        MediaServices {
+            strings: MediaStrings::default(),
+            attachments,
+        },
+    );
+    let reveal = Reveal::new(false, Vec::new());
+    let cx = BlockCx {
+        text: &engine,
+        theme: &theme,
+        config: &config,
+        buffer: doc.buffer(),
+        ast: doc.ast(),
+        reveal: &reveal,
+        objects: provider,
+        composition: None,
+        width: 352.0,
+        folded: false,
+        strings: &strings,
+        registry: &registry,
+    };
+    registry.measure(&cx, doc.ast().blocks.last().expect("a block"))
+}
+
+#[test]
+fn hidden_media_layouts_select_nothing_for_an_empty_range() {
+    let chip = hidden_layout(CHIP, &plain(), Rc::new(Files));
+    let diagram = hidden_layout(
+        MMD,
+        &Provider {
+            mermaid: ready(ObjectVisual::Scene(SceneId(4)), 200.0, 100.0),
+            ..plain()
+        },
+        Rc::new(Files),
+    );
+    let image = hidden_layout(
+        "a\n\n![alt](p.png)\n",
+        &image_provider(ready(ObjectVisual::Image(ImageId(3)), 100.0, 40.0)),
+        Rc::new(Files),
+    );
+    for layout in [chip, diagram, image] {
+        assert!(layout.selection_rects(TextRange::at(3)).is_empty());
+        assert_eq!(layout.selection_rects(TextRange::new(3, 8)).len(), 1);
+    }
+}
+
+#[test]
+fn math_source_is_muted_while_pending_and_a_one_line_block_reveals_whole() {
+    let h = harness("a\n\n$$\nx^2\ny\n$$\n", plain());
+    assert_eq!(
+        text_color(&h.paint(), "x^2\ny"),
+        Some(h.theme.tokens.text_muted)
+    );
+
+    let mut one = harness(
+        "a\n\n$$x$$\n",
+        Provider {
+            math: ready(ObjectVisual::Scene(SceneId(9)), 40.0, 20.0),
+            ..plain()
+        },
+    );
+    one.set_caret(5);
+    assert_eq!(one.painted_texts(), ["a", "$$x$$"]);
+}
+
+#[test]
+fn revealed_math_source_selects_navigates_by_line_and_is_named() {
+    let mut h = harness(
+        "a\n\n$$\nx^2\ny\n$$\n",
+        Provider {
+            math: ready(ObjectVisual::Scene(SceneId(9)), 100.0, 40.0),
+            ..plain()
+        },
+    );
+    h.set_caret(7);
+    h.press(vk::HOME);
+    assert_eq!(h.selection(), Selection::caret(6));
+    h.press(vk::END);
+    assert_eq!(h.selection(), Selection::caret(9));
+    assert_eq!(h.access().description, "Math block");
+
+    h.view.set_selection(Selection::new(6, 9));
+    let selected = rect_fills(&h.paint(), h.theme.tokens.selection_bg);
+    assert_eq!(selected.len(), 1);
+    assert!(close(selected[0].width, 3.0 * ADVANCE), "{selected:?}");
+
+    h.set_caret(7);
+    let target = h.view.rect_at(8).expect("inside the source");
+    h.click(
+        Point::new(target.x + 1.0, target.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(8));
+}
+
+const MMD: &str = "a\n\n```mermaid\ngraph TD\n```\n";
+
+fn mermaid_harness(state: ObjectState, read_only: bool) -> Harness {
+    let mut h = harness(
+        MMD,
+        Provider {
+            mermaid: state,
+            ..plain()
+        },
+    );
+    h.view.set_read_only(read_only);
+    h
+}
+
+#[test]
+fn a_pending_mermaid_diagram_shows_its_source_without_a_note() {
+    let h = mermaid_harness(ObjectState::Pending, false);
+    assert_eq!(h.painted_texts(), ["a", "graph TD"]);
+}
+
+#[test]
+fn a_hidden_diagram_is_one_unit_with_an_export_menu() {
+    let end = MMD.trim_end().len();
+    let scene = ready(ObjectVisual::Scene(SceneId(4)), 200.0, 100.0);
+    let mut h = mermaid_harness(scene, true);
+    let rect = scene_rects(&h.paint(), SceneId(4))[0];
+    let (start_rect, end_rect) = (h.view.rect_at(3).unwrap(), h.view.rect_at(end).unwrap());
+    assert!(close(start_rect.x, rect.x) && close(end_rect.x, rect.right()));
+
+    h.click(
+        Point::new(rect.x + 10.0, rect.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(3));
+    h.click(
+        Point::new(rect.right() - 10.0, rect.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(end));
+    h.press(vk::HOME);
+    assert_eq!(
+        h.selection(),
+        Selection::caret(3),
+        "the diagram is one line"
+    );
+    h.press(vk::END);
+    assert_eq!(h.selection(), Selection::caret(end));
+    assert!(
+        rect_fills(&h.paint(), h.theme.tokens.selection_bg).is_empty(),
+        "a caret selects nothing"
+    );
+
+    h.view.set_selection(Selection::new(3, end));
+    let selected = rect_fills(&h.paint(), h.theme.tokens.selection_bg);
+    assert_eq!(selected.len(), 1);
+    assert!(close(selected[0].x, rect.x) && close(selected[0].width, rect.width));
+    assert_eq!(h.access().description, "Mermaid diagram");
+
+    h.events();
+    let at = rect.center();
+    h.event(Event::Pointer(PointerEvent {
+        kind: PointerEventKind::Down,
+        button: Some(PointerButton::Right),
+        position: at,
+        pointer_type: PointerType::Mouse,
+        click_count: 1,
+        mods: Modifiers::NONE,
+    }));
+    let events = h.events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EditorEvent::Media(MediaEvent::MermaidMenu { source, anchor, .. })
+                if source == "graph TD" && close(anchor.x, at.x) && close(anchor.y, at.y)
+        )),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_revealed_diagram_keeps_the_copy_button_and_line_navigation_of_its_source() {
+    let scene = ready(ObjectVisual::Scene(SceneId(4)), 200.0, 100.0);
+    let mut h = mermaid_harness(scene, false);
+    h.set_caret(16);
+    let code_box = fills(&h.paint(), h.theme.tokens.code_bg)[0];
+    h.pointer(
+        PointerEventKind::Move,
+        code_box.center(),
+        0,
+        Modifiers::NONE,
+    );
+    let pill = fills(&h.paint(), h.theme.tokens.hover_bg)[0];
+    h.requests.take_cursor();
+    h.pointer(PointerEventKind::Move, pill.center(), 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Hand));
+    h.events();
+    h.click(pill.center(), 1, Modifiers::NONE);
+    let events = h.events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EditorEvent::Media(MediaEvent::CopyCode { text, .. }) if text == "graph TD\n"
+        )),
+        "{events:?}"
+    );
+
+    h.set_caret(16);
+    h.press(vk::HOME);
+    assert_eq!(h.selection(), Selection::caret(14));
+    h.press(vk::END);
+    assert_eq!(h.selection(), Selection::caret(22));
+}
+
+#[test]
+fn code_blocks_select_by_line_and_are_named_after_their_language() {
+    let mut h = harness(CODE, plain());
+    h.view.set_selection(Selection::new(13, 17));
+    let selected = rect_fills(&h.paint(), h.theme.tokens.selection_bg);
+    assert_eq!(selected.len(), 1);
+    let (from, to) = (h.view.rect_at(13).unwrap(), h.view.rect_at(17).unwrap());
+    assert!(close(selected[0].x, from.x) && close(selected[0].width, to.x - from.x));
+    assert_eq!(h.access().description, "Code block: rust");
+
+    h.set_caret(16);
+    h.press(vk::HOME);
+    assert_eq!(h.selection(), Selection::caret(11));
+    h.press(vk::END);
+    assert_eq!(h.selection(), Selection::caret(21));
+
+    let mut bare = harness("a\n\n```\nx\n```\n", plain());
+    bare.set_caret(5);
+    assert_eq!(bare.access().description, "Code block");
+}
+
+#[test]
+fn a_partly_consumed_tab_in_a_quoted_code_block_shows_as_spaces() {
+    let mut h = Harness::new("a\n\n>\t\tfoo\n");
+    blocks_text::register(h.view.registry_mut());
+    register(h.view.registry_mut());
+    let texts = h.painted_texts();
+    assert!(texts.contains(&"  foo".to_owned()), "{texts:?}");
+}
+
+#[test]
+fn ime_composition_inside_a_code_line_splits_the_token_it_interrupts() {
+    let text = "a\n\n```rust\nlet s = \"abc\"; let n = 1;\n```\n";
+    let mut h = harness(text, plain());
+    h.config(|config| config.syntax_highlighting = true);
+    h.set_caret(21);
+    h.ime(ImeEvent::Start);
+    h.ime(ImeEvent::Update {
+        text: "かな".into(),
+        caret: 1,
+        attrs: vec![ImeAttr {
+            range: 0..3,
+            style: ImeAttrStyle::TargetConverted,
+        }],
+    });
+    let canvas = h.paint();
+    assert!(
+        canvas
+            .texts()
+            .iter()
+            .any(|text| text.contains("let s = \"aかなbc\"; let n = 1;")),
+        "{:?}",
+        canvas.texts()
+    );
+    assert_eq!(h.text(), text, "nothing is written before the commit");
+    let caret = h
+        .view
+        .caret_rect()
+        .expect("the caret is in the composition");
+    let start = h.left + 14.0 + 10.0 * ADVANCE;
+    assert!(
+        caret.x >= start - 0.01 && caret.x <= start + 2.0 * ADVANCE + 0.01,
+        "{caret:?}"
+    );
+    h.ime(ImeEvent::End);
+}
+
+#[test]
+fn a_hidden_image_is_one_unit_and_a_revealed_one_shows_its_source() {
+    const IMG: &str = "a\n\n![alt](p.png)\n";
+    let end = IMG.trim_end().len();
+    let ready_image = ready(ObjectVisual::Image(ImageId(3)), 100.0, 40.0);
+    let mut h = harness(IMG, image_provider(ready_image));
+    h.view.set_read_only(true);
+    let rect = image_at(&h.paint());
+    let (start_rect, end_rect) = (h.view.rect_at(3).unwrap(), h.view.rect_at(end).unwrap());
+    assert!(close(start_rect.x, rect.x) && close(end_rect.x, rect.right()));
+    h.click(
+        Point::new(rect.x + 10.0, rect.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(3));
+    h.click(
+        Point::new(h.left + 300.0, rect.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(end));
+    h.press(vk::HOME);
+    assert_eq!(h.selection(), Selection::caret(3), "the image is one line");
+    h.press(vk::END);
+    assert_eq!(h.selection(), Selection::caret(end));
+    let selection_bg = h.theme.tokens.selection_bg;
+    assert!(
+        rect_fills(&h.paint(), selection_bg).is_empty(),
+        "a caret selects nothing"
+    );
+    h.view.set_selection(Selection::new(3, end));
+    let selected = rect_fills(&h.paint(), selection_bg);
+    assert_eq!(selected.len(), 1);
+    assert!(close(selected[0].width, rect.width) && close(selected[0].x, rect.x));
+
+    let mut h = harness(IMG, image_provider(ready_image));
+    h.set_caret(6);
+    assert_eq!(h.painted_texts(), ["a", "![alt](p.png)"]);
+    assert_eq!(h.access().description, "Image: alt");
+    h.press(vk::HOME);
+    assert_eq!(h.selection(), Selection::caret(3));
+    h.press(vk::END);
+    assert_eq!(h.selection(), Selection::caret(end));
+    h.view.set_selection(Selection::new(4, 7));
+    let selected = rect_fills(&h.paint(), h.theme.tokens.selection_bg);
+    assert_eq!(selected.len(), 1);
+    assert!(close(selected[0].width, 3.0 * ADVANCE), "{selected:?}");
+    h.set_caret(6);
+    let target = h.view.rect_at(8).expect("inside the source");
+    h.click(
+        Point::new(target.x + 1.0, target.center().y),
+        1,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::caret(8));
+}
+
+#[test]
+fn the_resize_handle_shows_its_cursor_previews_the_drag_and_ignores_a_zero_drag() {
+    let ready_image = ready(ObjectVisual::Image(ImageId(3)), 400.0, 100.0);
+    let mut h = harness("a\n\n![alt](p.png)\n", image_provider(ready_image));
+    let image = image_at(&h.paint());
+    h.pointer(PointerEventKind::Move, image.center(), 0, Modifiers::NONE);
+    let handle = fills(&h.paint(), h.theme.tokens.accent)
+        .into_iter()
+        .find(|rect| close(rect.width, 10.0))
+        .expect("the resize handle is drawn");
+    h.requests.take_cursor();
+    h.pointer(PointerEventKind::Move, handle.center(), 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::SizeWE));
+
+    h.pointer(PointerEventKind::Down, handle.center(), 1, Modifiers::NONE);
+    let to = Point::new(handle.center().x - 100.0, handle.center().y);
+    h.pointer(PointerEventKind::Move, to, 0, Modifiers::NONE);
+    let shown = image_at(&h.paint());
+    assert!(
+        close(shown.width, 252.0) && close(shown.height, 63.0),
+        "the drag previews the new size: {shown:?}"
+    );
+    h.pointer(PointerEventKind::Up, to, 0, Modifiers::NONE);
+    assert_eq!(h.text(), "a\n\n![alt|252](p.png)\n");
+
+    let mut still = harness("a\n\n![alt](p.png)\n", image_provider(ready_image));
+    drag_handle(&mut still, 0.0);
+    assert_eq!(
+        still.text(),
+        "a\n\n![alt](p.png)\n",
+        "no width change, no edit"
+    );
+}
+
+#[test]
+fn a_hovered_blocked_image_shows_the_hand_cursor() {
+    let mut h = harness(
+        "a\n\n![alt](https://x.test/p.png)\n",
+        image_provider(ObjectState::Blocked),
+    );
+    let placeholder = fills(&h.paint(), h.theme.tokens.code_bg)[0];
+    h.pointer(
+        PointerEventKind::Move,
+        placeholder.center(),
+        0,
+        Modifiers::NONE,
+    );
+    h.paint();
+    h.requests.take_cursor();
+    h.pointer(
+        PointerEventKind::Move,
+        placeholder.center(),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Hand));
+}
+
+#[test]
+fn resizing_an_img_tag_handles_unquoted_values_foreign_attributes_and_self_closing_tags() {
+    let ready_image = ready(ObjectVisual::Image(ImageId(3)), 400.0, 100.0);
+    for (tag, expected) in [
+        (
+            "<img src=\"p.png\" width=40>",
+            "<img src=\"p.png\" width=\"252\">",
+        ),
+        (
+            "<img src=\"p.png\" data-width=\"9\">",
+            "<img src=\"p.png\" data-width=\"9\" width=\"252\">",
+        ),
+        (
+            "<img src=\"p.png\" />",
+            "<img src=\"p.png\" width=\"252\" />",
+        ),
+    ] {
+        let mut h = harness(&format!("a\n\n{tag}\n"), image_provider(ready_image));
+        drag_handle(&mut h, -100.0);
+        assert_eq!(h.text(), format!("a\n\n{expected}\n"), "{tag}");
+    }
 }

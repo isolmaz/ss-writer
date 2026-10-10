@@ -942,6 +942,47 @@ fn watching_a_missing_folder_fails() {
     assert_eq!(error, FsError::NotFound(missing));
 }
 
+#[cfg(feature = "fault-injection")]
+#[test]
+fn every_os_step_of_starting_a_watch_reports_its_failure() {
+    use ssw_io::fault;
+    let dir = tempfile::tempdir().unwrap();
+    // The checked steps of `start`, in order: the stop event, the completion event and the
+    // reader thread (`E_FAIL` for the events, `ERROR_NO_SYSTEM_RESOURCES` for the thread).
+    let steps = [(0, 0x8000_4005_u32), (1, 0x8000_4005), (2, 1450)];
+    for (step, code) in steps {
+        fault::arm(step);
+        let error = Watcher::start(dir.path(), || {}).unwrap_err();
+        assert!(fault::tripped(), "step {step} was reached");
+        assert_eq!(
+            error,
+            FsError::Os {
+                code,
+                path: dir.path().to_path_buf()
+            },
+            "step {step}"
+        );
+    }
+    fault::arm(3);
+    let (watcher, _receiver) = Watcher::start(dir.path(), || {}).unwrap();
+    assert!(
+        !fault::tripped(),
+        "starting a watch makes three checked calls"
+    );
+    fault::disarm();
+    assert_eq!(watcher.root(), dir.path());
+}
+
+#[test]
+fn a_watcher_describes_the_folder_it_watches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (watcher, _receiver) = Watcher::start(dir.path(), || {}).unwrap();
+    let text = format!("{watcher:?}");
+    assert!(text.starts_with("Watcher { root: "), "{text}");
+    assert!(text.contains(&format!("{:?}", dir.path())), "{text}");
+    assert!(text.contains("StopEvent"), "{text}");
+}
+
 #[test]
 fn a_watch_that_cannot_be_read_ends_with_a_rescan() {
     let (_dir, file) = temp_file("not a folder");

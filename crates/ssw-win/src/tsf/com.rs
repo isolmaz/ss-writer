@@ -53,6 +53,15 @@ fn put<T>(pointer: *mut T, value: T) {
     }
 }
 
+/// The result of an allocator call: `E_OUTOFMEMORY` when it returned null.
+fn allocated<T>(pointer: *mut T) -> Result<*mut T> {
+    if pointer.is_null() {
+        Err(E_OUTOFMEMORY.into())
+    } else {
+        Ok(pointer)
+    }
+}
+
 /// `count` UTF-16 units at `text`, empty for a null pointer.
 fn wide<'a>(text: *const u16, count: u32) -> &'a [u16] {
     if text.is_null() || count == 0 {
@@ -147,29 +156,41 @@ impl AttributeReader {
 
     /// The styled runs of the whole context. Must run inside an edit with cookie `cookie`.
     fn read(&self, context: &ITfContext, cookie: u32) -> Result<Vec<(Range<usize>, ImeAttrStyle)>> {
-        let mut runs = Vec::new();
         // SAFETY: COM calls on live interfaces with valid out parameters; `cookie` is the
         // read-only edit cookie of the running edit.
-        unsafe {
+        let (property, ranges) = unsafe {
             let property = context.GetProperty(&GUID_PROP_ATTRIBUTE)?;
             let whole = context.GetStart(cookie)?;
             let end = context.GetEnd(cookie)?;
             whole.ShiftEndToRange(cookie, &end, TF_ANCHOR_END)?;
             let mut ranges: Option<IEnumTfRanges> = None;
             property.EnumRanges(cookie, &mut ranges, &whole)?;
-            let Some(ranges) = ranges else {
-                return Ok(runs);
-            };
-            loop {
-                let mut next: [Option<ITfRange>; 1] = [None];
-                let mut fetched = 0u32;
-                ranges.Next(&mut next, &mut fetched)?;
-                let Some(range) = next[0].take() else { break };
-                if let (Some(style), Some(extent)) =
-                    (self.style(&property, cookie, &range), range_extent(&range))
-                {
-                    runs.push((extent, style));
-                }
+            (property, ranges)
+        };
+        // No enumerator means no runs.
+        ranges.map_or(Ok(Vec::new()), |ranges| {
+            self.runs(&property, cookie, &ranges)
+        })
+    }
+
+    /// The styled runs `ranges` enumerates.
+    fn runs(
+        &self,
+        property: &ITfProperty,
+        cookie: u32,
+        ranges: &IEnumTfRanges,
+    ) -> Result<Vec<(Range<usize>, ImeAttrStyle)>> {
+        let mut runs = Vec::new();
+        loop {
+            let mut next: [Option<ITfRange>; 1] = [None];
+            let mut fetched = 0u32;
+            // SAFETY: `next` and `fetched` are valid out parameters for the call.
+            unsafe { ranges.Next(&mut next, &mut fetched) }?;
+            let Some(range) = next[0].take() else { break };
+            if let (Some(style), Some(extent)) =
+                (self.style(property, cookie, &range), range_extent(&range))
+            {
+                runs.push((extent, style));
             }
         }
         Ok(runs)
@@ -191,18 +212,16 @@ impl ITfInputScope_Impl for TextInputScope_Impl {
             return Err(E_POINTER.into());
         }
         // SAFETY: the caller frees the array with CoTaskMemFree; one InputScope is allocated.
-        let scopes = unsafe { CoTaskMemAlloc(size_of::<InputScope>()) }.cast::<InputScope>();
-        if scopes.is_null() {
-            return Err(E_OUTOFMEMORY.into());
-        }
-        // SAFETY: `scopes` is valid for one write of `InputScope`; both out pointers were
-        // checked above.
-        unsafe {
-            scopes.write(IS_DEFAULT);
-            *pprginputscopes = scopes;
-            *pccount = 1;
-        }
-        Ok(())
+        let allocation = unsafe { CoTaskMemAlloc(size_of::<InputScope>()) }.cast::<InputScope>();
+        allocated(allocation).map(|scopes| {
+            // SAFETY: `scopes` is valid for one write of `InputScope`; both out pointers were
+            // checked above.
+            unsafe {
+                scopes.write(IS_DEFAULT);
+                *pprginputscopes = scopes;
+                *pccount = 1;
+            }
+        })
     }
 
     fn GetPhrase(&self, _ppbstrphrases: *mut *mut BSTR, _pccount: *mut u32) -> Result<()> {
@@ -693,5 +712,19 @@ impl TextStore {
     #[must_use]
     pub fn is_composing(&self) -> bool {
         self.store.is_composing()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_null_allocation_is_out_of_memory_and_a_real_one_passes_through() {
+        let error = allocated(std::ptr::null_mut::<u8>()).expect_err("null is a failed allocation");
+        assert_eq!(error.code(), E_OUTOFMEMORY);
+        let mut value = 5u32;
+        let pointer: *mut u32 = &mut value;
+        assert_eq!(allocated(pointer).ok(), Some(pointer));
     }
 }

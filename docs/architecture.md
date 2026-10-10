@@ -22,8 +22,10 @@ crates/
   ssw-app       binary `SSWriter.exe`: wiring + main loop
   ssw-preview   cdylib Explorer preview handler
 third_party/    vendored + patched upstream crates (mermaid-rs-renderer, mitex-spec) with their licenses
-xtask/          cargo xtask: coverage, mutants, screenshots, docs sync check, dist (MSI/zip/winget)
-assets/         i18n/<locale>/*.ftl, welcome/<locale>.md, fonts/CascadiaMono.ttf (OFL), icons/
+xtask/          cargo xtask: coverage, mutants, screenshots, docs sync check, icons, dist (MSI/zip/winget)
+assets/         i18n/<locale>/*.ftl, welcome/<locale>.md, fonts/CascadiaMono.ttf (OFL),
+                icons/ (app.svg + document.svg masters, committed app.ico + document.ico from `cargo xtask icons`;
+                ssw-app's build.rs links them as RT_GROUP_ICON 1 = app, 2 = document, plus VERSIONINFO)
 tests/fixtures/ third-party sample documents with tests/fixtures/SOURCES.md (origin + license per file)
 installer/      WiX sources; packaging/winget/ manifests
 ```

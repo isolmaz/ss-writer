@@ -1,0 +1,242 @@
+//! The sidebar's [`TreeSource`] over [`ssw_io::workspace::Workspace`].
+//!
+//! The widget identifies entries by a `u64` key; the app needs the path behind a key (open the
+//! file, rename, delete). Keys are indexes into a shared [`TreePaths`] table that the source
+//! fills while listing folders and the controller reads.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+
+use ssw_io::fs::{FileSystem, FsError};
+use ssw_io::watch::{FsEvent, FsEventKind};
+use ssw_io::workspace::{FileClass, Node, SortKey as IoSortKey, ViewOptions, Workspace};
+use ssw_ui::shell::sidebar::{
+    EntryKind, NodeKey, SidebarEntry, SidebarOptions, SortKey as UiSortKey, TreeSource,
+};
+
+/// Key of the workspace root.
+const ROOT_KEY: NodeKey = 0;
+
+/// The paths behind the keys handed to the sidebar. Shared between the [`WorkspaceTree`] inside
+/// the widget and the controller.
+#[derive(Debug, Clone, Default)]
+pub struct TreePaths {
+    inner: Rc<RefCell<Table>>,
+}
+
+#[derive(Debug, Default)]
+struct Table {
+    paths: Vec<PathBuf>,
+    keys: HashMap<PathBuf, NodeKey>,
+    /// Changes on disk the tree has not looked at yet (see [`TreePaths::queue_event`]).
+    pending: Vec<FsEvent>,
+}
+
+impl TreePaths {
+    /// The path of entry `key`.
+    #[must_use]
+    pub fn path(&self, key: NodeKey) -> Option<PathBuf> {
+        let index = usize::try_from(key).ok()?;
+        self.inner.borrow().paths.get(index).cloned()
+    }
+
+    /// The key of `path`, handing out a new one the first time.
+    pub(super) fn key(&self, path: &Path) -> NodeKey {
+        let mut table = self.inner.borrow_mut();
+        if let Some(&key) = table.keys.get(path) {
+            return key;
+        }
+        let key = table.paths.len() as NodeKey;
+        table.paths.push(path.to_path_buf());
+        table.keys.insert(path.to_path_buf(), key);
+        key
+    }
+
+    /// Tells the tree that something changed on disk. The change shows the next time the
+    /// sidebar lists a folder (`SidebarView::refresh_all`): the tree applies every queued event
+    /// to its loaded folders first, so the listing needs no new disk read of its own.
+    pub fn queue_event(&self, event: FsEvent) {
+        self.inner.borrow_mut().pending.push(event);
+    }
+
+    /// Queues a full re-read of every loaded folder (after the app itself renamed, moved or
+    /// created files).
+    pub fn request_rescan(&self) {
+        if let Some(root) = self.path(ROOT_KEY) {
+            self.queue_event(FsEvent {
+                path: root,
+                kind: FsEventKind::Rescan,
+            });
+        }
+    }
+
+    fn take_events(&self) -> Vec<FsEvent> {
+        std::mem::take(&mut self.inner.borrow_mut().pending)
+    }
+}
+
+/// A [`TreeSource`] listing the folders of one workspace root, lazily.
+#[derive(Debug)]
+pub struct WorkspaceTree {
+    workspace: Workspace,
+    paths: TreePaths,
+}
+
+impl WorkspaceTree {
+    /// Opens `root`; the first level is loaded.
+    ///
+    /// # Errors
+    /// [`FsError::NotFound`] when the folder does not exist, or the listing error.
+    pub fn open(fs: Arc<dyn FileSystem>, root: &Path) -> Result<Self, FsError> {
+        let workspace = Workspace::open(fs, root)?;
+        let paths = TreePaths::default();
+        let key = paths.key(workspace.root());
+        debug_assert_eq!(key, ROOT_KEY);
+        Ok(Self { workspace, paths })
+    }
+
+    /// The table that maps the widget's keys back to paths.
+    #[must_use]
+    pub fn paths(&self) -> TreePaths {
+        self.paths.clone()
+    }
+}
+
+fn view_options(options: &SidebarOptions) -> ViewOptions {
+    ViewOptions {
+        sort: match options.sort {
+            UiSortKey::Name => IoSortKey::Name,
+            UiSortKey::Modified => IoSortKey::Modified,
+            UiSortKey::Created => IoSortKey::Created,
+            UiSortKey::Kind => IoSortKey::Kind,
+        },
+        descending: options.descending,
+        folders_first: options.folders_first,
+        show_hidden: options.show_hidden,
+        hide_images: options.hide_images,
+        hide_non_markdown: options.hide_non_markdown,
+    }
+}
+
+fn entry_for(key: NodeKey, node: &Node) -> SidebarEntry {
+    let mut entry = if node.is_dir() {
+        SidebarEntry::folder(key, node.name.clone())
+    } else {
+        let kind = match node.class() {
+            FileClass::Markdown => EntryKind::Markdown,
+            FileClass::Image => EntryKind::Image,
+            FileClass::Text => EntryKind::Text,
+            FileClass::Other => EntryKind::Other,
+        };
+        SidebarEntry::file(key, node.name.clone(), kind)
+    };
+    entry.placeholder = node.placeholder;
+    entry.hidden = node.is_hidden();
+    entry
+}
+
+impl TreeSource for WorkspaceTree {
+    fn root_name(&self) -> String {
+        self.workspace.tree().name.clone()
+    }
+
+    fn root_key(&self) -> NodeKey {
+        ROOT_KEY
+    }
+
+    fn children(&mut self, folder: NodeKey, options: &SidebarOptions) -> Vec<SidebarEntry> {
+        for event in self.paths.take_events() {
+            // A folder that cannot be re-read keeps its old listing; the next change retries.
+            let _ = self.workspace.apply(&event);
+        }
+        let Some(path) = self.paths.path(folder) else {
+            return Vec::new();
+        };
+        // An unreadable folder lists as empty (the trait's contract).
+        if self.workspace.load_children(&path).is_err() {
+            return Vec::new();
+        }
+        let view = view_options(options);
+        self.workspace
+            .visible_children(&path, &view)
+            .into_iter()
+            .map(|node| entry_for(self.paths.key(&path.join(&node.name)), node))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ssw_io::fs::RealFs;
+
+    use super::*;
+
+    #[test]
+    fn lists_folders_lazily_with_markdown_first_class_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("notes")).unwrap();
+        std::fs::write(tmp.path().join("notes").join("deep.md"), "x").unwrap();
+        std::fs::write(tmp.path().join("a.md"), "x").unwrap();
+        std::fs::write(tmp.path().join("pic.png"), "x").unwrap();
+        std::fs::write(tmp.path().join("b.bin"), "x").unwrap();
+        let mut tree = WorkspaceTree::open(Arc::new(RealFs), tmp.path()).unwrap();
+        let paths = tree.paths();
+        assert_eq!(paths.path(tree.root_key()).unwrap(), tmp.path());
+        let top = tree.children(tree.root_key(), &SidebarOptions::default());
+        let names: Vec<_> = top.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["notes", "a.md", "b.bin", "pic.png"]);
+        assert_eq!(top[0].kind, EntryKind::Folder);
+        assert_eq!(top[1].kind, EntryKind::Markdown);
+        assert_eq!(top[2].kind, EntryKind::Other);
+        assert_eq!(top[3].kind, EntryKind::Image);
+        assert_eq!(paths.path(top[1].key).unwrap(), tmp.path().join("a.md"));
+        let inner = tree.children(top[0].key, &SidebarOptions::default());
+        assert_eq!(inner.len(), 1);
+        assert_eq!(
+            paths.path(inner[0].key).unwrap(),
+            tmp.path().join("notes").join("deep.md")
+        );
+        // The same path always gets the same key.
+        let again = tree.children(top[0].key, &SidebarOptions::default());
+        assert_eq!(again[0].key, inner[0].key);
+        // Filters reach the listing.
+        let options = SidebarOptions {
+            hide_non_markdown: true,
+            ..SidebarOptions::default()
+        };
+        let filtered = tree.children(tree.root_key(), &options);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["notes", "a.md"]
+        );
+        assert!(tree.children(9999, &options).is_empty());
+        assert_eq!(paths.path(9999), None);
+    }
+
+    #[test]
+    fn a_missing_root_is_an_error_and_a_vanished_folder_lists_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            WorkspaceTree::open(Arc::new(RealFs), &tmp.path().join("missing")),
+            Err(FsError::NotFound(_))
+        ));
+        std::fs::create_dir(tmp.path().join("gone")).unwrap();
+        let mut tree = WorkspaceTree::open(Arc::new(RealFs), tmp.path()).unwrap();
+        let top = tree.children(0, &SidebarOptions::default());
+        std::fs::remove_dir(tmp.path().join("gone")).unwrap();
+        assert!(
+            tree.children(top[0].key, &SidebarOptions::default())
+                .is_empty()
+        );
+        assert_eq!(
+            tree.root_name(),
+            tmp.path().file_name().unwrap().to_string_lossy()
+        );
+    }
+}

@@ -6,7 +6,8 @@ use std::rc::Rc;
 
 use ssw_win::com::{ComGuard, WinError};
 use ssw_win::taskbar::{
-    Progress, SystemTaskbar, Taskbar, TaskbarApi, taskbar_button_created_message,
+    Progress, SystemTaskbar, SystemTaskbars, Taskbar, TaskbarApi, TaskbarFactory,
+    taskbar_button_created_message,
 };
 use windows::Win32::Foundation::{E_FAIL, HWND};
 use windows::Win32::UI::Shell::{
@@ -204,4 +205,71 @@ fn the_real_taskbar_accepts_every_progress_state_for_a_hidden_window() {
     }
     // SAFETY: destroys the window created above on its owning thread.
     unsafe { DestroyWindow(hwnd) }.unwrap();
+}
+
+#[test]
+fn a_boxed_api_forwards_and_the_system_factory_makes_a_working_one() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let api: Box<dyn TaskbarApi> = Box::new(Recording {
+        calls: Rc::clone(&calls),
+        fail_state: false,
+        fail_value: false,
+    });
+    let mut taskbar = Taskbar::with_api(HWND::default(), api);
+    taskbar.set(normal(2, 8)).unwrap();
+    taskbar.button_created().unwrap();
+    assert_eq!(
+        *calls.borrow(),
+        [
+            Call::State(TBPF_NORMAL.0),
+            Call::Value(2, 8),
+            Call::State(TBPF_NORMAL.0),
+            Call::Value(2, 8),
+        ]
+    );
+
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let hwnd = hidden_window();
+    {
+        let api = SystemTaskbars.create().unwrap();
+        let mut real = Taskbar::with_api(hwnd, api);
+        real.set(normal(1, 2)).unwrap();
+        real.button_created().unwrap();
+        real.set(Progress::None).unwrap();
+    }
+    // SAFETY: destroys the window created above on its owning thread.
+    unsafe { DestroyWindow(hwnd) }.unwrap();
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn every_failing_step_of_creating_the_taskbar_object_is_reported_by_all_three_constructors() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let hwnd = HWND::default();
+    let steps = |outcome: Result<(), WinError>| {
+        outcome.err().map(|error| {
+            error
+                .to_string()
+                .split(" failed: ")
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
+    };
+    let expected = [
+        Some("create ITaskbarList3".to_owned()),
+        Some("ITaskbarList3::HrInit".to_owned()),
+    ];
+    assert_eq!(
+        ssw_win::fault::sweep(|| steps(SystemTaskbar::new().map(|_| ()))),
+        expected
+    );
+    assert_eq!(
+        ssw_win::fault::sweep(|| steps(SystemTaskbars.create().map(|_| ()))),
+        expected
+    );
+    assert_eq!(
+        ssw_win::fault::sweep(|| steps(Taskbar::new(hwnd).map(|_| ()))),
+        expected
+    );
 }

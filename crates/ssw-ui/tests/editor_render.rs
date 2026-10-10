@@ -365,6 +365,22 @@ fn composition_replaces_a_selection_and_end_cancels() {
     assert_eq!(h.painted_texts(), ["ad"]);
 }
 
+#[test]
+fn committing_nothing_drops_the_composition_without_writing() {
+    let mut h = Harness::new("ab\n");
+    h.set_caret(2);
+    h.ime(ImeEvent::Update {
+        text: "か".into(),
+        caret: 3,
+        attrs: vec![],
+    });
+    assert_eq!(h.painted_texts(), ["abか"]);
+    h.ime(ImeEvent::Commit(String::new()));
+    assert_eq!(h.text(), "ab\n");
+    assert_eq!(h.painted_texts(), ["ab"]);
+    assert_eq!(h.selection(), Selection::caret(2));
+}
+
 struct MathProvider;
 
 impl InlineObjectProvider for MathProvider {

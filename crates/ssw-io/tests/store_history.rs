@@ -373,3 +373,21 @@ fn damaged_rows_are_reported_as_invalid_data() {
     let listed = store.history_list(Path::new("C:\\worse.md")).unwrap_err();
     assert!(matches!(listed, StoreError::InvalidData(_)), "{listed:?}");
 }
+
+#[test]
+fn history_queries_report_sqlite_failures_when_the_tables_are_gone() {
+    let (_tmp, store, db) = open();
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE history_snapshots; DROP TABLE history_blobs;")
+        .unwrap();
+    let path = Path::new("C:\\a.md");
+    let errors = [
+        store.history_last_snapshot_time(path).unwrap_err(),
+        store.history_list(path).unwrap_err(),
+        store.history_move(path, Path::new("C:\\b.md")).unwrap_err(),
+    ];
+    for error in errors {
+        assert!(matches!(error, StoreError::Sqlite(_)), "{error:?}");
+    }
+}

@@ -4,22 +4,29 @@
 //! recording sheet. The real share sheet is never shown.
 
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::ptr::null_mut;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ssw_win::com::{ComGuard, WinError};
 use ssw_win::share::{
     DataRequestTarget, PendingShare, ShareSlot, ShareUi, SharedFile, Sharer, SystemShareUi,
+    data_requested_handler,
 };
 use windows::ApplicationModel::DataTransfer::{
-    DataPackage, DataPackageOperation, StandardDataFormats,
+    DataPackage, DataPackageOperation, DataRequest, DataRequestedEventArgs, DataTransferManager,
+    IDataRequest_Vtbl, IDataRequestedEventArgs_Vtbl, StandardDataFormats,
 };
-use windows::Win32::Foundation::HWND;
+use windows::Foundation::DateTime;
+use windows::Win32::Foundation::{E_FAIL, E_NOINTERFACE, E_NOTIMPL, HWND, S_OK};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
-use windows::core::w;
+use windows::core::{
+    GUID, HRESULT, IInspectable, IInspectable_Vtbl, IUnknown, IUnknown_Vtbl, Interface, w,
+};
 
 /// A temporary folder holding `notes.md`; removed on drop.
 struct TempFile {
@@ -356,6 +363,26 @@ fn the_sharer_prepares_the_file_then_opens_the_sheet_through_the_seam() {
 }
 
 #[test]
+fn the_system_sheet_refuses_a_window_that_no_longer_exists() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let ui = SystemShareUi::new().unwrap();
+    // The window is destroyed when the guard ends: the handle that is left names nothing, so
+    // no sheet can open for it.
+    let stale = HiddenWindow::new().0;
+    let error = ui.show(stale).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            WinError::Os {
+                context: "ShowShareUIForWindow",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn the_system_sharer_is_created_for_a_window_without_showing_anything() {
     let _com = ComGuard::apartment_threaded().unwrap();
     let window = HiddenWindow::new();
@@ -364,4 +391,274 @@ fn the_system_sharer_is_created_for_a_window_without_showing_anything() {
     // Nothing was shared, so a data request has nothing to hand out.
     let error = sharer.slot().serve(&Request::new()).unwrap_err();
     assert!(matches!(error, WinError::Invalid(_)), "{error:?}");
+}
+
+/// A hand-written COM object of one WinRT interface. `DataRequest` and `DataRequestedEventArgs`
+/// are runtime classes only the system creates (while it shows the share sheet), so the objects
+/// the sheet would hand to the `DataRequested` handler are made here, vtable and reference count
+/// included. The one getter of the interface (`Data`, `Request`) returns `answer`.
+#[repr(C)]
+struct FakeObject {
+    /// The interface pointer of a COM object points at the pointer to its vtable.
+    vtable: *const c_void,
+    refs: AtomicU32,
+    /// The interface the object implements (it also answers for `IUnknown` and `IInspectable`).
+    iid: GUID,
+    answer: windows::core::Result<IUnknown>,
+}
+
+unsafe extern "system" fn query(
+    this: *mut c_void,
+    iid: *const GUID,
+    interface: *mut *mut c_void,
+) -> HRESULT {
+    // SAFETY: `this` is the `FakeObject` of `fake`; `iid` and `interface` are valid per the COM
+    // contract of `QueryInterface`.
+    unsafe {
+        let wanted = *iid;
+        if wanted == IUnknown::IID
+            || wanted == IInspectable::IID
+            || wanted == (*this.cast::<FakeObject>()).iid
+        {
+            add_ref(this);
+            interface.write(this);
+            S_OK
+        } else {
+            interface.write(null_mut());
+            E_NOINTERFACE
+        }
+    }
+}
+
+unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+    // SAFETY: `this` is the `FakeObject` of `fake`.
+    unsafe {
+        (*this.cast::<FakeObject>())
+            .refs
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+}
+
+unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+    // SAFETY: `this` is the `FakeObject` of `fake`; the last reference frees it.
+    unsafe {
+        let left = (*this.cast::<FakeObject>())
+            .refs
+            .fetch_sub(1, Ordering::SeqCst)
+            - 1;
+        if left == 0 {
+            drop(Box::from_raw(this.cast::<FakeObject>()));
+        }
+        left
+    }
+}
+
+unsafe extern "system" fn get_iids(_: *mut c_void, _: *mut u32, _: *mut *mut GUID) -> HRESULT {
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn get_runtime_class_name(_: *mut c_void, _: *mut *mut c_void) -> HRESULT {
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn get_trust_level(_: *mut c_void, _: *mut i32) -> HRESULT {
+    E_NOTIMPL
+}
+
+/// The getter the fakes have: hands out a new reference to the answer, or fails with its error.
+unsafe extern "system" fn answer(this: *mut c_void, result: *mut *mut c_void) -> HRESULT {
+    // SAFETY: `this` is the `FakeObject` of `fake`; `result` is a valid out pointer.
+    unsafe {
+        match &(*this.cast::<FakeObject>()).answer {
+            Ok(value) => {
+                result.write(value.clone().into_raw());
+                S_OK
+            }
+            Err(error) => {
+                result.write(null_mut());
+                error.code()
+            }
+        }
+    }
+}
+
+unsafe extern "system" fn set_data(_: *mut c_void, _: *mut c_void) -> HRESULT {
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn deadline(_: *mut c_void, _: *mut DateTime) -> HRESULT {
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn fail_with_display_text(_: *mut c_void, _: *mut c_void) -> HRESULT {
+    E_NOTIMPL
+}
+
+unsafe extern "system" fn get_deferral(_: *mut c_void, _: *mut *mut c_void) -> HRESULT {
+    E_NOTIMPL
+}
+
+const INSPECTABLE: IInspectable_Vtbl = IInspectable_Vtbl {
+    base: IUnknown_Vtbl {
+        QueryInterface: query,
+        AddRef: add_ref,
+        Release: release,
+    },
+    GetIids: get_iids,
+    GetRuntimeClassName: get_runtime_class_name,
+    GetTrustLevel: get_trust_level,
+};
+
+static REQUEST_ARGS_VTABLE: IDataRequestedEventArgs_Vtbl = IDataRequestedEventArgs_Vtbl {
+    base__: INSPECTABLE,
+    Request: answer,
+};
+
+static REQUEST_VTABLE: IDataRequest_Vtbl = IDataRequest_Vtbl {
+    base__: INSPECTABLE,
+    Data: answer,
+    SetData: set_data,
+    Deadline: deadline,
+    FailWithDisplayText: fail_with_display_text,
+    GetDeferral: get_deferral,
+};
+
+/// A COM object of interface `T` with the vtable `vtable`, one reference of which the returned
+/// value owns.
+fn fake<T: Interface, V>(vtable: &'static V, answer: windows::core::Result<IUnknown>) -> T {
+    let object = Box::new(FakeObject {
+        vtable: std::ptr::from_ref(vtable).cast(),
+        refs: AtomicU32::new(1),
+        iid: T::IID,
+        answer,
+    });
+    // SAFETY: the object starts with the pointer to a vtable of the layout of `T`, counts its
+    // references and frees itself when the last one is released.
+    unsafe { T::from_raw(Box::into_raw(object).cast()) }
+}
+
+/// What the share sheet hands out as the data request: it answers with `package`, or fails.
+fn data_request(package: windows::core::Result<DataPackage>) -> DataRequest {
+    fake(&REQUEST_VTABLE, package.map(Into::into))
+}
+
+/// What the share sheet hands to the handler as the arguments of the event.
+fn event_args(request: windows::core::Result<DataRequest>) -> DataRequestedEventArgs {
+    fake(&REQUEST_ARGS_VTABLE, request.map(Into::into))
+}
+
+#[test]
+fn the_data_request_of_the_system_hands_out_its_package() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let package = DataPackage::new().unwrap();
+    let request = data_request(Ok(package.clone()));
+    assert_eq!(request.package().unwrap(), package);
+
+    let error = data_request(Err(E_FAIL.into())).package().unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            WinError::Os { context: "DataRequest::Data", source } if source.code() == E_FAIL
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn the_data_requested_handler_answers_the_system_from_the_slot() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let temp = TempFile::new("notes.md");
+    let slot = ShareSlot::default();
+    let handler = data_requested_handler(slot.clone());
+    let nobody = None::<&DataTransferManager>;
+
+    // An event without arguments, and one whose request cannot be read.
+    assert!(
+        handler
+            .Invoke(nobody, None::<&DataRequestedEventArgs>)
+            .is_err()
+    );
+    let unreadable = event_args(Err(E_FAIL.into()));
+    assert_eq!(
+        handler.Invoke(nobody, &unreadable).unwrap_err().code(),
+        E_FAIL
+    );
+
+    // Nothing is shared yet: the request fails with `E_FAIL` and its package stays empty.
+    let package = DataPackage::new().unwrap();
+    let args = event_args(Ok(data_request(Ok(package.clone()))));
+    assert_eq!(handler.Invoke(nobody, &args).unwrap_err().code(), E_FAIL);
+    assert!(
+        !package
+            .GetView()
+            .unwrap()
+            .Contains(&StandardDataFormats::StorageItems().unwrap())
+            .unwrap()
+    );
+
+    // Once a file is shared, the same request is answered with it.
+    slot.set(PendingShare::resolve(&SharedFile::new(&temp.path).with_title("Notes")).unwrap());
+    handler.Invoke(nobody, &args).unwrap();
+    assert_eq!(inspect(&package), expected("Notes", &temp, "notes.md"));
+
+    // A request that has no package to fill cannot be answered either.
+    let hollow = event_args(Ok(data_request(Err(E_FAIL.into()))));
+    assert_eq!(handler.Invoke(nobody, &hollow).unwrap_err().code(), E_FAIL);
+}
+
+/// Every system call of the share that can fail does, in turn: the failure comes back as an OS
+/// error of the operation, and the operation succeeds again once nothing fails.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_failing_system_call_fails_the_share_with_an_os_error() {
+    use ssw_win::fault;
+
+    /// Runs `run` once per system call it makes, failing that call each time; returns how many
+    /// calls could fail.
+    fn fail_each_call(mut run: impl FnMut() -> Result<(), WinError>) -> u32 {
+        for call in 0.. {
+            fault::arm(call);
+            let result = run();
+            let tripped = fault::tripped();
+            fault::disarm();
+            if !tripped {
+                result.unwrap();
+                return call;
+            }
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, WinError::Os { .. }),
+                "call {call}: {error:?}"
+            );
+        }
+        unreachable!("the loop ends with the first run that trips nothing")
+    }
+
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let window = HiddenWindow::new();
+    let temp = TempFile::new("notes.md");
+    let file = SharedFile::new(&temp.path);
+
+    // `GetFileFromPathAsync`, `AgileReference::new`.
+    assert_eq!(fail_each_call(|| PendingShare::resolve(&file).map(drop)), 2);
+    let pending = PendingShare::resolve(&file).unwrap();
+    // Resolve the file again, the operation, `Properties`, `SetTitle`, the cast to a storage
+    // item and `SetStorageItems`.
+    let fill = || pending.fill(&DataPackage::new().unwrap());
+    assert_eq!(fail_each_call(fill), 6);
+    // `DataPackage::new` and the six calls of the fill.
+    assert_eq!(fail_each_call(|| pending.build().map(drop)), 7);
+    // The interop factory.
+    assert_eq!(fail_each_call(|| SystemShareUi::new().map(drop)), 1);
+    // The interop factory, the manager of the window and the handler registration.
+    let sheet = || RecordingSheet {
+        shown: Rc::default(),
+        fail: false,
+    };
+    assert_eq!(
+        fail_each_call(|| Sharer::with_ui(window.0, sheet()).map(drop)),
+        3
+    );
+    assert_eq!(fail_each_call(|| Sharer::new(window.0).map(drop)), 4);
 }

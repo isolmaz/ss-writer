@@ -271,12 +271,9 @@ impl TextBox {
         }
     }
 
-    /// Display offset of the byte offset `offset` of the text.
-    fn to_display(&self, offset: usize) -> usize {
-        match &self.composition {
-            Some(composition) if offset > self.caret => offset + composition.text.len(),
-            _ => offset,
-        }
+    /// Display offset of the caret: inside the composition while one is in progress.
+    fn display_caret(&self) -> usize {
+        self.caret + self.composition.as_ref().map_or(0, |c| c.caret)
     }
 
     /// Display range of the composition.
@@ -452,8 +449,7 @@ impl TextBox {
     fn reveal_caret(&mut self, cx: &EventCx) {
         let display = self.display();
         let layout = layout_line(cx.text, cx.theme, &display, FONT_SIZE);
-        let at = self.to_display(self.caret) + self.composition.as_ref().map_or(0, |c| c.caret);
-        let x = layout.caret_rect(at, false).x;
+        let x = layout.caret_rect(self.display_caret(), false).x;
         let width = self.inner().width;
         if x < self.scroll {
             self.scroll = x;
@@ -631,8 +627,7 @@ impl Widget for TextBox {
         if focused && self.selection().is_empty() {
             let display = self.display();
             let layout = layout_line(cx.text, cx.theme, &display, FONT_SIZE);
-            let at = self.to_display(self.caret) + self.composition.as_ref().map_or(0, |c| c.caret);
-            let caret = layout.caret_rect(at, false);
+            let caret = layout.caret_rect(self.display_caret(), false);
             let top = inner.y + (inner.height - layout.size().height) / 2.0 + caret.y;
             canvas.fill_rect(
                 Rect::new(inner.x - self.scroll + caret.x, top, 1.0, caret.height),
@@ -905,6 +900,7 @@ mod tests {
         textbox.set_selection(0, 0);
         harness.key_with(&mut textbox, KEY_C, Modifiers::CTRL);
         harness.key_with(&mut textbox, KEY_X, Modifiers::CTRL);
+        harness.key_with(&mut textbox, vk::DELETE, Modifiers::SHIFT);
         assert_eq!(textbox.text(), "worldworld");
         shared.borrow_mut().clear().expect("clear");
         harness.key_with(&mut textbox, KEY_V, Modifiers::CTRL);
@@ -1212,6 +1208,15 @@ mod tests {
             .with_motion(Motion::reduced());
         harness.arrange(&mut textbox, Rect::new(10.0, 10.0, 200.0, 32.0));
         let tokens = harness.theme.tokens;
+        let fill_colors = |canvas: &crate::canvas::RecordingCanvas| -> Vec<crate::geometry::Color> {
+            canvas
+                .ops()
+                .filter_map(|op| match op {
+                    DrawOp::FillRect { color, .. } => Some(*color),
+                    _ => None,
+                })
+                .collect()
+        };
         let canvas = harness.paint(&textbox);
         assert_eq!(canvas.texts(), vec!["Type a name"]);
         assert!(
@@ -1219,11 +1224,7 @@ mod tests {
                 .ops()
                 .any(|op| matches!(op, DrawOp::Text { color, .. } if *color == tokens.text_muted))
         );
-        assert!(
-            !canvas
-                .ops()
-                .any(|op| matches!(op, DrawOp::FillRect { color, .. } if *color == tokens.caret))
-        );
+        assert!(!fill_colors(&canvas).contains(&tokens.caret));
         harness.focus_widget(&mut textbox);
         let canvas = harness.paint(&textbox);
         // The focused empty box shows the accent line under it, and the placeholder stays.
@@ -1247,20 +1248,13 @@ mod tests {
                 .any(|op| matches!(op, DrawOp::FillRect { rect, color }
             if *color == tokens.selection_bg && rect.x == 28.0 && rect.width == 16.0))
         );
-        assert!(
-            !canvas
-                .ops()
-                .any(|op| matches!(op, DrawOp::FillRect { color, .. } if *color == tokens.caret))
-        );
+        assert!(!fill_colors(&canvas).contains(&tokens.caret));
         // Without focus the selection uses the inactive color and there is no accent line.
         harness.focus.blur();
         let canvas = harness.paint(&textbox);
-        assert!(canvas.ops().any(|op| matches!(op, DrawOp::FillRect { color, .. } if *color == tokens.selection_inactive_bg)));
-        assert!(
-            !canvas
-                .ops()
-                .any(|op| matches!(op, DrawOp::FillRect { color, .. } if *color == tokens.accent))
-        );
+        let fills = fill_colors(&canvas);
+        assert!(fills.contains(&tokens.selection_inactive_bg));
+        assert!(!fills.contains(&tokens.accent));
         // Disabled text is grey; damage elsewhere skips painting.
         textbox.set_enabled(false);
         let canvas = harness.paint(&textbox);
@@ -1314,5 +1308,52 @@ mod tests {
             &mut measuring,
             Event::AnimationFrame(std::time::Duration::from_millis(1)),
         );
+    }
+
+    #[test]
+    fn kit_textbox_with_id_and_eased_hover() {
+        let id = WidgetId::allocate();
+        let clipboard: SharedClipboard = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::services::MemoryClipboard::default(),
+        ));
+        let mut textbox = TextBox::new("Name", "hello", clipboard).with_id(id);
+        assert_eq!(textbox.id(), id);
+        let mut harness = Harness::new();
+        assert_eq!(harness.node(&textbox).id, id);
+        let bounds = harness.place(&mut textbox, Point::new(10.0, 10.0));
+        harness.hover(&mut textbox, bounds.center());
+        assert!(harness.requests.animation_frame_requested());
+        harness.frame(&mut textbox, 16);
+        harness.requests.take_invalidation();
+        harness.frame(&mut textbox, 50);
+        assert!(!harness.requests.take_invalidation().is_clean());
+        harness.run_animations(&mut textbox);
+    }
+
+    #[test]
+    fn kit_textbox_clamps_offsets_to_character_boundaries() {
+        assert_eq!(clamp_boundary("aé", 2), 1);
+        assert_eq!(clamp_boundary("aé", 3), 3);
+        assert_eq!(clamp_boundary("aé", 99), 3);
+    }
+
+    #[test]
+    fn kit_textbox_maps_display_offsets_around_a_composition_back_to_the_text() {
+        let clipboard: SharedClipboard = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::services::MemoryClipboard::default(),
+        ));
+        let mut textbox = TextBox::new("Name", "hello", clipboard);
+        textbox.caret = 2;
+        assert_eq!(textbox.source_offset(1), 1);
+        textbox.composition = Some(Composition {
+            text: "ab".to_owned(),
+            caret: 2,
+            attrs: Vec::new(),
+        });
+        // "heabllo": the first two characters, the composition, then the rest.
+        assert_eq!(textbox.source_offset(1), 1);
+        assert_eq!(textbox.source_offset(3), 2);
+        assert_eq!(textbox.source_offset(4), 2);
+        assert_eq!(textbox.source_offset(6), 4);
     }
 }

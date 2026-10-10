@@ -30,6 +30,8 @@ pub struct EpubOptions {
     pub author: Option<String>,
     /// BCP-47 language tag; defaults to `en`.
     pub lang: Option<String>,
+    /// The style sheet of the book.
+    pub theme: css::Theme,
 }
 
 /// Why the archive could not be built.
@@ -439,7 +441,7 @@ fn build(
         entry(
             "OEBPS/stylesheet.css",
             false,
-            css::light_theme_css().as_bytes(),
+            css::theme_css(opts.theme).as_bytes(),
         ),
     ];
     for page in &pages {
@@ -557,6 +559,7 @@ mod tests {
             title: None,
             author: Some("Ada".into()),
             lang: Some("tr".into()),
+            ..EpubOptions::default()
         };
         let epub = export_epub(
             "## Only sub\n\ntext",
@@ -635,14 +638,34 @@ mod tests {
         let md = "# T\n\na  \nb\n\n---\n\n- [x] t\n\n![i](https://x/y.png)\n\n| a |\n|---|\n| & |";
         let epub = export_epub(md, "a.md", &NoAssets, &EpubOptions::default()).unwrap();
         let page = read(&epub, "OEBPS/chapter_1.xhtml");
-        let mut reader = quick_xml::Reader::from_str(&page);
+        assert_eq!(xml_error(&page), None, "{page}");
+    }
+
+    /// The first well-formedness error of `xml`, if any.
+    fn xml_error(xml: &str) -> Option<String> {
+        let mut reader = quick_xml::Reader::from_str(xml);
         loop {
             match reader.read_event() {
-                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(quick_xml::events::Event::Eof) => return None,
                 Ok(_) => {}
-                Err(e) => panic!("not well-formed: {e}\n{page}"),
+                Err(e) => return Some(e.to_string()),
             }
         }
+    }
+
+    #[test]
+    fn the_well_formedness_check_reports_mismatched_tags() {
+        assert_eq!(xml_error("<a><b/></a>"), None);
+        assert!(xml_error("<a><b></a>").is_some());
+    }
+
+    #[test]
+    fn formulas_and_diagrams_without_svg_fall_back_to_their_source() {
+        let md = "# T\n\n$x^2$\n\n$$\ny\n$$\n\n```mermaid\ngraph TD\n```\n";
+        let epub = export_epub(md, "m.md", &Png, &EpubOptions::default()).unwrap();
+        let page = read(&epub, "OEBPS/chapter_1.xhtml");
+        assert!(!page.contains("<svg"), "{page}");
+        assert!(page.contains("x^2") && page.contains("graph TD"), "{page}");
     }
 
     #[test]
@@ -757,6 +780,7 @@ mod tests {
             title: Some("A <b> & \"c\"".into()),
             author: Some("O'Neil & <Co>".into()),
             lang: Some("en\"x".into()),
+            ..EpubOptions::default()
         };
         let epub = export_epub("text", "t.md", &Png, &opts).unwrap();
         for name in [
@@ -766,14 +790,7 @@ mod tests {
             "OEBPS/chapter_1.xhtml",
         ] {
             let xml = read(&epub, name);
-            let mut reader = quick_xml::Reader::from_str(&xml);
-            loop {
-                match reader.read_event() {
-                    Ok(quick_xml::events::Event::Eof) => break,
-                    Ok(_) => {}
-                    Err(e) => panic!("{name} not well-formed: {e}\n{xml}"),
-                }
-            }
+            assert_eq!(xml_error(&xml), None, "{name}\n{xml}");
         }
         let opf = read(&epub, "OEBPS/content.opf");
         assert!(

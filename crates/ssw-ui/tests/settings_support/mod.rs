@@ -11,7 +11,7 @@ use ssw_core::i18n::Localizer;
 use ssw_core::settings::Settings;
 use ssw_ui::access::{AccessAction, AccessNode, AccessTree, Role};
 use ssw_ui::canvas::RecordingCanvas;
-use ssw_ui::geometry::{Point, Rect};
+use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{
     Event, KeyEvent, Modifiers, PointerButton, PointerEvent, PointerEventKind, WheelEvent,
 };
@@ -118,6 +118,20 @@ impl Host {
         self.focus.take_changes();
     }
 
+    /// The size `root` wants within `available`.
+    pub fn measure(&mut self, root: &mut dyn Control, available: Size) -> Size {
+        let id = root.id();
+        let mut cx = LayoutCx::new(
+            id,
+            &self.theme,
+            1.0,
+            &self.engine,
+            &mut self.focus,
+            &mut self.requests,
+        );
+        root.measure(&mut cx, available)
+    }
+
     pub fn event(&mut self, root: &mut dyn Control, event: Event) -> EventResult {
         let id = root.id();
         let result = {
@@ -166,6 +180,11 @@ impl Host {
     }
 
     pub fn paint(&self, root: &dyn Control) -> RecordingCanvas {
+        self.paint_damaged(root, None)
+    }
+
+    /// Paints while only `damage` is being repainted (`None`: the whole window).
+    pub fn paint_damaged(&self, root: &dyn Control, damage: Option<Rect>) -> RecordingCanvas {
         let mut canvas = RecordingCanvas::new();
         let cx = PaintCx::new(
             root.id(),
@@ -174,7 +193,7 @@ impl Host {
             &self.engine,
             &self.focus,
             &self.capture,
-            None,
+            damage,
         );
         root.paint(&cx, &mut canvas);
         assert!(canvas.is_balanced(), "unbalanced canvas stack");

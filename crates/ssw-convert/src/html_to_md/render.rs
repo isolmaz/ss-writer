@@ -1,5 +1,7 @@
 //! Block/inline model of a converted HTML document and its rendering to Markdown.
 
+use crate::doc::md::flank;
+
 /// Character formatting that applies to a run of text.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Fmt {
@@ -280,10 +282,7 @@ pub(super) fn render_inline(items: &[Inline], cell: bool) -> String {
     };
     for item in normalize(items) {
         match item {
-            Inline::Break => {
-                emitter.pending_space = false;
-                emitter.out.push_str(if cell { "<br>" } else { "\\\n" });
-            }
+            Inline::Break => emitter.line_break(),
             Inline::Text(text, fmt) => emitter.text(&text, &fmt),
             Inline::Image { markdown, link } => {
                 emitter.transition(link.into_iter().map(Mark::Link).collect());
@@ -331,8 +330,13 @@ fn normalize(items: &[Inline]) -> Vec<Inline> {
     }
     let leading_breaks = spaced.iter().take_while(|i| **i == Inline::Break).count();
     spaced.drain(..leading_breaks);
-    let mut merged: Vec<Inline> = Vec::with_capacity(spaced.len());
-    for item in spaced {
+    merge_text(flank_marks(&merge_text(spaced)))
+}
+
+/// Joins neighbouring text with equal formatting.
+fn merge_text(items: Vec<Inline>) -> Vec<Inline> {
+    let mut merged: Vec<Inline> = Vec::with_capacity(items.len());
+    for item in items {
         match (merged.last_mut(), &item) {
             (Some(Inline::Text(previous, previous_fmt)), Inline::Text(text, fmt))
                 if previous_fmt == fmt =>
@@ -343,6 +347,91 @@ fn normalize(items: &[Inline]) -> Vec<Inline> {
         }
     }
     merged
+}
+
+/// Whether a mark of `fmt` that is not a link closes when the text after it has format `next`.
+fn closes(fmt: &Fmt, next: &Fmt) -> bool {
+    let (open, wanted) = (marks(fmt), marks(next));
+    let keep = open.iter().take_while(|m| wanted.contains(m)).count();
+    open[keep..].iter().any(|m| !matches!(m, Mark::Link(_)))
+}
+
+/// Whether a mark of `fmt` that is not a link opens after text with format `previous`.
+fn opens(fmt: &Fmt, previous: &Fmt) -> bool {
+    let (open, wanted) = (marks(previous), marks(fmt));
+    let keep = open.iter().take_while(|m| wanted.contains(m)).count();
+    wanted
+        .iter()
+        .any(|m| !matches!(m, Mark::Link(_)) && !open[..keep].contains(m))
+}
+
+/// The text character of `neighbor` (its last when `before`) that touches the marks of a text
+/// with format `fmt`; `None` when no mark is written between them.
+fn touching(neighbor: Option<&Inline>, fmt: &Fmt, before: bool) -> Option<char> {
+    let Some(Inline::Text(text, other)) = neighbor else {
+        return None;
+    };
+    if other.link != fmt.link {
+        return None;
+    }
+    match (before, opens(fmt, other), closes(fmt, other)) {
+        (true, true, _) => text.chars().next_back(),
+        (false, _, true) => text.chars().next(),
+        _ => None,
+    }
+}
+
+/// Moves boundary punctuation out of text with emphasis where CommonMark would not read the
+/// markers as delimiters (`<b>Note:</b>x` becomes `**Note**:x`); text that cannot be marked
+/// loses its emphasis. The rules are those of the shared `flank`.
+fn flank_marks(items: &[Inline]) -> Vec<Inline> {
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let Inline::Text(text, fmt) = item else {
+            out.push(item.clone());
+            continue;
+        };
+        let core = text.trim_matches(' ');
+        if core.is_empty() || !marks(fmt).iter().any(|m| !matches!(m, Mark::Link(_))) {
+            out.push(item.clone());
+            continue;
+        }
+        let lead = text.len() - text.trim_start_matches(' ').len();
+        let trail = text.len() - text.trim_end_matches(' ').len();
+        let before = match i.checked_sub(1) {
+            Some(previous) if lead == 0 => touching(items.get(previous), fmt, true),
+            _ => None,
+        };
+        let after = if trail == 0 {
+            touching(items.get(i + 1), fmt, false)
+        } else {
+            None
+        };
+        let (pre, inner, post, marked) = flank(core, fmt.code, before, after);
+        let plain = Fmt {
+            bold: false,
+            italic: false,
+            underline: false,
+            strike: false,
+            highlight: false,
+            ..fmt.clone()
+        };
+        if !marked {
+            out.push(Inline::Text(text.clone(), plain));
+            continue;
+        }
+        if !pre.is_empty() {
+            out.push(Inline::Text(pre.to_string(), plain.clone()));
+        }
+        out.push(Inline::Text(
+            format!("{}{inner}{}", &text[..lead], &text[text.len() - trail..]),
+            fmt.clone(),
+        ));
+        if !post.is_empty() {
+            out.push(Inline::Text(post.to_string(), plain));
+        }
+    }
+    out
 }
 
 fn trim_trailing_space(items: &mut Vec<Inline>) {
@@ -430,6 +519,15 @@ impl Emitter {
             self.out.push_str(&escape_inline(core, self.cell));
         }
         self.pending_space = text.ends_with(' ');
+    }
+
+    /// Writes a hard break. Every open mark closes before it and reopens with the next text, so
+    /// no closing delimiter is left at the start of the next line, where it would not read as
+    /// one (`<b>a<br></b>c` is `**a**` + break + `c`).
+    fn line_break(&mut self) {
+        self.pending_space = false;
+        self.transition(Vec::new());
+        self.out.push_str(if self.cell { "<br>" } else { "\\\n" });
     }
 
     /// Closes the marks that no longer apply (and those opened after them), writes a pending
@@ -685,6 +783,43 @@ mod tests {
             render_inline(&[text("a "), Inline::Break, Inline::Break, text("b")], true),
             "a<br><br>b"
         );
+    }
+
+    #[test]
+    fn marks_close_before_a_break_and_reopen_after_it() {
+        let bold = |t| styled(t, |f| f.bold = true);
+        let linked = |t| {
+            styled(t, |f| {
+                f.bold = true;
+                f.link = Some("u".to_string());
+            })
+        };
+        let table = [
+            // no closing delimiter is left at the start of the next line
+            (
+                vec![bold("a"), Inline::Break, text("b")],
+                "**a**\\\nb",
+                false,
+            ),
+            (
+                vec![bold("a"), Inline::Break, bold("b")],
+                "**a**\\\n**b**",
+                false,
+            ),
+            (
+                vec![bold("a"), Inline::Break, bold("b")],
+                "**a**<br>**b**",
+                true,
+            ),
+            (
+                vec![linked("a"), Inline::Break, linked("b")],
+                "[**a**](u)\\\n[**b**](u)",
+                false,
+            ),
+        ];
+        for (items, expected, cell) in table {
+            assert_eq!(render_inline(&items, cell), expected);
+        }
     }
 
     #[test]

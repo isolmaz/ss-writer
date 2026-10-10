@@ -34,6 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR};
 
 use crate::com::{OsResultExt, WinError};
+use crate::fault::check;
 
 /// The command-line option that asks for a new window.
 pub const NEW_WINDOW_ARG: &str = "--new-window";
@@ -186,7 +187,7 @@ impl InstanceConfig {
             queue: RefCell::new(VecDeque::new()),
             wake,
         });
-        let hwnd = create_window(&class, &state)?;
+        let hwnd = create_window(&class, &state, HWND_MESSAGE)?;
         Ok(Acquired::Primary(PrimaryInstance {
             hwnd,
             class,
@@ -219,11 +220,14 @@ impl Drop for MutexHandle {
 /// Creates or opens the named mutex; the flag tells whether it existed before.
 fn open_mutex(name: &HSTRING) -> Result<(MutexHandle, bool), WinError> {
     // SAFETY: `name` is a valid NUL-terminated string; default security attributes.
-    let handle = unsafe { CreateMutexW(None, false, name) }.ctx("CreateMutexW")?;
+    let created = unsafe { CreateMutexW(None, false, name) };
     // SAFETY: reads the calling thread's last error right after the call; `CreateMutexW`
     // reports "opened an existing mutex" through it even on success.
     let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    Ok((MutexHandle(handle), existed))
+    // The handle belongs to its guard from here on: a failure injected after the call closes it
+    // again, so the name is free for the next attempt.
+    let handle = check(created.map(MutexHandle)).ctx("CreateMutexW")?;
+    Ok((handle, existed))
 }
 
 fn module_instance() -> HINSTANCE {
@@ -240,8 +244,9 @@ struct State {
     wake: Option<Wake>,
 }
 
-/// Registers `class` and creates the message-only window with `state` attached.
-fn create_window(class: &HSTRING, state: &State) -> Result<HWND, WinError> {
+/// Registers `class` and creates the window with `state` attached under `parent` (the
+/// message-only root: [`HWND_MESSAGE`]); the class is unregistered again when that fails.
+fn create_window(class: &HSTRING, state: &State, parent: HWND) -> Result<HWND, WinError> {
     let description = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(instance_proc),
@@ -256,7 +261,8 @@ fn create_window(class: &HSTRING, state: &State) -> Result<HWND, WinError> {
             windows::core::Error::from_thread(),
         ));
     }
-    // SAFETY: creates a message-only window of the class registered above.
+    // SAFETY: creates a window of the class registered above; a parent that is not a window
+    // makes the call fail, nothing else.
     let created = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -267,7 +273,7 @@ fn create_window(class: &HSTRING, state: &State) -> Result<HWND, WinError> {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            Some(parent),
             None,
             Some(module_instance()),
             None,
@@ -551,5 +557,34 @@ mod tests {
         assert_eq!(config.mutex_name(), r"Local\SSWriter.Instance");
         assert_eq!(config.window_class(), "SSWriter.InstanceWindow");
         assert_eq!(config, InstanceConfig::new(String::from("SSWriter")));
+    }
+
+    #[test]
+    fn a_window_that_cannot_be_created_leaves_no_class_behind() {
+        let class = HSTRING::from(format!("SSWriterTest{}.InstanceWindow", std::process::id()));
+        let state = State {
+            queue: RefCell::new(VecDeque::new()),
+            wake: None,
+        };
+        // A parent that is no window: the class registers, the window cannot be created.
+        let error =
+            create_window(&class, &state, HWND(std::ptr::dangling_mut::<c_void>())).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WinError::Os {
+                    context: "CreateWindowExW",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        // The class is gone again: the same name registers and creates a window now.
+        let hwnd = create_window(&class, &state, HWND_MESSAGE).unwrap();
+        // SAFETY: destroys the window created above on its own thread and removes its class.
+        unsafe {
+            DestroyWindow(hwnd).unwrap();
+            UnregisterClassW(&class, Some(module_instance())).unwrap();
+        }
     }
 }

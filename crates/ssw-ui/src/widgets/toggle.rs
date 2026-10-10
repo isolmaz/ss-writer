@@ -310,7 +310,7 @@ mod tests {
                 _ => None,
             })
             .nth(1)
-            .unwrap_or_else(|| panic!("no knob"))
+            .expect("no knob")
     }
 
     #[test]
@@ -381,19 +381,20 @@ mod tests {
             DrawOp::FillRoundedRect { color, .. } if *color == tokens.accent
         )));
         // The border is only drawn while the track is not fully on.
-        assert!(
-            !canvas
+        let stroke_widths = |canvas: &crate::canvas::RecordingCanvas| -> Vec<f32> {
+            canvas
                 .ops()
-                .any(|op| matches!(op, DrawOp::StrokeRoundedRect { width, .. } if *width == 1.0))
-        );
+                .filter_map(|op| match op {
+                    DrawOp::StrokeRoundedRect { width, .. } => Some(*width),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(stroke_widths(&canvas).is_empty());
         assert_eq!(canvas.texts(), vec!["Wrap"]);
         toggle.set_on(false);
         let canvas = harness.paint(&toggle);
-        assert!(
-            canvas
-                .ops()
-                .any(|op| matches!(op, DrawOp::StrokeRoundedRect { width, .. } if *width == 1.0))
-        );
+        assert_eq!(stroke_widths(&canvas), vec![1.0]);
     }
 
     #[test]
@@ -443,5 +444,42 @@ mod tests {
         assert_eq!(toggle.take_changed(), None);
         assert!(toggle.is_on());
         harness.send(&mut toggle, Event::Focus(FocusEvent::Lost));
+    }
+
+    #[test]
+    fn kit_toggle_with_id_and_disabled_paint_and_damage() {
+        let id = WidgetId::allocate();
+        let mut toggle = ToggleSwitch::new("Wrap", true).with_id(id);
+        assert_eq!(toggle.id(), id);
+        let mut harness = crate::widgets::testkit::Harness::new();
+        assert_eq!(harness.node(&toggle).id, id);
+        let bounds = harness.place(&mut toggle, Point::new(10.0, 10.0));
+        let away = Rect::new(500.0, 500.0, 5.0, 5.0);
+        assert_eq!(harness.paint_damaged(&toggle, Some(away)).ops().count(), 0);
+        assert!(harness.paint_damaged(&toggle, Some(bounds)).ops().count() > 0);
+        // A disabled switch and its label are drawn dimmed.
+        let tokens = harness.theme.tokens;
+        toggle.set_enabled(false);
+        let canvas = harness.paint(&toggle);
+        assert!(canvas.ops().any(|op| matches!(
+            op,
+            crate::canvas::DrawOp::Text { color, .. } if *color == tokens.text_disabled
+        )));
+        // An off switch outlines its track in the disabled color too.
+        let mut off = ToggleSwitch::new("Wrap", false);
+        off.set_enabled(false);
+        harness.place(&mut off, Point::new(10.0, 60.0));
+        assert!(harness.paint(&off).ops().any(|op| matches!(
+            op,
+            crate::canvas::DrawOp::StrokeRoundedRect { color, .. } if *color == tokens.text_disabled
+        )));
+    }
+
+    #[test]
+    fn kit_toggle_without_a_label_draws_no_text() {
+        let mut toggle = ToggleSwitch::new("", true);
+        let mut harness = crate::widgets::testkit::Harness::new();
+        harness.place(&mut toggle, Point::new(10.0, 10.0));
+        assert!(harness.paint(&toggle).texts().is_empty());
     }
 }

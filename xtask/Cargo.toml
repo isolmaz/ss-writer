@@ -15,6 +15,9 @@ workspace = true
 ssw-core = { path = "../crates/ssw-core" }
 fluent-syntax = "0.12"
 regex = "1"
+# `icons` rasterizes the SVG masters; the usvg version matches the one ssw-render uses. No
+# `text` feature: the icon masters contain shapes only.
+resvg = { version = "0.48", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

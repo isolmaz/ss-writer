@@ -272,6 +272,10 @@ mod tests {
                 ClipboardError::BadOffset("StartHTML"),
             ),
             (
+                b"Version:0.9\r\nStartHTML:0000009999\r\n<p>".to_vec(),
+                ClipboardError::BadOffset("StartHTML"),
+            ),
+            (
                 b"Version:0.9\r\nStartFragment:0000000005\r\nEndFragment:0000000001\r\n<p>"
                     .to_vec(),
                 ClipboardError::BadOffset("StartFragment"),

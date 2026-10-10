@@ -215,6 +215,25 @@ pub fn parse_release(body: &[u8]) -> Result<Release, UpdateError> {
     })
 }
 
+/// The latest release published at `endpoint` (normally [`RELEASES_URL`]), asked for now: no
+/// schedule, no setting and no record of the check (the "Check for updates now" command).
+///
+/// # Errors
+/// [`UpdateError::Net`] for network and protocol failures and the errors of [`parse_release`].
+pub fn latest_release(http: &dyn Http, endpoint: &str) -> Result<Release, UpdateError> {
+    let fetched = fetch(
+        http,
+        endpoint,
+        &FetchOptions {
+            accept: Accept::Json,
+            max_body: MAX_RESPONSE_BYTES,
+            timeout: CHECK_TIMEOUT,
+            allow_http: false,
+        },
+    )?;
+    parse_release(&fetched.body)
+}
+
 /// The time of the last successful check, if any.
 ///
 /// # Errors
@@ -246,17 +265,7 @@ pub fn check_for_updates(
     if !is_due(last_check(store)?, now) {
         return Ok(UpdateStatus::NotDue);
     }
-    let fetched = fetch(
-        http,
-        endpoint,
-        &FetchOptions {
-            accept: Accept::Json,
-            max_body: MAX_RESPONSE_BYTES,
-            timeout: CHECK_TIMEOUT,
-            allow_http: false,
-        },
-    )?;
-    let release = parse_release(&fetched.body)?;
+    let release = latest_release(http, endpoint)?;
     store.kv_set(LAST_CHECK_KEY, &now.to_string())?;
     Ok(if release.version > *current {
         UpdateStatus::Available(release)

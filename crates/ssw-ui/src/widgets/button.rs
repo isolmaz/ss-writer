@@ -469,19 +469,13 @@ mod tests {
                 .filter(|op| matches!(op, DrawOp::FillRoundedRect { .. }))
                 .collect();
             assert_eq!(fills.len(), 1);
-            match fills[0] {
-                DrawOp::FillRoundedRect { rect, radii, color } => {
-                    assert_eq!(*rect, bounds);
-                    assert_eq!(*radii, CornerRadii::uniform(4.0));
-                    if accent_fill {
-                        assert_eq!(*color, tokens.accent);
-                    }
-                    if kind == ButtonKind::Subtle {
-                        assert_eq!(color.a, 0.0);
-                    }
-                }
-                _ => unreachable!(),
-            }
+            assert!(
+                matches!(fills[0], DrawOp::FillRoundedRect { rect, radii, color }
+                    if *rect == bounds
+                        && *radii == CornerRadii::uniform(4.0)
+                        && (!accent_fill || *color == tokens.accent)
+                        && (kind != ButtonKind::Subtle || color.a == 0.0))
+            );
             let border = canvas
                 .ops()
                 .filter(|op| matches!(op, DrawOp::StrokeRoundedRect { .. }))
@@ -499,13 +493,17 @@ mod tests {
         assert!(button.is_hovered());
         let color_of = |harness: &mut Harness, button: &Button| {
             let canvas = harness.paint(button);
+            // The label is drawn after the fill: look from the end.
             canvas
                 .ops()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
                 .find_map(|op| match op {
                     DrawOp::FillRoundedRect { color, .. } => Some(*color),
                     _ => None,
                 })
-                .unwrap_or_else(|| panic!("no fill"))
+                .expect("the button is filled")
         };
         assert_eq!(color_of(&mut harness, &button), tokens.hover_bg);
         let text_color = |harness: &mut Harness, button: &Button| {
@@ -640,5 +638,13 @@ mod tests {
         harness.requests.take_invalidation();
         harness.send(&mut button, Event::Focus(FocusEvent::Lost));
         assert!(!harness.requests.invalidation().is_clean());
+    }
+
+    #[test]
+    fn kit_button_with_id_names_the_control() {
+        let id = WidgetId::allocate();
+        let button = Button::new(ButtonKind::Standard, "Run").with_id(id);
+        assert_eq!(button.id(), id);
+        assert_eq!(Harness::new().node(&button).id, id);
     }
 }

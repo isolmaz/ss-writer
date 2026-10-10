@@ -4,13 +4,18 @@
 
 mod settings_support;
 
-use settings_support::{Host, SETTINGS_FTL, localizer, localizer_with, settings_window};
+use settings_support::{
+    Host, SETTINGS_FTL, localizer, localizer_with, settings_env, settings_window,
+};
 use ssw_core::settings::{Settings, SettingsSection};
 use ssw_ui::access::{AccessAction, Role, ToggleState};
 use ssw_ui::canvas::DrawOp;
-use ssw_ui::geometry::{Point, Rect};
-use ssw_ui::input::{Modifiers, vk};
-use ssw_ui::shell::settings::{FieldId, SettingsChange, SettingsEvent, SettingsWindow};
+use ssw_ui::geometry::{Point, Rect, Size};
+use ssw_ui::input::{Event, Modifiers, WheelEvent, vk};
+use ssw_ui::shell::settings::{
+    FieldId, SettingsChange, SettingsEnv, SettingsEvent, SettingsWindow,
+};
+use ssw_ui::widgets::anim::Motion;
 
 const WINDOW: Rect = Rect::new(0.0, 0.0, 900.0, 640.0);
 
@@ -590,6 +595,9 @@ fn advanced_actions_are_events_and_reset_replaces_the_settings() {
     let logs = host.node(&window, Role::Button, "Open logs folder");
     host.perform(&mut window, logs.id, AccessAction::Invoke);
     assert_eq!(window.take_events(), vec![SettingsEvent::OpenLogsFolder]);
+    let file = host.node(&window, Role::Button, "Open settings.json");
+    host.perform(&mut window, file.id, AccessAction::Invoke);
+    assert_eq!(window.take_events(), vec![SettingsEvent::OpenSettingsFile]);
     let reset = host.node(&window, Role::Button, "Reset all settings");
     assert_eq!(
         host.control(&window, "Reset all settings").description,
@@ -771,4 +779,94 @@ fn the_window_paints_balanced_with_its_page_title() {
         op,
         DrawOp::FillRect { color, rect } if *color == tokens.sidebar_bg && rect.width == 220.0
     )));
+}
+
+#[test]
+fn the_debug_forms_name_the_section_and_the_shipped_languages() {
+    let (window, _host) = open(Settings::default(), SettingsSection::Sidebar);
+    let debug = format!("{window:?}");
+    assert!(debug.starts_with("SettingsWindow {"), "{debug}");
+    assert!(debug.contains("section: Sidebar"), "{debug}");
+    let env = format!("{:?}", settings_env());
+    assert!(env.starts_with("SettingsEnv {"), "{env}");
+    assert!(env.contains("English") && env.contains("Türkçe"), "{env}");
+}
+
+#[test]
+fn the_window_measures_as_the_area_it_is_given_or_a_default_size() {
+    let (mut window, mut host) = open(Settings::default(), SettingsSection::Sidebar);
+    assert_eq!(
+        host.measure(&mut window, Size::new(1000.0, 700.0)),
+        Size::new(1000.0, 700.0)
+    );
+    let default = host.measure(&mut window, Size::UNBOUNDED);
+    assert!(default.width.is_finite() && default.height.is_finite());
+    assert_eq!(
+        host.measure(&mut window, Size::new(f32::INFINITY, 700.0)),
+        Size::new(default.width, 700.0)
+    );
+    assert_eq!(
+        host.measure(&mut window, Size::new(1000.0, f32::INFINITY)),
+        Size::new(1000.0, default.height)
+    );
+}
+
+#[test]
+fn nothing_is_painted_outside_the_damaged_area() {
+    let (window, host) = open(Settings::default(), SettingsSection::Sidebar);
+    let away = Rect::new(2000.0, 2000.0, 10.0, 10.0);
+    assert_eq!(host.paint_damaged(&window, Some(away)).ops().count(), 0);
+    assert!(host.paint_damaged(&window, Some(WINDOW)).ops().count() > 0);
+}
+
+#[test]
+fn enter_in_a_text_box_changes_nothing_by_itself() {
+    let field = FieldId::TextFont;
+    let (mut window, mut host) = open(Settings::default(), field.section());
+    host.focus_control(&mut window, &label(field));
+    let before = window.settings().clone();
+    host.key(&mut window, vk::RETURN, Modifiers::NONE);
+    assert_eq!(window.settings(), &before);
+    assert!(window.take_events().is_empty());
+}
+
+#[test]
+fn a_partial_repaint_skips_the_rows_outside_the_damage() {
+    let (window, host) = open(Settings::default(), SettingsSection::Editor);
+    let everything = host.paint(&window).ops().count();
+    let top = Rect::new(0.0, 0.0, WINDOW.width, 100.0);
+    let partial = host.paint_damaged(&window, Some(top)).ops().count();
+    assert!(
+        partial > 0 && partial < everything,
+        "{partial} of {everything}"
+    );
+}
+
+#[test]
+fn animation_frames_ease_the_page_after_a_notched_wheel() {
+    let env = SettingsEnv {
+        motion: Motion::full(),
+        ..settings_env()
+    };
+    let mut window = SettingsWindow::new(Settings::default(), localizer(), env);
+    let mut host = Host::new(WINDOW);
+    window.select_section(SettingsSection::Editor);
+    host.layout(&mut window);
+    let last = label(FieldId::ReadingSpeed);
+    let before = host.control(&window, &last).bounds.y;
+    let wheel = Event::Wheel(WheelEvent {
+        delta: Point::new(0.0, -3.0),
+        precise: false,
+        position: Point::new(500.0, 300.0),
+        mods: Modifiers::NONE,
+    });
+    assert!(host.event(&mut window, wheel).handled);
+    // Nothing has moved until the first frame fixes the start of the easing.
+    assert_eq!(host.control(&window, &last).bounds.y, before);
+    for millis in [100_u64, 200, 5_000] {
+        let frame = Event::AnimationFrame(std::time::Duration::from_millis(millis));
+        host.event(&mut window, frame);
+    }
+    let after = host.control(&window, &last).bounds.y;
+    assert!(after < before, "{before} -> {after}");
 }

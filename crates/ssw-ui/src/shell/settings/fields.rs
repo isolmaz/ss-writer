@@ -654,3 +654,20 @@ impl FieldId {
         self.def().label
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_value_read_as_another_kind_gives_the_neutral_answer() {
+        assert!(FieldValue::Bool(true).flag());
+        assert!(!FieldValue::Bool(false).flag() && !FieldValue::Choice(1).flag());
+        assert_eq!(FieldValue::Choice(3).index(), 3);
+        assert_eq!(FieldValue::Bool(true).index(), usize::MAX);
+        assert_eq!(FieldValue::Text("Georgia".into()).text(), "Georgia");
+        assert_eq!(FieldValue::Number(1.0).text(), "");
+        assert_eq!(FieldValue::Number(2.5).number(), 2.5);
+        assert_eq!(FieldValue::Text("2.5".into()).number(), 0.0);
+    }
+}

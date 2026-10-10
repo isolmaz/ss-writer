@@ -690,15 +690,14 @@ impl EditorView {
             if found.start >= range.end {
                 break;
             }
-            if let Some(shared) = found.intersection(range) {
-                let current = search.current == Some(index);
-                rects.extend(
-                    layout
-                        .selection_rects(shared)
-                        .into_iter()
-                        .map(|rect| (rect, current)),
-                );
-            }
+            let current = search.current == Some(index);
+            rects.extend(
+                found
+                    .intersection(range)
+                    .into_iter()
+                    .flat_map(|shared| layout.selection_rects(shared))
+                    .map(|rect| (rect, current)),
+            );
         }
         rects
     }
@@ -764,7 +763,8 @@ impl EditorView {
         }
     }
 
-    /// The layout of item `index`, measuring it (and recording its height) when needed.
+    /// The layout of item `index`, measuring it (and recording its height) when needed; `None`
+    /// for an item inside a folded section.
     fn ensure(
         &self,
         doc: &Document,
@@ -774,7 +774,8 @@ impl EditorView {
         cache: &mut Cache,
         index: usize,
     ) -> Option<Rc<dyn BlockLayout>> {
-        let item = *cache.items.get(index)?;
+        // Every caller derives `index` from the item list (a document always has an item).
+        let item = cache.items[index];
         if item.hidden {
             return None;
         }
@@ -866,9 +867,6 @@ impl EditorView {
         let doc = self.doc.borrow();
         let mut cache = self.cache.borrow_mut();
         let c = &mut *cache;
-        if c.items.is_empty() {
-            return;
-        }
         let reveal = self.reveal(&doc);
         let width = self.column().1;
         let viewport = self.bounds.height.max(1.0);
@@ -1055,71 +1053,68 @@ impl Widget for EditorView {
         let (left, width) = self.column();
         canvas.push_clip_rect(self.bounds);
         canvas.fill_rect(self.bounds, tokens.surface);
-        if !cache.items.is_empty() {
-            let viewport = self.bounds.height;
-            let first = cache.heights.find(f64::from(cache.scroll_y - TOP_PAD));
-            let last = cache
-                .heights
-                .find(f64::from(cache.scroll_y + viewport - TOP_PAD));
-            let selections: Vec<TextRange> = doc.selections().iter().map(|s| s.range()).collect();
-            let current = item_at(&cache.items, doc.primary_selection().head);
-            let selection_color = if self.focused {
-                tokens.selection_bg
-            } else {
-                tokens.selection_inactive_bg
+        let viewport = self.bounds.height;
+        let first = cache.heights.find(f64::from(cache.scroll_y - TOP_PAD));
+        let last = cache
+            .heights
+            .find(f64::from(cache.scroll_y + viewport - TOP_PAD));
+        let selections: Vec<TextRange> = doc.selections().iter().map(|s| s.range()).collect();
+        let current = item_at(&cache.items, doc.primary_selection().head);
+        let selection_color = if self.focused {
+            tokens.selection_bg
+        } else {
+            tokens.selection_inactive_bg
+        };
+        for index in first..=last {
+            let Some(layout) = cache.layouts.get(&index) else {
+                continue;
             };
-            for index in first..=last {
-                let Some(layout) = cache.layouts.get(&index) else {
-                    continue;
-                };
-                let item = &cache.items[index];
-                let top =
-                    self.bounds.y + TOP_PAD + cache.heights.prefix(index) as f32 - cache.scroll_y;
-                let extent = Rect::new(left - 64.0, top, width + 64.0, layout.height());
-                if !cx.needs_paint(extent) {
-                    continue;
-                }
-                canvas.save();
-                canvas.translate(left, top);
-                let paint_cx = BlockPaintCx {
-                    theme: cx.theme,
-                    config: &self.config,
-                    strings: &self.strings,
-                    text: cx.text,
-                    hovered: self.hovered_item == Some(index),
-                };
-                layout.paint_backdrop(&paint_cx, canvas);
-                let found = self.search_rects(&**layout, item.range);
-                for &(rect, is_current) in &found {
-                    let fill = if is_current {
-                        tokens.highlight.orange.background
-                    } else {
-                        tokens.highlight.yellow.background
-                    };
-                    canvas.fill_rounded_rect(rect, CornerRadii::uniform(2.0), fill);
-                }
-                for selection in &selections {
-                    let Some(shared) = selection.intersection(item.range) else {
-                        continue;
-                    };
-                    for rect in layout.selection_rects(shared) {
-                        canvas.fill_rect(rect, selection_color);
-                    }
-                }
-                for &(rect, _) in found.iter().filter(|(_, is_current)| *is_current) {
-                    canvas.stroke_rounded_rect(rect, CornerRadii::uniform(2.0), tokens.accent, 1.5);
-                }
-                let dim =
-                    self.focus_mode && index != current && matches!(item.kind, ItemKind::Block(_));
-                if dim {
-                    canvas.push_layer(0.35);
-                }
-                layout.paint(&paint_cx, canvas);
-                if dim {
-                    canvas.pop_layer();
-                }
-                canvas.restore();
+            let item = &cache.items[index];
+            let top = self.bounds.y + TOP_PAD + cache.heights.prefix(index) as f32 - cache.scroll_y;
+            let extent = Rect::new(left - 64.0, top, width + 64.0, layout.height());
+            if !cx.needs_paint(extent) {
+                continue;
             }
+            canvas.save();
+            canvas.translate(left, top);
+            let paint_cx = BlockPaintCx {
+                theme: cx.theme,
+                config: &self.config,
+                strings: &self.strings,
+                text: cx.text,
+                hovered: self.hovered_item == Some(index),
+            };
+            layout.paint_backdrop(&paint_cx, canvas);
+            let found = self.search_rects(&**layout, item.range);
+            for &(rect, is_current) in &found {
+                let fill = if is_current {
+                    tokens.highlight.orange.background
+                } else {
+                    tokens.highlight.yellow.background
+                };
+                canvas.fill_rounded_rect(rect, CornerRadii::uniform(2.0), fill);
+            }
+            for selection in &selections {
+                let Some(shared) = selection.intersection(item.range) else {
+                    continue;
+                };
+                for rect in layout.selection_rects(shared) {
+                    canvas.fill_rect(rect, selection_color);
+                }
+            }
+            for &(rect, _) in found.iter().filter(|(_, is_current)| *is_current) {
+                canvas.stroke_rounded_rect(rect, CornerRadii::uniform(2.0), tokens.accent, 1.5);
+            }
+            let dim =
+                self.focus_mode && index != current && matches!(item.kind, ItemKind::Block(_));
+            if dim {
+                canvas.push_layer(0.35);
+            }
+            layout.paint(&paint_cx, canvas);
+            if dim {
+                canvas.pop_layer();
+            }
+            canvas.restore();
         }
         if self.focused
             && self.caret_on

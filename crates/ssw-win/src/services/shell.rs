@@ -23,6 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, PCWSTR, w};
 
 use super::failed;
+use crate::fault::check;
 
 const SERVICE: &str = "shell";
 
@@ -204,40 +205,216 @@ impl<H: ShellHost> Shell for WindowsShell<H> {
     }
 
     fn recycle(&mut self, path: &Path) -> Result<(), ServiceError> {
-        // SAFETY: standard IFileOperation usage; the operation runs synchronously.
-        unsafe {
-            let operation: IFileOperation =
-                CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
-                    .map_err(|error| failed(SERVICE, error))?;
-            operation
-                .SetOperationFlags(FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT)
+        // SAFETY: standard IFileOperation usage.
+        let operation: IFileOperation =
+            check(unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) })
                 .map_err(|error| failed(SERVICE, error))?;
-            let item: IShellItem =
-                SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None::<&IBindCtx>)
-                    .map_err(|error| failed(SERVICE, error))?;
-            operation
-                .DeleteItem(&item, None::<&IFileOperationProgressSink>)
-                .map_err(|error| failed(SERVICE, error))?;
-            operation
-                .PerformOperations()
-                .map_err(|error| failed(SERVICE, error))?;
-            if operation
-                .GetAnyOperationsAborted()
-                .map_err(|error| failed(SERVICE, error))?
-                .as_bool()
-            {
-                return Err(failed(SERVICE, "the Recycle Bin operation was aborted"));
-            }
+        // SAFETY: valid NUL-terminated path.
+        let item: IShellItem = unsafe {
+            SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None::<&IBindCtx>)
         }
-        Ok(())
+        .map_err(|error| failed(SERVICE, error))?;
+        recycle_item(&operation, &item)
     }
+}
+
+/// Moves `item` to the Recycle Bin with `operation`, synchronously and without any
+/// confirmation or error window.
+fn recycle_item(operation: &IFileOperation, item: &IShellItem) -> Result<(), ServiceError> {
+    // SAFETY: live COM objects; the operation runs synchronously, so nothing outlives the call.
+    unsafe {
+        operation
+            .SetOperationFlags(FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT)
+            .map_err(|error| failed(SERVICE, error))?;
+        operation
+            .DeleteItem(item, None::<&IFileOperationProgressSink>)
+            .map_err(|error| failed(SERVICE, error))?;
+        operation
+            .PerformOperations()
+            .map_err(|error| failed(SERVICE, error))?;
+        if operation
+            .GetAnyOperationsAborted()
+            .map_err(|error| failed(SERVICE, error))?
+            .as_bool()
+        {
+            return Err(failed(SERVICE, "the Recycle Bin operation was aborted"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::com::ComGuard;
-    use windows::Win32::UI::Shell::SEE_MASK_FLAG_NO_UI;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL};
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyChangeArray;
+    use windows::Win32::UI::Shell::{
+        FILEOPERATION_FLAGS, IFileOperation_Impl, IOperationsProgressDialog, SEE_MASK_FLAG_NO_UI,
+    };
+    use windows::core::{BOOL, IUnknown, Ref, implement};
+
+    /// The methods of a file operation that recycling never calls.
+    macro_rules! unsupported {
+        ($($name:ident($($arg:ident: $kind:ty),*) -> $result:ty;)*) => {
+            $(
+                fn $name(&self $(, $arg: $kind)*) -> windows::core::Result<$result> {
+                    Err(E_NOTIMPL.into())
+                }
+            )*
+        };
+    }
+
+    /// A file operation that moves nothing: it records the four calls recycling makes, fails
+    /// the one scripted and answers whether the operation was aborted.
+    #[implement(IFileOperation)]
+    struct ScriptedOperation {
+        failing: Option<usize>,
+        aborted: bool,
+        calls: Rc<RefCell<Vec<&'static str>>>,
+        flags: Rc<RefCell<Option<i32>>>,
+    }
+
+    impl ScriptedOperation {
+        fn step(&self, name: &'static str) -> windows::core::Result<()> {
+            let index = self.calls.borrow().len();
+            self.calls.borrow_mut().push(name);
+            if self.failing == Some(index) {
+                Err(E_FAIL.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl IFileOperation_Impl for ScriptedOperation_Impl {
+        fn SetOperationFlags(&self, flags: FILEOPERATION_FLAGS) -> windows::core::Result<()> {
+            *self.flags.borrow_mut() = Some(flags.0 as i32);
+            self.step("SetOperationFlags")
+        }
+
+        fn DeleteItem(
+            &self,
+            _item: Ref<IShellItem>,
+            _sink: Ref<IFileOperationProgressSink>,
+        ) -> windows::core::Result<()> {
+            self.step("DeleteItem")
+        }
+
+        fn PerformOperations(&self) -> windows::core::Result<()> {
+            self.step("PerformOperations")
+        }
+
+        fn GetAnyOperationsAborted(&self) -> windows::core::Result<BOOL> {
+            self.step("GetAnyOperationsAborted")?;
+            Ok(BOOL::from(self.aborted))
+        }
+
+        unsupported! {
+            Advise(_sink: Ref<IFileOperationProgressSink>) -> u32;
+            Unadvise(_cookie: u32) -> ();
+            SetProgressMessage(_message: &PCWSTR) -> ();
+            SetProgressDialog(_dialog: Ref<IOperationsProgressDialog>) -> ();
+            SetProperties(_properties: Ref<IPropertyChangeArray>) -> ();
+            SetOwnerWindow(_owner: HWND) -> ();
+            ApplyPropertiesToItem(_item: Ref<IShellItem>) -> ();
+            ApplyPropertiesToItems(_items: Ref<IUnknown>) -> ();
+            RenameItem(_item: Ref<IShellItem>, _name: &PCWSTR, _sink: Ref<IFileOperationProgressSink>) -> ();
+            RenameItems(_items: Ref<IUnknown>, _name: &PCWSTR) -> ();
+            MoveItem(_item: Ref<IShellItem>, _to: Ref<IShellItem>, _name: &PCWSTR, _sink: Ref<IFileOperationProgressSink>) -> ();
+            MoveItems(_items: Ref<IUnknown>, _to: Ref<IShellItem>) -> ();
+            CopyItem(_item: Ref<IShellItem>, _to: Ref<IShellItem>, _name: &PCWSTR, _sink: Ref<IFileOperationProgressSink>) -> ();
+            CopyItems(_items: Ref<IUnknown>, _to: Ref<IShellItem>) -> ();
+            DeleteItems(_items: Ref<IUnknown>) -> ();
+            NewItem(_to: Ref<IShellItem>, _attributes: u32, _name: &PCWSTR, _template: &PCWSTR, _sink: Ref<IFileOperationProgressSink>) -> ();
+        }
+    }
+
+    /// Recycles a folder through a scripted operation (nothing is moved, whatever happens);
+    /// returns the outcome, the calls made and the flags the operation was given.
+    fn recycle_through(
+        failing: Option<usize>,
+        aborted: bool,
+    ) -> (Result<(), ServiceError>, Vec<&'static str>, Option<i32>) {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let flags = Rc::new(RefCell::new(None));
+        let operation: IFileOperation = ScriptedOperation {
+            failing,
+            aborted,
+            calls: Rc::clone(&calls),
+            flags: Rc::clone(&flags),
+        }
+        .into();
+        // SAFETY: valid NUL-terminated path of an existing folder.
+        let item: IShellItem = unsafe {
+            SHCreateItemFromParsingName(
+                &HSTRING::from(std::env::temp_dir().as_os_str()),
+                None::<&IBindCtx>,
+            )
+        }
+        .unwrap();
+        let outcome = recycle_item(&operation, &item);
+        let calls = calls.borrow().clone();
+        let flags = *flags.borrow();
+        (outcome, calls, flags)
+    }
+
+    #[test]
+    fn recycling_asks_for_no_confirmation_and_no_error_window() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let (outcome, calls, flags) = recycle_through(None, false);
+        outcome.unwrap();
+        assert_eq!(
+            calls,
+            [
+                "SetOperationFlags",
+                "DeleteItem",
+                "PerformOperations",
+                "GetAnyOperationsAborted"
+            ]
+        );
+        assert_eq!(
+            flags,
+            Some((FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT).0 as i32),
+            "undo (the Recycle Bin), no prompt, no error window, no progress window"
+        );
+    }
+
+    #[test]
+    fn a_failing_step_ends_the_recycling_with_a_shell_error() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        for (failing, steps) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            let (outcome, calls, _) = recycle_through(Some(failing), false);
+            let error = outcome.unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    ServiceError::Failed {
+                        service: "shell",
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(calls.len(), steps, "nothing runs after step {failing}");
+        }
+    }
+
+    #[test]
+    fn an_aborted_operation_is_not_a_recycled_file() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let (outcome, calls, _) = recycle_through(None, true);
+        assert_eq!(calls.len(), 4, "the operation ran to its end");
+        assert_eq!(
+            outcome.unwrap_err(),
+            ServiceError::Failed {
+                service: "shell",
+                message: "the Recycle Bin operation was aborted".to_owned(),
+            }
+        );
+    }
 
     #[test]
     fn only_web_and_mail_schemes_are_allowed() {
@@ -292,5 +469,42 @@ mod tests {
             ..Default::default()
         };
         assert!(SystemShellHost.execute(&mut info).is_err());
+    }
+
+    #[test]
+    fn an_item_id_list_exposes_the_pointer_it_owns() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let list = ItemIdList::from_path(&std::env::temp_dir()).unwrap();
+        assert!(!list.as_ptr().is_null());
+        assert_eq!(list.as_ptr(), list.0.cast_const());
+    }
+
+    #[test]
+    fn the_system_host_refuses_an_empty_item_without_opening_a_window() {
+        let _com = ComGuard::apartment_threaded().unwrap();
+        // A list that names nothing: the shell has no folder to open, so no window appears.
+        let nothing = ItemIdList(std::ptr::null_mut());
+        assert!(SystemShellHost.select_in_explorer(&nothing).is_err());
+    }
+
+    #[test]
+    fn a_shell_made_without_a_host_validates_before_launching_anything() {
+        let mut shell = WindowsShell::new(None);
+        for url in ["javascript:alert(1)", "file:///C:/Windows/notepad.exe"] {
+            let error = shell.open_url(url).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ServiceError::Failed {
+                        service: "shell",
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+        let missing = std::env::temp_dir().join("ssw-win-no-such-file-6c1e.txt");
+        assert!(shell.open_path(&missing).is_err());
+        assert!(shell.reveal_in_explorer(&missing).is_err());
     }
 }

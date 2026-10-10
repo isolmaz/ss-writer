@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SS Writer document icon (master) for the files the app is registered for (ProgID DefaultIcon).
+  `cargo xtask icons` rasterizes this file into document.ico; edit this file, regenerate, commit
+  both.
+
+  Design: a light page with a folded corner and the Markdown mark (M and a down arrow) in the
+  accent blue #1874D3. Shapes only (no <text>), so rendering never depends on installed fonts.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="page" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DCE8F6"/>
+    </linearGradient>
+    <linearGradient id="flap" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#A9C9EE"/>
+    </linearGradient>
+    <filter id="lift" x="-20%" y="-20%" width="140%" height="145%">
+      <feDropShadow dx="0" dy="8" stdDeviation="7" flood-color="#06274D" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Page -->
+  <path filter="url(#lift)" fill="url(#page)" stroke="#7BA3D6" stroke-width="6" stroke-linejoin="round"
+        d="M64 24H152L208 80V216A16 16 0 0 1 192 232H64A16 16 0 0 1 48 216V40A16 16 0 0 1 64 24Z"/>
+  <!-- Folded corner -->
+  <path fill="url(#flap)" stroke="#7BA3D6" stroke-width="6" stroke-linejoin="round"
+        d="M152 24V64A16 16 0 0 0 168 80H208Z"/>
+
+  <!-- Markdown mark: M and a down arrow -->
+  <g fill="none" stroke="#1874D3" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M80 186V118L100 148L120 118V186"/>
+    <path d="M158 116V184M140 162L158 184L176 162"/>
+  </g>
+</svg>

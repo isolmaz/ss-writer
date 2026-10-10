@@ -149,19 +149,18 @@ fn clip_path(clip: &usvg::ClipPath) -> Path {
     path.transformed(&convert_transform(clip.transform()))
 }
 
+/// usvg only keeps paths, groups and text in a clip path (`<image>` is dropped while parsing),
+/// so any other node kind contributes no geometry.
 fn collect_geometry(group: &usvg::Group, parent: &Transform, out: &mut Path) {
     for node in group.children() {
-        match node {
-            usvg::Node::Path(p) => {
-                out.verbs
-                    .extend(convert_geometry(p.data()).transformed(parent).verbs);
-            }
-            usvg::Node::Group(g) => {
-                let t = convert_transform(g.transform()).then(parent);
-                collect_geometry(g, &t, out);
-            }
-            usvg::Node::Text(t) => collect_geometry(t.flattened(), parent, out),
-            usvg::Node::Image(_) => {}
+        if let usvg::Node::Path(p) = node {
+            out.verbs
+                .extend(convert_geometry(p.data()).transformed(parent).verbs);
+        } else if let usvg::Node::Group(g) = node {
+            let t = convert_transform(g.transform()).then(parent);
+            collect_geometry(g, &t, out);
+        } else if let usvg::Node::Text(t) = node {
+            collect_geometry(t.flattened(), parent, out);
         }
     }
 }
@@ -304,12 +303,36 @@ mod tests {
         assert_eq!(s.size, Size::new(40.0, 20.0));
         let items = leaves(&s);
         assert_eq!(items.len(), 1);
-        let SceneItem::Fill(fill) = &items[0] else {
-            panic!("fill expected");
-        };
+        let fill = items[0].as_fill().expect("fill expected");
         assert_eq!(fill.paint, Paint::Solid(Color::rgba(255, 0, 0, 128)));
         let b = fill.path.bounds().expect("bounds");
         assert_eq!((b.x, b.y, b.width, b.height), (5.0, 2.0, 10.0, 6.0));
+    }
+
+    #[test]
+    fn even_odd_fills_square_caps_and_repeating_gradients() {
+        let s = scene(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10" viewBox="0 0 20 10">
+                <defs><linearGradient id="g" spreadMethod="repeat"><stop offset="0" stop-color="#f00"/><stop offset="1" stop-color="#00f"/></linearGradient></defs>
+                <path d="M0 0H10V10H0Z" fill="#000" fill-rule="evenodd"/>
+                <path d="M0 5H10" fill="none" stroke="#00f" stroke-width="2" stroke-linecap="square"/>
+                <rect x="10" width="10" height="10" fill="url(#g)"/></svg>"##,
+        );
+        let items = leaves(&s);
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, SceneItem::Fill(f) if f.rule == FillRule::EvenOdd))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, SceneItem::Stroke(st) if st.cap == LineCap::Square))
+        );
+        assert!(items.iter().any(|i| matches!(
+            i,
+            SceneItem::Fill(Fill { paint: Paint::Linear(g), .. }) if g.spread == SpreadMode::Repeat
+        )));
     }
 
     #[test]
@@ -320,9 +343,7 @@ mod tests {
                  stroke-linecap="round" stroke-linejoin="bevel" stroke-dasharray="3 1" stroke-dashoffset="1"/></svg>"##,
         );
         let items = leaves(&s);
-        let SceneItem::Stroke(stroke) = &items[0] else {
-            panic!("stroke expected");
-        };
+        let stroke = items[0].as_stroke().expect("stroke expected");
         assert_eq!(stroke.width, 2.0);
         assert_eq!(stroke.cap, LineCap::Round);
         assert_eq!(stroke.join, LineJoin::Bevel);
@@ -360,9 +381,7 @@ mod tests {
                 <rect width="10" height="10" fill="url(#r)"/>
               </g></svg>"##,
         );
-        let SceneItem::Group(g) = &s.items[0] else {
-            panic!("group expected");
-        };
+        let g = s.items[0].as_group().expect("group expected");
         assert_eq!(g.opacity, 0.5);
         assert!(g.clip.is_some());
         assert_eq!(g.transform, Transform::translate(3.0, 4.0));
@@ -381,6 +400,24 @@ mod tests {
     }
 
     #[test]
+    fn clip_path_children_keep_their_transforms() {
+        // A transformed child stays a nested group inside usvg's clip path; an `<image>` child is
+        // dropped by usvg and contributes no geometry.
+        let s = scene(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="20" height="20">
+              <defs><clipPath id="c">
+                <rect transform="translate(3 4)" width="5" height="5"/>
+                <image width="20" height="20" xlink:href="data:image/png;base64,AAAA"/>
+              </clipPath></defs>
+              <g clip-path="url(#c)"><rect width="20" height="20" fill="#000"/></g></svg>"##,
+        );
+        let group = s.items[0].as_group().expect("clipped group");
+        let clip = group.clip.as_ref().expect("clip path");
+        let b = clip.bounds().expect("clip bounds");
+        assert_eq!((b.x, b.y, b.width, b.height), (3.0, 4.0, 5.0, 5.0));
+    }
+
+    #[test]
     fn text_becomes_filled_outlines() {
         let s = scene(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="20">
@@ -393,9 +430,7 @@ mod tests {
             .filter(|item| matches!(item, SceneItem::Fill(f) if !f.path.is_empty()))
             .collect();
         assert!(!fills.is_empty(), "text must produce outlines");
-        let SceneItem::Fill(outline) = &fills[0] else {
-            panic!("fill expected");
-        };
+        let outline = fills[0].as_fill().expect("fill expected");
         assert_eq!(outline.paint, Paint::Solid(Color::BLACK));
         let move_count = outline
             .path

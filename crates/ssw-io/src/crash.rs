@@ -48,10 +48,25 @@ fn config() -> Option<Arc<Config>> {
         .clone()
 }
 
-fn write_dump(dir: &Path, exception: *const EXCEPTION_POINTERS) -> Result<PathBuf, CrashError> {
-    io(std::fs::create_dir_all(dir), dir)?;
+/// Minidump of this process.
+fn write_own_dump(dir: &Path, exception: *const EXCEPTION_POINTERS) -> Result<PathBuf, CrashError> {
+    // SAFETY: plain query of the pseudo handle of the current process.
+    let process = unsafe { GetCurrentProcess() };
     // SAFETY: plain query of the current process id.
     let process_id = unsafe { GetCurrentProcessId() };
+    write_dump(dir, process, process_id, exception)
+}
+
+/// Writes a minidump of the process `process_id` (opened through `process`) into `dir`. The file
+/// is named after `process_id` and the calling thread is reported as the faulting one, so both
+/// must denote this process.
+fn write_dump(
+    dir: &Path,
+    process: HANDLE,
+    process_id: u32,
+    exception: *const EXCEPTION_POINTERS,
+) -> Result<PathBuf, CrashError> {
+    io(std::fs::create_dir_all(dir), dir)?;
     let path = dir.join(format!("crash-{}-{process_id}.dmp", now_millis()));
     let file = io(std::fs::File::create(&path), &path)?;
     // SAFETY: plain query of the current thread id.
@@ -67,12 +82,12 @@ fn write_dump(dir: &Path, exception: *const EXCEPTION_POINTERS) -> Result<PathBu
         Some(&raw const information)
     };
     let kind = MINIDUMP_TYPE(MiniDumpWithDataSegs.0 | MiniDumpWithThreadInfo.0);
-    // SAFETY: the process handle is the pseudo handle of this process, the file handle stays
-    // open for the whole call, and `information` (when passed) points to a live struct whose
-    // exception pointers were handed to us by the OS or are null.
+    // SAFETY: the file handle stays open for the whole call, `information` (when passed) points
+    // to a live struct whose exception pointers were handed to us by the OS or are null, and the
+    // process handle is only read by the API (an invalid one makes the call fail).
     unsafe {
         MiniDumpWriteDump(
-            GetCurrentProcess(),
+            process,
             process_id,
             HANDLE(file.as_raw_handle()),
             kind,
@@ -89,7 +104,7 @@ fn write_dump(dir: &Path, exception: *const EXCEPTION_POINTERS) -> Result<PathBu
 /// # Errors
 /// [`CrashError`] when the file cannot be created or the dump fails.
 pub fn write_minidump(dir: &Path) -> Result<PathBuf, CrashError> {
-    write_dump(dir, std::ptr::null())
+    write_own_dump(dir, std::ptr::null())
 }
 
 fn handle_crash(exception: *const EXCEPTION_POINTERS) {
@@ -99,7 +114,7 @@ fn handle_crash(exception: *const EXCEPTION_POINTERS) {
     }
     if let Some(config) = config() {
         // The dump is best effort; the emergency save must run regardless.
-        let _ = write_dump(&config.dir, exception);
+        let _ = write_own_dump(&config.dir, exception);
         (config.emergency)();
     }
     HANDLING.store(false, Ordering::SeqCst);
@@ -138,4 +153,37 @@ pub fn install(dir: PathBuf, emergency: impl Fn() + Send + Sync + 'static) {
     });
     // SAFETY: the filter is a valid `extern "system"` function that lives for the whole process.
     unsafe { SetUnhandledExceptionFilter(Some(unhandled_exception_filter)) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rejected_dump_is_reported_as_a_dump_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file is created, then the API cannot open a process that does not exist (process
+        // ids are small multiples of four, so this one is never in use). A null handle alone is
+        // not refused: the API then opens the process by its id.
+        let error = write_dump(
+            dir.path(),
+            HANDLE::default(),
+            u32::MAX - 3,
+            std::ptr::null(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CrashError::Dump(_)), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .starts_with("writing the minidump failed: "),
+            "{error}"
+        );
+        let created: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(created.len(), 1, "{created:?}");
+        assert!(created[0].starts_with("crash-"), "{created:?}");
+    }
 }

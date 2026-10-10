@@ -9,7 +9,7 @@ use crate::editor::config::EditorStrings;
 use crate::geometry::{Point, Rect};
 use crate::text::TextLayout;
 
-use super::text::{Label, TextBlock};
+use super::text::TextBlock;
 use super::{Ctx, style};
 
 /// A divider or page break while its source is hidden: a hairline across the column, a page
@@ -118,7 +118,7 @@ fn rule(
             cx.theme.tokens.marker,
             0.0,
             false,
-            Label::Named(access.to_owned()),
+            access.to_owned(),
         ));
     }
     Box::new(RuleLayout {
@@ -203,7 +203,7 @@ pub(super) fn front_matter(ctx: &Ctx<'_>, block: &Block) -> Box<dyn BlockLayout>
         cx.theme.tokens.text_muted,
         0.75 * body,
         true,
-        Label::Named(access),
+        access,
     ))
 }
 
@@ -218,6 +218,6 @@ pub(super) fn html(ctx: &Ctx<'_>, block: &Block) -> Box<dyn BlockLayout> {
         cx.theme.tokens.text_muted,
         0.0,
         false,
-        Label::Named(ctx.strings.html.clone()),
+        ctx.strings.html.clone(),
     ))
 }

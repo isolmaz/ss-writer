@@ -773,6 +773,8 @@ fn push_break(blocks: &mut Vec<Block>) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -832,5 +834,279 @@ mod tests {
         let (refs, txt) = note_tables(&table, (0, 16), (16, 12));
         assert_eq!((refs, txt), (vec![5, 9], vec![0, 4, 7]));
         assert_eq!(note_tables(&table, (0, 3), (100, 12)), (vec![], vec![]));
+    }
+
+    // ---- `import` over a hand-built compound file --------------------------------------------
+
+    /// A compound file holding the two streams `import` needs.
+    fn ole(word: &[u8], table: &[u8]) -> Vec<u8> {
+        let mut cf = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+        for (name, data) in [("/WordDocument", word), ("/0Table", table)] {
+            let mut stream = cf.create_stream(name).unwrap();
+            stream.write_all(data).unwrap();
+        }
+        cf.flush().unwrap();
+        cf.into_inner().into_inner()
+    }
+
+    #[test]
+    fn unreadable_style_and_list_tables_are_counted_and_empty_notes_skipped() {
+        // main story "A[ref]B[ref]\r" (5 characters), then the footnote story: an empty first
+        // note and a second one reading "Second\r" (7 characters)
+        let text = b"A\x02B\x02\rSecond\r";
+        let ref_plc: Vec<u8> = [1u32, 3, 5]
+            .iter()
+            .flat_map(|cp| cp.to_le_bytes())
+            .chain([0u8; 4])
+            .collect();
+        let txt_plc: Vec<u8> = [0u32, 0, 7]
+            .iter()
+            .flat_map(|cp| cp.to_le_bytes())
+            .collect();
+        // one 8-bit piece whose text starts at byte 1024 of the WordDocument stream
+        let clx = pieces::tests::clx(&[], &[(0, 12, 0x4000_0000 | (1024 * 2), 0)]);
+        let ftn_ref_at = clx.len() as u32;
+        let mut table = clx.clone();
+        table.extend_from_slice(&ref_plc);
+        table.extend_from_slice(&txt_plc);
+
+        let mut pairs = vec![(0u32, 0u32); IDX_PLF_LFO + 1];
+        pairs[IDX_CLX] = (0, clx.len() as u32);
+        pairs[IDX_PLCFFND_REF] = (ftn_ref_at, ref_plc.len() as u32);
+        pairs[IDX_PLCFFND_TXT] = (ftn_ref_at + ref_plc.len() as u32, txt_plc.len() as u32);
+        // both structures lie far beyond the end of the table stream
+        pairs[IDX_STSHF] = (100_000, 4);
+        pairs[IDX_PLF_LST] = (100_000, 10);
+        let mut word = fib::tests::fib_bytes(0xA5EC, 0x00C1, 0, 14, 22, &pairs);
+        // FibRgLw97 starts at byte 64: ccpText, ccpFtn, then every other story empty
+        word[76..80].copy_from_slice(&5u32.to_le_bytes());
+        word[80..84].copy_from_slice(&7u32.to_le_bytes());
+        for at in [84, 92, 96, 100, 104] {
+            word[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        word.resize(1024, 0);
+        word.extend_from_slice(text);
+
+        let res = import(&ole(&word, &table), "assets").unwrap();
+        // the empty first note has no definition; the second keeps its number
+        assert_eq!(res.markdown, "A[^1]B[^2]\n\n[^2]: Second\n");
+        assert!(res.assets.is_empty());
+        assert_eq!(losses(&res), vec![(LossKind::CorruptParts, 2)]);
+    }
+
+    // ---- the paragraph walker over hand-built runs -------------------------------------------
+
+    const CFRMARKDEL: u16 = 0x0800;
+    const CFDATA: u16 = 0x0806;
+    const CFSPEC: u16 = 0x0855;
+    const CFOLE2: u16 = 0x0856;
+    const CPICLOCATION: u16 = 0x6A03;
+    const CSYMBOL: u16 = 0x6A09;
+    const PFINTABLE: u16 = 0x2416;
+    const PFTTP: u16 = 0x2417;
+    const PILFO: u16 = 0x460B;
+
+    fn sprm(op: u16, operand: &[u8]) -> Vec<u8> {
+        let mut v = op.to_le_bytes().to_vec();
+        v.extend_from_slice(operand);
+        v
+    }
+
+    fn run(cp0: u32, cp1: u32, grpprl: Vec<u8>) -> Run {
+        Run {
+            cp0,
+            cp1,
+            istd: 0,
+            grpprl,
+        }
+    }
+
+    fn losses(res: &ImportResult) -> Vec<(LossKind, usize)> {
+        res.sorted_losses()
+            .iter()
+            .map(|l| (l.kind, l.count))
+            .collect()
+    }
+
+    /// Runs the main story of a decoded document (one CP per UTF-16 unit of `text`) through the
+    /// paragraph walker exactly as `import` does.
+    fn convert(
+        text: &str,
+        paps: Vec<Run>,
+        chps: Vec<Run>,
+        lists: Lists,
+        data: Vec<u8>,
+        assets_dir: &str,
+    ) -> ImportResult {
+        let doc = Doc {
+            text: text.encode_utf16().collect(),
+            paps,
+            chps,
+            styles: Stylesheet::default(),
+            lists,
+            data,
+            ftn_ref: HashMap::new(),
+            edn_ref: HashMap::new(),
+        };
+        let mut res = ImportResult::default();
+        let mut cv = Conv {
+            d: &doc,
+            assets_dir,
+            res: &mut res,
+            counts: Counts::default(),
+            fields: Vec::new(),
+            numbering: Numbering::default(),
+            tables: Tables::default(),
+            table_loss: TableLoss::default(),
+            serial: 0,
+            sub: Sub::Main,
+            pending_break: false,
+            images: 0,
+        };
+        let blocks = cv.render_range(0, doc.text.len() as u32, Sub::Main);
+        let markdown = md::blocks_to_string(&blocks);
+        cv.finish();
+        res.markdown = markdown;
+        res
+    }
+
+    fn convert_plain(text: &str, chps: Vec<Run>) -> ImportResult {
+        convert(text, vec![], chps, Lists::default(), vec![], "")
+    }
+
+    #[test]
+    fn tracked_deletions_are_dropped_and_counted() {
+        let res = convert_plain("keep gone\r", vec![run(5, 9, sprm(CFRMARKDEL, &[1]))]);
+        assert_eq!(res.markdown, "keep");
+        assert_eq!(losses(&res), vec![(LossKind::TrackedChanges, 4)]);
+    }
+
+    #[test]
+    fn a_field_separator_without_a_field_is_ignored() {
+        let res = convert_plain("a\u{14}b\r", vec![]);
+        assert_eq!(res.markdown, "ab");
+        assert!(res.losses.is_empty());
+    }
+
+    #[test]
+    fn line_breaks_and_non_breaking_hyphens() {
+        let res = convert_plain("one\u{0B}two\u{1E}three\r", vec![]);
+        assert_eq!(res.markdown, "one\\\ntwo-three");
+        assert!(res.losses.is_empty());
+    }
+
+    #[test]
+    fn symbol_characters_map_to_unicode_and_are_reported() {
+        // sprmCSymbol on the "(" at CP 1: font 1, character U+F0B7 (the Symbol-font bullet)
+        let symbol = sprm(CSYMBOL, &[1, 0, 0xB7, 0xF0]);
+        let res = convert_plain("x(y\r", vec![run(1, 2, symbol)]);
+        assert_eq!(res.markdown, "x\u{2022}y");
+        assert_eq!(losses(&res), vec![(LossKind::SymbolFontCharacters, 1)]);
+
+        // the private-use bullets of Symbol/Wingdings, and a private-use code point that has no
+        // mapping and is kept as is
+        let res = convert_plain("\u{F0B7}\u{F0A7}\u{F0D8}\u{F076}\u{F0FC}\u{F021}\r", vec![]);
+        assert_eq!(
+            res.markdown,
+            "\u{2022}\u{25AA}\u{27A2}\u{2756}\u{2713}\u{F021}"
+        );
+        assert_eq!(losses(&res), vec![(LossKind::SymbolFontCharacters, 6)]);
+    }
+
+    /// PICFAndOfficeArtData holding one PNG BLIP (instance 0x6E0, one UID) with `payload`.
+    fn png_picture(payload: &[u8]) -> Vec<u8> {
+        let mut blip = Vec::new();
+        blip.extend_from_slice(&(0x6E0u16 << 4).to_le_bytes());
+        blip.extend_from_slice(&0xF01Eu16.to_le_bytes());
+        blip.extend_from_slice(&((16 + 1 + payload.len()) as u32).to_le_bytes());
+        blip.extend_from_slice(&[0; 17]);
+        blip.extend_from_slice(payload);
+        let mut v = Vec::new();
+        v.extend_from_slice(&(8 + blip.len() as u32).to_le_bytes());
+        v.extend_from_slice(&8u16.to_le_bytes());
+        v.extend_from_slice(&0x64u16.to_le_bytes());
+        v.extend_from_slice(&blip);
+        v
+    }
+
+    #[test]
+    fn picture_characters_become_images_objects_or_nothing() {
+        // a form-field data mark is not a picture
+        let data_mark = [sprm(CFSPEC, &[1]), sprm(CFDATA, &[1])].concat();
+        let res = convert_plain("a\u{1}b\r", vec![run(1, 2, data_mark)]);
+        assert_eq!(res.markdown, "ab");
+        assert!(res.losses.is_empty() && res.assets.is_empty());
+
+        // an embedded OLE object is replaced by a placeholder and reported
+        let ole_mark = [sprm(CFSPEC, &[1]), sprm(CFOLE2, &[1])].concat();
+        let res = convert_plain("\u{1}\r", vec![run(0, 1, ole_mark)]);
+        assert_eq!(res.markdown, "*[embedded object]*");
+        assert_eq!(losses(&res), vec![(LossKind::UnsupportedEquations, 1)]);
+
+        // a raster picture is extracted next to the Markdown file, or into the assets folder
+        let payload = [0x89, b'P', b'N', b'G', 1, 2];
+        let pic = [sprm(CFSPEC, &[1]), sprm(CPICLOCATION, &[0; 4])].concat();
+        for (dir, path) in [("", "image-1.png"), ("pics", "pics/image-1.png")] {
+            let res = convert(
+                "\u{1}\r",
+                vec![],
+                vec![run(0, 1, pic.clone())],
+                Lists::default(),
+                png_picture(&payload),
+                dir,
+            );
+            assert_eq!(res.markdown, format!("![image-1]({path})"));
+            assert_eq!(
+                res.assets,
+                vec![Asset {
+                    relative_path: path.into(),
+                    bytes: payload.to_vec()
+                }]
+            );
+            assert!(res.losses.is_empty());
+        }
+    }
+
+    #[test]
+    fn internal_links_and_suppressed_fields_keep_or_drop_their_result() {
+        let text = "\u{13} HYPERLINK \\l \"bm\" \u{14}jump\u{15}\r\
+                    x\u{13} PAGEREF _Toc1 \u{14}12\u{15}y\r";
+        let res = convert_plain(text, vec![]);
+        assert_eq!(res.markdown, "jump\n\nxy");
+        assert_eq!(losses(&res), vec![(LossKind::Fields, 2)]);
+    }
+
+    #[test]
+    fn list_markers_inside_table_cells() {
+        let nine = |first: (u32, u8)| {
+            let mut v = vec![first];
+            v.extend((1..9).map(|_| (1u32, 0u8)));
+            v
+        };
+        let (t, lst, lfo) = lists::tests::tables(
+            &[
+                (10, false, nine((1, 0x17))),
+                (20, false, nine((5, 0))),
+                (40, false, nine((1, 0xFF))),
+            ],
+            &[10, 20, 40],
+        );
+        let lists = Lists::parse(&t, lst, lfo).unwrap();
+        let in_table =
+            |ilfo: u16| [sprm(PFINTABLE, &[1]), sprm(PILFO, &ilfo.to_le_bytes())].concat();
+        // three cells (bullet, number starting at 5, a list level without any marker) and the
+        // row end mark
+        let paps = vec![
+            run(0, 2, in_table(1)),
+            run(2, 4, in_table(2)),
+            run(4, 6, in_table(3)),
+            run(6, 7, [sprm(PFINTABLE, &[1]), sprm(PFTTP, &[1])].concat()),
+        ];
+        let res = convert("a\x07b\x07c\x07\x07", paps, vec![], lists, vec![], "");
+        assert_eq!(
+            res.markdown,
+            "| \u{2022} a | 5. b | c |\n| --- | --- | --- |"
+        );
+        assert!(res.losses.is_empty());
     }
 }

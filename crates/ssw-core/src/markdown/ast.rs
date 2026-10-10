@@ -20,6 +20,11 @@ use super::definitions::Definitions;
 /// Syntax marker ranges of a node.
 pub type Markers = SmallVec<[TextRange; 4]>;
 
+/// The markers `ranges` (in source order); spills to the heap past the inline capacity.
+pub fn marks(ranges: &[TextRange]) -> Markers {
+    Markers::from_slice(ranges)
+}
+
 /// A parsed document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
@@ -553,7 +558,8 @@ fn pick<T>(items: &[T], offset: usize, range_of: impl Fn(&T) -> TextRange) -> Op
     {
         return Some(item);
     }
-    let prev = items.get(idx.checked_sub(1)?)?;
+    // `partition_point` never exceeds `items.len()`, so the predecessor of a non-zero index exists.
+    let prev = &items[idx.checked_sub(1)?];
     (range_of(prev).end == offset).then_some(prev)
 }
 
@@ -645,10 +651,28 @@ impl Block {
         }
     }
 
+    /// The task checkbox of a list item; `None` for plain items and every other block.
+    pub fn task(&self) -> Option<Task> {
+        match self.kind {
+            BlockKind::ListItem { task, .. } => task,
+            _ => None,
+        }
+    }
+
     /// Heading level for headings.
     pub fn heading_level(&self) -> Option<u8> {
         match self.kind {
             BlockKind::Heading { level, .. } => Some(level),
+            _ => None,
+        }
+    }
+}
+
+impl InlineKind {
+    /// The color of a highlight; `None` for an uncolored highlight and for every other kind.
+    pub fn highlight_color(&self) -> Option<HighlightColor> {
+        match self {
+            InlineKind::Highlight { color } => *color,
             _ => None,
         }
     }

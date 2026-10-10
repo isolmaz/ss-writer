@@ -42,7 +42,7 @@ use std::sync::LazyLock;
 use windows::Win32::Foundation::{
     DATA_S_SAMEFORMATETC, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
     DV_E_DVASPECT, DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_NOTIMPL, E_POINTER, E_UNEXPECTED,
-    GlobalFree, HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, POINTL, S_OK,
+    HGLOBAL, HWND, OLE_E_ADVISENOTSUPPORTED, POINT, POINTL, S_OK,
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
@@ -52,9 +52,7 @@ use windows::Win32::System::Com::{
     IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
     TYMED_HGLOBAL,
 };
-use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
-};
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{
     CF_HDROP, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE,
     DROPEFFECT_NONE, DoDragDrop, IDropSource, IDropSource_Impl, IDropTarget, IDropTarget_Impl,
@@ -66,7 +64,7 @@ use windows::Win32::System::SystemServices::{
 use windows::Win32::UI::Shell::{CLSID_DragDropHelper, IDropTargetHelper, SHCreateStdEnumFmtEtc};
 use windows::core::{BOOL, Error, HRESULT, HSTRING, Ref, implement};
 
-use crate::com::{OsResultExt, WinError, from_wide};
+use crate::com::{OsResultExt, WinError, from_wide, global_from_bytes};
 use crate::services::clipboard::{
     FORMAT_HTML, build_cf_html, build_hdrop, decode_text, encode_text, parse_cf_html, parse_hdrop,
     register,
@@ -464,20 +462,7 @@ fn read_global(global: HGLOBAL) -> Option<Vec<u8>> {
 /// A new movable global memory block holding `bytes`; the receiver of the storage medium owns
 /// it.
 fn alloc_global(bytes: &[u8]) -> windows::core::Result<HGLOBAL> {
-    // SAFETY: the block is fresh and large enough; it is locked only for the copy and freed
-    // when it cannot be locked.
-    unsafe {
-        let global = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1))?;
-        let pointer = GlobalLock(global).cast::<u8>();
-        if pointer.is_null() {
-            let error = Error::from_thread();
-            let _ = GlobalFree(Some(global));
-            return Err(error);
-        }
-        ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len());
-        let _ = GlobalUnlock(global);
-        Ok(global)
-    }
+    global_from_bytes(bytes)
 }
 
 /// The effects the source allows, from OLE's in / out effect parameter.
@@ -994,13 +979,19 @@ impl DragLoop for OleDragLoop {
         // SAFETY: both objects are live and `effect` outlives the call, which runs its own
         // modal loop on this thread.
         let result = unsafe { DoDragDrop(data, source, allowed.to_ole(), &mut effect) };
-        if result == DRAGDROP_S_DROP {
-            Ok(Effect::from_ole(effect))
-        } else if result == DRAGDROP_S_CANCEL {
-            Ok(Effect::None)
-        } else {
-            Err(WinError::from_os("DoDragDrop", result.into()))
-        }
+        drag_outcome(result, effect)
+    }
+}
+
+/// What `DoDragDrop` ended with: the effect of the drop, nothing for a cancelled drag, the
+/// failure otherwise.
+fn drag_outcome(result: HRESULT, effect: DROPEFFECT) -> Result<Effect, WinError> {
+    if result == DRAGDROP_S_DROP {
+        Ok(Effect::from_ole(effect))
+    } else if result == DRAGDROP_S_CANCEL {
+        Ok(Effect::None)
+    } else {
+        Err(WinError::from_os("DoDragDrop", result.into()))
     }
 }
 
@@ -1018,4 +1009,80 @@ pub fn start_drag<L: DragLoop>(
     let data = data_object(content)?;
     let source = drop_source(button);
     drag_loop.run(&data, &source, allowed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::E_FAIL;
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc};
+
+    #[test]
+    fn a_global_block_that_cannot_be_locked_has_no_bytes() {
+        // SAFETY: a fresh allocation, freed below.
+        let empty = unsafe { GlobalAlloc(GMEM_MOVEABLE, 0) }.unwrap();
+        assert_eq!(read_global(empty), None);
+        let block = alloc_global(b"data").unwrap();
+        assert!(read_global(block).is_some_and(|bytes| bytes.starts_with(b"data")));
+        // SAFETY: both blocks are ours and freed once.
+        unsafe {
+            let _ = windows::Win32::Foundation::GlobalFree(Some(empty));
+            let _ = windows::Win32::Foundation::GlobalFree(Some(block));
+        }
+    }
+
+    #[test]
+    fn the_outcome_of_a_drag_is_the_effect_nothing_or_the_failure() {
+        assert_eq!(
+            drag_outcome(DRAGDROP_S_DROP, DROPEFFECT_MOVE).unwrap(),
+            Effect::Move
+        );
+        assert_eq!(
+            drag_outcome(DRAGDROP_S_DROP, DROPEFFECT_COPY).unwrap(),
+            Effect::Copy
+        );
+        // A cancelled drag drops nothing, whatever effect was last reported.
+        assert_eq!(
+            drag_outcome(DRAGDROP_S_CANCEL, DROPEFFECT_COPY).unwrap(),
+            Effect::None
+        );
+        let error = drag_outcome(E_FAIL, DROPEFFECT_NONE).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WinError::Os {
+                    context: "DoDragDrop",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn the_ole_loop_fails_on_a_thread_that_never_initialized_ole() {
+        // No `OleGuard` on this thread: `DoDragDrop` refuses at once, before any pointer is
+        // involved, so no drag starts.
+        let content = DragContent {
+            text: Some("dragged".to_owned()),
+            ..DragContent::default()
+        };
+        let error = start_drag(
+            &mut OleDragLoop,
+            &content,
+            AllowedEffects::ALL,
+            DragButton::Left,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WinError::Os {
+                    context: "DoDragDrop",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
 }

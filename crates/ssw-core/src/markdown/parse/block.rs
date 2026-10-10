@@ -282,24 +282,19 @@ impl<'a> BlockParser<'a> {
         self.partially_consumed_tab = false;
     }
 
-    fn advance_offset(&mut self, mut count: usize, columns: bool) {
+    /// Advances over `count` columns; a tab wider than what is left is consumed partially.
+    /// (Markers are never tabs, so advancing over them in columns is the same as in bytes.)
+    fn advance_offset(&mut self, mut count: usize) {
         while count > 0 && self.offset < self.line_end {
             if self.bytes[self.offset] == b'\t' {
                 let chars_to_tab = 4 - (self.column % 4);
-                if columns {
-                    self.partially_consumed_tab = chars_to_tab > count;
-                    let advance = chars_to_tab.min(count);
-                    self.column += advance;
-                    if !self.partially_consumed_tab {
-                        self.offset += 1;
-                    }
-                    count -= advance;
-                } else {
-                    self.partially_consumed_tab = false;
-                    self.column += chars_to_tab;
+                self.partially_consumed_tab = chars_to_tab > count;
+                let advance = chars_to_tab.min(count);
+                self.column += advance;
+                if !self.partially_consumed_tab {
                     self.offset += 1;
-                    count -= 1;
                 }
+                count -= advance;
             } else {
                 self.partially_consumed_tab = false;
                 self.offset += 1;
@@ -446,6 +441,8 @@ impl<'a> BlockParser<'a> {
         }
     }
 
+    /// Whether the rest of the line ends an HTML block of kind 1..=5 (the only kinds with an
+    /// end condition; kind 5 is the CDATA section).
     fn html_end_condition(&self, kind: u8) -> bool {
         let rest = &self.bytes[self.offset.min(self.line_end)..self.line_end];
         let lower: Vec<u8> = rest.to_ascii_lowercase();
@@ -460,8 +457,7 @@ impl<'a> BlockParser<'a> {
             2 => contains(b"-->"),
             3 => contains(b"?>"),
             4 => contains(b">"),
-            5 => contains(b"]]>"),
-            _ => false,
+            _ => contains(b"]]>"),
         }
     }
 
@@ -487,10 +483,10 @@ impl<'a> BlockParser<'a> {
                 if self.indent < 4 && self.peek(self.next_nonspace) == Some(b'>') {
                     let gt = self.next_nonspace;
                     self.advance_next_nonspace();
-                    self.advance_offset(1, false);
+                    self.advance_offset(1);
                     self.nodes[id].markers.push(TextRange::new(gt, gt + 1));
                     if matches!(self.peek(self.offset), Some(b' ' | b'\t')) {
-                        self.advance_offset(1, true);
+                        self.advance_offset(1);
                     }
                     Cont::Matched
                 } else {
@@ -527,14 +523,14 @@ impl<'a> BlockParser<'a> {
                 }
                 let mut left = fence_indent;
                 while left > 0 && matches!(self.peek(self.offset), Some(b' ' | b'\t')) {
-                    self.advance_offset(1, true);
+                    self.advance_offset(1);
                     left -= 1;
                 }
                 Cont::Matched
             }
             NodeKind::Code { fence: None, .. } => {
                 if self.indent >= 4 {
-                    self.advance_offset(4, true);
+                    self.advance_offset(4);
                     Cont::Matched
                 } else if self.blank {
                     self.advance_next_nonspace();
@@ -570,7 +566,7 @@ impl<'a> BlockParser<'a> {
                 Cont::Matched
             }
         } else if self.indent >= marker_offset + padding {
-            self.advance_offset(marker_offset + padding, true);
+            self.advance_offset(marker_offset + padding);
             Cont::Matched
         } else {
             Cont::Failed
@@ -645,7 +641,7 @@ impl<'a> BlockParser<'a> {
             )
             && !self.blank
         {
-            self.advance_offset(4, true);
+            self.advance_offset(4);
             self.close_unmatched();
             let start = self.offset;
             self.add_child(
@@ -674,9 +670,9 @@ impl<'a> BlockParser<'a> {
         }
         let gt = self.next_nonspace;
         self.advance_next_nonspace();
-        self.advance_offset(1, false);
+        self.advance_offset(1);
         if matches!(self.peek(self.offset), Some(b' ' | b'\t')) {
-            self.advance_offset(1, true);
+            self.advance_offset(1);
         }
         self.close_unmatched();
         let id = self.add_child(NodeKind::Quote, gt);
@@ -923,12 +919,12 @@ impl<'a> BlockParser<'a> {
         let marker = TextRange::new(ns, ns + 2 + close + 2);
         let label = label.to_string();
         self.advance_next_nonspace();
-        self.advance_offset(marker.len(), false);
+        self.advance_offset(marker.len());
         let mut spaces = 0;
         while matches!(self.peek(self.offset + spaces), Some(b' ' | b'\t')) && spaces < 1 {
             spaces += 1;
         }
-        self.advance_offset(spaces, true);
+        self.advance_offset(spaces);
         self.close_unmatched();
         let id = self.add_child(NodeKind::Footnote { label }, ns);
         self.nodes[id].markers.push(marker);
@@ -1055,11 +1051,11 @@ impl<'a> BlockParser<'a> {
         }
         let marker_offset = self.indent;
         self.advance_next_nonspace();
-        self.advance_offset(len, true);
+        self.advance_offset(len);
         let spaces_start_col = self.column;
         let spaces_start_offset = self.offset;
         loop {
-            self.advance_offset(1, true);
+            self.advance_offset(1);
             if !(self.column - spaces_start_col < 5
                 && matches!(self.peek(self.offset), Some(b' ' | b'\t')))
             {
@@ -1075,7 +1071,7 @@ impl<'a> BlockParser<'a> {
             self.offset = spaces_start_offset;
             self.partially_consumed_tab = false;
             if matches!(self.peek(self.offset), Some(b' ' | b'\t')) {
-                self.advance_offset(1, true);
+                self.advance_offset(1);
             }
         } else {
             padding = len + spaces_after;
@@ -1101,9 +1097,11 @@ impl<'a> BlockParser<'a> {
         let Some(alignments) = parse_delimiter_row(delim_text) else {
             return false;
         };
-        let Some(&header) = self.nodes[container].lines.last() else {
-            return false;
-        };
+        // An open paragraph always has at least the line that created it.
+        let header = *self.nodes[container]
+            .lines
+            .last()
+            .expect("open paragraph has a line");
         let header_text = header.range.get(self.src).unwrap_or("");
         if split_row(header_text, header.range.start).cells.len() != alignments.len() {
             return false;
@@ -1211,9 +1209,6 @@ impl<'a> BlockParser<'a> {
 
     fn finalize_paragraph(&mut self, id: usize) {
         let ranges: Vec<TextRange> = self.nodes[id].lines.iter().map(|l| l.range).collect();
-        if ranges.is_empty() {
-            return;
-        }
         let source = Source::from_lines(self.src, &ranges);
         let b = source.buf.as_bytes();
         let mut pos = 0usize;
@@ -1260,8 +1255,9 @@ impl<'a> BlockParser<'a> {
             let trimmed = trim_range(self.src, last.range);
             last.range = TextRange::new(last.range.start, trimmed.end.max(last.range.start));
         }
-        let first_start = self.nodes[id].lines[0].range.start;
-        self.nodes[id].start = first_start;
+        if let Some(start) = self.nodes[id].lines.first().map(|l| l.range.start) {
+            self.nodes[id].start = start;
+        }
     }
 
     /// Registers footnote definitions in document order (first definition of a label wins).
@@ -1460,9 +1456,6 @@ pub(super) fn split_row(text: &str, base: usize) -> SplitRow {
 /// Alignments of a table delimiter row, or `None` when `text` is not one.
 fn parse_delimiter_row(text: &str) -> Option<Vec<Alignment>> {
     let row = split_row(text, 0);
-    if row.cells.is_empty() {
-        return None;
-    }
     let mut out = Vec::with_capacity(row.cells.len());
     for (_, content) in &row.cells {
         let c = content.get(text)?;
@@ -1484,7 +1477,7 @@ fn parse_delimiter_row(text: &str) -> Option<Vec<Alignment>> {
         .chars()
         .filter(|c| !matches!(c, ' ' | '\t' | '|' | ':' | '-'))
         .collect();
-    stripped.is_empty().then_some(out)
+    (!out.is_empty() && stripped.is_empty()).then_some(out)
 }
 
 // ------------------------------------------------------- link reference definitions

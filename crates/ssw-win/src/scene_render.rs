@@ -70,6 +70,7 @@ use windows_numerics::{Matrix3x2, Vector2};
 use crate::canvas::{CanvasAssets, ImageStore, SceneRenderer};
 use crate::com::{OsResultExt, WinError};
 use crate::dwrite::DWriteEngine;
+use crate::fault::check;
 use crate::wic::{DecodedImage, Wic};
 
 /// Font faces kept before the cache is emptied.
@@ -164,7 +165,7 @@ impl SceneRenderer for D2dSceneRenderer {
         };
         // SAFETY: valid target; the matrix is a valid out pointer.
         let (factory, base) = unsafe {
-            let factory = target.GetFactory().ctx("scene render target factory")?;
+            let factory = check(target.GetFactory()).ctx("scene render target factory")?;
             let mut base = Matrix3x2::identity();
             target.GetTransform(&mut base);
             (factory, base)
@@ -348,13 +349,13 @@ fn decode_image(wic: &Wic, image: &ImageData) -> Option<DecodedImage> {
     if image.mime != MIME_RGBA8 {
         return wic.decode(&image.bytes).ok();
     }
-    let expected = (image.width as usize)
-        .checked_mul(image.height as usize)?
-        .checked_mul(4)?;
-    if expected == 0 || image.bytes.len() != expected {
+    // Wide arithmetic: the byte count of any `u32` x `u32` image cannot overflow, so a size no
+    // buffer can match is refused by the comparison.
+    let expected = u128::from(image.width) * u128::from(image.height) * 4;
+    if expected == 0 || image.bytes.len() as u128 != expected {
         return None;
     }
-    let mut bgra = Vec::with_capacity(expected);
+    let mut bgra = Vec::with_capacity(image.bytes.len());
     for pixel in image.bytes.as_chunks::<4>().0 {
         let alpha = u32::from(pixel[3]);
         let premultiply = |channel: u8| ((u32::from(channel) * alpha + 127) / 255) as u8;
@@ -385,7 +386,7 @@ fn create_bitmap(
         dpiY: 96.0,
     };
     // SAFETY: the pixel buffer holds `stride * height` bytes and Direct2D copies it.
-    unsafe {
+    check(unsafe {
         target.CreateBitmap(
             D2D_SIZE_U {
                 width: image.width,
@@ -395,7 +396,7 @@ fn create_bitmap(
             image.stride(),
             &properties,
         )
-    }
+    })
     .ctx("create scene bitmap")
 }
 
@@ -488,14 +489,11 @@ impl FontCache {
         // SAFETY: plain factory and loader creation; the loader is registered with the factory
         // that created it.
         unsafe {
-            let factory: IDWriteFactory5 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED)
+            let factory: IDWriteFactory5 = check(DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED))
                 .ctx("create DirectWrite factory")?;
-            let loader = factory
-                .CreateInMemoryFontFileLoader()
+            let loader = check(factory.CreateInMemoryFontFileLoader())
                 .ctx("create in-memory font loader")?;
-            factory
-                .RegisterFontFileLoader(&loader)
-                .ctx("register in-memory font loader")?;
+            check(factory.RegisterFontFileLoader(&loader)).ctx("register in-memory font loader")?;
             Ok(Self {
                 faces: HashMap::new(),
                 loader,
@@ -522,37 +520,34 @@ impl FontCache {
         // DirectWrite makes because `owner` (a clone of `font`) is held by the file reference;
         // the out pointers are valid locals.
         let face = unsafe {
-            let file = self
-                .loader
-                .CreateInMemoryFontFileReference(
-                    &self.factory,
-                    bytes.as_ptr().cast::<c_void>(),
-                    length,
-                    &owner,
-                )
-                .ctx("create font file reference")?;
+            let file = check(self.loader.CreateInMemoryFontFileReference(
+                &self.factory,
+                bytes.as_ptr().cast::<c_void>(),
+                length,
+                &owner,
+            ))
+            .ctx("create font file reference")?;
             let mut supported = BOOL(0);
             let mut file_type = DWRITE_FONT_FILE_TYPE_UNKNOWN;
             let mut face_type = DWRITE_FONT_FACE_TYPE_UNKNOWN;
             let mut faces = 0u32;
-            file.Analyze(
+            check(file.Analyze(
                 &mut supported,
                 &mut file_type,
                 Some(&mut face_type),
                 &mut faces,
-            )
+            ))
             .ctx("analyze font file")?;
             if !supported.as_bool() {
                 return Err(WinError::Invalid("DirectWrite does not support this font"));
             }
-            self.factory
-                .CreateFontFace(
-                    face_type,
-                    &[Some(file)],
-                    font.index,
-                    DWRITE_FONT_SIMULATIONS_NONE,
-                )
-                .ctx("create font face")?
+            check(self.factory.CreateFontFace(
+                face_type,
+                &[Some(file)],
+                font.index,
+                DWRITE_FONT_SIMULATIONS_NONE,
+            ))
+            .ctx("create font face")?
         };
         if self.faces.len() >= MAX_FACES {
             self.faces.clear();
@@ -653,7 +648,7 @@ impl Session<'_> {
         let geometry = build_geometry(&self.factory, path, FillRule::NonZero)?;
         let m = matrix(current);
         // SAFETY: valid factory, geometry and matrix pointer.
-        let transformed = unsafe { self.factory.CreateTransformedGeometry(&geometry, &m) }
+        let transformed = check(unsafe { self.factory.CreateTransformedGeometry(&geometry, &m) })
             .ctx("create clip geometry")?;
         Ok(transformed.into())
     }
@@ -666,7 +661,7 @@ impl Session<'_> {
         let layer = match self.layers.pop() {
             Some(layer) => layer,
             // SAFETY: valid target; `None` lets Direct2D size the layer.
-            None => unsafe { self.target.CreateLayer(None) }.ctx("create layer")?,
+            None => check(unsafe { self.target.CreateLayer(None) }).ctx("create layer")?,
         };
         let mut parameters = D2D1_LAYER_PARAMETERS {
             contentBounds: D2D_RECT_F {
@@ -770,7 +765,7 @@ impl Session<'_> {
             dashOffset: phase,
         };
         // SAFETY: valid factory and properties; the dash array is only read during the call.
-        let style = unsafe {
+        let style = check(unsafe {
             self.factory.CreateStrokeStyle(
                 &properties,
                 if dashes.is_empty() {
@@ -779,7 +774,7 @@ impl Session<'_> {
                     Some(&dashes)
                 },
             )
-        }
+        })
         .ctx("create stroke style")?;
         self.strokes.insert(key, style.clone());
         Ok(style)
@@ -826,13 +821,10 @@ impl Session<'_> {
         // glyphs; a truncated count would only read fewer); the sink is opened, filled by
         // DirectWrite and closed before the geometry is used.
         unsafe {
-            let geometry = self
-                .factory
-                .CreatePathGeometry()
-                .ctx("create glyph geometry")?;
-            let sink = geometry.Open().ctx("open glyph geometry")?;
+            let geometry = check(self.factory.CreatePathGeometry()).ctx("create glyph geometry")?;
+            let sink = check(geometry.Open()).ctx("open glyph geometry")?;
             sink.SetFillMode(D2D1_FILL_MODE_WINDING);
-            face.GetGlyphRunOutline(
+            check(face.GetGlyphRunOutline(
                 run.size,
                 indices.as_ptr(),
                 Some(advances.as_ptr()),
@@ -841,9 +833,9 @@ impl Session<'_> {
                 false,
                 false,
                 &sink,
-            )
+            ))
             .ctx("get glyph outline")?;
-            sink.Close().ctx("close glyph geometry")?;
+            check(sink.Close()).ctx("close glyph geometry")?;
             Ok(geometry)
         }
     }
@@ -896,7 +888,7 @@ impl Session<'_> {
             Some(brush) => brush.clone(),
             None => {
                 // SAFETY: valid target and color pointer.
-                let brush = unsafe { self.target.CreateSolidColorBrush(&d2d, None) }
+                let brush = check(unsafe { self.target.CreateSolidColorBrush(&d2d, None) })
                     .ctx("create scene brush")?;
                 self.solid = Some(brush.clone());
                 brush
@@ -926,10 +918,10 @@ impl Session<'_> {
             transform: matrix(&gradient.transform),
         };
         // SAFETY: valid target, property pointers and stop collection.
-        let brush = unsafe {
+        let brush = check(unsafe {
             self.target
                 .CreateLinearGradientBrush(&properties, Some(&brush_properties), &collection)
-        }
+        })
         .ctx("create linear gradient")?;
         Ok(Some(brush.into()))
     }
@@ -969,10 +961,10 @@ impl Session<'_> {
             transform: matrix(&gradient.transform),
         };
         // SAFETY: valid target, property pointers and stop collection.
-        let brush = unsafe {
+        let brush = check(unsafe {
             self.target
                 .CreateRadialGradientBrush(&properties, Some(&brush_properties), &collection)
-        }
+        })
         .ctx("create radial gradient")?;
         Ok(Some(brush.into()))
     }
@@ -983,10 +975,10 @@ impl Session<'_> {
         spread: SpreadMode,
     ) -> Result<ID2D1GradientStopCollection, WinError> {
         // SAFETY: valid target; the stops are copied by the call.
-        unsafe {
+        check(unsafe {
             self.target
                 .CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, extend_mode(spread))
-        }
+        })
         .ctx("create gradient stops")
     }
 }
@@ -1013,8 +1005,8 @@ fn build_geometry(
     // SAFETY: the sink is opened, filled with balanced figures and closed before the geometry is
     // used.
     unsafe {
-        let geometry = factory.CreatePathGeometry().ctx("create path geometry")?;
-        let sink = geometry.Open().ctx("open geometry sink")?;
+        let geometry = check(factory.CreatePathGeometry()).ctx("create path geometry")?;
+        let sink = check(geometry.Open()).ctx("open geometry sink")?;
         sink.SetFillMode(match rule {
             FillRule::NonZero => D2D1_FILL_MODE_WINDING,
             FillRule::EvenOdd => D2D1_FILL_MODE_ALTERNATE,
@@ -1067,7 +1059,7 @@ fn build_geometry(
         if open {
             sink.EndFigure(D2D1_FIGURE_END_OPEN);
         }
-        sink.Close().ctx("close geometry sink")?;
+        check(sink.Close()).ctx("close geometry sink")?;
         Ok(geometry)
     }
 }
@@ -1189,6 +1181,11 @@ mod tests {
         // Wrong buffer length, zero size and undecodable bytes.
         assert!(decode_image(&wic, &ImageData::rgba8(2, 1, vec![0; 4])).is_none());
         assert!(decode_image(&wic, &ImageData::rgba8(0, 0, Vec::new())).is_none());
+        // Sizes whose byte count does not fit a machine word are not images either (and do
+        // not wrap around to a count that a buffer could match).
+        let huge = ImageData::rgba8(u32::MAX, u32::MAX, vec![0; 4]);
+        assert!(decode_image(&wic, &huge).is_none());
+        assert!(decode_image(&wic, &ImageData::rgba8(u32::MAX, 1, vec![0; 4])).is_none());
         let mut text = ImageData::rgba8(1, 1, b"not an image".to_vec());
         text.mime = "image/png".to_owned();
         assert!(decode_image(&wic, &text).is_none());

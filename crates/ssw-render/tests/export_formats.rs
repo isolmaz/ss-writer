@@ -236,6 +236,108 @@ fn png_pixels_are_white_paper_with_dark_text() {
     assert!(ink > 200, "{ink} dark pixels");
 }
 
+fn dark_options() -> ExportOptions {
+    ExportOptions {
+        light_theme: false,
+        ..ExportOptions::default()
+    }
+}
+
+#[test]
+fn the_dark_theme_paints_dark_pages_with_light_text() {
+    let exporter = Exporter::new(None);
+    let render = |options: &ExportOptions| {
+        let pngs = exporter
+            .export_png(
+                "# Big heading\n\nbody text",
+                options,
+                &NoDiagrams,
+                &PageSelection::All,
+                100.0,
+            )
+            .expect("png");
+        image::load_from_memory(&pngs[0])
+            .expect("decodes")
+            .to_rgba8()
+    };
+    let page = render(&dark_options());
+    let surface = [0x27, 0x27, 0x27, 255];
+    assert_eq!(
+        page.get_pixel(0, 0).0,
+        surface,
+        "the corner is the dark surface"
+    );
+    assert_eq!(
+        page.get_pixel(page.width() - 1, page.height() - 1).0,
+        surface
+    );
+    assert!(page.pixels().all(|p| p.0[3] == 255), "the page is opaque");
+    let brightest = page.pixels().map(|p| p.0[0]).max().expect("pixels");
+    assert!(
+        brightest > 200,
+        "text pixels are light, brightest {brightest}"
+    );
+    let ink = page.pixels().filter(|p| p.0[0] > 150).count();
+    assert!(ink > 200, "{ink} light pixels");
+
+    // Black ink needs light paper: black text wins over the dark theme.
+    let black = render(&ExportOptions {
+        black_text: true,
+        ..dark_options()
+    });
+    assert_eq!(black.get_pixel(0, 0).0, [255, 255, 255, 255]);
+    assert_eq!(
+        render(&ExportOptions::default()).get_pixel(0, 0).0,
+        [255, 255, 255, 255]
+    );
+}
+
+#[test]
+fn dark_pages_are_dark_paper_in_scenes_jpegs_and_pdfs() {
+    let exporter = Exporter::new(None);
+    let scenes = exporter
+        .layout_pages(TWO_PAGES, &dark_options(), &NoDiagrams)
+        .expect("layout");
+    assert_eq!(scenes.len(), 2);
+    for scene in &scenes {
+        match &scene.items[0] {
+            SceneItem::Fill(paper) => assert_eq!(
+                paper.paint,
+                Paint::Solid(ssw_render::scene::Color::rgb(0x27, 0x27, 0x27))
+            ),
+            other => panic!("paper expected first, got {other:?}"),
+        }
+    }
+
+    let jpegs = exporter
+        .export_jpg(
+            TWO_PAGES,
+            &dark_options(),
+            &NoDiagrams,
+            &PageSelection::All,
+            72.0,
+            95,
+        )
+        .expect("jpeg");
+    let page = image::load_from_memory(&jpegs[0])
+        .expect("decodes")
+        .to_rgb8();
+    let [r, g, b] = page.get_pixel(0, 0).0;
+    assert!(
+        [r, g, b].iter().all(|c| c.abs_diff(0x27) <= 3),
+        "{r} {g} {b}"
+    );
+
+    let dark = exporter
+        .export_pdf(TWO_PAGES, &dark_options(), &NoDiagrams)
+        .expect("pdf");
+    let light = exporter
+        .export_pdf(TWO_PAGES, &ExportOptions::default(), &NoDiagrams)
+        .expect("pdf");
+    assert!(dark.starts_with(b"%PDF"));
+    assert_ne!(dark, light, "the page fill is part of the PDF");
+}
+
 #[test]
 fn page_selection_picks_pages_and_rejects_missing_ones() {
     let exporter = Exporter::new(None);

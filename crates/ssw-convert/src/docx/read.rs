@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use ssw_core::markdown::ast::HighlightColor;
 
+use crate::doc::md::flank;
 use crate::import::{Asset, ImportError, ImportResult, LossKind};
 use crate::omml;
 use crate::ooxml::{
@@ -179,12 +180,16 @@ fn md_dest(dest: &str) -> String {
     format!("<{encoded}>")
 }
 
-fn render_atom(inl: &Inl) -> String {
+/// `(format, text, is_text)` of one inline node: text keeps its format and is escaped when the
+/// marks are laid out; every other node is already Markdown.
+fn render_item(inl: &Inl) -> (Fmt, String, bool) {
+    let markdown = |md: String| (Fmt::default(), md, false);
     match inl {
-        Inl::Text { .. } | Inl::PageBreak | Inl::Rule => String::new(),
-        Inl::Break => "\\\n".to_string(),
+        Inl::Text { text, fmt } => (fmt.clone(), text.clone(), true),
+        Inl::PageBreak | Inl::Rule => markdown(String::new()),
+        Inl::Break => markdown("\\\n".to_string()),
         Inl::Link { url, children } => {
-            format!("[{}]({})", render_inlines(children), md_dest(url))
+            markdown(format!("[{}]({})", render_inlines(children), md_dest(url)))
         }
         Inl::Image { alt, dest, width } => {
             let alt = alt.replace(['\n', '\r'], " ");
@@ -193,23 +198,22 @@ fn render_atom(inl: &Inl) -> String {
                 .replace('[', "\\[")
                 .replace(']', "\\]")
                 .replace('|', "\\|");
-            match width {
+            markdown(match width {
                 Some(w) => format!("![{alt}|{w}]({})", md_dest(dest)),
                 None => format!("![{alt}]({})", md_dest(dest)),
-            }
+            })
         }
-        Inl::NoteRef(label) => format!("[^{label}]"),
+        Inl::NoteRef(label) => markdown(format!("[^{label}]")),
+        // `Converter::math` only creates equations whose trimmed text is not empty
         Inl::Math { tex, display } => {
             let tex = tex.trim();
-            if tex.is_empty() {
-                String::new()
-            } else if *display {
+            markdown(if *display {
                 format!("$${tex}$$")
             } else {
                 format!("${tex}$")
-            }
+            })
         }
-        Inl::Raw(raw) => raw.clone(),
+        Inl::Raw(raw) => markdown(raw.clone()),
     }
 }
 
@@ -245,6 +249,14 @@ fn render_group(items: &[(Fmt, String, bool)], level: usize) -> String {
 /// Renders inline nodes to Markdown: merges equal formatting, nests marks, moves boundary
 /// whitespace outside the markers and escapes syntax characters.
 fn render_inlines(inlines: &[Inl]) -> String {
+    let merged = merge_text(inlines);
+    let flanked = merge_text(&flank_marks(&merged));
+    let items: Vec<(Fmt, String, bool)> = flanked.iter().map(render_item).collect();
+    render_group(&items, 0)
+}
+
+/// Joins neighbouring text nodes with equal formatting.
+fn merge_text(inlines: &[Inl]) -> Vec<Inl> {
     let mut merged: Vec<Inl> = Vec::new();
     for inl in inlines {
         if let Inl::Text { text, fmt } = inl
@@ -259,14 +271,86 @@ fn render_inlines(inlines: &[Inl]) -> String {
         }
         merged.push(inl.clone());
     }
-    let items: Vec<(Fmt, String, bool)> = merged
-        .iter()
-        .map(|inl| match inl {
-            Inl::Text { text, fmt } => (fmt.clone(), text.clone(), true),
-            other => (Fmt::default(), render_atom(other), false),
-        })
-        .collect();
-    render_group(&items, 0)
+    merged
+}
+
+/// Whether some mark of `fmt` opens or closes at the boundary to a text with format `other`:
+/// every level from the first one where the two differ starts a new group.
+fn delimits(fmt: &Fmt, other: &Fmt) -> bool {
+    (0..MARK_LEVELS)
+        .find(|&level| mark_open(fmt, level) != mark_open(other, level))
+        .is_some_and(|first| (first..MARK_LEVELS).any(|level| mark_open(fmt, level).is_some()))
+}
+
+/// The character of `neighbor` that touches a text with format `fmt` (its last one when
+/// `before`), when marks of `fmt` are written between the two.
+fn touching(neighbor: Option<&Inl>, fmt: &Fmt, before: bool) -> Option<char> {
+    match neighbor {
+        Some(Inl::Text { text, fmt: other }) if delimits(fmt, other) => {
+            if before {
+                text.chars().next_back()
+            } else {
+                text.chars().next()
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Moves boundary punctuation out of marked text where CommonMark would not read the markers as
+/// delimiters (`**bold.**x` becomes `**bold**.x`); text that cannot be marked loses its marks.
+/// The rules are those of the shared [`flank`]; boundary white space is handled by `wrap_mark`.
+fn flank_marks(items: &[Inl]) -> Vec<Inl> {
+    let mut out = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let Inl::Text { text, fmt } = item else {
+            out.push(item.clone());
+            continue;
+        };
+        let core = text.trim_matches(is_space);
+        if core.is_empty() || !(0..MARK_LEVELS).any(|level| mark_open(fmt, level).is_some()) {
+            out.push(item.clone());
+            continue;
+        }
+        let lead = text.len() - text.trim_start_matches(is_space).len();
+        let trail = text.len() - text.trim_end_matches(is_space).len();
+        let before = match i.checked_sub(1) {
+            Some(previous) if lead == 0 => touching(items.get(previous), fmt, true),
+            _ => None,
+        };
+        let after = if trail == 0 {
+            touching(items.get(i + 1), fmt, false)
+        } else {
+            None
+        };
+        let (pre, inner, post, marked) = flank(core, fmt.code, before, after);
+        if !marked {
+            let fmt = Fmt {
+                code: fmt.code,
+                ..Fmt::default()
+            };
+            out.push(Inl::Text {
+                text: text.clone(),
+                fmt,
+            });
+            continue;
+        }
+        let plain = |text: &str| Inl::Text {
+            text: text.to_string(),
+            fmt: Fmt::default(),
+        };
+        if !pre.is_empty() {
+            out.push(plain(pre));
+        }
+        out.push(Inl::Text {
+            text: format!("{}{inner}{}", &text[..lead], &text[text.len() - trail..]),
+            fmt: fmt.clone(),
+        });
+        if !post.is_empty() {
+            out.push(plain(post));
+        }
+    }
+    out
 }
 
 /// Escapes block-level syntax at the start of one paragraph line.
@@ -785,10 +869,8 @@ impl<'m> Converter<'m> {
                         first_text = false;
                         continue;
                     }
+                    // `has_visible` guarantees a character that no trimming removes
                     let text = escape_lines(&rendered);
-                    if text.is_empty() {
-                        continue;
-                    }
                     if is_quote {
                         push_block(out, Block::Quote(text));
                     } else if let Some(item) = self.list_item(num.as_ref(), &text, out, first_text)
@@ -1809,6 +1891,68 @@ mod tests {
     }
 
     #[test]
+    fn emphasis_next_to_punctuation_parses_back() {
+        use crate::doc::md::probe::{expect, runs};
+        let bold = |text: &str| rp("<w:b/>", text);
+        let italic = |text: &str| rp("<w:i/>", text);
+        // (runs, markdown, runs of equal emphasis the editor's parser finds in the markdown)
+        type Case<'a> = (String, &'a str, &'a [(&'a str, &'a str)]);
+        let table: [Case; 9] = [
+            (
+                format!("{}{}{}", r("x"), bold(" bold "), r("y")),
+                "x **bold** y\n",
+                &[("x ", ""), ("bold", "b"), (" y", "")],
+            ),
+            (
+                format!("{}{}{}", r("a"), bold("bold."), r("b")),
+                "a**bold**.b\n",
+                &[("a", ""), ("bold", "b"), (".b", "")],
+            ),
+            (
+                format!("{}{}{}", r("a"), bold("(bold)"), r("b")),
+                "a(**bold**)b\n",
+                &[("a(", ""), ("bold", "b"), (")b", "")],
+            ),
+            (
+                format!("{}{}{}", r("a"), bold("b"), r("c")),
+                "a**b**c\n",
+                &[("a", ""), ("b", "b"), ("c", "")],
+            ),
+            (
+                format!("{}{}{}", r("a"), italic("b"), r("c")),
+                "a*b*c\n",
+                &[("a", ""), ("b", "i"), ("c", "")],
+            ),
+            (
+                format!("{}{}{}", r("a"), bold("--"), r("b")),
+                "a--b\n",
+                &[("a--b", "")],
+            ),
+            (
+                format!("{}{}", bold("Note:"), r("text")),
+                "**Note**:text\n",
+                &[("Note", "b"), (":text", "")],
+            ),
+            (
+                format!("{}{}", rp("<w:b/><w:i/>", "b."), r("c")),
+                "***b***.c\n",
+                &[("b", "bi"), (".c", "")],
+            ),
+            // the opening punctuation leaves both marks, which open again after it
+            (
+                format!("{}{}{}", r("a"), bold("x"), rp("<w:b/><w:i/>", "(y)")),
+                "a**x**(***y)***\n",
+                &[("a", ""), ("x", "b"), ("(", ""), ("y)", "bi")],
+            ),
+        ];
+        for (runs_xml, want, spans) in table {
+            let markdown = md(&p(&runs_xml));
+            assert_eq!(markdown, want, "{runs_xml}");
+            assert_eq!(runs(&markdown), expect(spans), "{runs_xml}");
+        }
+    }
+
+    #[test]
     fn loss_accounting_for_run_and_paragraph_properties() {
         let body = format!(
             "{}{}{}{}",
@@ -2193,6 +2337,83 @@ mod tests {
     }
 
     #[test]
+    fn page_breaks_rules_and_display_equations_nested_in_links_and_cells() {
+        let frac = "<m:f><m:num><m:r><m:t>a</m:t></m:r></m:num><m:den><m:r><m:t>b</m:t></m:r></m:den></m:f>";
+        // the page break and the rule inside a link vanish, the link text stays
+        let link = p(
+            "<w:hyperlink w:anchor=\"a\"><w:r><w:t>go</w:t></w:r><w:r><w:br w:type=\"page\"/></w:r><w:r><w:pict><v:rect o:hr=\"t\"/></w:pict></w:r></w:hyperlink>",
+        );
+        // a display equation in a table cell cannot be a block: it stays inline in `$$`
+        let table = format!(
+            "<w:tbl><w:tr><w:tc><w:p><m:oMathPara><m:oMath>{frac}</m:oMath></m:oMathPara></w:p></w:tc></w:tr></w:tbl>"
+        );
+        assert_eq!(
+            md(&format!("{link}{table}")),
+            "[go](#a)\n\n| $$\\frac{a}{b}$$ |\n| --- |\n"
+        );
+    }
+
+    #[test]
+    fn paragraph_property_changes_are_tracked_changes() {
+        let result = convert_with(
+            &Fixture::default(),
+            "<w:p><w:pPr><w:pPrChange w:id=\"1\"><w:pPr/></w:pPrChange></w:pPr><w:r><w:t>text</w:t></w:r></w:p>",
+        );
+        assert_eq!(result.markdown, "text\n");
+        assert_eq!(kinds(&result), [(LossKind::TrackedChanges, 1)]);
+    }
+
+    #[test]
+    fn code_paragraphs_keep_only_text_and_breaks() {
+        let fixture = Fixture {
+            styles: r#"<w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Source Code"/></w:style>"#,
+            ..Fixture::default()
+        };
+        let body = "<w:p><w:pPr><w:pStyle w:val=\"Code\"/></w:pPr><w:r><w:t>run()</w:t></w:r><w:hyperlink w:anchor=\"x\"><w:r><w:t>link</w:t></w:r></w:hyperlink></w:p>";
+        assert_eq!(convert_with(&fixture, body).markdown, "```\nrun()\n```\n");
+    }
+
+    #[test]
+    fn a_rule_that_opens_the_document_is_written_with_stars() {
+        assert_eq!(
+            md("<w:p><w:r><w:pict><v:rect o:hr=\"t\"/></w:pict></w:r></w:p>"),
+            "***\n"
+        );
+    }
+
+    #[test]
+    fn alternate_content_inside_paragraphs_and_ruby_without_a_base() {
+        let body = format!(
+            "{}{}{}",
+            p(
+                "<mc:AlternateContent><mc:Choice Requires=\"w14\"><w:r><w:t>chosen</w:t></w:r></mc:Choice><mc:Fallback><w:r><w:t>fallback</w:t></w:r></mc:Fallback></mc:AlternateContent>"
+            ),
+            p(
+                "<mc:AlternateContent><mc:Fallback><w:r><w:t>only fallback</w:t></w:r></mc:Fallback></mc:AlternateContent>"
+            ),
+            p(
+                "<w:r><w:ruby><w:rt><w:r><w:t>guide</w:t></w:r></w:rt></w:ruby><w:t>tail</w:t></w:r>"
+            )
+        );
+        assert_eq!(md(&body), "chosen\n\nonly fallback\n\ntail\n");
+    }
+
+    #[test]
+    fn content_controls_inside_table_cells() {
+        let body = "<w:tbl><w:tr><w:tc><w:sdt><w:sdtContent><w:p><w:r><w:t>in sdt</w:t></w:r></w:p></w:sdtContent></w:sdt><w:sdt/></w:tc></w:tr></w:tbl>";
+        assert_eq!(md(body), "| in sdt |\n| --- |\n");
+    }
+
+    #[test]
+    fn a_document_without_a_body_is_empty() {
+        let document = parse_xml(format!("<w:document {NS}/>").as_bytes()).unwrap();
+        let mut media = |_: &str| -> Option<Vec<u8>> { None };
+        let result = Converter::new(Setup::default(), &mut media).run(&document);
+        assert_eq!(result.markdown, "");
+        assert!(result.losses.is_empty());
+    }
+
+    #[test]
     fn rendering_helpers() {
         assert_eq!(code_span(""), "");
         assert_eq!(code_span("a\nb"), "`a b`");
@@ -2348,5 +2569,90 @@ mod tests {
         let result = import_docx(&bytes, "x").unwrap();
         assert_eq!(result.markdown, "Kept\n");
         assert_eq!(kinds(&result), [(LossKind::CorruptParts, 1)]);
+    }
+
+    #[test]
+    fn packages_with_too_many_entries_are_too_large() {
+        let names: Vec<String> = (0..=crate::ooxml::MAX_ENTRIES)
+            .map(|i| format!("f{i}.txt"))
+            .collect();
+        let parts: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "")).collect();
+        assert!(matches!(
+            import_docx(&zip(&parts), "x"),
+            Err(ImportError::TooLarge(_))
+        ));
+    }
+
+    /// A ZIP of stored parts in which the first byte of `damaged` (the full content of one part)
+    /// is flipped: reading that part fails its checksum.
+    fn zip_with_damaged_part(parts: &[(&str, &str)], damaged: &str) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, content) in parts {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(content.as_bytes()).unwrap();
+        }
+        let mut bytes = writer.finish().unwrap().into_inner();
+        let at = bytes
+            .windows(damaged.len())
+            .position(|window| window == damaged.as_bytes())
+            .unwrap();
+        bytes[at] ^= 0xFF;
+        bytes
+    }
+
+    #[test]
+    fn unreadable_and_unparsable_parts_are_reported_by_name() {
+        let w = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
+        let document = format!(
+            "<w:document {w}><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://x/styles" Target="styles.xml"/></Relationships>"#;
+        let styles = format!("<w:styles {w}/>");
+        let loss_detail = |result: &ImportResult| {
+            assert_eq!(kinds(result), [(LossKind::CorruptParts, 1)]);
+            result.losses[0].detail.clone()
+        };
+
+        // a styles part whose data fails its checksum
+        let bytes = zip_with_damaged_part(
+            &[
+                ("word/document.xml", &document),
+                ("word/_rels/document.xml.rels", rels),
+                ("word/styles.xml", &styles),
+            ],
+            &styles,
+        );
+        let result = import_docx(&bytes, "x").unwrap();
+        assert_eq!(result.markdown, "Hello\n");
+        assert_eq!(loss_detail(&result).as_deref(), Some("word/styles.xml"));
+
+        // a relationships part that cannot be read, and one that is not XML
+        let bytes = zip_with_damaged_part(
+            &[
+                ("word/document.xml", &document),
+                ("word/_rels/document.xml.rels", rels),
+            ],
+            rels,
+        );
+        let result = import_docx(&bytes, "x").unwrap();
+        assert_eq!(result.markdown, "Hello\n");
+        assert_eq!(
+            loss_detail(&result).as_deref(),
+            Some("word/_rels/document.xml.rels")
+        );
+        let bytes = zip(&[
+            ("word/document.xml", &document),
+            ("word/_rels/document.xml.rels", "<Relationships>"),
+        ]);
+        let result = import_docx(&bytes, "x").unwrap();
+        assert_eq!(result.markdown, "Hello\n");
+        assert_eq!(
+            loss_detail(&result).as_deref(),
+            Some("word/_rels/document.xml.rels")
+        );
     }
 }

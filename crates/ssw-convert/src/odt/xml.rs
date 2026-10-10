@@ -180,6 +180,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_cdata_adds_no_text_node() {
+        let root = parse(b"<a>x<![CDATA[]]>y</a>").unwrap();
+        assert_eq!(root.text(), "xy");
+        assert_eq!(root.children.len(), 1, "the text on both sides is one node");
+    }
+
+    #[test]
     fn builds_a_tree_with_qualified_names_and_attributes() {
         let xml = r#"<?xml version="1.0"?><office:text xmlns:office="urn:x" xmlns="urn:d" a="1"><text:p text:style-name="P&amp;1" fo:x='q"'>Hello <text:span>big</text:span> world</text:p><text:p/></office:text>"#;
         let root = parse(xml.as_bytes()).unwrap();

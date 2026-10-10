@@ -8,9 +8,10 @@
 // matching on them is the idiomatic way to dispatch.
 #![allow(non_upper_case_globals)]
 
-use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG};
+use std::ffi::c_void;
+
+use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::System::Com::SAFEARRAY;
-use windows::Win32::System::Ole::{SafeArrayCreateVector, SafeArrayPutElement};
 use windows::Win32::System::Variant::VT_UNKNOWN;
 use windows::Win32::UI::Accessibility::{
     ExpandCollapseState, ExpandCollapseState_Collapsed, ExpandCollapseState_Expanded,
@@ -25,8 +26,8 @@ use windows::core::{BOOL, BSTR, Error, Interface, PCWSTR};
 
 use ssw_ui::access::{AccessAction, ScrollInfo, ToggleState as AccessToggle};
 
-use super::none;
 use super::provider::{ElementProvider_Impl, not_supported};
+use super::{none, safe_array};
 
 /// UIA's marker for "this axis does not scroll".
 const NO_SCROLL: f64 = -1.0;
@@ -35,19 +36,14 @@ const SMALL_STEP_OF_PAGE: f32 = 0.25;
 
 /// A SAFEARRAY of interface pointers (selection results).
 pub(crate) fn safe_array_of<I: Interface>(items: &[I]) -> windows::core::Result<*mut SAFEARRAY> {
-    let count = u32::try_from(items.len()).map_err(|_| Error::from(E_FAIL))?;
-    // SAFETY: creating a vector of `count` IUnknown slots.
-    let array = unsafe { SafeArrayCreateVector(VT_UNKNOWN, 0, count) };
-    if array.is_null() {
-        return Err(Error::from(E_FAIL));
-    }
-    for (position, item) in items.iter().enumerate() {
-        let index = i32::try_from(position).map_err(|_| Error::from(E_FAIL))?;
-        // SAFETY: `array` is a live vector of IUnknown and `index` is within it; PutElement
-        // takes its own reference to the interface.
-        unsafe { SafeArrayPutElement(array, &index, item.as_raw().cast_const()) }?;
-    }
-    Ok(array)
+    safe_array(VT_UNKNOWN.0, items.len(), |slots: *mut *mut c_void| {
+        for (index, item) in items.iter().enumerate() {
+            // SAFETY: `slots` has room for `items.len()` pointers (see `safe_array`). The array
+            // owns one reference per slot and releases it when destroyed: it is the one taken
+            // by cloning the interface and handing the clone over as a raw pointer.
+            unsafe { slots.add(index).write(item.clone().into_raw()) };
+        }
+    })
 }
 
 /// The UIA toggle state of an access toggle state.

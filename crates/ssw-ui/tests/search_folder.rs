@@ -6,13 +6,13 @@ mod search_common;
 use search_common::{Host, child_names, clipboard, covered, localizer, node_named};
 use ssw_ui::access::{AccessAction, Role};
 use ssw_ui::canvas::DrawOp;
-use ssw_ui::geometry::Rect;
-use ssw_ui::input::{Modifiers, vk};
+use ssw_ui::geometry::{Point, Rect, Size};
+use ssw_ui::input::{Modifiers, PointerEventKind, vk};
 use ssw_ui::shell::folder_search::{
     FolderSearchEvent, FolderSearchFile, FolderSearchHit, FolderSearchLine, FolderSearchPanel,
     FolderSearchRequest, FolderSearchSummary,
 };
-use ssw_ui::widget::WidgetId;
+use ssw_ui::widget::{Widget, WidgetId};
 use ssw_ui::widgets::Control;
 use ssw_ui::widgets::anim::Motion;
 
@@ -387,4 +387,125 @@ fn the_wheel_scrolls_long_results_and_the_panel_lays_out_below_its_controls() {
     });
     assert!(host.send(&mut panel, wheel).handled);
     assert_eq!(panel.list().first_visible(), 3);
+}
+
+#[test]
+fn the_query_can_be_set_and_the_panel_reports_where_it_was_arranged() {
+    let (_host, mut panel) = setup();
+    assert_eq!(panel.bounds(), BOUNDS);
+    panel.set_query("needle");
+    assert_eq!(panel.input().text(), "needle");
+    assert_eq!(panel.request().pattern, "needle");
+}
+
+#[test]
+fn the_panel_measures_as_the_sidebar_area_or_a_default_size() {
+    let (mut host, mut panel) = setup();
+    assert_eq!(
+        host.measure(&mut panel, Size::new(320.0, 480.0)),
+        Size::new(320.0, 480.0)
+    );
+    assert_eq!(
+        host.measure(&mut panel, Size::UNBOUNDED),
+        Size::new(260.0, 400.0)
+    );
+    assert_eq!(
+        host.measure(&mut panel, Size::new(f32::INFINITY, 480.0)),
+        Size::new(260.0, 480.0)
+    );
+    assert_eq!(
+        host.measure(&mut panel, Size::new(320.0, f32::INFINITY)),
+        Size::new(320.0, 400.0)
+    );
+}
+
+#[test]
+fn an_idle_panel_paints_no_status_line_and_no_error_outline() {
+    let (host, panel) = setup();
+    assert_eq!(panel.status_text(), "");
+    let error = host.theme.tokens.error;
+    let canvas = host.paint(&panel);
+    assert!(
+        !canvas
+            .ops()
+            .any(|op| matches!(op, DrawOp::StrokeRoundedRect { color, .. } if *color == error))
+    );
+    assert!(canvas.texts().contains(&"Aa"));
+    // Nothing is drawn outside the damaged area.
+    let away = Rect::new(400.0, 600.0, 10.0, 10.0);
+    assert_eq!(host.paint_damaged(&panel, Some(away)).ops().count(), 0);
+}
+
+#[test]
+fn rows_are_activated_by_index_and_unknown_rows_do_nothing() {
+    let (mut host, mut panel) = setup();
+    show_results(&mut host, &mut panel);
+    assert!(!panel.activate_row(99));
+    assert!(panel.take_events().is_empty());
+    // A header collapses its file; the match of the next file moves up to row 2.
+    assert!(panel.activate_row(0));
+    assert!(panel.is_collapsed(0));
+    assert!(panel.activate_row(2));
+    assert!(matches!(
+        panel.take_events().as_slice(),
+        [FolderSearchEvent::Open(hit)] if hit.path == "docs/b.md" && hit.line == 1
+    ));
+}
+
+#[test]
+fn the_pointer_highlights_the_hovered_result_until_it_leaves() {
+    let (mut host, mut panel) = setup();
+    show_results(&mut host, &mut panel);
+    let hover = host.theme.tokens.hover_bg;
+    let list = panel.list().bounds();
+    let hovered_rows = |host: &Host, panel: &FolderSearchPanel| {
+        host.paint(panel)
+            .ops_in(list)
+            .into_iter()
+            .filter(|op| matches!(op, DrawOp::FillRoundedRect { color, .. } if *color == hover))
+            .count()
+    };
+    assert_eq!(hovered_rows(&host, &panel), 0);
+    let row = panel.list().row_rect(2).expect("row 2").center();
+    host.pointer(&mut panel, PointerEventKind::Move, row);
+    assert_eq!(hovered_rows(&host, &panel), 1);
+    // Moving within the row keeps it; moving above the list clears it.
+    host.pointer(
+        &mut panel,
+        PointerEventKind::Move,
+        Point::new(row.x + 5.0, row.y),
+    );
+    assert_eq!(hovered_rows(&host, &panel), 1);
+    host.pointer(&mut panel, PointerEventKind::Move, Point::new(row.x, 40.0));
+    assert_eq!(hovered_rows(&host, &panel), 0);
+    // Leaving the panel clears it as well.
+    host.pointer(&mut panel, PointerEventKind::Move, row);
+    assert_eq!(hovered_rows(&host, &panel), 1);
+    host.pointer(&mut panel, PointerEventKind::Leave, row);
+    assert_eq!(hovered_rows(&host, &panel), 0);
+    host.pointer(&mut panel, PointerEventKind::Leave, row);
+    assert_eq!(hovered_rows(&host, &panel), 0);
+}
+
+#[test]
+fn clicking_the_empty_part_of_the_list_only_moves_focus_to_it() {
+    let (mut host, mut panel) = setup();
+    show_results(&mut host, &mut panel);
+    let selected = panel.list().selected();
+    let blank = Point::new(150.0, 112.0 + 5.0 * 32.0 + 40.0);
+    assert!(panel.list().bounds().contains(blank));
+    assert!(host.click(&mut panel, blank).handled);
+    assert!(host.focus.is_focused(panel.list().id()));
+    assert_eq!(panel.list().selected(), selected);
+    assert!(panel.take_events().is_empty());
+}
+
+#[test]
+fn the_panel_itself_takes_no_accessibility_actions() {
+    let (mut host, mut panel) = setup();
+    let id = panel.id();
+    let mut cx = host.cx(id);
+    for action in [AccessAction::Invoke, AccessAction::Focus] {
+        assert!(!Widget::perform(&mut panel, &mut cx, &action));
+    }
 }

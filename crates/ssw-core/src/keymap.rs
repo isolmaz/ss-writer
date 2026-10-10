@@ -296,7 +296,8 @@ impl FromStr for KeyChord {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let err = || ChordParseError(s.to_owned());
         let mut tokens = s.split('+').map(str::trim);
-        let key_token = tokens.next_back().ok_or_else(err)?;
+        // `split` yields at least one token; an empty key token fails `parse_key` below.
+        let key_token = tokens.next_back().unwrap_or_default();
         let mut chord = KeyChord::new(parse_key(key_token).ok_or_else(err)?);
         for token in tokens {
             let flag =
@@ -562,7 +563,7 @@ mod tests {
     use super::*;
 
     fn chord(s: &str) -> KeyChord {
-        s.parse().unwrap_or_else(|e| panic!("{e}"))
+        s.parse().expect("valid key chord")
     }
 
     /// Spec §11 table, one row per command: (command, default chords).
@@ -716,9 +717,94 @@ mod tests {
         );
         let odd = KeyChord::new(0xFA);
         assert_eq!(odd.to_string().parse::<KeyChord>(), Ok(odd));
-        for bad in ["", "Ctrl+", "Ctrl+Ctrl+A", "Hyper+A", "Ctrl+F25", "Ctrl+AB"] {
+        for bad in [
+            "",
+            "Ctrl+",
+            "Ctrl+Ctrl+A",
+            "Hyper+A",
+            "Ctrl+F25",
+            "Ctrl+AB",
+            "Fx",
+            "F0",
+            "Ctrl+VK_0xZZ",
+            "VK_0x10000",
+        ] {
             assert!(bad.parse::<KeyChord>().is_err(), "{bad}");
         }
+    }
+
+    /// A `fmt::Write` sink that fails once more than `budget` bytes would be written.
+    struct Capped {
+        budget: usize,
+        text: String,
+    }
+
+    impl fmt::Write for Capped {
+        fn write_str(&mut self, piece: &str) -> fmt::Result {
+            if piece.len() > self.budget {
+                return Err(fmt::Error);
+            }
+            self.budget -= piece.len();
+            self.text.push_str(piece);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failing_writer_aborts_chord_formatting_at_every_piece() {
+        let key_chord = chord("Ctrl+Shift+A");
+        let full = key_chord.to_string();
+        assert_eq!(full, "Ctrl+Shift+A");
+        for budget in 0..full.len() {
+            let mut sink = Capped {
+                budget,
+                text: String::new(),
+            };
+            assert_eq!(
+                fmt::write(&mut sink, format_args!("{key_chord}")),
+                Err(fmt::Error),
+                "budget {budget}"
+            );
+            assert!(full.starts_with(&sink.text));
+        }
+        let mut sink = Capped {
+            budget: full.len(),
+            text: String::new(),
+        };
+        assert_eq!(fmt::write(&mut sink, format_args!("{key_chord}")), Ok(()));
+        assert_eq!(sink.text, full);
+    }
+
+    #[test]
+    fn chord_parsing_accepts_aliases_spacing_and_raw_codes() {
+        assert_eq!(chord("Control+a"), chord("Ctrl+A"));
+        assert_eq!(chord(" Ctrl + Shift + a "), chord("Ctrl+Shift+A"));
+        assert_eq!(chord("vk_0xfa"), KeyChord::new(0xFA));
+        assert_eq!(chord("Return"), KeyChord::new(vk::RETURN));
+        assert_eq!(chord("pgup"), KeyChord::new(vk::PRIOR));
+        assert_eq!(chord("f24"), KeyChord::new(vk::F24));
+        assert_eq!(chord("7"), KeyChord::new(vk::D7));
+        assert_eq!(
+            "Ctrl+Ctrl+A".parse::<KeyChord>(),
+            Err(ChordParseError("Ctrl+Ctrl+A".to_owned()))
+        );
+    }
+
+    #[test]
+    fn default_table_helpers_set_exactly_their_modifiers() {
+        assert_eq!(plain(vk::F3), KeyChord::new(vk::F3));
+        assert_eq!(ctrl(vk::N), chord("Ctrl+N"));
+        assert_eq!(shift(vk::F3), chord("Shift+F3"));
+        assert_eq!(ctrl_shift(vk::P), chord("Ctrl+Shift+P"));
+        assert_eq!(KeyChord::new(vk::A).with_alt(), chord("Alt+A"));
+        assert_eq!(
+            KeyChord::new(vk::A).with_win().with_shift(),
+            chord("Shift+Win+A")
+        );
+        assert_eq!(
+            KeyChord::new(vk::A).with_ctrl().with_alt(),
+            chord("Ctrl+Alt+A")
+        );
     }
 
     #[test]

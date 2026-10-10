@@ -202,3 +202,16 @@ fn settings_errors_describe_themselves() {
     let wrapped = SettingsFileError::from(parse);
     assert!(wrapped.to_string().contains("not valid"));
 }
+
+#[test]
+fn saving_below_a_regular_file_reports_the_directory_that_cannot_be_created() {
+    let tmp = tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    std::fs::write(&plain, b"x").unwrap();
+    let parent = plain.join("sub");
+    let error = save_settings(&parent.join("settings.json"), &Settings::default()).unwrap_err();
+    assert!(
+        matches!(&error, SettingsFileError::Io { path, .. } if *path == parent),
+        "{error:?}"
+    );
+}

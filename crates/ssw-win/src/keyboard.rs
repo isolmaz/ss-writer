@@ -3,15 +3,15 @@
 //! [`ToUnicodeCharProbe`] answers "does Ctrl+Alt+key type a character in this layout" with
 //! `ToUnicodeEx` and the "do not change the keyboard state" flag (`0x4`), so asking never eats a
 //! dead key. [`key_name`] gives the localized name of a key (`GetKeyNameTextW`) for shortcut
-//! display. [`LoadedLayout`] loads a layout by KLID *without activating it* so tests can probe
-//! other layouts while the user's active layout stays untouched.
+//! display. [`session_layouts`] lists the layouts the user has, so a layout other than the
+//! active one can be probed ([`ToUnicodeCharProbe::for_layout`]). No layout is ever loaded,
+//! activated or unloaded here: that would change the user's session.
 
 use thiserror::Error;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ACTIVATE_KEYBOARD_LAYOUT_FLAGS, GetKeyNameTextW, GetKeyboardLayout, GetKeyboardLayoutList, HKL,
-    LoadKeyboardLayoutW, MAPVK_VK_TO_VSC, MapVirtualKeyW, ToUnicodeEx, UnloadKeyboardLayout,
+    GetKeyNameTextW, GetKeyboardLayout, GetKeyboardLayoutList, HKL, MAPVK_VK_TO_VSC,
+    MapVirtualKeyW, ToUnicodeEx,
 };
-use windows::core::PCWSTR;
 
 use ssw_ui::shortcuts::CharProbe;
 
@@ -32,13 +32,6 @@ const VK_RMENU: usize = 0xA5;
 /// Failures of the keyboard services.
 #[derive(Debug, Error)]
 pub enum KeyboardError {
-    /// A keyboard layout could not be loaded.
-    #[error("loading keyboard layout {klid} failed: {source}")]
-    Load {
-        klid: String,
-        #[source]
-        source: windows::core::Error,
-    },
     /// The system has no name for the key.
     #[error("virtual key {vk:#04x} has no name")]
     NoName { vk: u16 },
@@ -58,7 +51,7 @@ impl ToUnicodeCharProbe {
         Self { hkl: None }
     }
 
-    /// Probes a specific layout (for example one loaded with [`LoadedLayout`]).
+    /// Probes a specific layout (for example one of [`session_layouts`]).
     #[must_use]
     pub fn for_layout(hkl: HKL) -> Self {
         Self { hkl: Some(hkl) }
@@ -132,8 +125,11 @@ fn current_layout() -> HKL {
     unsafe { GetKeyboardLayout(0) }
 }
 
-/// The keyboard layouts currently loaded for the process.
-fn loaded_layouts() -> Vec<HKL> {
+/// The keyboard layouts of the user's session, as `GetKeyboardLayoutList` reports them (the
+/// low word of a handle is its language id, `0x041F` for Turkish). Probe one with
+/// [`ToUnicodeCharProbe::for_layout`]; nothing is loaded or activated.
+#[must_use]
+pub fn session_layouts() -> Vec<HKL> {
     // SAFETY: a `None` list asks only for the count.
     let count = unsafe { GetKeyboardLayoutList(None) };
     let mut list = vec![HKL::default(); usize::try_from(count).unwrap_or(0)];
@@ -141,65 +137,6 @@ fn loaded_layouts() -> Vec<HKL> {
     let filled = unsafe { GetKeyboardLayoutList(Some(&mut list)) };
     list.truncate(usize::try_from(filled).unwrap_or(0));
     list
-}
-
-/// A keyboard layout loaded by KLID without being activated. The layout is unloaded when the
-/// value is dropped, unless it was already loaded (the user's own layouts stay).
-#[derive(Debug)]
-pub struct LoadedLayout {
-    hkl: HKL,
-    already_loaded: bool,
-}
-
-impl LoadedLayout {
-    /// Loads the layout `klid` (for example `"0000041F"`, Turkish Q) without activating it.
-    ///
-    /// # Errors
-    /// [`KeyboardError::Load`] when the system rejects the layout id.
-    pub fn load(klid: &str) -> Result<Self, KeyboardError> {
-        let before = loaded_layouts();
-        let wide: Vec<u16> = klid.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: `wide` is NUL-terminated and outlives the call. Flags 0 never include
-        // KLF_ACTIVATE, so the active layout does not change.
-        let hkl = unsafe {
-            LoadKeyboardLayoutW(PCWSTR(wide.as_ptr()), ACTIVATE_KEYBOARD_LAYOUT_FLAGS(0))
-        }
-        .map_err(|source| KeyboardError::Load {
-            klid: klid.to_owned(),
-            source,
-        })?;
-        Ok(Self {
-            hkl,
-            already_loaded: before.contains(&hkl),
-        })
-    }
-
-    #[must_use]
-    pub fn hkl(&self) -> HKL {
-        self.hkl
-    }
-
-    /// True when the layout was loaded before [`LoadedLayout::load`] (it is kept on drop).
-    #[must_use]
-    pub fn was_already_loaded(&self) -> bool {
-        self.already_loaded
-    }
-
-    /// A probe for this layout.
-    #[must_use]
-    pub fn probe(&self) -> ToUnicodeCharProbe {
-        ToUnicodeCharProbe::for_layout(self.hkl)
-    }
-}
-
-impl Drop for LoadedLayout {
-    fn drop(&mut self) {
-        if !self.already_loaded {
-            // SAFETY: the handle came from LoadKeyboardLayoutW and was not loaded before. An
-            // unload refused because the layout is in use is harmless, so the result is ignored.
-            let _ = unsafe { UnloadKeyboardLayout(self.hkl) };
-        }
-    }
 }
 
 /// Keys whose scan code needs the "extended key" bit for `GetKeyNameTextW`.
@@ -247,15 +184,10 @@ pub fn key_name(vk: u16, scan: u16) -> Result<String, KeyboardError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Layout loading is process-wide; keep the tests that load and unload apart.
-    static LAYOUTS: Mutex<()> = Mutex::new(());
-
-    const TURKISH_Q: &str = "0000041F";
-    const TURKISH_F: &str = "0001041F";
+    /// The handle of Turkish Q (language 0x041F, layout 0x041F): `HKL` `0x041F041F`.
+    const TURKISH_Q_HKL: usize = 0x041F_041F;
     const VK_Q: u16 = 0x51;
-    const VK_F: u16 = 0x46;
     const VK_I: u16 = 0x49;
     const VK_7: u16 = 0x37;
     const VK_F5: u16 = 0x74;
@@ -263,99 +195,83 @@ mod tests {
     const SCAN_I_POSITION: u16 = 0x17;
     const SCAN_7: u16 = 0x08;
 
-    fn active_layout() -> HKL {
-        current_layout()
+    #[test]
+    fn the_session_layouts_are_the_users_and_probing_one_changes_nothing() {
+        let layouts = session_layouts();
+        assert!(!layouts.is_empty());
+        let active_before = current_layout();
+        // Every layout of the user's session can be probed; none of them is activated by it.
+        for hkl in layouts {
+            let probe = ToUnicodeCharProbe::for_layout(hkl);
+            // Function keys type nothing in any layout, even with AltGr.
+            assert!(!probe.produces_char(VK_F5, 0x3F, false, false));
+            assert!(probe.char_for(VK_F5, 0x3F, false, false, true).is_none());
+        }
+        assert_eq!(current_layout(), active_before);
     }
 
     #[test]
     fn uia_keyboard_turkish_q_altgr_layer_types_text() {
-        let _guard = LAYOUTS.lock().unwrap_or_else(|e| e.into_inner());
-        let active_before = active_layout();
-        let layout = LoadedLayout::load(TURKISH_Q).unwrap_or_else(|e| panic!("{e}"));
-        let probe = layout.probe();
-        // AltGr+Q is '@' and AltGr+7 is '{' on the Turkish Q layout.
-        assert_eq!(
-            probe
-                .char_for(VK_Q, SCAN_Q_POSITION, false, false, true)
-                .as_deref(),
-            Some("@")
-        );
-        assert_eq!(
-            probe.char_for(VK_7, SCAN_7, false, false, true).as_deref(),
-            Some("{")
-        );
-        assert!(probe.produces_char(VK_Q, SCAN_Q_POSITION, false, false));
-        assert!(probe.produces_char(VK_7, SCAN_7, false, false));
-        // Function keys type nothing, even with AltGr.
-        assert!(!probe.produces_char(VK_F5, 0x3F, false, false));
-        // Without AltGr the same keys type their plain letters; Turkish I is dotless.
-        assert_eq!(
-            probe
-                .char_for(VK_Q, SCAN_Q_POSITION, false, false, false)
-                .as_deref(),
-            Some("q")
-        );
-        assert_eq!(
-            probe
-                .char_for(VK_I, SCAN_I_POSITION, false, false, false)
-                .as_deref(),
-            Some("\u{131}")
-        );
-        assert_eq!(
-            probe
-                .char_for(VK_I, SCAN_I_POSITION, true, false, false)
-                .as_deref(),
-            Some("I")
-        );
-        // Caps Lock upper-cases without Shift.
-        assert_eq!(
-            probe
-                .char_for(VK_Q, SCAN_Q_POSITION, false, true, false)
-                .as_deref(),
-            Some("Q")
-        );
+        let active_before = current_layout();
+        // The user's own Turkish Q layout, when the session has it (it is only probed).
+        for hkl in session_layouts()
+            .into_iter()
+            .filter(|hkl| hkl.0 as usize == TURKISH_Q_HKL)
+        {
+            let probe = ToUnicodeCharProbe::for_layout(hkl);
+            // Function keys type nothing, whatever the layout, even with AltGr.
+            assert!(!probe.produces_char(VK_F5, 0x3F, false, false));
+            // AltGr+Q is '@' and AltGr+7 is '{' on the Turkish Q layout.
+            assert_eq!(
+                probe
+                    .char_for(VK_Q, SCAN_Q_POSITION, false, false, true)
+                    .as_deref(),
+                Some("@")
+            );
+            assert_eq!(
+                probe.char_for(VK_7, SCAN_7, false, false, true).as_deref(),
+                Some("{")
+            );
+            assert!(probe.produces_char(VK_Q, SCAN_Q_POSITION, false, false));
+            assert!(probe.produces_char(VK_7, SCAN_7, false, false));
+            // Without AltGr the same keys type their plain letters; Turkish I is dotless.
+            assert_eq!(
+                probe
+                    .char_for(VK_Q, SCAN_Q_POSITION, false, false, false)
+                    .as_deref(),
+                Some("q")
+            );
+            assert_eq!(
+                probe
+                    .char_for(VK_I, SCAN_I_POSITION, false, false, false)
+                    .as_deref(),
+                Some("\u{131}")
+            );
+            assert_eq!(
+                probe
+                    .char_for(VK_I, SCAN_I_POSITION, true, false, false)
+                    .as_deref(),
+                Some("I")
+            );
+            // Caps Lock upper-cases without Shift.
+            assert_eq!(
+                probe
+                    .char_for(VK_Q, SCAN_Q_POSITION, false, true, false)
+                    .as_deref(),
+                Some("Q")
+            );
+        }
         // Probing never changes the user's active layout.
-        assert_eq!(active_layout(), active_before);
-        drop(layout);
-        assert_eq!(active_layout(), active_before);
+        assert_eq!(current_layout(), active_before);
     }
 
     #[test]
-    fn uia_keyboard_turkish_f_layout_differs_from_q() {
-        let _guard = LAYOUTS.lock().unwrap_or_else(|e| e.into_inner());
-        let active_before = active_layout();
-        let f_layout = LoadedLayout::load(TURKISH_F).unwrap_or_else(|e| panic!("{e}"));
-        let q_layout = LoadedLayout::load(TURKISH_Q).unwrap_or_else(|e| panic!("{e}"));
-        assert_ne!(f_layout.hkl(), q_layout.hkl());
-        // The key at the Q position types 'f' on the F layout and 'q' on the Q layout.
-        let f = f_layout
-            .probe()
-            .char_for(VK_F, SCAN_Q_POSITION, false, false, false);
-        let q = q_layout
-            .probe()
-            .char_for(VK_Q, SCAN_Q_POSITION, false, false, false);
-        assert_eq!(f.as_deref(), Some("f"));
-        assert_eq!(q.as_deref(), Some("q"));
-        assert!(!f_layout.probe().produces_char(VK_F5, 0x3F, false, false));
-        assert_eq!(active_layout(), active_before);
-    }
+    fn caps_lock_follows_the_toggle_state_of_the_key() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CAPITAL};
 
-    #[test]
-    fn uia_keyboard_already_loaded_layout_is_kept() {
-        let _guard = LAYOUTS.lock().unwrap_or_else(|e| e.into_inner());
-        let first = LoadedLayout::load(TURKISH_Q).unwrap_or_else(|e| panic!("{e}"));
-        let second = LoadedLayout::load(TURKISH_Q).unwrap_or_else(|e| panic!("{e}"));
-        // The second load sees the first one's layout in the list, or the user already had it.
-        assert_eq!(first.hkl(), second.hkl());
-        assert!(second.was_already_loaded() || loaded_layouts().contains(&second.hkl()));
-        drop(second);
-        assert!(loaded_layouts().contains(&first.hkl()) || first.was_already_loaded());
-        assert!(
-            first
-                .probe()
-                .char_for(VK_Q, SCAN_Q_POSITION, false, false, true)
-                .is_some()
-        );
+        // SAFETY: a pure query of the calling thread's key state.
+        let toggled = unsafe { GetKeyState(i32::from(VK_CAPITAL.0)) } & 1 != 0;
+        assert_eq!(caps_lock_on(), toggled);
     }
 
     #[test]
@@ -378,18 +294,14 @@ mod tests {
             (0x70, 0),
             (0x53, 0x1F),
         ] {
-            let name = key_name(vk, scan).unwrap_or_else(|e| panic!("{e}"));
+            let name = key_name(vk, scan).unwrap();
             assert!(!name.is_empty(), "vk {vk:#x}");
         }
         // Deriving the scan code from the virtual key gives the same name as passing it.
-        assert_eq!(
-            key_name(0x0D, 0).unwrap_or_else(|e| panic!("{e}")),
-            key_name(0x0D, 0x1C).unwrap_or_else(|e| panic!("{e}"))
-        );
+        assert_eq!(key_name(0x0D, 0).unwrap(), key_name(0x0D, 0x1C).unwrap());
         // A virtual key with no scan code has no name.
         let err = key_name(0xFF, 0).unwrap_err();
-        assert!(matches!(err, KeyboardError::NoName { vk: 0xFF }));
-        assert!(err.to_string().contains("0xff"));
+        assert_eq!(err.to_string(), "virtual key 0xff has no name");
     }
 
     #[test]
@@ -402,16 +314,5 @@ mod tests {
         for vk in [0x0D_u16, 0x41, 0x70, 0x20, 0xA2] {
             assert!(!is_extended(vk), "{vk:#x}");
         }
-    }
-
-    #[test]
-    fn uia_keyboard_load_error_reports_klid() {
-        let error = KeyboardError::Load {
-            klid: "00000000".to_owned(),
-            source: windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG),
-        };
-        let text = error.to_string();
-        assert!(text.contains("00000000"));
-        assert!(std::error::Error::source(&error).is_some());
     }
 }

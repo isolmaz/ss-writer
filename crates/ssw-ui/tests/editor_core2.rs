@@ -239,3 +239,124 @@ fn lines_of_the_editor_are_the_configured_line_height_tall() {
     assert!(close(caret.height, 32.0), "{caret:?}");
     assert!(close(caret.y, TOP + 32.0), "{caret:?}");
 }
+
+#[test]
+fn a_tiny_movement_does_not_start_the_text_drag() {
+    let mut h = selected_hello();
+    let at = press_on_hello(&mut h);
+    let result = h.pointer(
+        PointerEventKind::Move,
+        Point::new(at.x + 1.0, at.y),
+        0,
+        Modifiers::NONE,
+    );
+    assert!(result.handled);
+    assert_eq!(h.selection(), Selection::new(0, 5), "still just a press");
+    assert_eq!(h.text(), "hello world\n");
+}
+
+#[test]
+fn a_text_drag_outside_the_editor_has_no_drop_point() {
+    let mut h = selected_hello();
+    press_on_hello(&mut h);
+    h.pointer(
+        PointerEventKind::Move,
+        Point::new(500.0, 100.0),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(ssw_ui::input::Cursor::Arrow));
+    let caret = h.paint().recorded().len();
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(11),
+        0,
+        Modifiers::NONE,
+    );
+    assert!(
+        h.paint().recorded().len() > caret,
+        "the drop caret is drawn inside"
+    );
+}
+
+#[test]
+fn a_text_drag_below_a_section_that_is_folded_away_has_no_drop_point() {
+    let text = "hello\n\n# H\n\nbody\n";
+    let mut h = Harness::new(text);
+    h.view.set_folds(vec![TextRange::new(11, 17)], vec![7]);
+    h.arrange();
+    h.view.set_selection(Selection::new(0, 5));
+    press_on_hello(&mut h);
+    // Under the heading there is only the folded section.
+    let below = Point::new(200.0, 195.0);
+    h.pointer(PointerEventKind::Move, below, 0, Modifiers::NONE);
+    assert_eq!(
+        h.requests.take_cursor(),
+        Some(ssw_ui::input::Cursor::NotAllowed)
+    );
+    h.pointer(PointerEventKind::Up, below, 0, Modifiers::NONE);
+    assert_eq!(h.text(), text, "nothing was dropped there");
+    assert_eq!(h.selection(), Selection::new(0, 5));
+}
+
+#[test]
+fn a_text_drag_scrolls_with_the_edge_timer_and_follows_the_pointer() {
+    let text: String = format!(
+        "hello world\n\n{}",
+        (0..100)
+            .map(|i| format!("para {i}\n\n"))
+            .collect::<String>()
+    );
+    let mut h = Harness::new(&text);
+    h.view.set_selection(Selection::new(0, 5));
+    press_on_hello(&mut h);
+    h.pointer(
+        PointerEventKind::Move,
+        Point::new(100.0, 199.0),
+        0,
+        Modifiers::NONE,
+    );
+    tick(&mut h, Duration::from_millis(100));
+    assert!(h.view.scroll_y() > 0.0, "the view scrolled under the drag");
+}
+
+#[test]
+fn a_move_whose_source_vanished_changes_nothing() {
+    let mut h = selected_hello();
+    press_on_hello(&mut h);
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(11),
+        0,
+        Modifiers::NONE,
+    );
+    // The text goes away under the running drag.
+    assert!(h.view.remove_range(TextRange::new(0, 12)));
+    assert_eq!(h.text(), "");
+    h.pointer(
+        PointerEventKind::Up,
+        h.first_line_point(0),
+        0,
+        Modifiers::CTRL,
+    );
+    assert_eq!(h.text(), "", "nothing was copied from the stale range");
+}
+
+#[test]
+fn dragging_the_selection_to_an_earlier_place_moves_it_before() {
+    let mut h = Harness::new("hello world\n");
+    h.view.set_selection(Selection::new(6, 11));
+    let press = h.first_line_point(8);
+    h.pointer(PointerEventKind::Down, press, 1, Modifiers::NONE);
+    let target = h.first_line_point(0);
+    h.pointer(PointerEventKind::Move, target, 0, Modifiers::NONE);
+    h.pointer(PointerEventKind::Up, target, 0, Modifiers::NONE);
+    assert_eq!(h.text(), "worldhello \n");
+    assert_eq!(
+        h.selection(),
+        Selection::new(0, 5),
+        "the moved text is selected"
+    );
+    h.key(editor_common::KEY_Z, Modifiers::CTRL);
+    assert_eq!(h.text(), "hello world\n", "one undo step");
+}

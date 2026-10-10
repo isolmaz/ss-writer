@@ -1400,6 +1400,7 @@ mod tests {
     use super::*;
     use crate::canvas::DrawOp;
     use crate::input::{Modifiers, WheelEvent};
+    use crate::widget::Invalidation;
     use crate::widgets::testkit::Harness;
     use ssw_core::markdown::parse_document;
 
@@ -1408,11 +1409,8 @@ mod tests {
 
     fn localizer() -> Localizer {
         let localizer = Localizer::new("en", &[("en", SHELL_FTL)]);
-        assert!(
-            localizer.diagnostics().is_empty(),
-            "{:?}",
-            localizer.diagnostics()
-        );
+        let diagnostics = localizer.diagnostics();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         localizer
     }
 
@@ -2071,5 +2069,224 @@ mod tests {
             Size::new(280.0, 40.0 + 36.0 + 6.0 * 28.0)
         );
         assert_eq!(inspector.bounds(), Rect::new(800.0, 80.0, 280.0, 400.0));
+    }
+
+    fn long_outline(motion: Motion) -> (Harness, Inspector) {
+        let mut harness = Harness::new();
+        let mut inspector =
+            Inspector::new(InspectorStrings::from_localizer(&localizer())).with_motion(motion);
+        let src: String = (0..60).map(|n| format!("# Heading {n}\n")).collect();
+        inspector.set_toc(&toc_of(&src));
+        harness.arrange(&mut inspector, Rect::new(800.0, 80.0, 280.0, 400.0));
+        (harness, inspector)
+    }
+
+    fn rings(harness: &mut Harness, inspector: &Inspector) -> usize {
+        let ring = harness.theme.tokens.focus_ring;
+        harness
+            .paint(inspector)
+            .ops()
+            .filter(|op| matches!(op, DrawOp::StrokeRoundedRect { color, .. } if *color == ring))
+            .count()
+    }
+
+    fn hover_fills(harness: &mut Harness, inspector: &Inspector) -> Vec<Rect> {
+        let hover = harness.theme.tokens.hover_bg;
+        harness
+            .paint(inspector)
+            .ops()
+            .filter_map(|op| match op {
+                DrawOp::FillRoundedRect { rect, color, .. } if *color == hover => Some(*rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_custom_id_names_the_panel_in_the_access_tree() {
+        let id = WidgetId::allocate();
+        let inspector = Inspector::new(InspectorStrings::from_localizer(&localizer())).with_id(id);
+        assert_eq!(inspector.id(), id);
+        assert_eq!(Harness::new().node(&inspector).id, id);
+    }
+
+    #[test]
+    fn hovering_a_tab_a_level_or_a_heading_fills_it() {
+        let (mut harness, mut inspector) = setup();
+        assert!(hover_fills(&mut harness, &inspector).is_empty());
+        let info_tab = inspector.tab_rect(InspectorTab::Info);
+        harness.hover(&mut inspector, info_tab.center());
+        assert_eq!(hover_fills(&mut harness, &inspector), [info_tab]);
+        let level = inspector.level_rect(3);
+        harness.hover(&mut inspector, level.center());
+        assert_eq!(hover_fills(&mut harness, &inspector), [level]);
+        // The active level and the active tab keep their own fill.
+        let active = inspector.level_rect(6);
+        harness.hover(&mut inspector, active.center());
+        assert!(hover_fills(&mut harness, &inspector).is_empty());
+        let row = inspector.item_rect(3);
+        harness.hover(&mut inspector, row.center());
+        let fills = hover_fills(&mut harness, &inspector);
+        assert_eq!(fills.len(), 1);
+        assert!(row.contains_rect(fills[0]), "{:?} in {row:?}", fills[0]);
+    }
+
+    #[test]
+    fn collapsed_sections_point_right_and_open_ones_down() {
+        let (mut harness, mut inspector) = setup();
+        let glyphs = |harness: &mut Harness, inspector: &Inspector| -> Vec<char> {
+            harness
+                .paint(inspector)
+                .ops()
+                .filter_map(|op| match op {
+                    DrawOp::Icon { glyph, .. } => Some(*glyph),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Intro, Setup and Reference have children; Install, Usage and Deep are leaves.
+        assert_eq!(
+            glyphs(&mut harness, &inspector),
+            [
+                glyph::CHEVRON_DOWN,
+                glyph::CHEVRON_DOWN,
+                glyph::CHEVRON_DOWN
+            ]
+        );
+        inspector.set_collapsed(1, true);
+        assert_eq!(
+            glyphs(&mut harness, &inspector),
+            [
+                glyph::CHEVRON_DOWN,
+                glyph::CHEVRON_RIGHT,
+                glyph::CHEVRON_DOWN
+            ]
+        );
+    }
+
+    #[test]
+    fn the_keyboard_focus_is_ringed_on_the_tab_the_filter_the_list_and_its_row() {
+        let (mut harness, mut inspector) = setup();
+        assert_eq!(rings(&mut harness, &inspector), 0);
+        harness.focus.focus(inspector.contents_tab_id);
+        assert_eq!(rings(&mut harness, &inspector), 1);
+        harness.focus.focus(inspector.levels_id);
+        assert_eq!(rings(&mut harness, &inspector), 1);
+        // The list is outlined, and so is the row the keyboard chose.
+        focus_list(&mut harness, &inspector);
+        assert_eq!(rings(&mut harness, &inspector), 1);
+        harness.key(&mut inspector, vk::DOWN);
+        assert_eq!(rings(&mut harness, &inspector), 2);
+    }
+
+    #[test]
+    fn backlink_rows_highlight_on_hover_and_ring_the_keyboard_choice() {
+        let (mut harness, mut inspector) = setup();
+        fill_info(&mut inspector);
+        inspector.set_tab(InspectorTab::Info);
+        harness.arrange(&mut inspector, Rect::new(800.0, 80.0, 280.0, 400.0));
+        focus_list(&mut harness, &inspector);
+        // Down twice chooses the second link and scrolls it into view.
+        harness.key(&mut inspector, vk::DOWN);
+        harness.key(&mut inspector, vk::DOWN);
+        assert_eq!(rings(&mut harness, &inspector), 2);
+        assert!(hover_fills(&mut harness, &inspector).is_empty());
+        let second = inspector.item_rect(16);
+        harness.hover(&mut inspector, second.center());
+        let fills = hover_fills(&mut harness, &inspector);
+        assert_eq!(fills.len(), 1);
+        assert!(
+            second.contains_rect(fills[0]),
+            "{:?} in {second:?}",
+            fills[0]
+        );
+    }
+
+    #[test]
+    fn nothing_is_painted_outside_the_damaged_area() {
+        let (mut harness, inspector) = setup();
+        let away = Rect::new(0.0, 0.0, 100.0, 100.0);
+        assert_eq!(
+            harness.paint_damaged(&inspector, Some(away)).ops().count(),
+            0
+        );
+        let over = inspector.bounds();
+        assert!(harness.paint_damaged(&inspector, Some(over)).ops().count() > 0);
+    }
+
+    #[test]
+    fn a_press_on_the_header_padding_hits_nothing() {
+        let (mut harness, mut inspector) = setup();
+        // Inside the panel, left of the first tab and above the filter row.
+        let result = harness.click(&mut inspector, Point::new(801.0, 100.0));
+        assert!(!result.handled);
+        assert!(inspector.take_events().is_empty());
+    }
+
+    #[test]
+    fn only_the_headings_in_view_are_described_to_accessibility() {
+        let (mut harness, mut inspector) = long_outline(Motion::reduced());
+        let described = |harness: &Harness, inspector: &Inspector| -> Vec<String> {
+            harness
+                .tree(inspector)
+                .nodes()
+                .iter()
+                .filter(|node| node.role == Role::TreeItem)
+                .map(|node| node.name.clone())
+                .collect()
+        };
+        let top = described(&harness, &inspector);
+        assert!(!top.is_empty() && top.len() < 20, "{} described", top.len());
+        assert_eq!(top[0], "Heading 0");
+        let max = inspector.bar.model().max_offset();
+        inspector.bar.model_mut().jump(max);
+        harness.arrange(&mut inspector, Rect::new(800.0, 80.0, 280.0, 400.0));
+        let bottom = described(&harness, &inspector);
+        assert!(bottom.len() < 20);
+        assert!(!bottom.contains(&"Heading 0".to_owned()));
+        assert_eq!(bottom.last().map(String::as_str), Some("Heading 59"));
+    }
+
+    #[test]
+    fn dragging_the_scroll_bar_scrolls_the_outline() {
+        let (mut harness, mut inspector) = long_outline(Motion::reduced());
+        let grab = inspector.bar.thumb_rect().center();
+        let left = Some(PointerButton::Left);
+        // The bar takes the press: no heading under it is clicked.
+        let down = harness.pointer(&mut inspector, PointerEventKind::Down, left, grab);
+        assert!(down.handled);
+        assert!(inspector.take_events().is_empty());
+        harness.requests.take_invalidation();
+        let to = Point::new(grab.x, grab.y + 60.0);
+        harness.pointer(&mut inspector, PointerEventKind::Move, None, to);
+        assert!(inspector.scroll_offset() > 0.0);
+        assert!(!harness.requests.take_invalidation().is_clean());
+        harness.pointer(&mut inspector, PointerEventKind::Up, left, to);
+        assert!(!inspector.bar.is_dragging());
+    }
+
+    #[test]
+    fn a_notched_wheel_eases_the_outline_and_every_frame_repaints_it() {
+        let (mut harness, mut inspector) = long_outline(Motion::full());
+        let notch = Event::Wheel(WheelEvent {
+            delta: Point::new(0.0, -5.0),
+            precise: false,
+            position: Point::new(900.0, 300.0),
+            mods: Modifiers::NONE,
+        });
+        assert!(harness.send(&mut inspector, notch).handled);
+        assert_eq!(inspector.scroll_offset(), 0.0);
+        harness.requests.take_invalidation();
+        // The first frame fixes the start; the later ones move the offset and ask to repaint.
+        harness.frame(&mut inspector, 16);
+        harness.requests.take_invalidation();
+        harness.frame(&mut inspector, 100);
+        assert!(inspector.scroll_offset() > 0.0);
+        assert_eq!(
+            harness.requests.take_invalidation(),
+            Invalidation::Rect(inspector.bounds())
+        );
+        harness.run_animations(&mut inspector);
+        assert_eq!(inspector.scroll_offset(), inspector.bar.model().target());
     }
 }

@@ -225,8 +225,10 @@ struct State {
     depth: u8,
 }
 
-fn spec(language: Language) -> Option<&'static engine::Spec> {
-    Some(match language {
+/// Scans one line (without its terminator); tokens are relative to the line. The markup
+/// languages have their own scanners, every other language is a `Spec` for the generic one.
+fn scan_line(language: Language, line: &str, state: State, out: &mut Vec<Token>) -> State {
+    let spec = match language {
         Language::Rust => &langs::RUST,
         Language::C => &langs::C,
         Language::Cpp => &langs::CPP,
@@ -242,24 +244,15 @@ fn spec(language: Language) -> Option<&'static engine::Spec> {
         Language::Sql => &langs::SQL,
         Language::Yaml => &langs::YAML,
         Language::Toml => &langs::TOML,
-        Language::Html | Language::Xml | Language::Css | Language::Markdown | Language::Diff => {
-            return None;
-        }
-    })
-}
-
-/// Scans one line (without its terminator); tokens are relative to the line.
-fn scan_line(language: Language, line: &str, state: State, out: &mut Vec<Token>) -> State {
-    match language {
-        Language::Html | Language::Xml => markup::scan_markup(line, state, out),
-        Language::Css => markup::scan_css(line, state, out),
-        Language::Markdown => markup::scan_markdown(line, state, out),
+        Language::Html | Language::Xml => return markup::scan_markup(line, state, out),
+        Language::Css => return markup::scan_css(line, state, out),
+        Language::Markdown => return markup::scan_markdown(line, state, out),
         Language::Diff => {
             markup::scan_diff(line, out);
-            State::default()
+            return State::default();
         }
-        other => spec(other).map_or(state, |spec| engine::scan_line(spec, line, state, out)),
-    }
+    };
+    engine::scan_line(spec, line, state, out)
 }
 
 /// Splits `text` into the lines the scanner works on: the content without `\n` / `\r\n`, and

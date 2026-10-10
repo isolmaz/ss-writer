@@ -127,6 +127,54 @@ fn read_only_files_are_refused_until_editing_is_allowed() {
     ));
 }
 
+#[test]
+fn failing_access_checks_are_reported_not_guessed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("checked.md");
+    std::fs::write(&path, b"x").unwrap();
+    let code = FsFailure::Code(1234);
+    let os = FsError::Os {
+        code: 1234,
+        path: path.clone(),
+    };
+
+    // The write test of a writable-looking file.
+    let fs = FaultFs::new();
+    fs.fail(FsOp::IsWritable, code, 1);
+    assert_eq!(write_access(&fs, &path).unwrap_err(), os);
+    assert_eq!(write_access(&fs, &path).unwrap(), WriteAccess::Writable);
+
+    // "Allow editing" clears the attribute and then verifies the file is writable.
+    let fs = FaultFs::new();
+    fs.fail(FsOp::IsWritable, code, 1);
+    assert_eq!(allow_editing(&fs, &path).unwrap_err(), os);
+    allow_editing(&fs, &path).unwrap();
+
+    RealFs
+        .set_attributes(&path, Attributes(Attributes::READONLY))
+        .unwrap();
+    let fs = FaultFs::new();
+    fs.fail(FsOp::SetAttributes, code, 1);
+    assert_eq!(allow_editing(&fs, &path).unwrap_err(), os);
+    assert!(RealFs.metadata(&path).unwrap().attrs.is_readonly());
+    allow_editing(&fs, &path).unwrap();
+    assert!(!RealFs.metadata(&path).unwrap().attrs.is_readonly());
+}
+
+#[test]
+fn a_save_whose_stamp_cannot_be_read_back_still_wrote_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stamp.md");
+    // The first metadata call is the existence check (a scripted "not found" like the real
+    // one), the second the stamp query after the file was moved into place.
+    let fs = FaultFs::new();
+    fs.fail_for_path(FsOp::Metadata, &path, FsFailure::NotFound, 2);
+    let error = save_atomic(&fs, &RecordingSleeper::default(), &path, b"written").unwrap_err();
+    assert_eq!(error, SaveError::Fs(FsError::NotFound(path.clone())));
+    assert_eq!(std::fs::read(&path).unwrap(), b"written");
+    assert_eq!(names(dir.path()), ["stamp.md"], "no temp file is left");
+}
+
 /// Denies write access to Everyone on `path`; the guard restores it so the folder can be removed.
 struct DenyWrite<'a>(&'a Path);
 

@@ -704,4 +704,24 @@ mod tests {
         harness.arrange(&mut dialog, Rect::new(0.0, 0.0, 800.0, 600.0));
         assert!(harness.focus.tab_order().is_empty());
     }
+
+    #[test]
+    fn kit_dialog_with_id_names_the_control_and_measure_covers_the_window() {
+        let id = WidgetId::allocate();
+        let mut dialog = ContentDialog::new("Title", "Body", "Close").with_id(id);
+        assert_eq!(dialog.id(), id);
+        let mut harness = crate::widgets::testkit::Harness::new();
+        assert_eq!(harness.node(&dialog).id, id);
+        let window = Size::new(900.0, 700.0);
+        assert_eq!(harness.measure(&mut dialog, window), window);
+        let unbounded = harness.measure(&mut dialog, Size::UNBOUNDED);
+        assert_eq!(
+            harness.measure(&mut dialog, Size::new(f32::INFINITY, 700.0)),
+            Size::new(unbounded.width, 700.0)
+        );
+        assert_eq!(
+            harness.measure(&mut dialog, Size::new(900.0, f32::INFINITY)),
+            Size::new(900.0, unbounded.height)
+        );
+    }
 }

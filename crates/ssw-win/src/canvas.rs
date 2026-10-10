@@ -29,11 +29,11 @@ use windows::Win32::Graphics::Direct2D::{
     ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{DWRITE_TEXT_METRICS, IDWriteTextLayout};
-use windows::core::Interface;
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::com::{OsResultExt, WinError};
 use crate::dwrite::{DWriteEngine, DWriteLayout};
+use crate::fault::check;
 use crate::fonts::icon_family;
 use crate::wic::{DecodedImage, Wic};
 
@@ -266,7 +266,8 @@ impl TargetResources {
             a: color.a,
         };
         // SAFETY: valid target and color pointer.
-        let brush = unsafe { target.CreateSolidColorBrush(&d2d, None) }.ctx("create brush")?;
+        let brush =
+            check(unsafe { target.CreateSolidColorBrush(&d2d, None) }).ctx("create brush")?;
         self.brushes.insert(key, brush.clone());
         Ok(brush)
     }
@@ -295,8 +296,8 @@ impl TargetResources {
         // version is wanted here.
         let factory: &ID2D1Factory = &self.factory;
         // SAFETY: valid factory; preset dash styles take no custom array.
-        let style =
-            unsafe { factory.CreateStrokeStyle(&properties, None) }.ctx("create stroke style")?;
+        let style = check(unsafe { factory.CreateStrokeStyle(&properties, None) })
+            .ctx("create stroke style")?;
         self.strokes.insert(dash, style.clone());
         Ok(Some(style))
     }
@@ -306,7 +307,7 @@ impl TargetResources {
             return Ok(layer);
         }
         // SAFETY: valid target; `None` lets D2D size the layer automatically.
-        unsafe { target.CreateLayer(None) }.ctx("create layer")
+        check(unsafe { target.CreateLayer(None) }).ctx("create layer")
     }
 
     fn geometry(
@@ -346,7 +347,7 @@ impl TargetResources {
             dpiY: 96.0,
         };
         // SAFETY: the pixel buffer holds `stride * height` bytes and D2D copies it.
-        let bitmap = unsafe {
+        let bitmap = check(unsafe {
             target.CreateBitmap(
                 D2D_SIZE_U {
                     width: image.width,
@@ -356,7 +357,7 @@ impl TargetResources {
                 image.stride(),
                 &properties,
             )
-        }
+        })
         .ctx("create bitmap")?;
         self.bitmaps.insert(id, (revision, bitmap.clone()));
         Ok(bitmap)
@@ -472,8 +473,8 @@ fn build_geometry(factory: &ID2D1Factory1, path: &Path) -> Result<ID2D1Geometry,
     // SAFETY: the sink is opened, filled with balanced figures and closed before the geometry
     // is used.
     unsafe {
-        let geometry = factory.CreatePathGeometry().ctx("create path geometry")?;
-        let sink = geometry.Open().ctx("open geometry sink")?;
+        let geometry = check(factory.CreatePathGeometry()).ctx("create path geometry")?;
+        let sink = check(geometry.Open()).ctx("open geometry sink")?;
         sink.SetFillMode(D2D1_FILL_MODE_WINDING);
         let mut open = false;
         for verb in path.verbs() {
@@ -525,19 +526,18 @@ fn build_geometry(factory: &ID2D1Factory1, path: &Path) -> Result<ID2D1Geometry,
                         D2D1_ARC_SIZE_SMALL
                     },
                 }),
+                // `Path` only records a close for an open subpath.
                 PathVerb::Close => {
-                    if open {
-                        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                        open = false;
-                    }
+                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                    open = false;
                 }
             }
         }
         if open {
             sink.EndFigure(D2D1_FIGURE_END_OPEN);
         }
-        sink.Close().ctx("close geometry sink")?;
-        geometry.cast().ctx("geometry interface")
+        check(sink.Close()).ctx("close geometry sink")?;
+        Ok(geometry.into())
     }
 }
 
@@ -742,12 +742,14 @@ impl<'a> D2dCanvas<'a> {
             let encoded = glyph.encode_utf16(&mut units);
             // SAFETY: valid factory and format; the metrics struct is a valid out pointer.
             unsafe {
-                let layout = engine
-                    .factory()
-                    .CreateTextLayout(encoded, &format, 10_000.0, 10_000.0)
-                    .ctx("icon layout")?;
+                let layout = check(
+                    engine
+                        .factory()
+                        .CreateTextLayout(encoded, &format, 10_000.0, 10_000.0),
+                )
+                .ctx("icon layout")?;
                 let mut metrics = DWRITE_TEXT_METRICS::default();
-                layout.GetMetrics(&mut metrics).ctx("icon metrics")?;
+                check(layout.GetMetrics(&mut metrics)).ctx("icon metrics")?;
                 Ok((
                     layout,
                     Size::new(metrics.widthIncludingTrailingWhitespace, metrics.height),
@@ -1411,10 +1413,7 @@ mod tests {
                 (0..120u32).any(|x| bgra(&image, x, y)[0] < 60 && bgra(&image, x, y)[2] < 60)
             })
             .unwrap();
-        assert!(
-            red_rows[0] + 6 <= black_top + 2 || red_rows[0] < black_top,
-            "{red_rows:?} {black_top}"
-        );
+        assert!(red_rows[0] + 4 <= black_top, "{red_rows:?} {black_top}");
     }
 
     #[test]
@@ -1576,13 +1575,18 @@ mod tests {
 
     #[test]
     fn rounded_rect_paths_are_closed_outlines() {
-        let path = rounded_rect_path(
-            Rect::new(0.0, 0.0, 20.0, 10.0),
-            CornerRadii::new(4.0, 0.0, 2.0, 100.0),
-        );
+        let radii = CornerRadii::new(4.0, 0.0, 2.0, 100.0);
+        let rect = Rect::new(0.0, 0.0, 20.0, 10.0);
+        let path = rounded_rect_path(rect, radii);
         let verbs = path.verbs();
-        assert!(matches!(verbs.first(), Some(PathVerb::MoveTo(_))));
-        assert!(matches!(verbs.last(), Some(PathVerb::Close)));
+        // The radii are scaled to fit the rectangle; the outline starts after the top-left arc.
+        let top_left = radii.clamped(rect.size()).top_left;
+        assert!(top_left > 0.0 && top_left < 4.0, "{top_left}");
+        assert_eq!(
+            verbs.first(),
+            Some(&PathVerb::MoveTo(Point::new(top_left, 0.0)))
+        );
+        assert_eq!(verbs.last(), Some(&PathVerb::Close));
         let arcs = verbs
             .iter()
             .filter(|verb| matches!(verb, PathVerb::ArcTo { .. }))
@@ -1597,5 +1601,326 @@ mod tests {
         );
         assert_ne!(path_key(&path), path_key(&square));
         assert_eq!(path_key(&path), path_key(&path.clone()));
+    }
+
+    #[test]
+    fn assets_resources_and_canvases_describe_their_state_when_debugged() {
+        let mut rig = rig(16, 16);
+        let empty = format!("{:?}", rig.assets);
+        for expected in ["images: 0", "scenes: 0", "has_scene_renderer: false"] {
+            assert!(empty.contains(expected), "{empty}");
+        }
+        rig.assets
+            .images
+            .register_bgra(ImageId(1), 1, 1, vec![0, 0, 0, 255])
+            .unwrap();
+        rig.assets.register_scene(
+            SceneId(1),
+            Arc::new(Scene::new(ssw_render::scene::Size::new(4.0, 4.0))),
+        );
+        let renderer = crate::scene_render::D2dSceneRenderer::new(rig.wic.clone()).unwrap();
+        rig.assets.set_scene_renderer(Box::new(renderer));
+        let filled = format!("{:?}", rig.assets);
+        for expected in ["images: 1", "scenes: 1", "has_scene_renderer: true"] {
+            assert!(filled.contains(expected), "{filled}");
+        }
+
+        let mut seen = Vec::new();
+        let error = rig
+            .draw(Some(WHITE), |canvas| {
+                assert_eq!(canvas.transform(), Transform2D::IDENTITY);
+                canvas.fill_rect(Rect::new(0.0, 0.0, 2.0, 2.0), RED);
+                canvas.fill_path(&Path::from_rect(Rect::new(0.0, 0.0, 1.0, 1.0)), BLUE);
+                canvas.push_clip_rect(Rect::new(0.0, 0.0, 4.0, 4.0));
+                seen.push(format!("{canvas:?}"));
+                canvas.pop_clip();
+                canvas.translate(3.0, 4.0);
+                let moved = canvas.transform();
+                assert_eq!((moved.dx, moved.dy), (3.0, 4.0));
+                // A restore without a save is the canvas' first error.
+                canvas.restore();
+                seen.push(format!("{canvas:?}"));
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "restore without save");
+        let (clipped, failed) = (&seen[0], &seen[1]);
+        for expected in ["stack: 1", "failed: false"] {
+            assert!(clipped.contains(expected), "{clipped}");
+        }
+        for expected in ["stack: 0", "failed: true"] {
+            assert!(failed.contains(expected), "{failed}");
+        }
+        let resources = format!("{:?}", rig.resources);
+        for expected in ["generation: 1", "brushes: 2", "geometries: 1"] {
+            assert!(resources.contains(expected), "{resources}");
+        }
+    }
+
+    #[test]
+    fn the_brush_and_geometry_caches_are_emptied_when_they_are_full() {
+        let mut rig = rig(16, 16);
+        rig.draw(Some(WHITE), |canvas| {
+            for i in 0..=MAX_BRUSHES {
+                let shade = Color::new(i as f32 / 1024.0, 0.0, 0.0, 1.0);
+                canvas.fill_rect(Rect::new(0.0, 0.0, 1.0, 1.0), shade);
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            rig.resources.brush_count(),
+            1,
+            "the colour after the 512th found the cache full and emptied it"
+        );
+        rig.draw(Some(WHITE), |canvas| {
+            for i in 0..=MAX_GEOMETRIES {
+                let square = Rect::new(i as f32 * 0.01, 0.0, 1.0, 1.0);
+                canvas.fill_path(&Path::from_rect(square), RED);
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            rig.resources.geometry_count(),
+            1,
+            "the shape after the 256th found the cache full and emptied it"
+        );
+    }
+
+    #[test]
+    fn dash_styles_are_created_once_per_pattern() {
+        let mut rig = rig(32, 8);
+        let image = rig
+            .draw(Some(WHITE), |canvas| {
+                for y in [1.5, 3.5] {
+                    let (from, to) = (Point::new(0.0, y), Point::new(31.0, y));
+                    canvas.stroke_line(from, to, RED, 1.0, Dash::Dashed);
+                }
+                let (from, to) = (Point::new(0.0, 6.5), Point::new(31.0, 6.5));
+                canvas.stroke_line(from, to, RED, 1.0, Dash::Dotted);
+            })
+            .unwrap();
+        assert_eq!(rig.resources.strokes.len(), 2, "dashed and dotted");
+        let row = |y: u32| -> Vec<[u8; 4]> { (0..32).map(|x| bgra(&image, x, y)).collect() };
+        assert_eq!(row(1), row(3), "the second dashed line reuses the style");
+        assert!(row(1).contains(&[0, 0, 255, 255]));
+        assert!(row(1).contains(&[255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn paths_fill_every_subpath_they_start() {
+        let mut rig = rig(32, 12);
+        // Two triangles; the first is left open when the second one starts.
+        let two = Path::new()
+            .move_to(Point::new(2.0, 2.0))
+            .line_to(Point::new(10.0, 2.0))
+            .line_to(Point::new(10.0, 10.0))
+            .move_to(Point::new(20.0, 2.0))
+            .line_to(Point::new(28.0, 2.0))
+            .line_to(Point::new(28.0, 10.0));
+        let image = rig
+            .draw(Some(WHITE), |canvas| canvas.fill_path(&two, RED))
+            .unwrap();
+        assert_eq!(bgra(&image, 9, 4), [0, 0, 255, 255], "first triangle");
+        assert_eq!(bgra(&image, 27, 4), [0, 0, 255, 255], "second triangle");
+        assert_eq!(
+            bgra(&image, 3, 9),
+            [255, 255, 255, 255],
+            "outside the first"
+        );
+        assert_eq!(
+            bgra(&image, 22, 9),
+            [255, 255, 255, 255],
+            "outside the second"
+        );
+    }
+
+    #[test]
+    fn a_rejected_icon_size_is_reported_by_finish() {
+        let mut rig = rig(16, 16);
+        let error = rig
+            .draw(None, |canvas| {
+                canvas.draw_icon('\u{E921}', IconFont::SegoeFluent, 0.0, RED, Point::ZERO)
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("create text format failed:"),
+            "{error}"
+        );
+        assert!(rig.resources.icons.is_empty(), "failures are not cached");
+    }
+
+    /// Fault injection: every checked system call of an operation fails in turn.
+    #[cfg(feature = "fault-injection")]
+    mod faults {
+        use super::*;
+        use crate::fault;
+
+        const AREA: Rect = Rect::new(2.0, 2.0, 20.0, 20.0);
+        const SAME: CornerRadii = CornerRadii::uniform(4.0);
+        const MIXED: CornerRadii = CornerRadii::new(6.0, 0.0, 6.0, 0.0);
+
+        /// The operation a failed call names ("{context} failed: {source}").
+        fn context(error: &WinError) -> String {
+            let text = error.to_string();
+            text.split(" failed: ").next().unwrap().to_owned()
+        }
+
+        /// Draws `operation` on canvases with empty caches, once per checked system call, with
+        /// that call failing: the failure is what `finish` returns. Returns what the failures
+        /// named, in call order; the draw after the last one is not affected.
+        fn failures(rig: &mut Rig, operation: impl Fn(&mut D2dCanvas<'_>)) -> Vec<String> {
+            let factory = rig.resources.factory.clone();
+            let mut named = Vec::new();
+            let mut n = 0;
+            loop {
+                rig.resources = TargetResources::new(factory.clone(), 1);
+                let Rig {
+                    target,
+                    assets,
+                    resources,
+                    ..
+                } = &mut *rig;
+                let mut reached = false;
+                let outcome = target.paint(Some(WHITE), |render_target| {
+                    let mut canvas = D2dCanvas::new(render_target, assets, resources);
+                    fault::arm(n);
+                    operation(&mut canvas);
+                    reached = fault::tripped();
+                    fault::disarm();
+                    canvas.finish()
+                });
+                if !reached {
+                    outcome.unwrap();
+                    return named;
+                }
+                named.push(context(&outcome.unwrap_err()));
+                n += 1;
+            }
+        }
+
+        #[test]
+        fn every_failing_call_is_the_first_error_of_the_canvas() {
+            let mut rig = rig(32, 32);
+            rig.assets
+                .images
+                .register_bgra(ImageId(5), 2, 2, vec![255; 16])
+                .unwrap();
+            /// The calls that build a path geometry, then `rest`.
+            fn geometry_then(rest: &[&'static str]) -> Vec<&'static str> {
+                let build = [
+                    "create path geometry",
+                    "open geometry sink",
+                    "close geometry sink",
+                ];
+                [&build[..], rest].concat()
+            }
+            type Operation = fn(&mut D2dCanvas<'_>);
+            let cases: [(Operation, Vec<&str>); 13] = [
+                (|c| c.fill_rect(AREA, RED), vec!["create brush"]),
+                (
+                    |c| c.fill_rounded_rect(AREA, SAME, RED),
+                    vec!["create brush"],
+                ),
+                (
+                    |c| c.fill_rounded_rect(AREA, MIXED, RED),
+                    geometry_then(&["create brush"]),
+                ),
+                (
+                    |c| c.stroke_rounded_rect(AREA, SAME, RED, 1.0),
+                    vec!["create brush"],
+                ),
+                (
+                    |c| c.stroke_rounded_rect(AREA, MIXED, RED, 1.0),
+                    geometry_then(&["create brush"]),
+                ),
+                (
+                    |c| {
+                        let (from, to) = (Point::new(0.0, 5.5), Point::new(31.0, 5.5));
+                        c.stroke_line(from, to, RED, 1.0, Dash::Dashed);
+                    },
+                    vec!["create brush", "create stroke style"],
+                ),
+                (
+                    |c| c.fill_path(&Path::from_rect(AREA), RED),
+                    geometry_then(&["create brush"]),
+                ),
+                (
+                    |c| c.stroke_path(&Path::from_rect(AREA), RED, 1.0, Dash::Dashed),
+                    geometry_then(&["create brush", "create stroke style"]),
+                ),
+                (
+                    |c| {
+                        c.concat_transform(Transform2D::rotation(0.5));
+                        c.push_clip_rect(AREA);
+                        c.pop_clip();
+                    },
+                    geometry_then(&["create layer"]),
+                ),
+                (
+                    |c| {
+                        c.push_clip_rounded_rect(AREA, SAME);
+                        c.pop_clip();
+                    },
+                    geometry_then(&["create layer"]),
+                ),
+                (
+                    |c| {
+                        c.push_layer(0.5);
+                        c.pop_layer();
+                    },
+                    vec!["create layer"],
+                ),
+                (
+                    |c| c.draw_icon('\u{E921}', IconFont::SegoeFluent, 12.0, RED, Point::ZERO),
+                    vec![
+                        "create text format",
+                        "icon layout",
+                        "icon metrics",
+                        "create brush",
+                    ],
+                ),
+                (
+                    |c| c.draw_image(ImageId(5), AREA, 1.0),
+                    vec!["create bitmap"],
+                ),
+            ];
+            for (index, (operation, expected)) in cases.into_iter().enumerate() {
+                assert_eq!(failures(&mut rig, operation), expected, "operation {index}");
+            }
+        }
+
+        #[test]
+        fn failing_brushes_and_effects_while_drawing_text_are_reported() {
+            let mut rig = rig(160, 40);
+            let engine = rig.engine.clone();
+            let ranges = [ssw_ui::text::StyledRange {
+                range: 0..2,
+                style: TextStyle::new("Segoe UI", 20.0)
+                    .with_color(RED)
+                    .with_background(Color::from_rgb_u32(0xFFFF00)),
+            }];
+            let layout = engine.layout(
+                "MMMM",
+                &TextStyle::new("Segoe UI", 20.0),
+                &ranges,
+                &[],
+                f32::INFINITY,
+            );
+            let named = failures(&mut rig, |canvas| {
+                canvas.draw_text_layout(&*layout, Point::new(4.0, 4.0), Color::BLACK);
+            });
+            // The background's brush, the default and the transparent brush, the reset of the
+            // effects, the run's brush and its effect.
+            assert_eq!(
+                named,
+                [
+                    "create brush",
+                    "create brush",
+                    "create brush",
+                    "set drawing effect",
+                    "create brush",
+                    "set drawing effect",
+                ]
+            );
+        }
     }
 }

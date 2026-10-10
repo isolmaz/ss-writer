@@ -6,16 +6,14 @@
 //! can change them holds a [`DictionaryFiles`] guard, which puts every file back byte for byte
 //! (or removes it again when it did not exist), also when the test fails.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use ssw_win::com::ComGuard;
 use ssw_win::spell::{CorrectiveAction, SpellChecker, SpellFactory, SpellingError};
-
-/// Tests that touch the dictionary files run one at a time: a snapshot taken while another
-/// test's changes are in place would "restore" them.
-static DICTIONARY_FILES: Mutex<()> = Mutex::new(());
+use support::MachineLock;
 
 /// The kinds of user dictionary file of a language folder.
 const DICTIONARY_FILE_NAMES: [&str; 3] = ["default.dic", "default.exc", "default.acl"];
@@ -25,16 +23,16 @@ const DICTIONARY_FILE_NAMES: [&str; 3] = ["default.dic", "default.exc", "default
 struct DictionaryFiles {
     /// Every file with its content, `None` for a file that did not exist.
     saved: Vec<(PathBuf, Option<Vec<u8>>)>,
-    /// Declared after `saved`: released once the files are restored.
-    _exclusive: MutexGuard<'static, ()>,
+    /// Declared after `saved`: released once the files are restored. Tests that touch the
+    /// dictionary files run one at a time, also across the processes of a parallel test run: a
+    /// snapshot taken while another test's changes are in place would "restore" them.
+    _exclusive: MachineLock,
 }
 
 impl DictionaryFiles {
     /// Snapshots the files of the `neutral` folder and of the folders of `languages`.
     fn protect(languages: &[String]) -> Self {
-        let exclusive = DICTIONARY_FILES
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let exclusive = MachineLock::acquire("spelling-dictionaries");
         let appdata = std::env::var_os("APPDATA").expect("APPDATA is set for a user session");
         let root = Path::new(&appdata).join(r"Microsoft\Spelling");
         let mut saved = Vec::new();

@@ -20,6 +20,7 @@ use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
 use windows::core::{Owned, PCWSTR};
 
+use crate::fault::{check, gate_io};
 use crate::fs::{FileSystem, FsError, io, wide, win};
 use crate::save::SaveStamp;
 
@@ -155,8 +156,8 @@ pub struct Coalescer {
     entries: Vec<Option<FsEvent>>,
     index: HashMap<String, usize>,
     pending_rename: Option<PathBuf>,
-    first_push: Option<Instant>,
-    last_push: Option<Instant>,
+    /// The first and the latest push of the pending window; `None` when nothing is pending.
+    window: Option<(Instant, Instant)>,
 }
 
 impl Coalescer {
@@ -168,8 +169,8 @@ impl Coalescer {
 
     /// Adds one raw change observed at `now`.
     pub fn push(&mut self, change: RawChange, now: Instant) {
-        self.first_push.get_or_insert(now);
-        self.last_push = Some(now);
+        let first = self.window.map_or(now, |(first, _)| first);
+        self.window = Some((first, now));
         match change.action {
             RawAction::Added => self.merge(change.path, Incoming::Created),
             RawAction::Modified => self.merge(change.path, Incoming::Modified),
@@ -251,8 +252,7 @@ impl Coalescer {
     }
 
     fn deadline(&self) -> Option<Instant> {
-        let first = self.first_push?;
-        let last = self.last_push?;
+        let (first, last) = self.window?;
         Some((last + DEBOUNCE).min(first + MAX_DELAY))
     }
 
@@ -279,8 +279,7 @@ impl Coalescer {
             self.merge(from, Incoming::Removed);
         }
         self.index.clear();
-        self.first_push = None;
-        self.last_push = None;
+        self.window = None;
         self.entries.drain(..).flatten().collect()
     }
 }
@@ -369,6 +368,7 @@ impl<T> SendBox<T> {
     }
 }
 
+#[derive(Debug)]
 struct StopEvent(Owned<HANDLE>);
 
 // SAFETY: an event handle may be signalled and waited on from any thread.
@@ -379,7 +379,7 @@ unsafe impl Sync for StopEvent {}
 fn create_event(path: &Path) -> Result<Owned<HANDLE>, FsError> {
     // SAFETY: no security attributes, manual-reset, initially non-signalled, unnamed.
     let handle = win(
-        unsafe { CreateEventW(None, true, false, PCWSTR::null()) },
+        check(unsafe { CreateEventW(None, true, false, PCWSTR::null()) }),
         path,
     )?;
     // SAFETY: `handle` is a freshly created, valid handle that nothing else owns.
@@ -398,6 +398,40 @@ struct RdcwSource {
 }
 
 impl RdcwSource {
+    /// Opens `root` for overlapped change notification; no request is pending yet.
+    fn open(root: &Path, stop: Arc<StopEvent>) -> Result<Self, FsError> {
+        let name = wide(root);
+        // SAFETY: `name` is NUL-terminated and outlives the call; the handle is opened for
+        // overlapped directory listing with full sharing so the folder can still be renamed.
+        let dir = win(
+            unsafe {
+                CreateFileW(
+                    PCWSTR(name.as_ptr()),
+                    FILE_LIST_DIRECTORY.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                    None,
+                )
+            },
+            root,
+        )?;
+        // SAFETY: `dir` is a freshly opened handle that nothing else owns.
+        let dir = unsafe { Owned::new(dir) };
+        let mut source = Self {
+            root: root.to_path_buf(),
+            dir,
+            io_event: create_event(root)?,
+            stop,
+            overlapped: Box::default(),
+            buffer: vec![0u32; BUFFER_BYTES / 4],
+            pending: false,
+        };
+        source.overlapped.hEvent = *source.io_event;
+        Ok(source)
+    }
+
     fn issue(&mut self) -> windows::core::Result<()> {
         let filter = FILE_NOTIFY_CHANGE_FILE_NAME
             | FILE_NOTIFY_CHANGE_DIR_NAME
@@ -441,14 +475,14 @@ impl RdcwSource {
                 let mut transferred = 0u32;
                 // SAFETY: the request was issued on `dir` with this `overlapped` and has
                 // completed (its event is signalled), so the call does not block.
-                unsafe {
+                check(unsafe {
                     GetOverlappedResult(
                         *self.dir,
                         &raw const *self.overlapped,
                         &raw mut transferred,
                         false,
                     )
-                }?;
+                })?;
                 // SAFETY: the kernel wrote `transferred` bytes into `buffer`, which is at least
                 // that long and `u8` has no alignment requirement.
                 let bytes = unsafe {
@@ -503,12 +537,6 @@ pub struct Watcher {
     thread: Option<JoinHandle<()>>,
 }
 
-impl std::fmt::Debug for StopEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("StopEvent")
-    }
-}
-
 impl Watcher {
     /// Starts watching `root` recursively. Coalesced events arrive on the returned channel;
     /// `wake` runs after each delivered batch (e.g. to post a window message). When the watch
@@ -520,59 +548,34 @@ impl Watcher {
         root: &Path,
         wake: impl Fn() + Send + 'static,
     ) -> Result<(Self, Receiver<FsEvent>), FsError> {
-        let name = wide(root);
-        // SAFETY: `name` is NUL-terminated and outlives the call; the handle is opened for
-        // overlapped directory listing with full sharing so the folder can still be renamed.
-        let dir = win(
-            unsafe {
-                CreateFileW(
-                    PCWSTR(name.as_ptr()),
-                    FILE_LIST_DIRECTORY.0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    None,
-                    OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-                    None,
-                )
-            },
-            root,
-        )?;
-        // SAFETY: `dir` is a freshly opened handle that nothing else owns.
-        let dir = unsafe { Owned::new(dir) };
         let stop = Arc::new(StopEvent(create_event(root)?));
-        let mut source = RdcwSource {
-            root: root.to_path_buf(),
-            dir,
-            io_event: create_event(root)?,
-            stop: Arc::clone(&stop),
-            overlapped: Box::default(),
-            buffer: vec![0u32; BUFFER_BYTES / 4],
-            pending: false,
-        };
-        source.overlapped.hEvent = *source.io_event;
+        let source = RdcwSource::open(root, Arc::clone(&stop))?;
         let (sender, receiver) = channel();
         let (armed_sender, armed) = channel::<()>();
         let owned_root = root.to_path_buf();
         let moved = SendBox(source);
         let thread = io(
-            std::thread::Builder::new()
-                .name("ssw-watch".to_owned())
-                .spawn(move || {
-                    let mut source = moved.into_inner();
-                    // The first request must be pending before `start` returns, or changes made
-                    // right after it would be missed. It is issued on this thread because
-                    // overlapped requests are cancelled when their issuing thread ends. A
-                    // failure here is not reported separately: `pump` retries the request on its
-                    // first poll and ends with a rescan when that fails as well.
-                    let _ = source.issue();
-                    let _ = armed_sender.send(());
-                    pump(&mut source, &owned_root, &mut Instant::now, &mut |events| {
-                        for event in events {
-                            let _ = sender.send(event);
-                        }
-                        wake();
-                    });
-                }),
+            gate_io().and_then(|()| {
+                std::thread::Builder::new()
+                    .name("ssw-watch".to_owned())
+                    .spawn(move || {
+                        let mut source = moved.into_inner();
+                        // The first request must be pending before `start` returns, or changes
+                        // made right after it would be missed. It is issued on this thread
+                        // because overlapped requests are cancelled when their issuing thread
+                        // ends. A failure here is not reported separately: `pump` retries the
+                        // request on its first poll and ends with a rescan when that fails as
+                        // well.
+                        let _ = source.issue();
+                        let _ = armed_sender.send(());
+                        pump(&mut source, &owned_root, &mut Instant::now, &mut |events| {
+                            for event in events {
+                                let _ = sender.send(event);
+                            }
+                            wake();
+                        });
+                    })
+            }),
             root,
         )?;
         // Blocks until the reader thread has issued the first request. A disconnect means the
@@ -600,9 +603,8 @@ impl Drop for Watcher {
         // SAFETY: the stop event is a valid handle kept alive by the `Arc`. If signalling
         // fails the reader already ended (watch lost) and `join` returns immediately.
         let _ = unsafe { SetEvent(*self.stop.0) };
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        // A panicked reader has nothing left to clean up either.
+        let _ = self.thread.take().map(JoinHandle::join);
     }
 }
 
@@ -710,5 +712,25 @@ impl ExternalChanges {
             .filter(|(_, _, change)| *change != DocChange::Unchanged)
             .map(|(_, path, change)| (path, change))
             .collect()
+    }
+}
+
+#[cfg(all(test, feature = "fault-injection"))]
+mod tests {
+    use super::*;
+
+    /// The poll runs on the reader thread in production; here it runs on the test thread so
+    /// the failure countdown (per thread) reaches its `GetOverlappedResult` call.
+    #[test]
+    fn a_failing_completion_ends_the_watch_instead_of_reporting_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = Arc::new(StopEvent(create_event(dir.path()).unwrap()));
+        let mut source = RdcwSource::open(dir.path(), stop).unwrap();
+        source.issue().unwrap();
+        std::fs::write(dir.path().join("changed.md"), "x").unwrap();
+        crate::fault::arm(0);
+        let polled = source.poll(Some(Duration::from_secs(15)));
+        assert!(crate::fault::tripped(), "the completion was checked");
+        assert_eq!(format!("{polled:?}"), "Lost");
     }
 }

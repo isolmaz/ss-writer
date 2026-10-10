@@ -17,8 +17,8 @@ use ssw_win::com::ComGuard;
 use ssw_win::wic::DecodedImage;
 use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, HWND, RECT};
 use windows::Win32::System::Com::{
-    IClassFactory, ISequentialStream_Impl, IStream, IStream_Impl, LOCKTYPE, STATFLAG, STATSTG,
-    STGC, STREAM_SEEK,
+    CoTaskMemAlloc, IClassFactory, ISequentialStream_Impl, IStream, IStream_Impl, LOCKTYPE,
+    STATFLAG, STATFLAG_NONAME, STATSTG, STGC, STREAM_SEEK,
 };
 use windows::Win32::System::Ole::IOleWindow;
 use windows::Win32::UI::Shell::PropertiesSystem::IInitializeWithStream;
@@ -26,7 +26,7 @@ use windows::Win32::UI::Shell::{IPreviewHandler, IPreviewHandlerVisuals, SHCreat
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, WINDOW_EX_STYLE, WS_OVERLAPPEDWINDOW,
 };
-use windows::core::{HRESULT, Interface, Ref, implement, w};
+use windows::core::{HRESULT, Interface, PWSTR, Ref, implement, w};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -212,6 +212,9 @@ pub enum Fault {
     NoSize,
     /// `Stat` fails and `Read` never ends.
     Endless,
+    /// A healthy stream whose `Stat` reports the file name and size, like the shell's file
+    /// streams.
+    Named(&'static str),
 }
 
 /// A stream that fails in a chosen way.
@@ -236,7 +239,7 @@ impl ISequentialStream_Impl for ScriptedStream_Impl {
     fn Read(&self, pv: *mut c_void, cb: u32, pcbread: *mut u32) -> HRESULT {
         let count = match self.fault {
             Fault::FailRead => return E_FAIL,
-            Fault::NoSize => {
+            Fault::NoSize | Fault::Named(_) => {
                 let mut data = self.data.borrow_mut();
                 let count = data.len().min(cb as usize);
                 // SAFETY: `pv` is valid for `cb >= count` bytes and `data` holds `count` bytes.
@@ -311,9 +314,28 @@ impl IStream_Impl for ScriptedStream_Impl {
         Err(E_NOTIMPL.into())
     }
 
-    fn Stat(&self, _pstatstg: *mut STATSTG, _grfstatflag: &STATFLAG) -> windows::core::Result<()> {
-        // Streams that cannot report a size: the reader must go by what `Read` yields.
-        Err(E_FAIL.into())
+    fn Stat(&self, pstatstg: *mut STATSTG, grfstatflag: &STATFLAG) -> windows::core::Result<()> {
+        let Fault::Named(name) = self.fault else {
+            // Streams that cannot report a size: the reader must go by what `Read` yields.
+            return Err(E_FAIL.into());
+        };
+        let mut stat = STATSTG {
+            cbSize: self.data.borrow().len() as u64,
+            ..Default::default()
+        };
+        if *grfstatflag != STATFLAG_NONAME {
+            let units: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            // SAFETY: the buffer holds `units.len()` code units; the caller frees the name
+            // with `CoTaskMemFree`, as `STATFLAG_DEFAULT` requires.
+            let buffer = unsafe { CoTaskMemAlloc(units.len() * size_of::<u16>()) }.cast::<u16>();
+            assert!(!buffer.is_null(), "the task allocator is out of memory");
+            // SAFETY: `buffer` is valid for `units.len()` units and cannot overlap `units`.
+            unsafe { std::ptr::copy_nonoverlapping(units.as_ptr(), buffer, units.len()) };
+            stat.pwcsName = PWSTR(buffer);
+        }
+        // SAFETY: `pstatstg` is a valid out pointer (the caller's contract).
+        unsafe { *pstatstg = stat };
+        Ok(())
     }
 
     fn Clone(&self) -> windows::core::Result<IStream> {

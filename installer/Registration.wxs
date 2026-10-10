@@ -18,11 +18,14 @@
   <Fragment>
     <ComponentGroup Id="Registration" Directory="INSTALLFOLDER">
 
-      <!-- ProgIDs: one per document family. -->
+      <!-- ProgIDs: one per document family. The negative icon index selects a resource id of
+           SSWriter.exe: -1 is the application icon, -2 the document icon (the ids come from
+           crates/ssw-app/build.rs; the pictures from assets/icons). -->
+
       <Component Id="ProgIdMarkdown">
         <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.Markdown">
           <RegistryValue Type="string" Value="Markdown Document" KeyPath="yes" />
-          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,-2" /></RegistryKey>
           <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
         </RegistryKey>
         <RegistryValue Root="HKCU" Key="Software\Classes\.md\OpenWithProgids" Name="SSWriter.Markdown" Type="string" Value="" />
@@ -33,7 +36,7 @@
       <Component Id="ProgIdMermaid">
         <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.Mermaid">
           <RegistryValue Type="string" Value="Mermaid Diagram" KeyPath="yes" />
-          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,-2" /></RegistryKey>
           <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
         </RegistryKey>
         <RegistryValue Root="HKCU" Key="Software\Classes\.mmd\OpenWithProgids" Name="SSWriter.Mermaid" Type="string" Value="" />
@@ -42,7 +45,7 @@
       <Component Id="ProgIdText">
         <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.Text">
           <RegistryValue Type="string" Value="Text Document" KeyPath="yes" />
-          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,-2" /></RegistryKey>
           <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
         </RegistryKey>
         <RegistryValue Root="HKCU" Key="Software\Classes\.txt\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
@@ -51,7 +54,7 @@
       <Component Id="ProgIdTextBundle">
         <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.TextBundle">
           <RegistryValue Type="string" Value="TextBundle Document" KeyPath="yes" />
-          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,-2" /></RegistryKey>
           <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
         </RegistryKey>
         <RegistryValue Root="HKCU" Key="Software\Classes\.textbundle\OpenWithProgids" Name="SSWriter.TextBundle" Type="string" Value="" />
@@ -61,7 +64,7 @@
       <Component Id="ProgIdWord">
         <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.Word">
           <RegistryValue Type="string" Value="Word Document" KeyPath="yes" />
-          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,-2" /></RegistryKey>
           <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
         </RegistryKey>
         <RegistryValue Root="HKCU" Key="Software\Classes\.docx\OpenWithProgids" Name="SSWriter.Word" Type="string" Value="" />
@@ -71,7 +74,7 @@
       <Component Id="ProgIdOpenDocument">
         <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.OpenDocument">
           <RegistryValue Type="string" Value="OpenDocument Text" KeyPath="yes" />
-          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,-2" /></RegistryKey>
           <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
         </RegistryKey>
         <RegistryValue Root="HKCU" Key="Software\Classes\.odt\OpenWithProgids" Name="SSWriter.OpenDocument" Type="string" Value="" />
@@ -80,7 +83,7 @@
       <Component Id="ProgIdRichText">
         <RegistryKey Root="HKCU" Key="Software\Classes\SSWriter.RichText">
           <RegistryValue Type="string" Value="Rich Text Document" KeyPath="yes" />
-          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" /></RegistryKey>
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,-2" /></RegistryKey>
           <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
         </RegistryKey>
         <RegistryValue Root="HKCU" Key="Software\Classes\.rtf\OpenWithProgids" Name="SSWriter.RichText" Type="string" Value="" />
@@ -113,7 +116,7 @@
       <Component Id="FolderVerb">
         <RegistryKey Root="HKCU" Key="Software\Classes\Directory\shell\SSWriter">
           <RegistryValue Type="string" Value="Open with SS Writer" KeyPath="yes" />
-          <RegistryValue Name="Icon" Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,0" />
+          <RegistryValue Name="Icon" Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,-1" />
           <RegistryKey Key="command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
         </RegistryKey>
       </Component>

@@ -592,10 +592,18 @@ mod tests {
             )
         );
         assert_eq!(rects[3].1, tokens.accent);
-        assert!(
-            !canvas
-                .ops()
-                .any(|op| matches!(op, DrawOp::StrokeRoundedRect { width, .. } if *width == 2.0))
+        let stroke_widths: Vec<f32> = canvas
+            .ops()
+            .filter_map(|op| match op {
+                DrawOp::StrokeRoundedRect { width, .. } => Some(*width),
+                _ => None,
+            })
+            .collect();
+        // The thumb's 1 DIP border is drawn; the 2 DIP focus ring is not.
+        assert_eq!(
+            stroke_widths,
+            [1.0],
+            "no focus ring while unfocused: {stroke_widths:?}"
         );
         harness.focus_widget(&mut slider);
         let canvas = harness.paint(&slider);
@@ -672,5 +680,29 @@ mod tests {
         );
         assert_eq!(flat.value(), 5.0);
         assert_eq!(flat.take_changed(), None);
+    }
+
+    #[test]
+    fn kit_slider_with_id_and_paint_damage() {
+        let id = WidgetId::allocate();
+        let mut slider = Slider::new("Volume", 0.0, 100.0, 50.0, 1.0).with_id(id);
+        assert_eq!(slider.id(), id);
+        let mut harness = crate::widgets::testkit::Harness::new();
+        assert_eq!(harness.node(&slider).id, id);
+        let bounds = harness.place(&mut slider, Point::new(10.0, 10.0));
+        let away = Rect::new(500.0, 500.0, 5.0, 5.0);
+        assert_eq!(harness.paint_damaged(&slider, Some(away)).ops().count(), 0);
+        assert!(harness.paint_damaged(&slider, Some(bounds)).ops().count() > 0);
+    }
+
+    #[test]
+    fn kit_slider_without_travel_has_nothing_to_drag_to() {
+        let mut harness = crate::widgets::testkit::Harness::new();
+        let mut slider = Slider::new("Volume", 10.0, 20.0, 15.0, 1.0);
+        // A track too short for the thumb has no travel: every position reads as the minimum.
+        harness.arrange(&mut slider, Rect::new(0.0, 0.0, 4.0, 32.0));
+        harness.focus.focus(slider.id());
+        harness.click(&mut slider, Point::new(2.0, 16.0));
+        assert_eq!(slider.value(), 10.0);
     }
 }

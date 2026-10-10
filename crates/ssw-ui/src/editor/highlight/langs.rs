@@ -2,19 +2,23 @@
 
 use super::engine::{Attr, BASE, Interp, KeyStyle, Spec, StrRule};
 
-const fn rule(open: &'static str, close: &'static str, escape: bool, multiline: bool) -> StrRule {
-    StrRule {
-        open,
-        close,
-        escape,
-        multiline,
-        doubled: false,
-        interp: Interp::No,
-    }
+/// A `StrRule` without doubled delimiters or interpolation. (A macro rather than a `const fn`:
+/// it only ever runs at compile time.)
+macro_rules! rule {
+    ($open:expr, $close:expr, $escape:expr, $multiline:expr) => {
+        StrRule {
+            open: $open,
+            close: $close,
+            escape: $escape,
+            multiline: $multiline,
+            doubled: false,
+            interp: Interp::No,
+        }
+    };
 }
 
-const DQ: StrRule = rule("\"", "\"", true, false);
-const SQ: StrRule = rule("'", "'", true, false);
+const DQ: StrRule = rule!("\"", "\"", true, false);
+const SQ: StrRule = rule!("'", "'", true, false);
 
 pub(super) static RUST: Spec = Spec {
     keywords: &[
@@ -306,7 +310,7 @@ pub(super) static CSHARP: Spec = Spec {
             doubled: true,
             interp: Interp::No,
         },
-        rule("$\"", "\"", true, false),
+        rule!("$\"", "\"", true, false),
         DQ,
         SQ,
     ],
@@ -372,7 +376,7 @@ pub(super) static JAVA: Spec = Spec {
     constants: &["true", "false", "null"],
     line_comments: &["//"],
     block_comment: Some(("/*", "*/")),
-    strings: &[rule("\"\"\"", "\"\"\"", true, true), DQ, SQ],
+    strings: &[rule!("\"\"\"", "\"\"\"", true, true), DQ, SQ],
     capitalized_types: true,
     caps_constants: true,
     call_is_function: true,
@@ -569,8 +573,8 @@ pub(super) static PYTHON: Spec = Spec {
     ],
     line_comments: &["#"],
     strings: &[
-        rule("\"\"\"", "\"\"\"", true, true),
-        rule("'''", "'''", true, true),
+        rule!("\"\"\"", "\"\"\"", true, true),
+        rule!("'''", "'''", true, true),
         DQ,
         SQ,
     ],
@@ -640,7 +644,7 @@ pub(super) static GO: Spec = Spec {
     ],
     line_comments: &["//"],
     block_comment: Some(("/*", "*/")),
-    strings: &[DQ, rule("`", "`", false, true), SQ],
+    strings: &[DQ, rule!("`", "`", false, true), SQ],
     capitalized_types: true,
     call_is_function: true,
     ..BASE
@@ -920,10 +924,10 @@ pub(super) static TOML: Spec = Spec {
     constants: &["true", "false", "inf", "nan"],
     line_comments: &["#"],
     strings: &[
-        rule("\"\"\"", "\"\"\"", true, true),
-        rule("'''", "'''", false, true),
+        rule!("\"\"\"", "\"\"\"", true, true),
+        rule!("'''", "'''", false, true),
         DQ,
-        rule("'", "'", false, false),
+        rule!("'", "'", false, false),
     ],
     ident_extra: "-",
     key: KeyStyle::Toml,

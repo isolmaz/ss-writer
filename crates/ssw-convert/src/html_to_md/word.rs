@@ -191,13 +191,15 @@ mod tests {
 
     fn find_in(doc: &Handle, name: &str) -> Handle {
         let mut stack = vec![doc.clone()];
+        let mut found = None;
         while let Some(node) = stack.pop() {
             if tag(&node) == Some(name) {
-                return node;
+                found = Some(node);
+                break;
             }
             stack.extend(children(&node).into_iter().rev());
         }
-        panic!("no <{name}>");
+        found.expect("the document has the element")
     }
 
     #[test]

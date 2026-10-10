@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use ssw_ui::geometry::Point;
@@ -22,7 +22,7 @@ use ssw_ui::widget::EventResult;
 use ssw_ui::widgets::SharedClipboard;
 use ssw_win::canvas::{CanvasAssets, D2dCanvas, ImageStore, TargetResources};
 use ssw_win::com::{OsResultExt, WinError};
-use ssw_win::dpi::{DEFAULT_DPI, point_px_to_dip, scale_for_dpi};
+use ssw_win::dpi::{DEFAULT_DPI, point_px_to_dip, scale_for_dpi, window_dpi};
 use ssw_win::gfx::{GfxDevices, WindowSurface};
 use ssw_win::services::clipboard::WindowsClipboard;
 use ssw_win::services::timers::{TimerTable, WindowTimers};
@@ -33,7 +33,6 @@ use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient, ValidateRect};
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE,
     TRACKMOUSEEVENT, TrackMouseEvent,
@@ -55,6 +54,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::appearance::Visuals;
 use crate::content::PreviewContent;
+use crate::fault;
 use crate::server::module_handle;
 
 const CLASS_NAME: PCWSTR = w!("SSWriterPreviewWindow");
@@ -76,29 +76,47 @@ const CLICK_SLOP: f32 = 4.0;
 /// unloaded once every window is gone).
 static CLASS_USERS: Mutex<usize> = Mutex::new(0);
 
+/// The class user count; a count left behind by a panicking thread is still a valid count.
+fn class_users() -> MutexGuard<'static, usize> {
+    CLASS_USERS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The window class of the preview child window.
+fn window_class() -> WNDCLASSEXW {
+    WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        style: CS_DBLCLKS,
+        lpfnWndProc: Some(wndproc),
+        hInstance: module_handle(),
+        // SAFETY: loading a stock cursor.
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        lpszClassName: CLASS_NAME,
+        ..Default::default()
+    }
+}
+
+/// Registers `class`. A class that already exists is fine: it is the registration an earlier
+/// [`release_class`] could not remove.
+fn register_class(class: &WNDCLASSEXW) -> Result<(), WinError> {
+    fault::point()?;
+    // SAFETY: the class structure is fully initialized (the caller's contract) and outlives the
+    // call.
+    let atom = unsafe { RegisterClassExW(class) };
+    // SAFETY: reads the calling thread's last error right after the failed call.
+    if atom == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
+        return Err(WinError::from_os(
+            "RegisterClassExW",
+            windows::core::Error::from_thread(),
+        ));
+    }
+    Ok(())
+}
+
 /// Takes a use of the window class, registering it for the first user.
 fn acquire_class() -> Result<(), WinError> {
-    let mut users = CLASS_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut users = class_users();
     if *users == 0 {
-        let class = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            style: CS_DBLCLKS,
-            lpfnWndProc: Some(wndproc),
-            hInstance: module_handle(),
-            // SAFETY: loading a stock cursor.
-            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
-            lpszClassName: CLASS_NAME,
-            ..Default::default()
-        };
-        // SAFETY: the class structure is fully initialized and outlives the call.
-        let atom = unsafe { RegisterClassExW(&class) };
-        // SAFETY: reads the calling thread's last error right after the failed call.
-        if atom == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
-            return Err(WinError::from_os(
-                "RegisterClassExW",
-                windows::core::Error::from_thread(),
-            ));
-        }
+        register_class(&window_class())?;
     }
     *users += 1;
     Ok(())
@@ -106,7 +124,7 @@ fn acquire_class() -> Result<(), WinError> {
 
 /// Gives a use of the window class back, unregistering it for the last one.
 fn release_class() {
-    let mut users = CLASS_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut users = class_users();
     *users = users.saturating_sub(1);
     if *users == 0 {
         // SAFETY: no window of the class is left; a failure leaves a registration that the
@@ -267,11 +285,7 @@ impl WindowState {
             let resized = graphics
                 .surface
                 .resize(width.max(1) as u32, height.max(1) as u32);
-            if let Err(error) = resized
-                && error.is_device_lost()
-            {
-                self.recover_graphics();
-            }
+            self.recover_if_lost(&resized);
         }
         self.content.resize(self.size_px, self.dpi);
         self.paint();
@@ -282,10 +296,12 @@ impl WindowState {
             return;
         }
         self.painting = true;
-        let outcome = self.paint_once();
-        if matches!(&outcome, Err(error) if error.is_device_lost()) {
-            self.recover_graphics();
-            let _ = self.paint_once();
+        // A frame that meets a lost device is drawn once more on the rebuilt devices.
+        for _ in 0..2 {
+            let outcome = self.paint_once();
+            if !self.recover_if_lost(&outcome) {
+                break;
+            }
         }
         self.painting = false;
         if self.content.needs_repaint_for_scenes() {
@@ -314,34 +330,33 @@ impl WindowState {
         })
     }
 
-    /// Rebuilds every device resource after a device loss; the next paint redraws.
+    /// Rebuilds the device resources when `outcome` is a lost device; true when it was.
+    fn recover_if_lost(&mut self, outcome: &Result<(), WinError>) -> bool {
+        let lost = matches!(outcome, Err(error) if error.is_device_lost());
+        if lost {
+            self.recover_graphics();
+        }
+        lost
+    }
+
+    /// Rebuilds every device resource after a device loss; the next paint redraws. When the
+    /// devices cannot be recreated the window stays without graphics (blank).
     fn recover_graphics(&mut self) {
-        let Some(old) = self.graphics.take() else {
-            return;
-        };
-        let Graphics {
-            devices,
-            surface,
-            resources,
-            assets,
-        } = old;
-        // The composition target must be released before a new one is made for this HWND.
-        drop(surface);
-        drop(resources);
-        let Ok(devices) = devices.recreate() else {
-            return;
-        };
-        let (width, height) = (self.size_px.0.max(1) as u32, self.size_px.1.max(1) as u32);
-        let Ok(surface) = WindowSurface::new(&devices, self.hwnd, width, height, self.dpi as f32)
-        else {
-            return;
-        };
-        let resources = TargetResources::new(devices.d2d_factory().clone(), devices.generation());
-        self.graphics = Some(Graphics {
-            devices,
-            surface,
-            resources,
-            assets,
+        let (hwnd, size_px, dpi) = (self.hwnd, self.size_px, self.dpi);
+        self.graphics = self.graphics.take().and_then(|old| {
+            let Graphics {
+                devices,
+                surface,
+                resources,
+                assets,
+            } = old;
+            // The composition target must be released before a new one is made for this HWND.
+            drop(surface);
+            drop(resources);
+            devices
+                .recreate()
+                .ok()
+                .and_then(|devices| attach_surface(devices, hwnd, size_px, dpi, assets).ok())
         });
     }
 
@@ -364,9 +379,7 @@ impl WindowState {
                 (Some(LRESULT(0)), After::None)
             }
             WM_DPICHANGED_AFTERPARENT => {
-                // SAFETY: plain query on our own window.
-                let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-                self.dpi = if dpi == 0 { DEFAULT_DPI } else { dpi };
+                self.dpi = window_dpi(self.hwnd);
                 self.resize(self.size_px.0, self.size_px.1);
                 (Some(LRESULT(0)), After::None)
             }
@@ -525,12 +538,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         // SAFETY: for WM_NCCREATE `lparam` points to the CREATESTRUCTW whose creation parameter
-        // is the `RefCell<WindowState>` pointer passed by `PreviewWindow::create`.
+        // is the `RefCell<WindowState>` pointer passed by `PreviewWindow::create`, or null for a
+        // window of this class that something else made (it then gets default processing only).
         unsafe {
             let create = &*(lparam.0 as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
-            let cell = &*(create.lpCreateParams as *const RefCell<WindowState>);
-            if let Ok(mut state) = cell.try_borrow_mut() {
+            if let Some(cell) = (create.lpCreateParams as *const RefCell<WindowState>).as_ref()
+                && let Ok(mut state) = cell.try_borrow_mut()
+            {
                 state.hwnd = hwnd;
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -588,18 +603,27 @@ fn attach_graphics(
     dpi: u32,
     engine: &ssw_win::dwrite::DWriteEngine,
 ) -> Result<Graphics, WinError> {
-    let devices = GfxDevices::create(1)?;
-    let surface = WindowSurface::new(
-        &devices,
-        hwnd,
-        size_px.0.max(1) as u32,
-        size_px.1.max(1) as u32,
-        dpi as f32,
-    )?;
+    let devices = fault::check(GfxDevices::create(1))?;
+    let wic = fault::check(Wic::new())?;
+    let images = ImageStore::new(wic.clone());
+    let assets = CanvasAssets::with_scene_renderer(images, engine.clone(), wic);
+    let assets = fault::check(assets)?;
+    attach_surface(devices, hwnd, size_px, dpi, assets)
+}
+
+/// The composition swap chain of `hwnd` on `devices` and the resources that draw into it,
+/// with the canvas `assets` they work with.
+fn attach_surface(
+    devices: GfxDevices,
+    hwnd: HWND,
+    size_px: (i32, i32),
+    dpi: u32,
+    assets: CanvasAssets,
+) -> Result<Graphics, WinError> {
+    let (width, height) = (size_px.0.max(1) as u32, size_px.1.max(1) as u32);
+    let created = WindowSurface::new(&devices, hwnd, width, height, dpi as f32);
+    let surface = fault::check(created)?;
     let resources = TargetResources::new(devices.d2d_factory().clone(), devices.generation());
-    let wic = Wic::new()?;
-    let assets =
-        CanvasAssets::with_scene_renderer(ImageStore::new(wic.clone()), engine.clone(), wic)?;
     Ok(Graphics {
         devices,
         surface,
@@ -691,26 +715,22 @@ impl PreviewWindow {
     /// Reads DPI and size, attaches the composition surface and paints the first frame.
     fn initialize(&self) -> Result<(), WinError> {
         let hwnd = self.hwnd;
-        // SAFETY: plain query on the window just created.
-        let dpi = match unsafe { GetDpiForWindow(hwnd) } {
-            0 => DEFAULT_DPI,
-            dpi => dpi,
-        };
+        let dpi = window_dpi(hwnd);
         let mut client = RECT::default();
         // SAFETY: valid out pointer.
-        unsafe { GetClientRect(hwnd, &mut client) }.ctx("GetClientRect")?;
+        let queried = unsafe { GetClientRect(hwnd, &mut client) }.ctx("GetClientRect");
+        fault::check(queried)?;
         let size_px = (client.right - client.left, client.bottom - client.top);
-        let mut state = self
-            .state
-            .try_borrow_mut()
-            .map_err(|_| WinError::Invalid("the preview window is busy"))?;
+        // Nothing else holds the state of a window that was just created: the window procedure
+        // only borrows it while it handles a message.
+        let mut state = self.state.borrow_mut();
         state.hwnd = hwnd;
         state.dpi = dpi;
         state.size_px = size_px;
         let graphics = attach_graphics(hwnd, size_px, dpi, state.content.engine())?;
         state.graphics = Some(graphics);
-        let clipboard: SharedClipboard =
-            Rc::new(RefCell::new(WindowsClipboard::new(hwnd, Wic::new()?)));
+        let wic = fault::check(Wic::new())?;
+        let clipboard: SharedClipboard = Rc::new(RefCell::new(WindowsClipboard::new(hwnd, wic)));
         state.content.set_clipboard(clipboard);
         state.content.resize(size_px, dpi);
         state.paint();
@@ -792,9 +812,9 @@ impl PreviewWindow {
             .state
             .try_borrow_mut()
             .map_err(|_| WinError::Invalid("the preview window is busy"))?;
-        let (size_px, window_dpi) = (state.size_px, state.dpi);
+        let (size_px, own_dpi) = (state.size_px, state.dpi);
         let image = state.content.render(width_px, height_px, dpi);
-        state.content.resize(size_px, window_dpi);
+        state.content.resize(size_px, own_dpi);
         image
     }
 }
@@ -807,5 +827,613 @@ impl Drop for PreviewWindow {
             let _ = DestroyWindow(self.hwnd);
         }
         release_class();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ssw_ui::editor::DocumentKind;
+    use ssw_ui::services::TimerId;
+    use ssw_win::com::ComGuard;
+    use ssw_win::dwrite::DWriteEngine;
+    use ssw_win::theme::{Win32Settings, read_system_theme};
+    #[cfg(feature = "fault-injection")]
+    use windows::Win32::UI::WindowsAndMessaging::{GW_CHILD, GetWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassInfoExW, GetCursor, GetParent, HTCAPTION, SendMessageW, SetTimer, WINDOW_EX_STYLE,
+        WS_OVERLAPPEDWINDOW,
+    };
+
+    use super::*;
+
+    /// The pane the windows of these tests fill, in pixels.
+    const PANE: RECT = RECT {
+        left: 0,
+        top: 0,
+        right: 600,
+        bottom: 400,
+    };
+
+    /// Serializes the tests of one process that count users of the window class (nextest runs
+    /// one test per process; `cargo test` shares the process).
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// What every test needs: exclusive use of the class counter and a COM apartment (for the
+    /// text engine, WIC and the clipboard).
+    struct Env {
+        _com: ComGuard,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    fn env() -> Env {
+        let lock = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        Env {
+            _com: ComGuard::apartment_threaded().unwrap(),
+            _lock: lock,
+        }
+    }
+
+    /// A hidden, never shown top-level window: the host of a preview.
+    struct Host(HWND);
+
+    impl Host {
+        fn new() -> Self {
+            // SAFETY: creates a plain system "STATIC" window without `WS_VISIBLE`; it is never
+            // shown or activated.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("ssw-preview window test host"),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    800,
+                    600,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .unwrap();
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for Host {
+        fn drop(&mut self) {
+            // SAFETY: destroys the window created in `new` on its own thread.
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    fn make_content(text: &str) -> PreviewContent {
+        let system = read_system_theme(&Win32Settings);
+        let engine = DWriteEngine::new().unwrap();
+        PreviewContent::new(
+            text,
+            DocumentKind::Markdown,
+            &Visuals::default(),
+            &system,
+            engine,
+        )
+    }
+
+    fn window_in(host: &Host, text: &str) -> PreviewWindow {
+        PreviewWindow::create(host.0, PANE, make_content(text), None).unwrap()
+    }
+
+    /// A preview window in its host. Field order is drop order: the window goes first, then the
+    /// host, then COM and the lock.
+    struct Rig {
+        window: PreviewWindow,
+        host: Host,
+        _env: Env,
+    }
+
+    fn rig(text: &str) -> Rig {
+        let env = env();
+        let host = Host::new();
+        let window = window_in(&host, text);
+        Rig {
+            window,
+            host,
+            _env: env,
+        }
+    }
+
+    fn send(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize {
+        // SAFETY: a synchronous message to a window of this thread; the arguments are plain
+        // values, no pointers.
+        unsafe { SendMessageW(hwnd, msg, Some(WPARAM(wparam)), Some(LPARAM(lparam))) }.0
+    }
+
+    /// `x | y << 16` as a mouse message's `lParam`.
+    fn pack(x: i32, y: i32) -> isize {
+        ((y as u16 as isize) << 16) | (x as u16 as isize)
+    }
+
+    fn class_registered() -> bool {
+        let mut info = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: a valid out structure with its size set and a constant class name.
+        unsafe { GetClassInfoExW(Some(module_handle()), CLASS_NAME, &mut info) }.is_ok()
+    }
+
+    #[test]
+    fn a_class_the_system_rejects_is_an_error_and_an_existing_one_is_accepted() {
+        let error = register_class(&WNDCLASSEXW::default()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                WinError::Os {
+                    context: "RegisterClassExW",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().starts_with("RegisterClassExW failed"));
+        let _env = env();
+        acquire_class().unwrap();
+        register_class(&window_class()).unwrap();
+        release_class();
+    }
+
+    #[test]
+    fn the_class_lives_exactly_as_long_as_a_window_of_it_does() {
+        let _env = env();
+        let host = Host::new();
+        assert!(!class_registered(), "no window, no class");
+        let first = window_in(&host, "one\n");
+        assert!(class_registered());
+        let second = window_in(&host, "two\n");
+        drop(first);
+        assert!(
+            class_registered(),
+            "the second window still needs the class"
+        );
+        assert_eq!(send(second.hwnd(), WM_GETDLGCODE, 0, 0), DLGC_WANTARROWS);
+        drop(second);
+        assert!(
+            !class_registered(),
+            "the last window takes the class with it"
+        );
+        let again = window_in(&host, "three\n");
+        assert!(class_registered(), "a later window registers it again");
+        drop(again);
+    }
+
+    #[test]
+    fn a_window_cannot_be_made_in_a_parent_that_is_gone() {
+        let _env = env();
+        let gone = Host::new().0;
+        let error = PreviewWindow::create(gone, PANE, make_content("x\n"), None)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                &error,
+                WinError::Os {
+                    context: "CreateWindowExW",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!class_registered(), "the failed window gave its use back");
+    }
+
+    #[test]
+    fn graphics_cannot_be_attached_to_a_window_that_is_gone() {
+        let _env = env();
+        let gone = Host::new().0;
+        let engine = DWriteEngine::new().unwrap();
+        let error = attach_graphics(gone, (100, 100), 96, &engine)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                &error,
+                WinError::Os {
+                    context: "create composition target",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_without_state_gets_default_processing() {
+        let _env = env();
+        let host = Host::new();
+        acquire_class().unwrap();
+        // SAFETY: creates a hidden child of the test host without a creation parameter; it is
+        // destroyed below.
+        let bare = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                CLASS_NAME,
+                w!(""),
+                WS_CHILD,
+                0,
+                0,
+                50,
+                50,
+                Some(host.0),
+                None,
+                Some(module_handle()),
+                None,
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            send(bare, WM_GETDLGCODE, 0, 0),
+            0,
+            "no state, no claim on the arrow keys"
+        );
+        // SAFETY: destroys the window created above on its own thread.
+        unsafe { DestroyWindow(bare) }.unwrap();
+        release_class();
+    }
+
+    #[test]
+    fn every_cursor_kind_is_a_different_stock_cursor() {
+        let all = [
+            Cursor::Arrow,
+            Cursor::IBeam,
+            Cursor::Hand,
+            Cursor::Cross,
+            Cursor::SizeWE,
+            Cursor::SizeNS,
+            Cursor::SizeNWSE,
+            Cursor::SizeNESW,
+            Cursor::SizeAll,
+            Cursor::NotAllowed,
+            Cursor::Wait,
+            Cursor::Help,
+        ];
+        let mut handles: Vec<usize> = all
+            .iter()
+            .map(|&cursor| {
+                // SAFETY: loads a stock cursor.
+                let loaded = unsafe { LoadCursorW(None, cursor_resource(cursor)) };
+                loaded.unwrap().0 as usize
+            })
+            .collect();
+        handles.sort_unstable();
+        handles.dedup();
+        assert_eq!(handles.len(), all.len());
+    }
+
+    #[test]
+    fn the_pane_answers_its_own_background_and_dialog_code_and_paints_on_request() {
+        let rig = rig("# Title\n\ntext\n");
+        let hwnd = rig.window.hwnd();
+        assert_eq!(
+            send(hwnd, WM_ERASEBKGND, 0, 0),
+            1,
+            "no flicker from the system"
+        );
+        assert_eq!(send(hwnd, WM_GETDLGCODE, 0, 0), DLGC_WANTARROWS);
+        assert_eq!(send(hwnd, WM_PAINT, 0, 0), 0);
+        assert!(!rig.window.state.borrow().painting);
+    }
+
+    #[test]
+    fn size_messages_resize_the_swap_chain_and_an_empty_client_paints_nothing() {
+        let rig = rig("# Title\n\ntext\n");
+        let hwnd = rig.window.hwnd();
+        let sizes = || {
+            let state = rig.window.state.borrow();
+            let surface = state.graphics.as_ref().unwrap().surface.size_px();
+            (state.size_px, surface)
+        };
+        assert_eq!(sizes(), ((600, 400), (600, 400)));
+        send(hwnd, WM_SIZE, SIZE_MINIMIZED as usize, pack(0, 0));
+        assert_eq!(
+            sizes(),
+            ((600, 400), (600, 400)),
+            "a minimized window keeps its size"
+        );
+        send(hwnd, WM_SIZE, 0, pack(300, 200));
+        assert_eq!(sizes(), ((300, 200), (300, 200)));
+        send(hwnd, WM_SIZE, 0, pack(0, 0));
+        assert_eq!(sizes(), ((0, 0), (1, 1)), "the swap chain keeps one pixel");
+        send(hwnd, WM_SIZE, 0, pack(600, 400));
+        assert_eq!(sizes(), ((600, 400), (600, 400)));
+    }
+
+    #[test]
+    fn a_dpi_change_of_the_parent_makes_the_window_read_its_dpi_again() {
+        let rig = rig("text\n");
+        let hwnd = rig.window.hwnd();
+        let own = rig.window.state.borrow().dpi;
+        assert_eq!(own, window_dpi(hwnd));
+        rig.window.state.borrow_mut().dpi = 4 * own;
+        assert_eq!(send(hwnd, WM_DPICHANGED_AFTERPARENT, 0, 0), 0);
+        assert_eq!(rig.window.state.borrow().dpi, own);
+    }
+
+    #[test]
+    fn hovering_the_text_shows_the_i_beam_and_only_the_client_area_is_the_panes() {
+        let rig = rig("Some text to hover over.\n");
+        let hwnd = rig.window.hwnd();
+        assert_eq!(rig.window.state.borrow().cursor, Cursor::Arrow);
+        assert_eq!(send(hwnd, WM_MOUSEMOVE, 0, pack(300, 100)), 0);
+        assert_eq!(rig.window.state.borrow().cursor, Cursor::IBeam);
+        let client = ((WM_MOUSEMOVE as isize) << 16) | HTCLIENT as isize;
+        assert_eq!(send(hwnd, WM_SETCURSOR, hwnd.0 as usize, client), 1);
+        // SAFETY: plain queries of the thread's cursor and a stock cursor.
+        let (current, ibeam) = unsafe { (GetCursor(), LoadCursorW(None, IDC_IBEAM).unwrap()) };
+        assert_eq!(current, ibeam);
+        let caption = HTCAPTION as isize;
+        // SAFETY: default processing of a message to our own window.
+        let default =
+            unsafe { DefWindowProcW(hwnd, WM_SETCURSOR, WPARAM(hwnd.0 as usize), LPARAM(caption)) };
+        assert_eq!(
+            send(hwnd, WM_SETCURSOR, hwnd.0 as usize, caption),
+            default.0,
+            "the frame decides the cursor outside the client area"
+        );
+    }
+
+    #[test]
+    fn mouse_tracking_starts_once_and_restarts_after_the_pointer_left() {
+        let rig = rig("text\n");
+        let hwnd = rig.window.hwnd();
+        let tracking = || rig.window.state.borrow().tracking_mouse;
+        assert!(!tracking());
+        send(hwnd, WM_MOUSEMOVE, 0, pack(100, 100));
+        assert!(tracking());
+        send(hwnd, WM_MOUSEMOVE, 0, pack(110, 100));
+        assert!(tracking(), "one request covers the following moves");
+        assert_eq!(send(hwnd, WM_MOUSELEAVE, 0, 0), 0);
+        assert!(!tracking());
+        send(hwnd, WM_MOUSEMOVE, 0, pack(120, 100));
+        assert!(tracking(), "the next move asks again");
+    }
+
+    #[test]
+    fn only_the_left_button_captures_the_mouse_and_x_buttons_answer_true() {
+        let rig = rig("Hello selected world, a line of text.\n");
+        let hwnd = rig.window.hwnd();
+        let captured = || rig.window.state.borrow().captured;
+        for (down, up) in [
+            (WM_RBUTTONDOWN, WM_RBUTTONUP),
+            (WM_MBUTTONDOWN, WM_MBUTTONUP),
+        ] {
+            assert_eq!(send(hwnd, down, 0, pack(30, 40)), 0);
+            assert!(!captured(), "{down:#x} does not capture");
+            assert_eq!(send(hwnd, up, 0, pack(30, 40)), 0);
+        }
+        for button in [1usize, 2] {
+            assert_eq!(send(hwnd, WM_XBUTTONDOWN, button << 16, pack(30, 40)), 1);
+            assert!(!captured());
+            assert_eq!(send(hwnd, WM_XBUTTONUP, button << 16, pack(30, 40)), 1);
+        }
+        assert_eq!(
+            send(hwnd, WM_LBUTTONUP, 0, pack(30, 40)),
+            0,
+            "a stray release"
+        );
+        assert!(!captured());
+        assert_eq!(send(hwnd, WM_LBUTTONDOWN, 1, pack(30, 40)), 0);
+        assert!(captured());
+        assert_eq!(
+            send(hwnd, WM_LBUTTONDOWN, 1, pack(35, 40)),
+            0,
+            "a second press"
+        );
+        assert!(captured());
+        assert_eq!(send(hwnd, WM_LBUTTONUP, 0, pack(35, 40)), 0);
+        assert!(
+            !captured(),
+            "releasing the left button gives the mouse back"
+        );
+    }
+
+    #[test]
+    fn dragging_below_the_pane_scrolls_on_the_autoscroll_timer_until_the_button_is_released() {
+        let text: String = (0..80)
+            .map(|i| format!("Paragraph {i} of the long document.\n\n"))
+            .collect();
+        let rig = rig(&text);
+        let hwnd = rig.window.hwnd();
+        let timers = Rc::clone(&rig.window.state.borrow().timers);
+        send(hwnd, WM_LBUTTONDOWN, 1, pack(30, 40));
+        send(hwnd, WM_MOUSEMOVE, 1, pack(300, 500));
+        assert_eq!(
+            timers.borrow().len(),
+            1,
+            "the drag started the autoscroll timer"
+        );
+        let os_id = (1..8)
+            .find(|&id| timers.borrow_mut().fire(id).is_some())
+            .expect("the OS id of the timer");
+        let before = rig.window.scroll_y().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(send(hwnd, WM_TIMER, os_id, 0), 0);
+        assert!(
+            rig.window.scroll_y().unwrap() > before,
+            "the tick scrolled the view"
+        );
+        send(hwnd, WM_LBUTTONUP, 0, pack(300, 500));
+        assert!(
+            timers.borrow().is_empty(),
+            "releasing the button stops the timer"
+        );
+    }
+
+    #[test]
+    fn one_shot_timers_are_forgotten_when_they_fire_and_unknown_ones_are_ignored() {
+        let rig = rig("text\n");
+        let hwnd = rig.window.hwnd();
+        let timers = Rc::clone(&rig.window.state.borrow().timers);
+        assert_eq!(send(hwnd, WM_TIMER, 0xDEAD, 0), 0, "nobody set this timer");
+        let repeating = timers.borrow_mut().register(TimerId::new(900), true);
+        let once = timers.borrow_mut().register(TimerId::new(901), false);
+        // SAFETY: real OS timers of our own window with the ids of the table; the window kills
+        // the one-shot, the test the other.
+        unsafe {
+            let _ = SetTimer(Some(hwnd), repeating, 60_000, None);
+            let _ = SetTimer(Some(hwnd), once, 60_000, None);
+        }
+        assert_eq!(send(hwnd, WM_TIMER, repeating, 0), 0);
+        assert_eq!(timers.borrow().len(), 2, "a repeating timer stays");
+        assert_eq!(send(hwnd, WM_TIMER, once, 0), 0);
+        assert_eq!(timers.borrow().len(), 1, "a one-shot timer is forgotten");
+        // SAFETY: kills timers of our own window; the one-shot is already gone.
+        unsafe {
+            assert!(KillTimer(Some(hwnd), once).is_err(), "the window killed it");
+            assert!(KillTimer(Some(hwnd), repeating).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_panic_while_handling_a_message_gets_default_processing_and_the_window_goes_on() {
+        let rig = rig("text\n");
+        let hwnd = rig.window.hwnd();
+        let timers = Rc::clone(&rig.window.state.borrow().timers);
+        // The WM_TIMER handler panics on its own borrow of the timer table.
+        let held = timers.borrow_mut();
+        assert_eq!(send(hwnd, WM_TIMER, 1, 0), 0);
+        drop(held);
+        assert_eq!(
+            send(hwnd, WM_GETDLGCODE, 0, 0),
+            DLGC_WANTARROWS,
+            "the state was not left borrowed"
+        );
+    }
+
+    #[test]
+    fn a_window_in_the_middle_of_a_message_takes_no_new_state_and_renders_nothing() {
+        let rig = rig("text\n");
+        let system = read_system_theme(&Win32Settings);
+        let mut visuals = Visuals::default();
+        visuals.set_background(0x0010_2030);
+        let plain = rig.window.state.borrow().content.background();
+        let held = rig.window.state.borrow_mut();
+        rig.window.set_frame(None);
+        rig.window.set_visuals(&visuals, &system);
+        assert_eq!(
+            rig.window.scroll_y(),
+            None,
+            "the scroll offset is not readable now"
+        );
+        let refused = rig.window.render(100, 100, 96).err();
+        assert!(
+            matches!(
+                refused,
+                Some(WinError::Invalid("the preview window is busy"))
+            ),
+            "{refused:?}"
+        );
+        drop(held);
+        assert_eq!(rig.window.state.borrow().content.background(), plain);
+        rig.window.set_visuals(&visuals, &system);
+        assert_eq!(
+            rig.window.state.borrow().content.background(),
+            visuals.background.unwrap()
+        );
+        assert_eq!(rig.window.scroll_y(), Some(0.0));
+    }
+
+    #[test]
+    fn a_lost_device_is_rebuilt_on_the_next_generation_and_the_window_paints_again() {
+        let rig = rig("# Title\n\nSome text\n");
+        let mut state = rig.window.state.borrow_mut();
+        let generation = |state: &WindowState| {
+            state
+                .graphics
+                .as_ref()
+                .map(|graphics| graphics.devices.generation())
+        };
+        assert_eq!(generation(&state), Some(1));
+        assert!(!state.recover_if_lost(&Ok(())));
+        assert!(!state.recover_if_lost(&Err(WinError::Invalid("not a device loss"))));
+        assert_eq!(generation(&state), Some(1), "only a lost device is rebuilt");
+        assert!(state.recover_if_lost(&Err(WinError::DeviceLost { context: "Present" })));
+        assert_eq!(generation(&state), Some(2));
+        let surface = state.graphics.as_ref().unwrap().surface.size_px();
+        assert_eq!(
+            surface,
+            (600, 400),
+            "the new swap chain has the window's size"
+        );
+        state.paint_once().unwrap();
+        state.paint();
+        assert!(!state.painting);
+    }
+
+    #[test]
+    fn a_window_that_lost_its_graphics_stays_blank_when_asked_to_recover() {
+        let rig = rig("text\n");
+        let mut state = rig.window.state.borrow_mut();
+        state.graphics = None;
+        state.recover_graphics();
+        assert!(state.graphics.is_none());
+        state.paint_once().unwrap();
+    }
+
+    #[test]
+    fn the_debug_form_names_the_window_handle() {
+        let rig = rig("text\n");
+        assert_eq!(
+            format!("{:?}", rig.window),
+            format!("PreviewWindow {{ hwnd: {:?}, .. }}", rig.window.hwnd())
+        );
+    }
+
+    #[test]
+    fn a_window_can_move_to_another_parent_and_take_the_focus() {
+        let rig = rig("text\n");
+        let hwnd = rig.window.hwnd();
+        let other = Host::new();
+        rig.window.set_parent(other.0);
+        // SAFETY: a plain query of the parent of our own window.
+        assert_eq!(unsafe { GetParent(hwnd) }.unwrap(), other.0);
+        rig.window.set_parent(rig.host.0);
+        // SAFETY: a plain query of the parent of our own window.
+        assert_eq!(unsafe { GetParent(hwnd) }.unwrap(), rig.host.0);
+        rig.window.focus();
+        // SAFETY: a plain query of the thread's focus window.
+        assert_eq!(unsafe { GetFocus() }, hwnd);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn every_failure_while_creating_a_window_leaves_nothing_behind() {
+        let _env = env();
+        let host = Host::new();
+        for n in 0.. {
+            let content = make_content("Some $x^2$ text\n");
+            fault::arm(n);
+            let created = PreviewWindow::create(host.0, PANE, content, None);
+            let tripped = fault::tripped();
+            fault::disarm();
+            if !tripped {
+                assert!(
+                    created.is_ok(),
+                    "no failure was injected, so the window is made"
+                );
+                break;
+            }
+            let error = created.expect_err("the injected failure fails the creation");
+            assert!(
+                matches!(error, WinError::Invalid("injected fault")),
+                "check {n}: {error:?}"
+            );
+            assert!(!class_registered(), "check {n}: the class was given back");
+            // SAFETY: a plain query for the first child of our host.
+            let child = unsafe { GetWindow(host.0, GW_CHILD) };
+            assert!(child.is_err(), "check {n}: no window was left in the host");
+        }
     }
 }

@@ -103,9 +103,11 @@ fn fallback_chain(locale: &str) -> Vec<LanguageIdentifier> {
         push(id);
         push(language_only);
     }
-    if let Some(en) = parse_locale(FALLBACK_LOCALE) {
-        push(en);
-    }
+    push(
+        FALLBACK_LOCALE
+            .parse()
+            .expect("the fallback locale is a valid language tag"),
+    );
     chain
 }
 
@@ -260,6 +262,51 @@ mod tests {
     }
 
     #[test]
+    fn arguments_convert_from_str_integer_and_float() {
+        assert_eq!(Arg::from("Ada"), Arg::Str("Ada"));
+        assert_eq!(Arg::from(7_i64), Arg::Int(7));
+        assert_eq!(Arg::from(2.5_f64), Arg::Float(2.5));
+
+        let l = Localizer::new("en", &[("en", "amount = Total { $value }\n")]);
+        assert_eq!(l.format("amount", &[("value", 7_i64.into())]), "Total 7");
+        assert_eq!(
+            l.format("amount", &[("value", 2.5_f64.into())]),
+            "Total 2.5"
+        );
+        assert_eq!(
+            l.format("amount", &[("value", Arg::Float(-0.25))]),
+            "Total -0.25"
+        );
+        assert_eq!(l.format("amount", &[("value", "n/a".into())]), "Total n/a");
+    }
+
+    #[test]
+    fn debug_output_lists_the_chain_and_the_diagnostic_count() {
+        let l = Localizer::new("tr-TR", &sources());
+        assert_eq!(
+            format!("{l:?}"),
+            r#"Localizer { chain: ["tr-TR", "tr", "en"], diagnostics: 0 }"#
+        );
+        let broken = Localizer::new("en", &[("en", "ok = fine\nthis is junk\n")]);
+        let rendered = format!("{broken:?}");
+        assert!(rendered.starts_with(r#"Localizer { chain: ["en"], diagnostics: "#));
+        assert!(!rendered.ends_with("diagnostics: 0 }"));
+    }
+
+    #[test]
+    fn duplicate_ids_across_sources_keep_the_first_and_are_reported() {
+        let l = Localizer::new(
+            "en",
+            &[("en", "a = first\n"), ("en", "a = second\nb = other\n")],
+        );
+        assert_eq!(l.text("a"), "first");
+        assert_eq!(l.text("b"), "other");
+        assert_eq!(l.diagnostics().len(), 1);
+        let overridden = &l.diagnostics()[0];
+        assert!(overridden.starts_with("en: Overriding"), "{overridden}");
+    }
+
+    #[test]
     fn multiple_sources_for_one_locale_are_merged() {
         let l = Localizer::new("en", &[("en", "a = A\n"), ("en", "b = B\n")]);
         assert_eq!((l.text("a"), l.text("b")), ("A".to_owned(), "B".to_owned()));
@@ -277,16 +324,13 @@ mod tests {
     fn shipped_english_catalog_is_well_formed_and_complete() {
         let ftl = include_str!("../../../assets/i18n/en/main.ftl");
         let l = Localizer::new("en-US", &[("en", ftl)]);
-        assert!(l.diagnostics().is_empty(), "{:?}", l.diagnostics());
-        for cmd in CommandId::all() {
-            assert!(l.has_message(cmd.label_id()), "{}", cmd.label_id());
-        }
-        for group in CommandGroup::ALL {
-            assert!(l.has_message(group.label_id()), "{}", group.label_id());
-        }
-        for section in SettingsSection::ALL {
-            assert!(l.has_message(section.label_id()), "{}", section.label_id());
-        }
+        assert_eq!(l.diagnostics(), Vec::<String>::new());
+        let label_ids = CommandId::all()
+            .map(CommandId::label_id)
+            .chain(CommandGroup::ALL.iter().map(|g| g.label_id()))
+            .chain(SettingsSection::ALL.iter().map(|s| s.label_id()));
+        let missing: Vec<_> = label_ids.filter(|id| !l.has_message(id)).collect();
+        assert_eq!(missing, Vec::<&str>::new());
         assert_eq!(l.text(CommandId::FormatBold.label_id()), "Bold");
         assert_eq!(l.text("settings-section-shortcuts"), "Shortcuts");
     }

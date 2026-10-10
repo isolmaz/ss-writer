@@ -163,7 +163,7 @@ impl Document {
 mod tests {
     use super::*;
     use crate::markdown::ast::BlockKind;
-    use crate::text::TextRange;
+    use crate::text::{TextError, TextRange};
 
     fn insert(at: usize, text: &str) -> Transaction {
         Transaction::single(
@@ -184,10 +184,7 @@ mod tests {
         assert_eq!(doc.version(), 0);
         assert_eq!(doc.primary_selection(), Selection::caret(0));
         assert_eq!(doc.selections(), [Selection::caret(0)]);
-        assert!(matches!(
-            doc.ast().blocks[0].kind,
-            BlockKind::Heading { level: 1, .. }
-        ));
+        assert_eq!(doc.ast().blocks[0].heading_level(), Some(1));
         assert_eq!(doc.buffer().len(), 5);
         assert!(!doc.can_undo());
         assert!(!doc.can_redo());
@@ -200,10 +197,7 @@ mod tests {
         assert_eq!(doc.text(), "# Hi\n");
         assert_eq!(doc.version(), 1);
         assert_eq!(doc.primary_selection(), Selection::caret(2));
-        assert!(matches!(
-            doc.ast().blocks[0].kind,
-            BlockKind::Heading { level: 1, .. }
-        ));
+        assert_eq!(doc.ast().blocks[0].heading_level(), Some(1));
         assert!(doc.can_undo());
     }
 
@@ -219,6 +213,53 @@ mod tests {
         assert_eq!(doc.text(), "ab");
         assert_eq!(doc.version(), 0);
         assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn invalid_typing_transaction_leaves_document_and_history_untouched() {
+        let mut doc = Document::new("ab");
+        let bad = Transaction::single(
+            Edit::insert(9, "x"),
+            Selection::caret(0),
+            Selection::caret(1),
+        );
+        assert_eq!(
+            doc.apply_typing(bad, ms(0)),
+            Err(EditError::Text(TextError::OutOfBounds {
+                offset: 9,
+                len: 2
+            }))
+        );
+        assert_eq!(doc.text(), "ab");
+        assert_eq!(doc.version(), 0);
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
+    fn undo_and_redo_report_a_history_step_that_no_longer_fits() {
+        let stale = Transaction::single(
+            Edit::insert(9, "x"),
+            Selection::caret(0),
+            Selection::caret(1),
+        );
+        let out_of_bounds = Err(EditError::Text(TextError::OutOfBounds {
+            offset: 9,
+            len: 2,
+        }));
+
+        let mut doc = Document::new("ab");
+        doc.undo.push_command(stale.clone());
+        assert_eq!(doc.undo(), out_of_bounds);
+        assert_eq!(doc.text(), "ab");
+        assert_eq!(doc.version(), 0);
+        assert!(!doc.can_redo(), "a failed undo records no redo step");
+
+        let mut doc = Document::new("ab");
+        doc.undo.push_redo(stale);
+        assert_eq!(doc.redo(), out_of_bounds);
+        assert_eq!(doc.text(), "ab");
+        assert_eq!(doc.version(), 0);
+        assert!(!doc.can_undo(), "a failed redo records no undo step");
     }
 
     #[test]
@@ -305,7 +346,7 @@ mod tests {
         assert!(doc.undo().expect("undo"));
         assert_eq!(doc.text(), "Hi\n");
         assert_eq!(doc.primary_selection(), Selection::new(0, 2));
-        assert!(matches!(doc.ast().blocks[0].kind, BlockKind::Paragraph));
+        assert_eq!(doc.ast().blocks[0].kind, BlockKind::Paragraph);
         assert_eq!(doc.version(), 2);
         assert!(doc.can_redo());
         assert!(!doc.can_undo());
@@ -313,10 +354,7 @@ mod tests {
         assert!(doc.redo().expect("redo"));
         assert_eq!(doc.text(), "# Hi\n");
         assert_eq!(doc.primary_selection(), Selection::new(2, 4));
-        assert!(matches!(
-            doc.ast().blocks[0].kind,
-            BlockKind::Heading { .. }
-        ));
+        assert_eq!(doc.ast().blocks[0].heading_level(), Some(1));
         assert!(doc.can_undo());
         assert!(!doc.can_redo());
     }

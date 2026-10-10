@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::fmt;
+use std::ops::Deref;
 use std::rc::Rc;
 
 use windows::Win32::Foundation::{E_FAIL, HWND};
@@ -30,10 +31,27 @@ impl ITfEditSession_Impl for ClosureSession_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         // Release the borrow before running user code, which may request another session.
         let run = self.run.borrow_mut().take();
-        match run {
-            Some(run) => run(ec),
-            None => Ok(()),
-        }
+        // A session TSF runs twice does nothing the second time.
+        run.map_or(Ok(()), |run| run(ec))
+    }
+}
+
+/// The activated thread manager. Deactivates it when dropped, whichever way setup or teardown
+/// ends.
+struct ActiveThreadMgr(ITfThreadMgr);
+
+impl Deref for ActiveThreadMgr {
+    type Target = ITfThreadMgr;
+
+    fn deref(&self) -> &ITfThreadMgr {
+        &self.0
+    }
+}
+
+impl Drop for ActiveThreadMgr {
+    fn drop(&mut self) {
+        // SAFETY: balances the successful `Activate`; a failure leaves nothing to clean up.
+        let _ = unsafe { self.0.Deactivate() };
     }
 }
 
@@ -46,8 +64,9 @@ impl ITfEditSession_Impl for ClosureSession_Impl {
 /// order: `TS_LC_DESTROY`, text-edit sink, focus association, context pop (TSF unadvises the
 /// store), thread manager deactivation.
 pub struct TextServices {
+    // Fields drop in this order: the thread manager is deactivated first, after `Drop::drop`.
+    thread_mgr: ActiveThreadMgr,
     store: TextStore,
-    thread_mgr: ITfThreadMgr,
     client_id: u32,
     doc_mgr: ITfDocumentMgr,
     context: ITfContext,
@@ -78,22 +97,19 @@ impl TextServices {
                 .ctx("CoCreateInstance(TF_ThreadMgr)")?;
         // SAFETY: plain call on the live thread manager.
         let client_id = unsafe { thread_mgr.Activate() }.ctx("ITfThreadMgr::Activate")?;
-        match Self::attach(&thread_mgr, client_id, hwnd, host) {
-            Ok((store, doc_mgr, context, edit_sink_cookie)) => Ok(Self {
-                store,
-                thread_mgr,
-                client_id,
-                doc_mgr,
-                context,
-                edit_sink_cookie,
-                hwnd,
-            }),
-            Err(error) => {
-                // SAFETY: balances the successful `Activate` above.
-                let _ = unsafe { thread_mgr.Deactivate() };
-                Err(error)
-            }
-        }
+        // From here on the guard deactivates the manager, also when `attach` fails.
+        let thread_mgr = ActiveThreadMgr(thread_mgr);
+        let (store, doc_mgr, context, edit_sink_cookie) =
+            Self::attach(&thread_mgr, client_id, hwnd, host)?;
+        Ok(Self {
+            store,
+            thread_mgr,
+            client_id,
+            doc_mgr,
+            context,
+            edit_sink_cookie,
+            hwnd,
+        })
     }
 
     /// Creates the document manager and context for `store`, pushes it (TSF advises the
@@ -207,7 +223,7 @@ impl Drop for TextServices {
                 .thread_mgr
                 .AssociateFocus(self.hwnd, None::<&ITfDocumentMgr>);
             let _ = self.doc_mgr.Pop(TF_POPF_ALL);
-            let _ = self.thread_mgr.Deactivate();
         }
+        // The thread manager is deactivated when the `thread_mgr` field drops, after this.
     }
 }

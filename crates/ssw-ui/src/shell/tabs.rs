@@ -637,13 +637,13 @@ mod tests {
         );
         let events = tabs.take_events();
         assert_eq!(events.len(), 2);
-        for event in events {
-            let TabsEvent::ContextMenu { key, at, .. } = event else {
-                panic!("expected a context menu request, got {event:?}");
-            };
-            assert_eq!(key, 20);
-            assert_eq!(at, Point::new(200.0, 40.0));
-        }
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                TabsEvent::ContextMenu { key: 20, at, .. } if *at == Point::new(200.0, 40.0)
+            )),
+            "{events:?}"
+        );
         // F10 alone is not a context key; arrow keys still move the selection.
         assert!(!harness.key(&mut tabs, vk::F10).handled);
         assert!(harness.key(&mut tabs, vk::RIGHT).handled);
@@ -787,5 +787,13 @@ mod tests {
         let (mut harness, mut tabs) = setup();
         let bounds = harness.place(&mut tabs, Point::ZERO);
         assert_eq!(bounds.height, TAB_HEIGHT);
+    }
+
+    #[test]
+    fn a_custom_id_names_the_strip_in_the_access_tree() {
+        let id = WidgetId::allocate();
+        let tabs = DocumentTabs::new(&strings()).with_id(id);
+        assert_eq!(tabs.id(), id);
+        assert_eq!(Harness::new().node(&tabs).id, id);
     }
 }

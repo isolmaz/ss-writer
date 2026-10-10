@@ -114,7 +114,8 @@ impl Logger {
             OpenOptions::new().create(true).append(true).open(&path),
             &path,
         )?;
-        let size = io(file.metadata(), &path)?.len();
+        // The size only decides when to rotate: a handle that cannot report it starts at zero.
+        let size = file.metadata().map_or(0, |meta| meta.len());
         Ok(Self {
             dir: dir.to_path_buf(),
             options,

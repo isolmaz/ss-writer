@@ -399,6 +399,329 @@ impl IPreviewHandlerFrame_Impl for Frame_Impl {
     }
 }
 
+use windows::Win32::System::Ole::IOleWindow;
+use windows::Win32::UI::Shell::{IPreviewHandler, IPreviewHandler_Impl};
+
+const FLOW: &str = "graph TD\n  A[Start] --> B[End]\n";
+
+/// The pane of a stream that reports `name` and holds [`FLOW`].
+fn render_named_stream(name: &'static str) -> ssw_win::wic::DecodedImage {
+    let session = Session::new();
+    session.colors(WHITE, BLACK);
+    session
+        .initialize_with(&scripted_stream(Fault::Named(name), FLOW.as_bytes()))
+        .unwrap();
+    session.set_window().unwrap();
+    session.do_preview().unwrap();
+    session.render()
+}
+
+#[test]
+fn a_stream_named_mmd_is_one_diagram_and_other_names_are_markdown() {
+    let diagram = render_named_stream("flow.mmd");
+    let markdown = render_named_stream("flow.md");
+    assert!(ink(&diagram, WHITE_PIXEL) > 100);
+    assert_ne!(
+        diagram.bgra, markdown.bgra,
+        "the diagram is drawn, not its source"
+    );
+    assert_eq!(
+        markdown.bgra,
+        Session::show(FLOW).render().bgra,
+        "any other name is a Markdown file"
+    );
+}
+
+#[test]
+fn the_pane_rectangle_is_kept_until_the_preview_starts_and_followed_afterwards() {
+    let session = Session::new();
+    session.colors(WHITE, BLACK);
+    session.initialize(SAMPLE.as_bytes()).unwrap();
+    session.set_window().unwrap();
+    let smaller = RECT {
+        left: 10,
+        top: 20,
+        right: 310,
+        bottom: 220,
+    };
+    // SAFETY: a valid rectangle.
+    unsafe { session.handler.SetRect(&smaller) }.unwrap();
+    session.do_preview().unwrap();
+    let child = session.child().unwrap();
+    assert_eq!(
+        client_size(child),
+        (300, 200),
+        "DoPreview uses the latest rectangle"
+    );
+    // Another host takes the preview over with its own rectangle.
+    let other = common::Parent::new();
+    let moved = RECT {
+        left: 0,
+        top: 0,
+        right: 200,
+        bottom: 100,
+    };
+    // SAFETY: valid window handle and rectangle.
+    unsafe { session.handler.SetWindow(other.0, &moved) }.unwrap();
+    // SAFETY: a plain query of the parent of a live window.
+    let parent = unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(child) };
+    assert_eq!(parent.unwrap(), other.0);
+    assert_eq!(client_size(child), (200, 100));
+    // SAFETY: valid window handle and rectangle.
+    unsafe { session.handler.SetWindow(session.parent.0, &RECT_PANE) }.unwrap();
+}
+
+#[test]
+fn a_host_window_that_is_gone_fails_the_preview_and_the_handler_recovers() {
+    let session = Session::new();
+    session.initialize(b"x").unwrap();
+    let gone = common::Parent::new().0;
+    // SAFETY: a stale but non-null window handle is the point.
+    unsafe { session.handler.SetWindow(gone, &RECT_PANE) }.unwrap();
+    assert_eq!(
+        session.do_preview().unwrap_err().code(),
+        HRESULT::from_win32(1400),
+        "ERROR_INVALID_WINDOW_HANDLE"
+    );
+    assert!(session.child().is_err());
+    session.set_window().unwrap();
+    session.do_preview().unwrap();
+    assert!(is_window(session.child().unwrap()));
+}
+
+#[test]
+fn the_focus_goes_to_the_pane_and_the_keys_it_uses_stay_out_of_the_hosts_frame() {
+    let session = Session::new();
+    let keys = Rc::new(RefCell::new(Vec::new()));
+    let frame: IPreviewHandlerFrame = Frame {
+        keys: Rc::clone(&keys),
+    }
+    .into();
+    let site: IUnknown = frame.cast().unwrap();
+    let with_site: IObjectWithSite = session.handler.cast().unwrap();
+    // SAFETY: plain call with live interface pointers.
+    unsafe { with_site.SetSite(&site) }.unwrap();
+    session.colors(WHITE, BLACK);
+    session.initialize(SAMPLE.as_bytes()).unwrap();
+    session.set_window().unwrap();
+    session.do_preview().unwrap();
+    let child = session.child().unwrap();
+    // SAFETY: plain call.
+    let nobody = unsafe { session.handler.QueryFocus() };
+    assert_eq!(
+        nobody.unwrap_err().code(),
+        E_FAIL,
+        "nothing has the focus yet"
+    );
+    let down = || {
+        // SAFETY: a synchronous message to a window of this thread.
+        unsafe { SendMessageW(child, WM_KEYDOWN, Some(WPARAM(0x28)), Some(LPARAM(0))) };
+    };
+    down();
+    assert_eq!(
+        *keys.borrow(),
+        [(WM_KEYDOWN, 0x28)],
+        "an unfocused pane passes the key on"
+    );
+    // SAFETY: plain calls.
+    unsafe { session.handler.SetFocus() }.unwrap();
+    // SAFETY: plain call.
+    assert_eq!(unsafe { session.handler.QueryFocus() }.unwrap(), child);
+    down();
+    assert_eq!(
+        keys.borrow().len(),
+        1,
+        "a focused pane keeps the arrow keys"
+    );
+    // A click on the focused pane does not ask for the focus again.
+    mouse(child, WM_LBUTTONDOWN, 30, 40, 1);
+    mouse(child, WM_LBUTTONUP, 30, 40, 0);
+    assert_eq!(keys.borrow().len(), 1);
+}
+
+/// A host site that calls back into the handler while the handler releases it.
+#[implement(IPreviewHandlerFrame)]
+struct BusySite {
+    on_release: RefCell<Option<Box<dyn FnOnce()>>>,
+}
+
+impl Drop for BusySite {
+    fn drop(&mut self) {
+        if let Some(call) = self.on_release.get_mut().take() {
+            call();
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+impl IPreviewHandlerFrame_Impl for BusySite_Impl {
+    fn GetWindowContext(&self) -> windows::core::Result<PREVIEWHANDLERFRAMEINFO> {
+        Err(E_NOTIMPL.into())
+    }
+
+    fn TranslateAccelerator(&self, _pmsg: *const MSG) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+#[test]
+fn calls_that_arrive_while_the_handler_is_busy_fail_instead_of_aliasing_its_state() {
+    let session = Session::new();
+    let codes = Rc::new(RefCell::new(Vec::new()));
+    let refused_inspection = Rc::new(RefCell::new(false));
+    let (log, inspected) = (Rc::clone(&codes), Rc::clone(&refused_inspection));
+    let handler = session.handler.clone();
+    let parent = session.parent.0;
+    let call_back = move || {
+        let init: IInitializeWithStream = handler.cast().unwrap();
+        let with_site: IObjectWithSite = handler.cast().unwrap();
+        let ole: IOleWindow = handler.cast().unwrap();
+        let visuals: IPreviewHandlerVisuals = handler.cast().unwrap();
+        let mut seen = log.borrow_mut();
+        let mut note = |result: windows::core::Result<()>| seen.push(result.unwrap_err().code());
+        // SAFETY: plain calls with live interface pointers and valid arguments; every one of
+        // them is refused because the handler is in the middle of `SetSite`.
+        unsafe {
+            note(init.Initialize(&common::memory_stream(b"x"), 0));
+            note(handler.SetWindow(parent, &RECT_PANE));
+            note(handler.SetRect(&RECT_PANE));
+            note(handler.DoPreview());
+            note(handler.Unload());
+            note(handler.SetFocus());
+            note(handler.TranslateAccelerator(&MSG::default()));
+            note(with_site.SetSite(None::<&IUnknown>));
+            note(with_site.GetSite::<IUnknown>().map(|_| ()));
+            note(ole.GetWindow().map(|_| ()));
+            note(visuals.SetBackgroundColor(windows::Win32::Foundation::COLORREF(0)));
+            note(visuals.SetFont(&LOGFONTW::default()));
+            note(visuals.SetTextColor(windows::Win32::Foundation::COLORREF(0)));
+        }
+        *inspected.borrow_mut() =
+            render_preview(&handler, 10, 10, 96).is_err() && scroll_offset(&handler).is_none();
+    };
+    let frame: IPreviewHandlerFrame = BusySite {
+        on_release: RefCell::new(Some(Box::new(call_back))),
+    }
+    .into();
+    let site: IUnknown = frame.cast().unwrap();
+    let with_site: IObjectWithSite = session.handler.cast().unwrap();
+    // SAFETY: plain calls with live interface pointers; dropping the host's own references
+    // leaves the handler holding the only one, which `SetSite(None)` releases inside the call.
+    unsafe { with_site.SetSite(&site) }.unwrap();
+    drop((site, frame));
+    // SAFETY: as above.
+    unsafe { with_site.SetSite(None::<&IUnknown>) }.unwrap();
+    assert_eq!(*codes.borrow(), vec![E_FAIL; 13]);
+    assert!(
+        *refused_inspection.borrow(),
+        "inspection refuses a busy handler too"
+    );
+}
+
+/// A preview handler of some other implementation.
+#[implement(IPreviewHandler)]
+struct Stranger;
+
+#[allow(non_snake_case)]
+impl IPreviewHandler_Impl for Stranger_Impl {
+    fn SetWindow(&self, _hwnd: HWND, _prc: *const RECT) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn SetRect(&self, _prc: *const RECT) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn DoPreview(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn Unload(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn SetFocus(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn QueryFocus(&self) -> windows::core::Result<HWND> {
+        Ok(HWND::default())
+    }
+
+    fn TranslateAccelerator(&self, _pmsg: *const MSG) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn the_inspection_helpers_refuse_handlers_of_other_implementations() {
+    let stranger: IPreviewHandler = Stranger.into();
+    let refused = render_preview(&stranger, 10, 10, 96).err();
+    assert!(
+        matches!(
+            refused,
+            Some(ssw_win::com::WinError::Invalid(
+                "not a preview handler of this crate"
+            ))
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(scroll_offset(&stranger), None);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn every_platform_failure_while_previewing_or_rendering_is_a_clean_error() {
+    use ssw_preview::fault;
+
+    for n in 0.. {
+        let session = Session::new();
+        session.colors(WHITE, BLACK);
+        session.initialize(b"Some $x^2$ text\n").unwrap();
+        session.set_window().unwrap();
+        fault::arm(n);
+        let result = session.do_preview();
+        let tripped = fault::tripped();
+        fault::disarm();
+        if !tripped {
+            result.unwrap();
+            break;
+        }
+        assert_eq!(result.unwrap_err().code(), E_FAIL, "check {n}");
+        assert!(
+            session.child().is_err(),
+            "check {n}: nothing is left showing"
+        );
+        session.do_preview().unwrap();
+        assert!(
+            is_window(session.child().unwrap()),
+            "check {n}: the handler recovers"
+        );
+    }
+    let session = Session::show(SAMPLE);
+    for n in 0.. {
+        fault::arm(n);
+        let image = render_preview(&session.handler, WIDTH, HEIGHT, 96);
+        let tripped = fault::tripped();
+        fault::disarm();
+        if !tripped {
+            assert!(image.is_ok());
+            break;
+        }
+        let error = image.err().unwrap();
+        assert!(
+            matches!(error, ssw_win::com::WinError::Invalid("injected fault")),
+            "check {n}: {error:?}"
+        );
+        let size = client_size(session.child().unwrap());
+        assert_eq!(
+            size,
+            (WIDTH as i32, HEIGHT as i32),
+            "check {n}: the window is untouched"
+        );
+    }
+}
+
 #[test]
 fn keys_the_preview_does_not_use_go_to_the_hosts_frame() {
     let session = Session::new();

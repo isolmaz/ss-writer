@@ -48,6 +48,7 @@ use windows::Win32::Graphics::DirectManipulation::{
     IDirectManipulationViewport, IDirectManipulationViewportEventHandler,
     IDirectManipulationViewportEventHandler_Impl,
 };
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Input::Pointer::{
     GetPointerInfo, GetPointerType, POINTER_FLAG_INCONTACT, POINTER_INFO,
@@ -595,6 +596,31 @@ pub fn wants_contact(msg: u32, kind: POINTER_INPUT_TYPE) -> bool {
 #[must_use]
 pub fn pointer_id(wparam: WPARAM) -> u32 {
     (wparam.0 & 0xFFFF) as u32
+}
+
+/// The position, in client pixels of `hwnd`, of the pointer whose id is in the `wParam` of a
+/// pointer message; `None` when the system does not know the pointer (any more) or the window
+/// cannot convert the position. The window uses it to start a manipulation only for contacts
+/// that land on the scrollable area.
+#[must_use]
+pub fn pointer_client_position(hwnd: HWND, wparam: WPARAM) -> Option<(i32, i32)> {
+    let mut info = POINTER_INFO::default();
+    // SAFETY: valid out pointer; unknown ids make the call fail.
+    unsafe { GetPointerInfo(pointer_id(wparam), &mut info) }.ok()?;
+    let mut point = info.ptPixelLocation;
+    // SAFETY: converts the screen position in the local `point` with the caller's window handle;
+    // a window that is gone makes the call fail.
+    unsafe { ScreenToClient(hwnd, &mut point) }
+        .as_bool()
+        .then_some((point.x, point.y))
+}
+
+/// Whether the pointer whose id is in the `wParam` of a pointer message is a pen. The pen acts
+/// as a pointer (it selects text), so the window does not hand it to the viewport although
+/// [`wants_contact`] accepts it. `false` for unknown pointers.
+#[must_use]
+pub fn pointer_is_pen(wparam: WPARAM) -> bool {
+    pointer_type(pointer_id(wparam)) == Some(PT_PEN)
 }
 
 fn pointer_type(id: u32) -> Option<POINTER_INPUT_TYPE> {

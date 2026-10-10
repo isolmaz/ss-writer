@@ -11,11 +11,11 @@ use ssw_core::document::Document;
 use ssw_core::edit::Selection;
 use ssw_ui::access::{AccessAction, Role};
 use ssw_ui::canvas::DrawOp;
-use ssw_ui::geometry::{Point, Rect};
+use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::vk;
 use ssw_ui::shell::find::SharedDocument;
 use ssw_ui::shell::goto::{GoToEvent, GoToLine};
-use ssw_ui::widget::WidgetId;
+use ssw_ui::widget::{Widget, WidgetId};
 use ssw_ui::widgets::Control;
 use ssw_ui::widgets::anim::Motion;
 
@@ -183,4 +183,67 @@ fn another_document_can_be_navigated() {
     goto.set_input("3");
     assert!(goto.submit());
     assert_eq!(caret(&other), 4);
+}
+
+#[test]
+fn the_overlay_measures_its_panel_and_nothing_while_hidden() {
+    let (mut host, mut goto, _doc) = setup("a\nbb", 0);
+    assert_eq!(
+        host.measure(&mut goto, Size::new(800.0, 600.0)),
+        Size::new(360.0, 76.0)
+    );
+    // A narrow editor leaves the padding on both sides; an unbounded one gets the widest panel.
+    assert_eq!(
+        host.measure(&mut goto, Size::new(200.0, 600.0)),
+        Size::new(184.0, 76.0)
+    );
+    assert_eq!(
+        host.measure(&mut goto, Size::UNBOUNDED),
+        Size::new(360.0, 76.0)
+    );
+    goto.close();
+    assert_eq!(host.measure(&mut goto, Size::new(800.0, 600.0)), Size::ZERO);
+}
+
+#[test]
+fn a_valid_position_gets_a_muted_hint_and_painting_follows_visibility_and_damage() {
+    let (mut host, mut goto, _doc) = setup("a\nbb\nccc", 0);
+    let muted = host.theme.tokens.text_muted;
+    let canvas = host.paint(&goto);
+    let hint = canvas.ops().find_map(|op| match op {
+        DrawOp::Text { text, color, .. } if text == "Type a line number between 1 and 3" => {
+            Some(*color)
+        }
+        _ => None,
+    });
+    assert_eq!(hint, Some(muted));
+    // Nothing is drawn outside the damaged area.
+    let away = Rect::new(0.0, 400.0, 100.0, 100.0);
+    assert_eq!(host.paint_damaged(&goto, Some(away)).ops().count(), 0);
+    let over = goto.panel();
+    assert!(host.paint_damaged(&goto, Some(over)).ops().count() > 0);
+    // A hidden overlay draws nothing at all.
+    goto.close();
+    host.layout(&mut goto, WINDOW);
+    assert_eq!(host.paint(&goto).ops().count(), 0);
+}
+
+#[test]
+fn clicking_the_box_takes_the_focus_back() {
+    let (mut host, mut goto, _doc) = setup("a\nbb", 0);
+    host.focus.blur();
+    assert_eq!(host.focus.focused(), None);
+    let at = goto.input().bounds().center();
+    assert!(host.click(&mut goto, at).handled);
+    assert_eq!(host.focus.focused(), Some(goto.input().id()));
+}
+
+#[test]
+fn the_overlay_itself_takes_no_accessibility_actions() {
+    let (mut host, mut goto, _doc) = setup("a", 0);
+    let id = goto.id();
+    let mut cx = host.cx(id);
+    for action in [AccessAction::Invoke, AccessAction::Focus] {
+        assert!(!Widget::perform(&mut goto, &mut cx, &action));
+    }
 }

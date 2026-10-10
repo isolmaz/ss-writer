@@ -12,6 +12,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Tests only: lets `fault::arm` make the n-th checked system call fail (see src/fault.rs).
+fault-injection = []
+
 [dependencies]
 ssw-core = { path = "../ssw-core" }
 thiserror = "2"

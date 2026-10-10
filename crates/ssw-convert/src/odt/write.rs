@@ -653,15 +653,11 @@ impl<'a, 'r> Writer<'a, 'r> {
             BlockKind::Heading { level, .. } => {
                 self.prev_space = true;
                 let inner = self.inlines(&block.inlines, RunFmt::default());
-                let inner = match self.heading_bookmarks.get(&block.range.start).cloned() {
-                    Some(name) => {
-                        let name = attr(&name);
-                        format!(
-                            r#"<text:bookmark-start text:name="{name}"/>{inner}<text:bookmark-end text:name="{name}"/>"#
-                        )
-                    }
-                    None => inner,
-                };
+                // `export_odt` registers a bookmark for every heading before any block is written
+                let name = attr(&self.heading_bookmarks[&block.range.start]);
+                let inner = format!(
+                    r#"<text:bookmark-start text:name="{name}"/>{inner}<text:bookmark-end text:name="{name}"/>"#
+                );
                 let level = (*level).clamp(1, 6);
                 let extra = format!(r#" text:outline-level="{level}""#);
                 self.element(
@@ -683,7 +679,6 @@ impl<'a, 'r> Writer<'a, 'r> {
                 self.paragraph(parent, props, &block.inlines);
             }
             BlockKind::List { ordered, start, .. } => self.list(block, *ordered, *start),
-            BlockKind::ListItem { .. } => self.blocks(&block.children, ctx),
             BlockKind::BlockQuote => {
                 let inner = Ctx {
                     quote: ctx.quote.saturating_add(1),
@@ -748,7 +743,9 @@ impl<'a, 'r> Writer<'a, 'r> {
                     self.paragraph("Text_20_body", ParaProps::default(), &block.inlines);
                 }
             }
-            BlockKind::FrontMatter { .. }
+            // list items are written by `list`; the rest is not part of the page
+            BlockKind::ListItem { .. }
+            | BlockKind::FrontMatter { .. }
             | BlockKind::FootnoteDefinition { .. }
             | BlockKind::LinkReferenceDefinition(_) => {}
         }
@@ -1630,6 +1627,67 @@ mod tests {
         writer.blocks(&document.blocks, Ctx::default());
         assert_eq!(writer.body.matches("<text:list-item>").count(), 2);
         assert_eq!(writer.body.matches("<text:list ").count(), 1);
+    }
+
+    #[test]
+    fn jpeg_headers_may_have_noise_between_segments() {
+        let mut noisy = vec![0xFF, 0xD8, 0x12, 0x34, 0xFF];
+        noisy.extend_from_slice(&jpeg(2, 3)[3..]);
+        let info = image_info(&noisy).unwrap();
+        assert_eq!((info.ext, info.width, info.height), ("jpg", 2, 3));
+    }
+
+    #[test]
+    fn plain_text_of_inlines_skips_images_and_footnote_references() {
+        let src = "a \\* &amp; `c` $x$ [[Page]] ![i](p.png) j[^1] *k*\nl\\\nm\n\n[^1]: note\n";
+        let document = parse_document(src);
+        let mut text = String::new();
+        inline_text(src, &document.blocks[0].inlines, &mut text);
+        assert_eq!(text, "a * & c x Page  j k l m");
+    }
+
+    #[test]
+    fn block_text_joins_nested_blocks_with_spaces() {
+        let src = "- one\n- two\n";
+        let document = parse_document(src);
+        assert_eq!(block_text(src, &document.blocks[0]), "one two");
+    }
+
+    #[test]
+    fn text_xml_keeps_line_breaks_tabs_and_trailing_spaces() {
+        let mut image = |_: &str| -> Option<Vec<u8>> { None };
+        let mut math = |_: &str, _: bool| -> Option<MathImage> { None };
+        let mut resources = Resources {
+            image: &mut image,
+            math: &mut math,
+        };
+        let mut writer = Writer::new("", &ExportOptions::default(), &mut resources);
+        assert_eq!(
+            writer.text_xml("a\nb\rc\td"),
+            "a<text:line-break/>b<text:line-break/>c<text:tab/>d"
+        );
+        writer.prev_space = true;
+        assert_eq!(writer.text_xml("x  "), r#"x <text:s text:c="1"/>"#);
+        assert_eq!(writer.text_run(RunFmt::default(), ""), "");
+    }
+
+    #[test]
+    fn height_only_images_keep_their_aspect_ratio() {
+        // p.jpg is 10x20 pixels: a height of 40 gives a width of 20
+        let xml = content("<img src=\"p.jpg\" height=\"40\">\n");
+        assert_has(&xml, &[r#"svg:width="0.529cm" svg:height="1.058cm""#]);
+    }
+
+    #[test]
+    fn footnotes_with_lists_and_without_content() {
+        let xml = content("x[^1] y[^2]\n\n[^1]: first\n\n    - one\n    - two\n\n[^2]:\n");
+        assert_has(
+            &xml,
+            &[
+                r#"<text:p text:style-name="Footnote">first</text:p><text:p text:style-name="Footnote">one two</text:p>"#,
+                r#"<text:note-body><text:p text:style-name="Footnote"/></text:note-body>"#,
+            ],
+        );
     }
 
     #[test]

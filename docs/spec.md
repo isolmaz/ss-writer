@@ -48,11 +48,12 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 
 ### 2.3 Paste priority
 1. Image only → saved as a file per attachment settings; inserts `![](relative/path.png)`. Each pasted image becomes its own file.
-2. Files (`CF_HDROP`) → images embedded, other files linked (attachment chip).
-3. VS Code (`vscode-editor-data` format present) or HTML whose whole content is one monospace block → plain text (inside a fenced block if the caret is not in one).
+2. Files (`CF_HDROP`) → images embedded (copied into the attachment folder unless they already lie inside the document's folder or workspace), other files linked where they are (attachment chip).
+3. VS Code (`vscode-editor-data` format present) or HTML whose whole content is one monospace block → plain text; with several lines it goes inside a fenced block unless the caret is already in one. Text VS Code copied from a Markdown or plain-text file is ordinary text (pasted as it is, never fenced).
 4. HTML (`HTML Format`) → converted to Markdown (Word `mso-list`, Google Docs, browsers).
 5. Plain text.
-- Inside a code block, always plain text. `Ctrl+Shift+V` always plain text.
+- Inside a code block, always plain text. `Ctrl+Shift+V` always plain text. Text copied in SS Writer pastes back exactly (its private `SS Writer Markdown` clipboard format wins over the HTML).
+- A document without a file has no attachment folder: pasting a picture asks to save the document first; pasted files are linked by their absolute path.
 
 ### 2.4 Selection & navigation
 - Click caret, Shift+click extend, double-click word, triple-click paragraph, drag select, drag-drop move (Ctrl = copy) including onto other tabs.
@@ -194,7 +195,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Status bar (View toggle): Ln/Col, words, zoom %, encoding, EOL (encoding/EOL clickable).
 
 ## 9. Copy, share, export, print
-- `Ctrl+C` puts Markdown text (`CF_UNICODETEXT`), `HTML Format` and `Rich Text Format` on the clipboard. Edit → Copy as: Plain text (markers stripped), Markdown, Rich text, HTML.
+- `Ctrl+C` puts Markdown text (`CF_UNICODETEXT`), `HTML Format` and `Rich Text Format` on the clipboard (local images of the selection are embedded); `Ctrl+X` does the same and removes the selection. Edit → Copy as: Plain text (markers stripped), Markdown, Rich text (RTF + HTML, plain text as fallback), HTML (also as text). Documents that are not Markdown copy their text only.
 - Share (`DataTransferManager` via `IDataTransferManagerInterop`): shares the file.
 - Export (File → Export): PDF, PNG, JPG, HTML (single file, embedded CSS/images, math as SVG), ePub, DOCX, ODT, RTF, TXT, Markdown with attachments, TextBundle. Options: page size (A4/Letter), margins, base font size, page numbers, black text, light theme, include title. PDF/PNG/JPG through Typst. Mermaid exportable as PNG/SVG from its context menu.
 - Print (`Ctrl+P`): system print dialog; pages from the Typst layout drawn as vectors through `ID2D1PrintControl`.

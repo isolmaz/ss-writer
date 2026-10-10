@@ -619,6 +619,16 @@ mod tests {
     }
 
     #[test]
+    fn styles_without_a_name_are_ignored() {
+        let s = styles(
+            r#"<office:automatic-styles><style:style style:family="text"><style:text-properties fo:font-weight="bold"/></style:style><style:style style:name="B" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style></office:automatic-styles>"#,
+            None,
+        );
+        assert_eq!(s.text("B").bold, Some(true));
+        assert_eq!(s.text(""), TextProps::default());
+    }
+
+    #[test]
     fn reads_character_properties() {
         let p = props(
             r##"fo:font-weight="bold" fo:font-style="oblique" style:text-underline-style="solid" style:text-line-through-style="solid" fo:background-color="#ffff00" fo:color="#ff0000" style:text-position="super 58%" text:display="none" style:font-name="Plain""##,

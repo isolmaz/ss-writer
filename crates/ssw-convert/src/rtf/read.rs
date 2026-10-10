@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use crate::doc::md::flank;
 use crate::import::{Asset, ImportError, ImportResult, LossKind};
 
 /// Group nesting beyond this depth is ignored (the groups are still balanced).
@@ -1108,7 +1109,7 @@ fn render_runs(runs: &[Run], heading: bool) -> String {
             let mut j = i;
             let mut label = String::new();
             while j < merged.len() && merged[j].link.as_ref() == Some(url) {
-                label.push_str(&render_run(&merged[j], heading, true));
+                label.push_str(&render_neighbored(&merged, j, heading, true));
                 j += 1;
             }
             out.push('[');
@@ -1118,14 +1119,38 @@ fn render_runs(runs: &[Run], heading: bool) -> String {
             out.push(')');
             i = j;
         } else {
-            out.push_str(&render_run(run, heading, false));
+            out.push_str(&render_neighbored(&merged, i, heading, false));
             i += 1;
         }
     }
     out
 }
 
-fn render_run(run: &Run, heading: bool, in_link: bool) -> String {
+/// Renders `runs[at]` with the characters of its neighbours in the same link (or outside any
+/// link) that touch its marks.
+fn render_neighbored(runs: &[Run], at: usize, heading: bool, in_link: bool) -> String {
+    let run = &runs[at];
+    let touching = |neighbor: Option<&Run>, before: bool| {
+        let other = neighbor.filter(|n| n.link == run.link)?;
+        if before {
+            other.text.chars().next_back()
+        } else {
+            other.text.chars().next()
+        }
+    };
+    let before = touching(at.checked_sub(1).map(|p| &runs[p]), true);
+    let after = touching(runs.get(at + 1), false);
+    render_run(run, heading, in_link, before, after)
+}
+
+/// Renders one run; `before` and `after` are the text characters next to it.
+fn render_run(
+    run: &Run,
+    heading: bool,
+    in_link: bool,
+    before: Option<char>,
+    after: Option<char>,
+) -> String {
     let text = if run.raw {
         run.text.clone()
     } else {
@@ -1155,7 +1180,16 @@ fn render_run(run: &Run, heading: bool, in_link: bool) -> String {
         open.push('*');
         close.insert(0, '*');
     }
-    format!("{lead}{open}{trimmed}{close}{trail}")
+    if open.is_empty() {
+        return text;
+    }
+    let before = if lead.is_empty() { before } else { None };
+    let after = if trail.is_empty() { after } else { None };
+    let (pre, inner, post, marked) = flank(trimmed, false, before, after);
+    if !marked {
+        return text;
+    }
+    format!("{lead}{pre}{open}{inner}{close}{post}{trail}")
 }
 
 /// Imports RTF bytes into Markdown, assets and a loss report.
@@ -1225,6 +1259,17 @@ mod tests {
                 "a\\*b\\_c\\`d\\[e\\]f\\<g\\>h\\~i\\$j\\|k\n",
             ),
             ("{\\rtf1 line\\line two\\par}", "line\\\ntwo\n"),
+            // optional and non-breaking hyphens, a backslash before a line end, an unknown symbol
+            (
+                "{\\rtf1 a\\-b\\_c\\\nd\\!e\\par}",
+                "a\u{ad}b\u{2011}c\n\nde\n",
+            ),
+            // a high surrogate followed by another high surrogate, or by a BMP character
+            (
+                "{\\rtf1\\uc0 \\u-10240\\u-10179\\u-8704 x\\par}",
+                "\u{fffd}\u{1f600}x\n",
+            ),
+            ("{\\rtf1\\uc0 \\u-10240\\u65 x\\par}", "\u{fffd}Ax\n"),
         ];
         for (rtf, expected) in table {
             assert_eq!(md(rtf), expected, "{rtf}");
@@ -1255,6 +1300,123 @@ mod tests {
         }
         let r = import_rtf(b"{\\rtf1 hide{\\v secret}x\\par}").unwrap();
         assert!(r.losses.iter().any(|l| l.kind == LossKind::HiddenText));
+    }
+
+    #[test]
+    fn emphasis_next_to_punctuation_parses_back() {
+        use crate::doc::md::probe::{expect, runs};
+        // (rtf, markdown, runs of equal emphasis the editor's parser finds in the markdown)
+        type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+        let table: [Case; 10] = [
+            (
+                "{\\rtf1 x{\\b  bold }y\\par}",
+                "x **bold** y\n",
+                &[("x ", ""), ("bold", "b"), (" y", "")],
+            ),
+            (
+                "{\\rtf1 a{\\b bold.}b\\par}",
+                "a**bold**.b\n",
+                &[("a", ""), ("bold", "b"), (".b", "")],
+            ),
+            (
+                "{\\rtf1 a{\\b (bold)}b\\par}",
+                "a(**bold**)b\n",
+                &[("a(", ""), ("bold", "b"), (")b", "")],
+            ),
+            (
+                "{\\rtf1 a{\\b b}c\\par}",
+                "a**b**c\n",
+                &[("a", ""), ("b", "b"), ("c", "")],
+            ),
+            (
+                "{\\rtf1 a{\\i b}c\\par}",
+                "a*b*c\n",
+                &[("a", ""), ("b", "i"), ("c", "")],
+            ),
+            ("{\\rtf1 a{\\b --}b\\par}", "a--b\n", &[("a--b", "")]),
+            (
+                "{\\rtf1 {\\b Note:}text\\par}",
+                "**Note**:text\n",
+                &[("Note", "b"), (":text", "")],
+            ),
+            (
+                "{\\rtf1 a{\\b\\i b.}c\\par}",
+                "a***b***.c\n",
+                &[("a", ""), ("b", "bi"), (".c", "")],
+            ),
+            // the delimiters of a marked run next to another marked run still see the letter
+            (
+                "{\\rtf1 {\\b x}{\\i (y)}\\par}",
+                "**x**(*y)*\n",
+                &[("x", "b"), ("(", ""), ("y)", "i")],
+            ),
+            // a run inside a link sees only its neighbours in the same link
+            (
+                "{\\rtf1 {\\field{\\*\\fldinst HYPERLINK \"http://u\"}{\\fldrslt {\\b a.}b}}\\par}",
+                "[**a**.b](http://u)\n",
+                &[("a", "b"), (".b", "")],
+            ),
+        ];
+        for (rtf, want, spans) in table {
+            let markdown = md(rtf);
+            assert_eq!(markdown, want, "{rtf}");
+            assert_eq!(runs(&markdown), expect(spans), "{rtf}");
+        }
+    }
+
+    #[test]
+    fn font_charsets_map_to_windows_code_pages() {
+        let cases = [
+            (77, Some(10000)),
+            (128, Some(932)),
+            (129, Some(949)),
+            (134, Some(936)),
+            (136, Some(950)),
+            (161, Some(1253)),
+            (162, Some(1254)),
+            (163, Some(1258)),
+            (177, Some(1255)),
+            (178, Some(1256)),
+            (186, Some(1257)),
+            (204, Some(1251)),
+            (222, Some(874)),
+            (238, Some(1250)),
+            (0, None),
+            (1, None),
+        ];
+        for (charset, codepage) in cases {
+            assert_eq!(codepage_for_charset(charset), codepage, "charset {charset}");
+        }
+    }
+
+    #[test]
+    fn bytes_are_decoded_with_their_code_page() {
+        let cases: [(u32, &[u8], &str); 15] = [
+            (874, &[0xA1], "\u{e01}"),
+            (932, &[0x82, 0xA0], "\u{3042}"),
+            (936, &[0xB0, 0xA1], "\u{554a}"),
+            (949, &[0xB0, 0xA1], "\u{ac00}"),
+            (950, &[0xA4, 0x40], "\u{4e00}"),
+            (1250, &[0xBF], "\u{17c}"),
+            (1251, &[0xE9], "\u{439}"),
+            (1253, &[0xE1], "\u{3b1}"),
+            (1254, &[0xFE], "\u{15f}"),
+            (1255, &[0xE0], "\u{5d0}"),
+            (1256, &[0xC7], "\u{627}"),
+            (1257, &[0xE0], "\u{105}"),
+            (1258, &[0xD0], "\u{110}"),
+            (10000, &[0x80], "\u{c4}"),
+            (65001, &[0xC3, 0xA9], "\u{e9}"),
+        ];
+        for (codepage, bytes, expected) in cases {
+            assert_eq!(
+                decode_bytes(codepage, bytes),
+                expected,
+                "code page {codepage}"
+            );
+        }
+        // an unknown code page is read as windows-1252
+        assert_eq!(decode_bytes(12345, &[0xE9]), "\u{e9}");
     }
 
     #[test]

@@ -444,6 +444,13 @@ fn write_failures_are_reported_without_leaving_half_written_state() {
 
     // A good entry survives a failing manifest update during discard.
     store.backup(&untitled("good", "G"), 1).unwrap();
+    // The manifest update creates the folder too (a discard does nothing else before it).
+    fault.fail(FsOp::CreateDirAll, FsFailure::AccessDenied, 1);
+    assert!(matches!(
+        store.discard("good"),
+        Err(RecoveryError::Fs(FsError::AccessDenied(_)))
+    ));
+    assert_eq!(ids(&store), ["good"]);
     fault.fail_always(FsOp::WriteNew, FsFailure::DiskFull);
     assert!(matches!(
         store.discard("good"),

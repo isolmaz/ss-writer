@@ -39,6 +39,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::{IUnknown, PCWSTR};
 
+use crate::fault::check;
+
 /// Win32 error codes the file layer reacts to.
 pub mod win32 {
     /// `ERROR_FILE_NOT_FOUND`.
@@ -468,6 +470,12 @@ pub(crate) fn wide(path: &Path) -> Vec<u16> {
         .collect()
 }
 
+/// Writes all of `data` to the freshly created `file` and flushes it to the disk.
+fn write_and_sync(mut file: std::fs::File, path: &Path, data: &[u8]) -> Result<(), FsError> {
+    io(file.write_all(data), path)?;
+    io(file.sync_all(), path)
+}
+
 /// The production implementation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RealFs;
@@ -517,15 +525,14 @@ impl FileSystem for RealFs {
     }
 
     fn write_new(&self, path: &Path, data: &[u8]) -> Result<(), FsError> {
-        let mut file = io(
+        let file = io(
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(path),
             path,
         )?;
-        io(file.write_all(data), path)?;
-        io(file.sync_all(), path)
+        write_and_sync(file, path, data)
     }
 
     fn replace_file(&self, target: &Path, replacement: &Path) -> Result<(), FsError> {
@@ -696,44 +703,70 @@ struct ComApartment;
 
 impl Drop for ComApartment {
     fn drop(&mut self) {
-        // SAFETY: balanced with the successful `CoInitializeEx` in `recycle_on_sta`.
+        // SAFETY: balanced with the successful `CoInitializeEx` in `enter_sta`.
         unsafe { CoUninitialize() };
     }
 }
 
-fn recycle_on_sta(paths: &[PathBuf], first: &Path) -> Result<(), FsError> {
-    // SAFETY: initializes COM for this dedicated thread; balanced by `ComApartment::drop`.
+/// Enters a single-threaded apartment on the calling thread; leaving it is the guard's drop.
+fn enter_sta(first: &Path) -> Result<ComApartment, FsError> {
+    // SAFETY: initializes COM for this thread; balanced by `ComApartment::drop`.
     let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    win(init.ok(), first)?;
-    let _apartment = ComApartment;
+    win(check(init.ok()), first)?;
+    Ok(ComApartment)
+}
+
+/// A silent, undo-able (Recycle Bin) `IFileOperation` with nothing queued yet.
+fn new_operation(first: &Path) -> Result<IFileOperation, FsError> {
     // SAFETY: `FileOperation` is the registered CLSID of `IFileOperation`.
     let operation: IFileOperation = win(
-        unsafe { CoCreateInstance(&FileOperation, None::<&IUnknown>, CLSCTX_ALL) },
+        check(unsafe { CoCreateInstance(&FileOperation, None::<&IUnknown>, CLSCTX_ALL) }),
         first,
     )?;
     // SAFETY: valid COM object on its owning thread.
     let flags_set = unsafe {
         operation.SetOperationFlags(FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT)
     };
-    win(flags_set, first)?;
-    for path in paths {
-        let name = wide(path);
-        // SAFETY: `name` is NUL-terminated and outlives the call.
-        let item: IShellItem = win(
-            unsafe { SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None::<&IBindCtx>) },
-            path,
-        )?;
-        // SAFETY: `item` is a valid shell item; no progress sink is used.
-        let deleted = unsafe { operation.DeleteItem(&item, None::<&IFileOperationProgressSink>) };
-        win(deleted, path)?;
-    }
+    win(check(flags_set), first)?;
+    Ok(operation)
+}
+
+/// Queues the deletion of `path`; nothing happens to the item before `perform`.
+fn queue_delete(operation: &IFileOperation, path: &Path) -> Result<(), FsError> {
+    let name = wide(path);
+    // SAFETY: `name` is NUL-terminated and outlives the call.
+    let item: IShellItem = win(
+        check(unsafe { SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None::<&IBindCtx>) }),
+        path,
+    )?;
+    // SAFETY: `item` is a valid shell item; no progress sink is used.
+    let deleted = unsafe { operation.DeleteItem(&item, None::<&IFileOperationProgressSink>) };
+    win(check(deleted), path)
+}
+
+/// Runs the queued operations and reports a shell abort.
+fn perform(operation: &IFileOperation, first: &Path) -> Result<(), FsError> {
     // SAFETY: valid COM object on its owning thread.
-    win(unsafe { operation.PerformOperations() }, first)?;
+    win(check(unsafe { operation.PerformOperations() }), first)?;
+    ensure_not_aborted(operation, first)
+}
+
+/// [`FsError::AccessDenied`] when the shell stopped a queued operation before it finished.
+fn ensure_not_aborted(operation: &IFileOperation, first: &Path) -> Result<(), FsError> {
     // SAFETY: valid COM object on its owning thread.
-    let aborted = win(unsafe { operation.GetAnyOperationsAborted() }, first)?;
+    let aborted = win(check(unsafe { operation.GetAnyOperationsAborted() }), first)?;
     (!aborted.as_bool())
         .then_some(())
         .ok_or(FsError::AccessDenied(first.to_path_buf()))
+}
+
+fn recycle_on_sta(paths: &[PathBuf], first: &Path) -> Result<(), FsError> {
+    let _apartment = enter_sta(first)?;
+    let operation = new_operation(first)?;
+    for path in paths {
+        queue_delete(&operation, path)?;
+    }
+    perform(&operation, first)
 }
 
 /// The kind of call a [`FaultFs`] script targets.
@@ -977,5 +1010,124 @@ impl FileSystem for FaultFs {
             paths.first().map_or(Path::new(""), PathBuf::as_path),
         )?;
         self.inner.recycle(paths)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_and_sync_stores_the_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        let file = std::fs::File::create_new(&path).unwrap();
+        write_and_sync(file, &path, b"payload").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn write_and_sync_classifies_write_and_flush_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.txt");
+        std::fs::write(&path, b"old").unwrap();
+        let denied = FsError::AccessDenied(path.clone());
+        // A read-only handle cannot write: the write fails before anything is flushed.
+        let read_only = std::fs::File::open(&path).unwrap();
+        assert_eq!(write_and_sync(read_only, &path, b"x"), Err(denied.clone()));
+        // Nothing to write, so the write succeeds; flushing needs write access and fails.
+        let read_only = std::fs::File::open(&path).unwrap();
+        assert_eq!(write_and_sync(read_only, &path, b""), Err(denied));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+    }
+
+    #[cfg(feature = "fault-injection")]
+    mod com_faults {
+        use windows::Win32::Foundation::E_FAIL;
+
+        use super::*;
+        use crate::fault;
+
+        /// Runs `body` on a fresh thread: COM state and the failure countdown are per thread.
+        fn on_thread<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+            std::thread::scope(|scope| scope.spawn(body).join().unwrap())
+        }
+
+        fn injected(path: &Path) -> FsError {
+            FsError::Os {
+                code: E_FAIL.0.cast_unsigned(),
+                path: path.to_path_buf(),
+            }
+        }
+
+        #[test]
+        fn every_step_of_a_recycle_reports_the_injected_failure() {
+            let first = Path::new("C:\\ssw-io-never-recycled.txt");
+            // Checked calls of an empty recycle, in order: CoInitializeEx, CoCreateInstance,
+            // SetOperationFlags, PerformOperations. Nothing is queued, so no step of this sweep
+            // can move a real item to the Recycle Bin. (The shell rejects an empty queue
+            // itself, so the abort query after it is tested on its own below.)
+            for call in 0..4 {
+                let (result, tripped) = on_thread(|| {
+                    fault::arm(call);
+                    let result = recycle_on_sta(&[], first);
+                    (result, fault::tripped())
+                });
+                assert!(tripped, "checked call {call} was reached");
+                assert_eq!(result, Err(injected(first)), "checked call {call}");
+            }
+        }
+
+        #[test]
+        fn the_abort_query_reports_its_failure_and_a_clean_run() {
+            let first = Path::new("C:\\ssw-io-never-recycled.txt");
+            // Nothing was performed, so nothing was aborted.
+            let (failed, tripped, clean) = on_thread(|| {
+                let _apartment = enter_sta(first).unwrap();
+                let operation = new_operation(first).unwrap();
+                fault::arm(0);
+                let failed = ensure_not_aborted(&operation, first);
+                let tripped = fault::tripped();
+                fault::arm(1);
+                let clean = ensure_not_aborted(&operation, first);
+                (failed, tripped, clean)
+            });
+            assert!(tripped);
+            assert_eq!(failed, Err(injected(first)));
+            assert_eq!(clean, Ok(()));
+        }
+
+        #[test]
+        fn a_failing_queue_step_names_the_item_and_leaves_it_alone() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("kept.txt");
+            std::fs::write(&file, b"kept").unwrap();
+            // Checked calls of `queue_delete`: SHCreateItemFromParsingName, DeleteItem. The
+            // operation is never performed, so the file stays where it is.
+            for call in 0..2 {
+                let (result, tripped) = on_thread(|| {
+                    let _apartment = enter_sta(&file).unwrap();
+                    let operation = new_operation(&file).unwrap();
+                    fault::arm(call);
+                    let result = queue_delete(&operation, &file);
+                    (result, fault::tripped())
+                });
+                assert!(tripped, "checked call {call} was reached");
+                assert_eq!(result, Err(injected(&file)), "checked call {call}");
+            }
+            let (result, tripped) = on_thread(|| {
+                let _apartment = enter_sta(&file).unwrap();
+                let operation = new_operation(&file).unwrap();
+                fault::arm(2);
+                let result = queue_delete(&operation, &file);
+                (result, fault::tripped())
+            });
+            assert_eq!(result, Ok(()));
+            assert!(
+                !tripped,
+                "queueing a deletion makes exactly two checked calls"
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"kept");
+        }
     }
 }

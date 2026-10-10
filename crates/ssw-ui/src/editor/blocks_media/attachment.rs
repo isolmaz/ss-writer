@@ -4,7 +4,7 @@
 
 use std::rc::Rc;
 
-use ssw_core::markdown::ast::{Block, BlockKind, InlineKind, LinkKind};
+use ssw_core::markdown::ast::{Block, InlineKind, LinkKind};
 use ssw_core::text::TextRange;
 
 use crate::canvas::{Canvas, ImageId};
@@ -39,9 +39,7 @@ impl AttachmentRenderer {
 
 impl SpecialRenderer for AttachmentRenderer {
     fn try_measure(&self, cx: &BlockCx<'_>, block: &Block) -> Option<Box<dyn BlockLayout>> {
-        if !matches!(block.kind, BlockKind::Paragraph) {
-            return None;
-        }
+        // Registered for paragraphs only (see `register_with`).
         let [inline] = block.inlines.as_slice() else {
             return None;
         };

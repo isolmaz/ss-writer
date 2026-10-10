@@ -393,11 +393,17 @@ mod tests {
             if let Some((_, color)) = icon {
                 assert_eq!(color, tokens.accent_text_on);
             }
-            let fill = canvas.ops().find_map(|op| match op {
-                DrawOp::FillRoundedRect { rect, color, .. } => Some((*rect, *color)),
-                _ => None,
-            });
-            let (rect, color) = fill.unwrap_or_else(|| panic!("no box fill"));
+            // The mark is drawn after the box: look from the end.
+            let fill = canvas
+                .ops()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .find_map(|op| match op {
+                    DrawOp::FillRoundedRect { rect, color, .. } => Some((*rect, *color)),
+                    _ => None,
+                });
+            let (rect, color) = fill.expect("the box is filled");
             assert_eq!(rect, Rect::new(bounds.x, bounds.y + 6.0, 20.0, 20.0));
             if state == ToggleState::Off {
                 assert_eq!(color.a, 0.0);
@@ -471,5 +477,21 @@ mod tests {
         harness.requests.take_invalidation();
         harness.frame(&mut check, 16);
         assert!(harness.requests.invalidation().is_clean());
+    }
+
+    #[test]
+    fn kit_checkbox_with_id_names_the_control_and_paints_only_where_damaged() {
+        let id = WidgetId::allocate();
+        let mut checkbox = CheckBox::new("Agree", ToggleState::Off).with_id(id);
+        assert_eq!(checkbox.id(), id);
+        let mut harness = crate::widgets::testkit::Harness::new();
+        assert_eq!(harness.node(&checkbox).id, id);
+        let bounds = harness.place(&mut checkbox, Point::new(10.0, 10.0));
+        let away = Rect::new(500.0, 500.0, 5.0, 5.0);
+        assert_eq!(
+            harness.paint_damaged(&checkbox, Some(away)).ops().count(),
+            0
+        );
+        assert!(harness.paint_damaged(&checkbox, Some(bounds)).ops().count() > 0);
     }
 }

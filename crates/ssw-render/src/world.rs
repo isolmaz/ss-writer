@@ -291,6 +291,14 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn the_main_file_is_served_from_the_current_source_text() {
+        let world = TypstWorld::new(None);
+        world.compile("hello world").expect("compiles");
+        let bytes = World::file(&world, World::main(&world)).expect("main file");
+        assert!(String::from_utf8_lossy(bytes.as_slice()).contains("hello world"));
+    }
+
     fn first_text(doc: &PagedDocument) -> String {
         let mut out = String::new();
         for (_, item) in doc.pages()[0].frame.items() {
@@ -421,6 +429,49 @@ mod tests {
         std::os::unix::fs::symlink(outer.join("secret.txt"), root.join("link.txt")).expect("link");
         let world = TypstWorld::new(Some(&root));
         assert!(!world.file_available("link.txt"));
+        std::fs::remove_dir_all(&outer).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_out_of_the_root_are_denied() {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let outer = temp_dir("junction");
+        let root = outer.join("doc");
+        let elsewhere = outer.join("elsewhere");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        std::fs::write(elsewhere.join("secret.txt"), "secret").expect("write");
+        std::fs::write(root.join("inside.txt"), "inside").expect("write");
+        let link = root.join("link");
+        // A junction needs no privilege, unlike a symbolic link.
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&elsewhere)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .expect("cmd runs");
+        assert!(made.status.success(), "mklink /J failed: {made:?}");
+        // The junction really leads to the file, so the denial below is down to the allow-list.
+        assert_eq!(
+            std::fs::read(link.join("secret.txt")).expect("via link"),
+            b"secret"
+        );
+
+        let world = TypstWorld::new(Some(&root));
+        assert!(world.file_available("inside.txt"));
+        assert!(!world.file_available("link/secret.txt"));
+        let denied = world
+            .compile("#read(\"link/secret.txt\")")
+            .expect_err("denied");
+        assert!(!denied.message.is_empty());
+        // Remove the junction itself first so the cleanup can never walk through it.
+        std::fs::remove_dir(&link).expect("unlink");
         std::fs::remove_dir_all(&outer).expect("cleanup");
     }
 

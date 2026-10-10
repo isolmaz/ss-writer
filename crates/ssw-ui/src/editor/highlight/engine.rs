@@ -186,17 +186,18 @@ impl<'a> Scanner<'a> {
     }
 
     fn run(&mut self) {
-        let mut i = match self.state.mode {
-            Mode::Comment => self.comment_body(0, 0),
-            Mode::Str(rule) => {
+        // Only languages with block comments ever end a line inside one.
+        let mut i = match (self.state.mode, self.spec.block_comment) {
+            (Mode::Comment, Some(delimiters)) => self.comment_body(delimiters, 0, 0),
+            (Mode::Str(rule), _) => {
                 let raw = self.state.depth == 1;
                 self.string_body(0, usize::from(rule), 0, raw)
             }
-            Mode::RawStr => self.raw_body(0, 0, usize::from(self.state.depth)),
+            (Mode::RawStr, _) => self.raw_body(0, 0, usize::from(self.state.depth)),
             _ => self.line_start(),
         };
-        while i < self.line.len() {
-            i = self.token(i);
+        while let Some(ch) = self.line.get(i..).and_then(|rest| rest.chars().next()) {
+            i = self.token(i, ch);
         }
     }
 
@@ -218,11 +219,14 @@ impl<'a> Scanner<'a> {
         i + len
     }
 
-    fn comment_body(&mut self, token_start: usize, from: usize) -> usize {
+    /// Scans the rest of a block comment delimited by `(open, close)`.
+    fn comment_body(
+        &mut self,
+        (open, close): (&str, &str),
+        token_start: usize,
+        from: usize,
+    ) -> usize {
         let line = self.line;
-        let Some((open, close)) = self.spec.block_comment else {
-            return line.len();
-        };
         let mut j = from;
         while j < line.len() {
             let rest = &line[j..];
@@ -418,13 +422,10 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Scans the token at `i`; returns the index after it.
-    fn token(&mut self, i: usize) -> usize {
+    /// Scans the token at `i`, which starts with `ch`; returns the index after it.
+    fn token(&mut self, i: usize, ch: char) -> usize {
         let line = self.line;
         let rest = &line[i..];
-        let Some(ch) = rest.chars().next() else {
-            return line.len();
-        };
         if ch.is_whitespace() {
             return i + ch.len_utf8();
         }
@@ -439,14 +440,14 @@ impl<'a> Scanner<'a> {
             self.push(i, line.len(), TokenKind::Comment);
             return line.len();
         }
-        if let Some((open, _)) = self.spec.block_comment
-            && rest.starts_with(open)
+        if let Some(delimiters) = self.spec.block_comment
+            && rest.starts_with(delimiters.0)
         {
             self.state = State {
                 mode: Mode::Comment,
                 depth: 1,
             };
-            return self.comment_body(i, i + open.len());
+            return self.comment_body(delimiters, i, i + delimiters.0.len());
         }
         if let Some(index) = self
             .spec

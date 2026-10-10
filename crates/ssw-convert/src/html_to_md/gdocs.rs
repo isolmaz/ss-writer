@@ -82,13 +82,15 @@ mod tests {
         );
         let list = |id: &str| {
             let mut stack = vec![doc.clone()];
+            let mut found = None;
             while let Some(node) = stack.pop() {
                 if attr(&node, "id").as_deref() == Some(id) {
-                    return node;
+                    found = Some(node);
+                    break;
                 }
                 stack.extend(children(&node));
             }
-            panic!("no list {id}");
+            found.expect("the document has a list with that id")
         };
         let first_item = |id: &str| {
             children(&list(id))

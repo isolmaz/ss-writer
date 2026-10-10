@@ -810,6 +810,31 @@ fn a_raw_table_still_offers_its_cell_menu_flagged_raw() {
 }
 
 #[test]
+fn a_raw_table_places_carets_hits_and_selections_in_its_source_text() {
+    let lab = Lab::new("| a | b\\|c |\n|---|---|\n| 1 | 2 |\n");
+    let layout = lab.layout();
+    let last_row = lab.at("| 1");
+
+    let caret = layout.caret_rect(last_row + 2);
+    assert!(
+        close(caret.x, 2.0 * 8.0),
+        "two advances into the line: {caret:?}"
+    );
+    assert!(caret.y > 0.0, "on the third source line: {caret:?}");
+    let probe = Point::new(caret.x + 1.0, caret.y + caret.height / 2.0);
+    assert_eq!(layout.hit_test(probe), last_row + 2);
+    assert_eq!(
+        layout.line_range(last_row + 3),
+        TextRange::new(last_row, last_row + "| 1 | 2 |".len())
+    );
+
+    let rects = layout.selection_rects(TextRange::new(last_row + 2, last_row + 5));
+    assert_eq!(rects.len(), 1);
+    assert!(close(rects[0].x, 2.0 * 8.0) && close(rects[0].width, 3.0 * 8.0));
+    assert!(close(rects[0].y, caret.y));
+}
+
+#[test]
 fn edit_as_raw_markdown_shows_the_source_until_the_caret_leaves_the_table() {
     let text = format!("{SAMPLE}\nafter\n");
     let mut h = Harness::new(&text);

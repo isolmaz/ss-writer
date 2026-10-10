@@ -26,10 +26,7 @@ impl ItemRef<'_> {
     }
 
     pub fn checkbox(&self) -> Option<ast::Task> {
-        match self.item.kind {
-            BlockKind::ListItem { task, .. } => task,
-            _ => None,
-        }
+        self.item.task()
     }
 }
 
@@ -927,5 +924,20 @@ mod tests {
         ] {
             assert_eq!(quote_prefix_len(line), len, "{line:?}");
         }
+    }
+
+    #[test]
+    fn common_affixes_never_split_a_character() {
+        assert_eq!(common_affixes("1. é\n", "1. ©\n"), (3, 1));
+        assert_eq!(common_affixes("é", "ê"), (0, 0));
+        assert_eq!(common_affixes("1. a\n2. b", "1. a\n3. b"), (5, 3));
+    }
+
+    #[test]
+    fn finish_without_a_net_change_yields_an_empty_transaction() {
+        check("1. a\n2. b‸", "1. a\n2. b‸", |c| {
+            let end = Selection::caret(c.buffer.len());
+            Some(finish(c, vec![Edit::insert(0, "")], end))
+        });
     }
 }

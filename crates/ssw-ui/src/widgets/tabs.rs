@@ -1190,4 +1190,82 @@ mod tests {
             Event::AnimationFrame(std::time::Duration::from_millis(5)),
         );
     }
+
+    #[test]
+    fn kit_tabs_with_id_and_measure() {
+        let id = WidgetId::allocate();
+        let (mut harness, strip) = strip(3, 700.0);
+        let mut strip = strip.with_id(id);
+        assert_eq!(strip.id(), id);
+        assert_eq!(harness.node(&strip).id, id);
+        assert_eq!(
+            harness.measure(&mut strip, Size::new(500.0, 40.0)).width,
+            500.0
+        );
+        let wanted = harness.measure(&mut strip, Size::UNBOUNDED);
+        assert_eq!(wanted.width, 3.0 * TAB_MAX_WIDTH + NEW_TAB_SIZE);
+    }
+
+    #[test]
+    fn kit_tabs_a_closed_dragged_tab_ends_the_drag() {
+        let (mut harness, mut strip) = strip(3, 700.0);
+        let last = strip.tab_rect(2).center();
+        press(&mut harness, &mut strip, PointerButton::Left, last);
+        assert_eq!(strip.dragging(), Some(2));
+        strip.remove_tab(2);
+        harness.pointer(
+            &mut strip,
+            PointerEventKind::Move,
+            None,
+            Point::new(last.x + 5.0, last.y),
+        );
+        assert_eq!(strip.dragging(), None);
+    }
+
+    #[test]
+    fn kit_tabs_a_short_drag_keeps_the_order() {
+        let (mut harness, mut strip) = strip(3, 700.0);
+        let first = strip.tab_rect(0).center();
+        press(&mut harness, &mut strip, PointerButton::Left, first);
+        strip.take_events();
+        harness.pointer(
+            &mut strip,
+            PointerEventKind::Move,
+            None,
+            Point::new(first.x + 5.0, first.y),
+        );
+        assert!(strip.take_events().is_empty());
+        assert_eq!(strip.dragging(), Some(0));
+        assert_eq!(strip.key_at(0), Some(10));
+    }
+
+    #[test]
+    fn kit_tabs_an_empty_strip_has_no_key_navigation() {
+        let (_, mut strip) = strip(0, 700.0);
+        assert!(!strip.key(crate::input::vk::RIGHT));
+        assert!(!strip.key(crate::input::vk::HOME));
+    }
+
+    #[test]
+    fn kit_tabs_scrolled_out_tabs_are_not_painted_and_disabled_titles_are_dimmed() {
+        let (mut harness, mut strip) = strip(10, 700.0);
+        let titles = |harness: &mut Harness, strip: &TabStrip| {
+            harness
+                .paint(strip)
+                .texts()
+                .iter()
+                .filter(|text| text.starts_with("doc"))
+                .count()
+        };
+        assert!(titles(&mut harness, &strip) < 10);
+        let tokens = harness.theme.tokens;
+        let dimmed = |harness: &mut Harness, strip: &TabStrip| {
+            harness.paint(strip).ops().any(
+                |op| matches!(op, DrawOp::Text { color, .. } if *color == tokens.text_disabled),
+            )
+        };
+        assert!(!dimmed(&mut harness, &strip));
+        strip.set_enabled(false);
+        assert!(dimmed(&mut harness, &strip));
+    }
 }

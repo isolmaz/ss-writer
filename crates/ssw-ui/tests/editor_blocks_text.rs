@@ -13,7 +13,7 @@ use ssw_core::text::TextRange;
 use ssw_ui::canvas::{Canvas, Dash, DrawOp, IconFont, RecordingCanvas};
 use ssw_ui::editor::block::{
     BlockClass, BlockCx, BlockEdit, BlockLayout, BlockPaintCx, BlockPress, BlockRegistry,
-    BlockRenderer,
+    BlockRenderer, GapLayout, HeadingRenderer,
 };
 use ssw_ui::editor::blocks_text::{self, BlockStrings};
 use ssw_ui::editor::config::LinkTarget;
@@ -21,7 +21,7 @@ use ssw_ui::editor::display::Reveal;
 use ssw_ui::editor::object::NoObjects;
 use ssw_ui::editor::{Composition, EditorConfig, EditorEvent, EditorStrings};
 use ssw_ui::geometry::{Color, CornerRadii, Point, Rect, Size};
-use ssw_ui::input::{Cursor, Modifiers};
+use ssw_ui::input::{Cursor, Modifiers, PointerEventKind};
 use ssw_ui::text::MonoTextEngine;
 use ssw_ui::theme::{CalloutKind as ThemeKind, DEFAULT_ACCENT, Theme};
 
@@ -991,6 +991,8 @@ fn a_footnote_definition_shows_its_label_beside_the_text() {
 /// A block of fixed height that records where it is asked about.
 struct ProbeLayout {
     range: TextRange,
+    link: LinkTarget,
+    press: bool,
 }
 
 impl BlockLayout for ProbeLayout {
@@ -1022,7 +1024,7 @@ impl BlockLayout for ProbeLayout {
     }
 
     fn link_at(&self, _point: Point) -> Option<LinkTarget> {
-        Some(LinkTarget::Url("probe".into()))
+        Some(self.link.clone())
     }
 
     fn context_menu(&self, point: Point, origin: Point) -> Option<EditorEvent> {
@@ -1034,10 +1036,12 @@ impl BlockLayout for ProbeLayout {
     }
 
     fn press(&self, point: Point, origin: Point, _mods: Modifiers) -> Option<BlockPress> {
-        Some(BlockPress::Edit(BlockEdit {
-            range: self.range,
-            text: format!("{} {}", origin.x + point.x, origin.y + point.y),
-        }))
+        self.press.then(|| {
+            BlockPress::Edit(BlockEdit {
+                range: self.range,
+                text: format!("{} {}", origin.x + point.x, origin.y + point.y),
+            })
+        })
     }
 
     fn cursor_at(&self, _point: Point) -> Option<Cursor> {
@@ -1049,18 +1053,36 @@ impl BlockLayout for ProbeLayout {
     }
 }
 
-struct Probe;
+/// Lays every block out as a [`ProbeLayout`] with `link` under the pointer; `press` makes a
+/// press replace the block with the position it was made at.
+struct Probe {
+    link: LinkTarget,
+    press: bool,
+}
+
+impl Probe {
+    fn url() -> Rc<Self> {
+        Rc::new(Self {
+            link: LinkTarget::Url("probe".into()),
+            press: true,
+        })
+    }
+}
 
 impl BlockRenderer for Probe {
     fn measure(&self, _cx: &BlockCx<'_>, block: &Block) -> Box<dyn BlockLayout> {
-        Box::new(ProbeLayout { range: block.range })
+        Box::new(ProbeLayout {
+            range: block.range,
+            link: self.link.clone(),
+            press: self.press,
+        })
     }
 }
 
 #[test]
 fn other_block_kinds_inside_containers_are_laid_out_through_the_registry() {
     let mut f = Fixture::new("- item\n\n  ```\n  x\n  ```\n");
-    f.registry.register(BlockClass::CodeBlock, Rc::new(Probe));
+    f.registry.register(BlockClass::CodeBlock, Probe::url());
     let layout = f.measure(0, &[]);
     let (col, line, spacing) = (1.5 * f.body(), f.line(), f.config.spacing_px());
     let top = line + spacing;
@@ -1154,6 +1176,225 @@ fn a_stray_list_item_is_laid_out_as_a_one_item_list() {
     assert_eq!(canvas.texts(), ["b"]);
 }
 
+#[test]
+fn a_callout_body_forwards_geometry_and_interaction_to_its_children() {
+    let mut f = Fixture::new("> [!NOTE]\n> ```\n> x\n> ```\n");
+    f.registry.register(BlockClass::CodeBlock, Probe::url());
+    let layout = f.measure(0, &[]);
+    let code = f.block(0).children.last().expect("the code block").range;
+    let inside = Point::new(100.0, layout.height() - 0.5 * f.body() - 10.0);
+
+    assert_eq!(
+        layout.link_at(inside),
+        Some(LinkTarget::Url("probe".into()))
+    );
+    assert!(layout.task_box_at(inside).is_none());
+    let origin = Point::new(7.0, 11.0);
+    let Some(EditorEvent::HeadingMenu { anchor, .. }) = layout.context_menu(inside, origin) else {
+        panic!("the probe opens a menu");
+    };
+    assert!(close(anchor.x, origin.x + inside.x) && close(anchor.y, origin.y + inside.y));
+
+    // A line inside the body is the child's line, not the header's.
+    assert_eq!(layout.line_range(code.start), code);
+    // A selection inside the body has no rectangle in the header.
+    let rects = layout.selection_rects(code);
+    assert_eq!(rects.len(), 1);
+    assert!(rects[0].y >= f.line(), "below the header: {:?}", rects[0]);
+}
+
+#[test]
+fn a_callout_body_task_is_found_through_the_callout() {
+    let src = "> [!NOTE]\n> see [link](http://x.test)\n> - [ ] task\n";
+    let f = Fixture::new(src);
+    let layout = f.measure(0, &[]);
+    let line = f.line();
+
+    let link = layout.caret_rect(src.find("link").expect("link"));
+    let on_link = Point::new(link.x + 2.0, link.y + link.height / 2.0);
+    assert_eq!(
+        layout.link_at(on_link),
+        Some(LinkTarget::Url("http://x.test".into()))
+    );
+
+    let task = layout.caret_rect(src.find("task").expect("task"));
+    let y = task.y + line / 2.0;
+    let found = (0..WIDTH as u32)
+        .find_map(|x| layout.task_box_at(Point::new(x as f32, y)))
+        .expect("the checkbox is reported through the callout");
+    assert_eq!(found.offset, src.find("[ ]").expect("marker"));
+    assert!(found.rect.y <= y && y <= found.rect.bottom());
+}
+
+#[test]
+fn an_empty_list_item_answers_through_an_empty_stack() {
+    let f = Fixture::new("-\n");
+    let layout = f.measure(0, &[]);
+    let item = f.block(0).children[0].range;
+    let col = 1.5 * f.body();
+
+    // Right of the marker column there is no content: the end of the item.
+    assert_eq!(layout.hit_test(Point::new(100.0, 5.0)), item.end);
+    assert_eq!(layout.line_range(item.start), item);
+    let caret = layout.caret_rect(item.end);
+    assert!(close(caret.x, col) && close(caret.y, 0.0), "{caret:?}");
+    assert!(close(caret.height, f.line()));
+}
+
+#[test]
+fn an_empty_quote_is_one_blank_row() {
+    let f = Fixture::new(">\n");
+    let layout = f.measure(0, &[]);
+    let range = f.block(0).range;
+    assert!(close(layout.height(), f.line()));
+    assert_eq!(layout.hit_test(Point::new(100.0, 5.0)), range.end);
+    assert_eq!(layout.line_range(range.start), range);
+    let caret = layout.caret_rect(range.end);
+    assert!(close(caret.x, 3.0 + 0.7 * f.body()) && close(caret.height, f.line()));
+}
+
+#[test]
+fn blank_rows_of_a_container_are_not_interactive() {
+    let f = Fixture::new("> a\n>\n> b\n");
+    let layout = f.measure(0, &[]);
+    let (line, spacing) = (f.line(), f.config.spacing_px());
+    let blank = Point::new(50.0, line + spacing / 2.0);
+    assert!(layout.link_at(blank).is_none());
+    assert!(layout.task_box_at(blank).is_none());
+    assert!(layout.context_menu(blank, Point::ZERO).is_none());
+    assert!(layout.press(blank, Point::ZERO, Modifiers::NONE).is_none());
+    assert!(layout.cursor_at(blank).is_none());
+}
+
+#[test]
+fn links_in_a_container_need_the_point_on_the_text() {
+    let src = "> see [l](http://x.test)\n";
+    let f = Fixture::new(src);
+    let layout = f.measure(0, &[]);
+    let caret = layout.caret_rect(src.find("l](").expect("link text"));
+    let y = caret.y + caret.height / 2.0;
+    assert_eq!(
+        layout.link_at(Point::new(caret.x + 2.0, y)),
+        Some(LinkTarget::Url("http://x.test".into()))
+    );
+    assert!(layout.link_at(Point::new(WIDTH - 10.0, y)).is_none());
+}
+
+// ----- block.rs: classes, defaults, plain text blocks ------------------------------------------
+
+#[test]
+fn every_block_kind_maps_to_its_class() {
+    let cases = [
+        ("para\n", BlockClass::Paragraph),
+        ("# h\n", BlockClass::Heading),
+        ("- a\n", BlockClass::List),
+        ("> q\n", BlockClass::BlockQuote),
+        ("> [!NOTE]\n", BlockClass::Callout),
+        ("```\nx\n```\n", BlockClass::CodeBlock),
+        ("$$\nx\n$$\n", BlockClass::MathBlock),
+        ("| a |\n|---|\n", BlockClass::Table),
+        ("***\n", BlockClass::ThematicBreak),
+        ("---\ntitle: x\n---\n", BlockClass::FrontMatter),
+        ("<div>\nhi\n</div>\n", BlockClass::HtmlBlock),
+        ("[^1]: note\n", BlockClass::FootnoteDefinition),
+        ("[ref]: /url\n", BlockClass::LinkReferenceDefinition),
+        ("<!-- pagebreak -->\n", BlockClass::PageBreak),
+    ];
+    for (src, class) in cases {
+        let doc = Document::new(src);
+        assert_eq!(BlockClass::of(&doc.ast().blocks[0].kind), class, "{src:?}");
+    }
+}
+
+#[test]
+fn a_blank_gap_uses_the_layout_defaults() {
+    let strings = EditorStrings::default();
+    let gap = GapLayout::new(TextRange::new(2, 2), 12.0);
+    assert!(close(gap.height(), 12.0));
+    assert!(close(gap.content_width(), 0.0));
+    assert_eq!(gap.gutter_hit(Point::new(-10.0, 5.0)), None);
+    assert_eq!(gap.cursor_at(Point::new(1.0, 1.0)), None);
+    assert_eq!(gap.hit_test(Point::new(50.0, 5.0)), 2);
+    assert_eq!(gap.line_range(0), TextRange::new(2, 2));
+    assert_eq!(gap.access_label(&strings), strings.blank_line);
+    assert!(gap.selection_rects(TextRange::new(2, 2)).is_empty());
+    assert_eq!(gap.selection_rects(TextRange::new(1, 3)).len(), 1);
+    assert_eq!(gap.caret_rect(2), Rect::new(0.0, 0.0, 0.0, 12.0));
+}
+
+#[test]
+fn paragraphs_and_raw_blocks_describe_themselves() {
+    let mut f = Fixture::new("see [l](http://x.test)\n\n> quote\n");
+    f.registry = BlockRegistry::with_defaults();
+    let paragraph = f.measure(0, &[]);
+    assert_eq!(paragraph.access_label(&f.strings), f.strings.paragraph);
+    // Only a heading has gutter widgets.
+    assert_eq!(paragraph.gutter_hit(Point::new(-30.0, 5.0)), None);
+
+    // A link answers over its text and not in the empty space after the line.
+    let link = paragraph.caret_rect(5);
+    let y = link.y + link.height / 2.0;
+    assert_eq!(
+        paragraph.link_at(Point::new(link.x + 2.0, y)),
+        Some(LinkTarget::Url("http://x.test".into()))
+    );
+    assert!(paragraph.link_at(Point::new(WIDTH - 10.0, y)).is_none());
+
+    // Without a renderer the quote is dimmed source.
+    let raw = f.measure(1, &[]);
+    assert_eq!(raw.access_label(&f.strings), f.strings.block);
+}
+
+#[test]
+fn the_heading_renderer_sizes_a_block_that_is_not_a_heading_as_level_one() {
+    let mut f = Fixture::new("# abc\n\nabc\n");
+    f.registry
+        .register(BlockClass::Paragraph, Rc::new(HeadingRenderer));
+    let heading = f.measure(0, &[]);
+    let lookalike = f.measure(1, &[]);
+    assert!(close(lookalike.height(), heading.height()));
+    assert!(lookalike.height() > f.line(), "taller than a body line");
+}
+
+#[test]
+fn contexts_and_registries_show_what_identifies_them() {
+    let f = Fixture::new("a\n");
+    let reveal = Reveal::new(true, Vec::new());
+    let cx = BlockCx {
+        text: &f.engine,
+        theme: &f.theme,
+        config: &f.config,
+        buffer: f.doc.buffer(),
+        ast: f.doc.ast(),
+        reveal: &reveal,
+        objects: &NoObjects,
+        composition: None,
+        width: WIDTH,
+        folded: true,
+        strings: &f.strings,
+        registry: &f.registry,
+    };
+    let printed = format!("{cx:?}");
+    assert!(printed.contains("width: 352.0"), "{printed}");
+    assert!(printed.contains("folded: true"), "{printed}");
+
+    let paint = BlockPaintCx {
+        theme: &f.theme,
+        config: &f.config,
+        strings: &f.strings,
+        text: &f.engine,
+        hovered: true,
+    };
+    assert!(format!("{paint:?}").contains("hovered: true"));
+
+    // The default registry knows paragraphs and headings, listed in sorted order.
+    let registry = format!("{:?}", BlockRegistry::default());
+    assert!(
+        registry.contains(r#"["Heading", "Paragraph"]"#),
+        "{registry}"
+    );
+}
+
 // ----- in the editor --------------------------------------------------------------------------
 
 fn editor(text: &str, size: Size) -> Harness {
@@ -1179,6 +1420,91 @@ fn clicking_a_task_checkbox_toggles_it_in_one_undo_step() {
     assert_eq!(h.selection(), before, "the caret does not move");
     h.key(editor_common::KEY_Z, Modifiers::CTRL);
     assert_eq!(h.text(), "- [ ] a\n\nb\n", "one undo step");
+}
+
+#[test]
+fn a_read_only_view_leaves_a_clicked_task_checkbox_alone() {
+    let mut h = editor("- [ ] a\n\nb\n", Size::new(400.0, 200.0));
+    let (body, line) = (h.view.config().body_size(), h.view.config().line_px());
+    let box_center = Point::new(
+        h.left + 1.5 * body - 0.4 * body - 0.95 * body / 2.0,
+        TOP + line / 2.0,
+    );
+    h.set_caret(10);
+    h.view.set_read_only(true);
+    h.click(box_center, 1, Modifiers::NONE);
+    assert_eq!(h.text(), "- [ ] a\n\nb\n");
+    assert!(!h.doc.borrow().can_undo());
+}
+
+#[test]
+fn the_pointer_is_a_hand_over_a_task_checkbox_and_a_text_cursor_beside_it() {
+    let mut h = editor("- [ ] a\n\nb\n", Size::new(400.0, 200.0));
+    let (body, line) = (h.view.config().body_size(), h.view.config().line_px());
+    let box_center = Point::new(
+        h.left + 1.5 * body - 0.4 * body - 0.95 * body / 2.0,
+        TOP + line / 2.0,
+    );
+    h.set_caret(10);
+    h.pointer(PointerEventKind::Move, box_center, 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Hand));
+    let beside = Point::new(h.left + 3.0 * body, TOP + line / 2.0);
+    h.pointer(PointerEventKind::Move, beside, 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+}
+
+#[test]
+fn the_pointer_over_a_heading_shows_its_open_fold_chevron() {
+    let mut h = editor("# Title\n\nbody\n", Size::new(400.0, 200.0));
+    h.set_caret(12);
+    assert!(
+        icons(&h.paint()).is_empty(),
+        "no chevron until the pointer is over the heading"
+    );
+    let over = Point::new(h.left + 10.0, TOP + 10.0);
+    h.pointer(PointerEventKind::Move, over, 0, Modifiers::NONE);
+    let shown = icons(&h.paint());
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0].0, '\u{E70D}', "the chevron of an open section");
+    assert_eq!(shown[0].1, h.theme.tokens.text_muted);
+}
+
+#[test]
+fn a_block_press_edit_replaces_the_block_as_one_undo_step() {
+    let mut h = editor("```\nx\n```\n\npara\n", Size::new(400.0, 200.0));
+    h.view
+        .registry_mut()
+        .register(BlockClass::CodeBlock, Probe::url());
+    h.arrange();
+    h.click(Point::new(h.left + 5.0, TOP + 5.0), 1, Modifiers::NONE);
+    assert_eq!(
+        h.text(),
+        format!("{} {}\n\npara\n", h.left + 5.0, TOP + 5.0)
+    );
+    h.key(editor_common::KEY_Z, Modifiers::CTRL);
+    assert_eq!(h.text(), "```\nx\n```\n\npara\n");
+}
+
+#[test]
+fn a_footnote_link_without_a_definition_only_places_the_caret() {
+    let mut h = editor("```\nx\n```\n\npara\n", Size::new(400.0, 200.0));
+    h.view.registry_mut().register(
+        BlockClass::CodeBlock,
+        Rc::new(Probe {
+            link: LinkTarget::Footnote("missing".into()),
+            press: false,
+        }),
+    );
+    h.arrange();
+    h.set_caret(h.text().len() - 1);
+    h.events();
+    h.click(Point::new(h.left + 5.0, TOP + 5.0), 1, Modifiers::NONE);
+    assert_eq!(h.selection().head, 0, "the caret went to the block");
+    assert!(
+        !h.events()
+            .iter()
+            .any(|event| matches!(event, EditorEvent::LinkActivated(_)))
+    );
 }
 
 #[test]

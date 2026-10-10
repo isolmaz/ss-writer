@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
+build = "build.rs"
+
+[lib]
+name = "ssw_app"
+path = "src/lib.rs"
 
 [[bin]]
 name = "SSWriter"
@@ -17,3 +22,27 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+ssw-core = { path = "../ssw-core" }
+ssw-io = { path = "../ssw-io" }
+ssw-convert = { path = "../ssw-convert" }
+ssw-render = { path = "../ssw-render" }
+ssw-ui = { path = "../ssw-ui" }
+ssw-win = { path = "../ssw-win" }
+serde_json = "1"
+thiserror = "2"
+# Message numbers and handle types of the window glue (`ui::window`, `ui::platform`); every
+# call into the OS goes through `ssw-win`.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+embed-manifest = "1.4"
+
+[dev-dependencies]
+tempfile = "3"
+# Decodes the PNG pages of the dark-theme export tests (the version and features `ssw-render` uses).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# A second connection to the state database that breaks it, for the failed-purge test of
+# `autosave` (the same version and feature as `ssw-io`).
+rusqlite = { version = "0.40", features = ["bundled"] }
+# `TBPFLAG` of the recording taskbar double in `tests/ui_window.rs`.
+windows = { version = "0.62", features = ["Win32_UI_Shell"] }

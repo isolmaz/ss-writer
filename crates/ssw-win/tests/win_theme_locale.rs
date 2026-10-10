@@ -224,3 +224,12 @@ fn language_ids_and_grouping_strings_convert() {
         "1234"
     );
 }
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_failing_colorization_query_leaves_the_accent_to_the_other_sources() {
+    // One checked call: the DWM query. Its failure is "no colorization color".
+    let outcomes = ssw_win::fault::sweep(|| Win32Settings.colorization_color());
+    assert_eq!(outcomes, [None]);
+    assert!(Win32Settings.colorization_color().is_some());
+}

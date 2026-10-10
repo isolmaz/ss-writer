@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,6 +11,11 @@ use ssw_io::folder_search::{
     FileMatches, MAX_PREVIEW_BYTES, SearchError, SearchOptions, SearchSummary, search_folder,
 };
 use tempfile::{TempDir, tempdir};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::{
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+};
+use windows::Win32::System::IO::OVERLAPPED;
 
 fn write(root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
     let path = rel
@@ -341,6 +347,59 @@ fn files_that_cannot_be_opened_are_counted_not_fatal() {
     assert_eq!(found.len(), 1);
     assert_eq!(summary.unreadable, 1);
     assert_eq!(summary.files_matched, 1);
+}
+
+/// Locks `len` bytes at `offset` of `file` against every other handle (reads of the range fail
+/// with `ERROR_LOCK_VIOLATION`) until `file` is closed.
+fn lock_range(file: &std::fs::File, offset: u64, len: u32) {
+    let mut overlapped = OVERLAPPED::default();
+    // SAFETY: the handle belongs to `file`, which outlives the call; `overlapped` is a valid
+    // `OVERLAPPED` that only carries the offset of this synchronous call.
+    unsafe {
+        overlapped.Anonymous.Anonymous.Offset = offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        LockFileEx(
+            HANDLE(file.as_raw_handle()),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            None,
+            len,
+            0,
+            &mut overlapped,
+        )
+    }
+    .unwrap();
+}
+
+#[test]
+fn files_that_fail_while_being_read_are_counted_not_fatal() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "ok.txt", b"hit\n");
+    let content = format!("hit\n{}", "x".repeat(49_996));
+    // One file fails inside the 32 KiB encoding sample, the other only after it, while the
+    // searcher streams the rest of the file.
+    let early = write(root, "early.txt", content.as_bytes());
+    let late = write(root, "late.txt", content.as_bytes());
+    let mut held = Vec::new();
+    for (path, offset) in [(&early, 0), (&late, 40_000)] {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        lock_range(&file, offset, 1_000);
+        held.push(file);
+    }
+    let (found, summary) = search(root, &SearchOptions::literal("hit"));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, root.join("ok.txt"));
+    assert_eq!(summary.unreadable, 2);
+    assert_eq!(summary.files_matched, 1);
+    drop(held);
+    // Without the locks both files are searched normally.
+    let (found, summary) = search(root, &SearchOptions::literal("hit"));
+    assert_eq!(found.len(), 3);
+    assert_eq!(summary.unreadable, 0);
 }
 
 #[test]

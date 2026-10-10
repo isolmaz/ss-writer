@@ -3066,6 +3066,8 @@ name = "ssw-app"
 version = "0.1.0"
 dependencies = [
  "embed-manifest",
+ "image",
+ "rusqlite",
  "serde_json",
  "ssw-convert",
  "ssw-core",

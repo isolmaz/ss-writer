@@ -65,6 +65,7 @@ use windows::core::{GUID, HSTRING, Interface, Ref, implement};
 
 use crate::canvas::{CanvasAssets, D2dCanvas, TargetResources};
 use crate::com::{OsResultExt, WinError};
+use crate::fault::check;
 use crate::gfx::GfxDevices;
 use crate::wic::Wic;
 
@@ -139,12 +140,12 @@ fn add_pages(
     };
     let device = surface.devices.d2d_device();
     // SAFETY: live device, imaging factory and target; `properties` outlives the call.
-    let control = unsafe {
+    let control = check(unsafe {
         device.CreatePrintControl(surface.wic.factory(), target, Some(&raw const properties))
-    }
+    })
     .ctx("create the print control")?;
     // SAFETY: live device.
-    let context = unsafe { device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE) }
+    let context = check(unsafe { device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE) })
         .ctx("create the print device context")?;
     let mut resources = TargetResources::new(
         surface.devices.d2d_factory().clone(),
@@ -161,7 +162,7 @@ fn add_pages(
     }
     drawn?;
     // SAFETY: plain call on the live print control; every page was added.
-    unsafe { control.Close() }.ctx("close the print control")?;
+    check(unsafe { control.Close() }).ctx("close the print control")?;
     Ok(pages.len())
 }
 
@@ -176,15 +177,13 @@ fn draw_pages(
     resources: &mut TargetResources,
     sizes: &[(f32, f32)],
 ) -> Result<(), WinError> {
-    let render_target: ID2D1RenderTarget = context.cast().ctx("query the render target")?;
+    let render_target: ID2D1RenderTarget = check(context.cast()).ctx("query the render target")?;
     for (index, &(width, height)) in sizes.iter().enumerate() {
         // SAFETY: live device context; the command list is closed before it is added and the
         // context's target is reset (and its draw ended) on every path, so no D2D reference to
         // the list outlives the page.
         unsafe {
-            let list = context
-                .CreateCommandList()
-                .ctx("create the page command list")?;
+            let list = check(context.CreateCommandList()).ctx("create the page command list")?;
             context.SetTarget(&list);
             context.BeginDraw();
             let mut canvas = D2dCanvas::new(&render_target, assets, resources);
@@ -193,17 +192,16 @@ fn draw_pages(
             let ended = context.EndDraw(None, None);
             context.SetTarget(None::<&ID2D1Image>);
             drawn?;
-            ended.ctx("end the page drawing")?;
-            list.Close().ctx("close the page command list")?;
-            control
-                .AddPage(
-                    &list,
-                    D2D_SIZE_F { width, height },
-                    None::<&IStream>,
-                    None,
-                    None,
-                )
-                .ctx("add the page")?;
+            check(ended).ctx("end the page drawing")?;
+            check(list.Close()).ctx("close the page command list")?;
+            check(control.AddPage(
+                &list,
+                D2D_SIZE_F { width, height },
+                None::<&IStream>,
+                None,
+                None,
+            ))
+            .ctx("add the page")?;
         }
     }
     Ok(())
@@ -219,13 +217,13 @@ pub fn printer_target(
     job_name: &str,
 ) -> Result<IPrintDocumentPackageTarget, WinError> {
     // SAFETY: standard in-process COM activation.
-    let factory: IPrintDocumentPackageTargetFactory = unsafe {
+    let factory: IPrintDocumentPackageTargetFactory = check(unsafe {
         CoCreateInstance(
             &PrintDocumentPackageTargetFactory,
             None,
             CLSCTX_INPROC_SERVER,
         )
-    }
+    })
     .ctx("create the print target factory")?;
     // SAFETY: live factory; the strings outlive the call; no output stream or ticket means the
     // job goes to the printer with its default ticket.
@@ -278,6 +276,15 @@ impl IXpsDocumentPackageTarget_Impl for XpsPackage_Impl {
     }
 }
 
+/// The result of an allocator call: `E_OUTOFMEMORY` when it returned null.
+fn allocated<T>(pointer: *mut T) -> windows::core::Result<*mut T> {
+    if pointer.is_null() {
+        Err(E_OUTOFMEMORY.into())
+    } else {
+        Ok(pointer)
+    }
+}
+
 /// A print target that writes an XPS package to a file stream.
 #[implement(IPrintDocumentPackageTarget)]
 struct XpsFileTarget {
@@ -297,10 +304,7 @@ impl IPrintDocumentPackageTarget_Impl for XpsFileTarget_Impl {
         // SAFETY: both out pointers are non-null and valid for writes per the interface
         // contract; the array is CoTaskMem memory the caller frees.
         unsafe {
-            let types = CoTaskMemAlloc(size_of::<GUID>()).cast::<GUID>();
-            if types.is_null() {
-                return Err(E_OUTOFMEMORY.into());
-            }
+            let types = allocated(CoTaskMemAlloc(size_of::<GUID>()).cast::<GUID>())?;
             types.write(ID_DOCUMENTPACKAGETARGET_MSXPS);
             targetcount.write(1);
             targettypes.write(types);
@@ -344,7 +348,8 @@ impl IPrintDocumentPackageTarget_Impl for XpsFileTarget_Impl {
 /// released with them.
 ///
 /// # Errors
-/// Fails when the file cannot be created or the XPS object model is unavailable.
+/// Fails when the file cannot be created or the XPS object model is unavailable (no file is left
+/// behind then).
 pub fn xps_file_target(path: &Path) -> Result<IPrintDocumentPackageTarget, WinError> {
     // SAFETY: `path` is converted to a NUL-terminated string that outlives the call.
     let output = unsafe {
@@ -358,10 +363,18 @@ pub fn xps_file_target(path: &Path) -> Result<IPrintDocumentPackageTarget, WinEr
     }
     .ctx("create the XPS file")?;
     // SAFETY: standard in-process COM activation.
-    let factory: IXpsOMObjectFactory =
-        unsafe { CoCreateInstance(&XpsOMObjectFactory, None, CLSCTX_INPROC_SERVER) }
-            .ctx("create the XPS object factory")?;
-    Ok(XpsFileTarget { output, factory }.into())
+    let created: windows::core::Result<IXpsOMObjectFactory> =
+        check(unsafe { CoCreateInstance(&XpsOMObjectFactory, None, CLSCTX_INPROC_SERVER) });
+    match created.ctx("create the XPS object factory") {
+        Ok(factory) => Ok(XpsFileTarget { output, factory }.into()),
+        Err(error) => {
+            // The file exists since the stream above made it: a target that cannot be made
+            // leaves none behind (the stream is released first, it denies deleting).
+            drop(output);
+            let _ = std::fs::remove_file(path);
+            Err(error)
+        }
+    }
 }
 
 /// Prints `pages` into an XPS file. A failed job leaves no file behind. Returns the number of
@@ -451,26 +464,43 @@ impl PrintDialogHost for SystemPrintDialogHost {
         // The dialog allocates the device mode and names even when it fails half way.
         let names = take_global_words(dialog.hDevNames);
         free_global(dialog.hDevMode);
-        shown.ctx("show the print dialog")?;
-        if dialog.dwResultAction != PD_RESULT_PRINT {
-            return Ok(None);
-        }
-        let printer = names
-            .as_deref()
-            .and_then(parse_devnames)
-            .ok_or(WinError::Invalid("the print dialog returned no printer"))?;
-        let used = (dialog.nPageRanges as usize).min(MAX_RANGES);
-        Ok(Some(PrintSelection {
-            printer,
-            copies: u16::try_from(dialog.nCopies.max(1)).unwrap_or(u16::MAX),
-            collate: dialog.Flags.0 & PD_COLLATE.0 != 0,
-            ranges: dialog_ranges(
-                dialog.Flags.0 & PD_PAGENUMS.0 != 0,
-                &ranges[..used],
-                request.page_count,
-            ),
-        }))
+        answer_from_dialog(
+            shown,
+            &dialog,
+            names.as_deref(),
+            &ranges,
+            request.page_count,
+        )
     }
+}
+
+/// The selection `dialog` holds after `PrintDlgExW` returned `shown`; `names` is its
+/// `DEVNAMES` block and `ranges` the array `dialog` points at. `None` when the user cancelled.
+fn answer_from_dialog(
+    shown: windows::core::Result<()>,
+    dialog: &PRINTDLGEXW,
+    names: Option<&[u16]>,
+    ranges: &[PRINTPAGERANGE; MAX_RANGES],
+    page_count: u32,
+) -> Result<Option<PrintSelection>, WinError> {
+    shown.ctx("show the print dialog")?;
+    if dialog.dwResultAction != PD_RESULT_PRINT {
+        return Ok(None);
+    }
+    let printer = names
+        .and_then(parse_devnames)
+        .ok_or(WinError::Invalid("the print dialog returned no printer"))?;
+    let used = (dialog.nPageRanges as usize).min(MAX_RANGES);
+    Ok(Some(PrintSelection {
+        printer,
+        copies: u16::try_from(dialog.nCopies.max(1)).unwrap_or(u16::MAX),
+        collate: dialog.Flags.0 & PD_COLLATE.0 != 0,
+        ranges: dialog_ranges(
+            dialog.Flags.0 & PD_PAGENUMS.0 != 0,
+            &ranges[..used],
+            page_count,
+        ),
+    }))
 }
 
 /// Copies a global memory block as UTF-16 words and frees it.
@@ -598,12 +628,29 @@ pub fn print_selection(
     job_name: &str,
     pages: Vec<Scene>,
 ) -> Result<usize, WinError> {
+    print_selection_to(surface, selection, pages, || {
+        printer_target(&selection.printer, job_name)
+    })
+}
+
+/// Prints the chosen pages of `pages` into the target `open_target` provides, which is asked
+/// for only after the pages to print are known. Returns the number of pages sent (copies
+/// included).
+///
+/// # Errors
+/// Fails when `open_target` fails or printing fails; see [`print_pages`].
+pub fn print_selection_to(
+    surface: &mut PrintSurface<'_>,
+    selection: &PrintSelection,
+    pages: Vec<Scene>,
+    open_target: impl FnOnce() -> Result<IPrintDocumentPackageTarget, WinError>,
+) -> Result<usize, WinError> {
     let pages: Vec<Arc<Scene>> = pages.into_iter().map(Arc::new).collect();
     let plan: Vec<Arc<Scene>> = page_plan(selection, pages.len())
         .into_iter()
         .map(|index| Arc::clone(&pages[index]))
         .collect();
-    let target = printer_target(&selection.printer, job_name)?;
+    let target = open_target()?;
     print_pages(surface, &target, &plan)
 }
 
@@ -657,5 +704,107 @@ mod tests {
         free_global(HGLOBAL::default());
         // A block that is only freed.
         free_global(global_words(&[1, 2, 3]));
+        // A discarded block (of no bytes) cannot be locked: no words, and it is still freed.
+        // SAFETY: a fresh allocation handed over to `take_global_words`.
+        let discarded = unsafe { GlobalAlloc(GMEM_MOVEABLE, 0) }.expect("allocation");
+        assert_eq!(take_global_words(discarded), None);
+    }
+
+    /// A `DEVNAMES` block naming the printer `device`.
+    fn devnames(device: &str) -> Vec<u16> {
+        let mut words = vec![0, 4, 0, 0];
+        words.extend(device.encode_utf16());
+        words.push(0);
+        words
+    }
+
+    fn ranges(pairs: &[(u32, u32)]) -> [PRINTPAGERANGE; MAX_RANGES] {
+        let mut ranges = [PRINTPAGERANGE::default(); MAX_RANGES];
+        for (slot, &(from, to)) in ranges.iter_mut().zip(pairs) {
+            *slot = PRINTPAGERANGE {
+                nFromPage: from,
+                nToPage: to,
+            };
+        }
+        ranges
+    }
+
+    #[test]
+    fn a_print_answer_becomes_a_selection() {
+        use windows::Win32::UI::Controls::Dialogs::PD_RESULT_CANCEL;
+
+        let names = devnames("Çay Yazıcısı");
+        let typed = ranges(&[(2, 4), (9, 6)]);
+        let dialog = PRINTDLGEXW {
+            dwResultAction: PD_RESULT_PRINT,
+            Flags: PD_PAGENUMS | PD_COLLATE,
+            nCopies: 3,
+            nPageRanges: 2,
+            ..Default::default()
+        };
+        let selection = answer_from_dialog(Ok(()), &dialog, Some(&names), &typed, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selection,
+            PrintSelection {
+                printer: "Çay Yazıcısı".to_owned(),
+                copies: 3,
+                collate: true,
+                ranges: vec![2..=4, 6..=9],
+            }
+        );
+
+        // Without typed page numbers every page is printed; no copies means one; the count
+        // does not overflow.
+        let all = PRINTDLGEXW {
+            dwResultAction: PD_RESULT_PRINT,
+            nCopies: 0,
+            ..Default::default()
+        };
+        let selection = answer_from_dialog(Ok(()), &all, Some(&names), &typed, 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!((selection.copies, selection.collate), (1, false));
+        assert_eq!(selection.ranges, vec![1..=7]);
+        let many = PRINTDLGEXW {
+            dwResultAction: PD_RESULT_PRINT,
+            nCopies: 100_000,
+            ..Default::default()
+        };
+        let selection = answer_from_dialog(Ok(()), &many, Some(&names), &typed, 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.copies, u16::MAX);
+
+        // Cancelled: no selection, even when the dialog filled in a printer.
+        let cancelled = PRINTDLGEXW {
+            dwResultAction: PD_RESULT_CANCEL,
+            ..Default::default()
+        };
+        assert_eq!(
+            answer_from_dialog(Ok(()), &cancelled, Some(&names), &typed, 7).unwrap(),
+            None
+        );
+        // Print, but no printer name came back; or the dialog itself failed.
+        let error = answer_from_dialog(Ok(()), &all, None, &typed, 7).unwrap_err();
+        assert_eq!(error.to_string(), "the print dialog returned no printer");
+        let failed = Err(windows::Win32::Foundation::E_FAIL.into());
+        let error = answer_from_dialog(failed, &all, Some(&names), &typed, 7).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "show the print dialog failed: {}",
+                windows::core::Error::from(windows::Win32::Foundation::E_FAIL)
+            )
+        );
+    }
+
+    #[test]
+    fn a_null_allocation_is_an_out_of_memory_error() {
+        let error = allocated::<u8>(std::ptr::null_mut()).unwrap_err();
+        assert_eq!(error.code(), E_OUTOFMEMORY);
+        let mut value = 7u8;
+        assert_eq!(allocated(&raw mut value).unwrap(), &raw mut value);
     }
 }

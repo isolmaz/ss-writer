@@ -448,19 +448,22 @@ fn every_option_combination_compiles() {
     let world = world();
     for page in [PageSize::A4, PageSize::Letter] {
         for black_text in [false, true] {
-            for page_numbers in [false, true] {
-                for title in [None, Some("T"), Some("   ")] {
-                    let options = ExportOptions {
-                        page,
-                        margin_mm: 10.0,
-                        base_font_pt: 9.0,
-                        page_numbers,
-                        black_text,
-                        include_title: title.is_some(),
-                        title: title.map(str::to_owned),
-                    };
-                    let document = compile_with(&world, KITCHEN_SINK, &options, &NoDiagrams);
-                    assert!(document.pages().len() >= 2);
+            for light_theme in [false, true] {
+                for page_numbers in [false, true] {
+                    for title in [None, Some("T"), Some("   ")] {
+                        let options = ExportOptions {
+                            page,
+                            margin_mm: 10.0,
+                            base_font_pt: 9.0,
+                            page_numbers,
+                            black_text,
+                            light_theme,
+                            include_title: title.is_some(),
+                            title: title.map(str::to_owned),
+                        };
+                        let document = compile_with(&world, KITCHEN_SINK, &options, &NoDiagrams);
+                        assert!(document.pages().len() >= 2);
+                    }
                 }
             }
         }

@@ -810,14 +810,15 @@ impl SidebarView {
             .collect();
         while let Some(key) = pending.pop() {
             self.set_expanded(key, true);
-            if let Some(children) = find(&self.roots, key).and_then(|n| n.children.as_deref()) {
-                pending.extend(
-                    children
-                        .iter()
-                        .filter(|c| c.entry.is_folder())
-                        .map(|c| c.entry.key),
-                );
-            }
+            // A folder that was just expanded has its children listed.
+            let children = find(&self.roots, key).and_then(|node| node.children.as_deref());
+            pending.extend(
+                children
+                    .into_iter()
+                    .flatten()
+                    .filter(|child| child.entry.is_folder())
+                    .map(|child| child.entry.key),
+            );
         }
         self.rebuild_rows();
     }
@@ -1197,9 +1198,7 @@ impl SidebarView {
     fn paint_row(&self, cx: &PaintCx, canvas: &mut dyn Canvas, index: usize) {
         let tokens = &cx.theme.tokens;
         let row = &self.rows[index];
-        let Some(node) = find(&self.roots, row.key) else {
-            return;
-        };
+        let node = find(&self.roots, row.key).expect("every row stands for a node of the tree");
         let entry = &node.entry;
         let rect = self.row_rect(index);
         let radius = CornerRadii::uniform(tokens.metrics.control_radius);
@@ -1647,11 +1646,8 @@ mod tests {
 
     fn strings() -> SidebarStrings {
         let localizer = Localizer::new("en", &[("en", MAIN_FTL), ("en", SHELL_FTL)]);
-        assert!(
-            localizer.diagnostics().is_empty(),
-            "{:?}",
-            localizer.diagnostics()
-        );
+        let diagnostics = localizer.diagnostics();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         SidebarStrings::from_localizer(&localizer)
     }
 
@@ -2575,5 +2571,200 @@ mod tests {
         assert_eq!(f.view.bounds(), Rect::new(0.0, 80.0, 260.0, 400.0));
         let debug = format!("{:?}", f.view);
         assert!(debug.contains("SidebarView") && debug.contains("Notes"));
+    }
+
+    fn many_files(f: &mut Fixture) {
+        f.listings.borrow_mut()[0].1.extend(
+            (100..140).map(|n| SidebarEntry::file(n, format!("note-{n}.md"), EntryKind::Markdown)),
+        );
+        f.view.refresh_all();
+        f.layout();
+    }
+
+    fn wheel_notch(f: &Fixture, dy: f32) -> Event {
+        Event::Wheel(WheelEvent {
+            delta: Point::new(0.0, dy),
+            precise: false,
+            position: f.view.row_rect(0).center(),
+            mods: Modifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn a_custom_id_names_the_view() {
+        let id = WidgetId::allocate();
+        let f = fixture(SidebarOptions::default());
+        let view = f.view.with_id(id);
+        assert_eq!(view.id(), id);
+        assert_eq!(Harness::new().node(&view).id, id);
+    }
+
+    #[test]
+    fn expanding_needs_a_known_collapsed_folder() {
+        let mut f = fixture(SidebarOptions::default());
+        assert!(!f.view.set_expanded(9999, true));
+        // A file cannot expand, and a collapsed folder cannot collapse again.
+        assert!(!f.view.set_expanded(7, true));
+        assert!(!f.view.set_expanded(1, false));
+        f.view.user_expand(7, true);
+        f.view.user_expand(1, false);
+        assert!(f.view.take_events().is_empty());
+        assert_eq!(f.view.is_expanded(1), Some(false));
+    }
+
+    #[test]
+    fn expand_all_lists_every_nested_folder_and_collapse_all_closes_them() {
+        let mut f = fixture(SidebarOptions::default());
+        f.view.expand_all();
+        assert_eq!(f.view.is_expanded(1), Some(true));
+        assert_eq!(f.view.is_expanded(5), Some(true));
+        assert_eq!(f.view.is_expanded(2), Some(true));
+        assert!(f.names().contains(&"c.md".to_owned()));
+        f.view.collapse_all();
+        assert_eq!(f.view.is_expanded(5), Some(false));
+        assert_eq!(f.view.row_count(), 6);
+    }
+
+    #[test]
+    fn only_visible_entries_can_be_renamed_and_ending_without_a_rename_does_nothing() {
+        let mut f = fixture(SidebarOptions::default());
+        let id = f.view.id();
+        let mut cx = f.harness.event_cx(id);
+        assert!(!f.view.begin_rename(&mut cx, 9999));
+        f.view.end_rename(&mut cx, true);
+        assert_eq!(f.view.renaming(), None);
+        assert!(f.view.take_events().is_empty());
+        // An entry inside a folder that is collapsed again has no row to edit in.
+        f.view.user_expand(1, true);
+        f.view.user_expand(1, false);
+        f.view.take_events();
+        let mut cx = f.harness.event_cx(id);
+        assert!(!f.view.begin_rename(&mut cx, 3));
+        assert_eq!(f.view.renaming(), None);
+    }
+
+    #[test]
+    fn animation_frames_and_wheels_pass_through_an_open_rename() {
+        let mut f = fixture(SidebarOptions::default());
+        let id = f.view.id();
+        let mut cx = f.harness.event_cx(id);
+        assert!(f.view.begin_rename(&mut cx, 7));
+        let frame = Event::AnimationFrame(std::time::Duration::from_millis(16));
+        f.harness.send(&mut f.view, frame);
+        let notch = wheel_notch(&f, -1.0);
+        f.harness.send(&mut f.view, notch);
+        assert_eq!(f.view.renaming(), Some(7));
+    }
+
+    #[test]
+    fn the_pointer_highlights_the_hovered_row_until_it_leaves() {
+        let mut f = fixture(SidebarOptions::default());
+        let hover = f.harness.theme.tokens.hover_bg;
+        let fills = |f: &mut Fixture| {
+            f.harness
+                .paint(&f.view)
+                .ops()
+                .filter(|op| matches!(op, DrawOp::FillRoundedRect { color, .. } if *color == hover))
+                .count()
+        };
+        assert_eq!(fills(&mut f), 0);
+        let at = f.row_center(2);
+        assert!(f.harness.hover(&mut f.view, at).handled);
+        assert_eq!(fills(&mut f), 1);
+        // The same row again changes nothing.
+        assert!(!f.harness.hover(&mut f.view, at).handled);
+        f.harness
+            .pointer(&mut f.view, PointerEventKind::Leave, None, at);
+        assert_eq!(fills(&mut f), 0);
+    }
+
+    #[test]
+    fn the_arrow_keys_walk_the_rows_from_the_current_selection() {
+        let mut f = fixture(SidebarOptions::default());
+        f.focus_tree();
+        assert!(f.key(vk::DOWN));
+        assert_eq!(f.view.selected_key(), f.view.row_key(0));
+        assert!(f.key(vk::DOWN));
+        assert_eq!(f.view.selected_key(), f.view.row_key(1));
+        assert!(f.key(vk::UP));
+        assert_eq!(f.view.selected_key(), f.view.row_key(0));
+    }
+
+    #[test]
+    fn nothing_is_painted_outside_the_damaged_area() {
+        let mut f = fixture(SidebarOptions::default());
+        let away = Rect::new(600.0, 0.0, 50.0, 50.0);
+        assert_eq!(
+            f.harness.paint_damaged(&f.view, Some(away)).ops().count(),
+            0
+        );
+        let over = f.view.bounds();
+        assert!(f.harness.paint_damaged(&f.view, Some(over)).ops().count() > 0);
+    }
+
+    #[test]
+    fn a_drop_onto_the_workspace_root_outlines_the_whole_list() {
+        let mut f = fixture(SidebarOptions::default());
+        let accent = f.harness.theme.tokens.accent;
+        let outlines = |f: &mut Fixture| {
+            f.harness
+                .paint(&f.view)
+                .ops()
+                .filter(|op| matches!(op, DrawOp::StrokeRoundedRect { color, width, .. } if *color == accent && *width == 2.0))
+                .count()
+        };
+        assert_eq!(outlines(&mut f), 0);
+        f.view.drag = Some(Drag {
+            source: 7,
+            target: Some(0),
+        });
+        assert_eq!(outlines(&mut f), 1);
+    }
+
+    #[test]
+    fn a_wheel_over_a_short_list_is_left_alone() {
+        let mut f = fixture(SidebarOptions::default());
+        let notch = wheel_notch(&f, -1.0);
+        assert!(!f.harness.send(&mut f.view, notch).handled);
+        assert_eq!(f.view.scroll_offset(), 0.0);
+    }
+
+    #[test]
+    fn dragging_the_scroll_bar_scrolls_a_long_list() {
+        let mut f = fixture(SidebarOptions::default());
+        many_files(&mut f);
+        let grab = f.view.bar.thumb_rect().center();
+        let left = Some(PointerButton::Left);
+        let down = f
+            .harness
+            .pointer(&mut f.view, PointerEventKind::Down, left, grab);
+        assert!(down.handled);
+        assert!(f.view.take_events().is_empty());
+        f.harness.requests.take_invalidation();
+        let to = Point::new(grab.x, grab.y + 60.0);
+        f.harness
+            .pointer(&mut f.view, PointerEventKind::Move, None, to);
+        assert!(f.view.scroll_offset() > 0.0);
+        assert!(!f.harness.requests.take_invalidation().is_clean());
+        f.harness
+            .pointer(&mut f.view, PointerEventKind::Up, left, to);
+        assert!(!f.view.bar.is_dragging());
+    }
+
+    #[test]
+    fn a_notched_wheel_eases_a_long_list_and_every_frame_repaints_it() {
+        let mut f = fixture(SidebarOptions::default());
+        many_files(&mut f);
+        f.view.bar.model_mut().set_motion(Motion::full());
+        let notch = wheel_notch(&f, -3.0);
+        assert!(f.harness.send(&mut f.view, notch).handled);
+        assert_eq!(f.view.scroll_offset(), 0.0);
+        f.harness.frame(&mut f.view, 16);
+        f.harness.requests.take_invalidation();
+        f.harness.frame(&mut f.view, 100);
+        assert!(f.view.scroll_offset() > 0.0);
+        assert!(!f.harness.requests.take_invalidation().is_clean());
+        f.harness.run_animations(&mut f.view);
+        assert_eq!(f.view.scroll_offset(), f.view.bar.model().target());
     }
 }

@@ -5,6 +5,7 @@ mod search_common;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use search_common::{Host, child_names, clipboard, localizer, node_named};
 use ssw_core::document::Document;
@@ -12,9 +13,10 @@ use ssw_core::edit::{Edit, Selection, Transaction};
 use ssw_core::text::TextRange;
 use ssw_ui::access::{AccessAction, Role, ToggleState};
 use ssw_ui::canvas::DrawOp;
-use ssw_ui::geometry::{Point, Rect};
-use ssw_ui::input::{Modifiers, vk};
-use ssw_ui::shell::find::{FindBar, FindEvent, SharedDocument};
+use ssw_ui::geometry::{Point, Rect, Size};
+use ssw_ui::input::{Event, FocusEvent, KeyEvent, Modifiers, PointerEventKind, vk};
+use ssw_ui::shell::find::{CHIP_SIZE, FindBar, FindEvent, SharedDocument, ToggleChip};
+use ssw_ui::widget::{Invalidation, Widget};
 use ssw_ui::widgets::Control;
 use ssw_ui::widgets::anim::Motion;
 
@@ -466,4 +468,181 @@ fn options_set_by_the_host_search_again() {
     assert_eq!(bar.matches(), &[range(4, 7)]);
     assert_eq!(selection(&doc), (4, 7));
     assert!(bar.query().match_case && !bar.query().regex);
+}
+
+#[test]
+fn a_toggle_chip_is_a_fixed_size_square_that_registers_one_tab_stop() {
+    let mut host = Host::new();
+    let mut chip = ToggleChip::text("Aa", "Match case", false);
+    let size = host.measure(&mut chip, Size::UNBOUNDED);
+    assert_eq!(size, Size::new(CHIP_SIZE, CHIP_SIZE));
+    assert_eq!(host.measure(&mut chip, Size::new(5.0, 5.0)), size);
+    let bounds = Rect::new(10.0, 10.0, CHIP_SIZE, CHIP_SIZE);
+    host.layout(&mut chip, bounds);
+    assert_eq!(chip.bounds(), bounds);
+    assert_eq!(host.focus.tab_order(), [chip.id()]);
+}
+
+#[test]
+fn a_toggle_chip_reports_one_change_per_flip_from_clicks_keys_and_assistive_technology() {
+    let mut host = Host::new();
+    let mut chip = ToggleChip::text("Aa", "Match case", false);
+    let bounds = Rect::new(10.0, 10.0, CHIP_SIZE, CHIP_SIZE);
+    host.layout(&mut chip, bounds);
+    // A click flips it and reports the new state once.
+    assert!(host.click(&mut chip, bounds.center()).handled);
+    assert!(chip.is_on());
+    assert_eq!(chip.take_changed(), Some(true));
+    assert_eq!(chip.take_changed(), None);
+    // Keys only count while the chip has focus, without modifiers.
+    assert!(!host.key(&mut chip, vk::SPACE).handled);
+    assert_eq!(chip.take_changed(), None);
+    host.focus_on(chip.id());
+    assert!(
+        !host
+            .key_with(&mut chip, vk::RETURN, Modifiers::SHIFT)
+            .handled
+    );
+    assert!(host.key(&mut chip, vk::SPACE).handled);
+    assert_eq!(chip.take_changed(), Some(false));
+    // A held key does not flip it again.
+    let held = KeyEvent {
+        repeat: true,
+        ..KeyEvent::press(vk::SPACE, Modifiers::NONE)
+    };
+    assert!(host.send(&mut chip, Event::Key(held)).handled);
+    assert_eq!(chip.take_changed(), None);
+    assert!(!chip.is_on());
+    // Assistive technology toggles and focuses; anything else is refused.
+    let id = chip.id();
+    let mut cx = host.cx(id);
+    assert!(chip.perform(&mut cx, &AccessAction::Toggle));
+    assert_eq!(chip.take_changed(), Some(true));
+    assert!(!chip.perform(&mut cx, &AccessAction::Invoke));
+    host.focus.blur();
+    let mut cx = host.cx(id);
+    assert!(chip.perform(&mut cx, &AccessAction::Focus));
+    assert!(host.focus.is_focused(id));
+    // The host can set the state without a change being reported.
+    chip.set_on(false);
+    assert!(!chip.is_on());
+    assert_eq!(chip.take_changed(), None);
+}
+
+#[test]
+fn a_toggle_chip_repaints_its_focus_halo_and_eases_its_hover() {
+    let mut host = Host::new();
+    let mut chip = ToggleChip::text("Aa", "Match case", false);
+    let bounds = Rect::new(10.0, 10.0, CHIP_SIZE, CHIP_SIZE);
+    host.layout(&mut chip, bounds);
+    host.requests.take_invalidation();
+    // Gaining focus repaints the chip with room for the ring around it.
+    assert!(
+        !host
+            .send(&mut chip, Event::Focus(FocusEvent::Gained))
+            .handled
+    );
+    assert_eq!(
+        host.requests.take_invalidation(),
+        Invalidation::Rect(Rect::new(8.0, 8.0, CHIP_SIZE + 4.0, CHIP_SIZE + 4.0))
+    );
+    // Hovering starts a transition that every animation frame repaints until it settles.
+    host.pointer(&mut chip, PointerEventKind::Move, bounds.center());
+    assert!(host.requests.animation_frame_requested());
+    host.requests.take_invalidation();
+    for (millis, repaints) in [(100, true), (300, true), (600, false)] {
+        let frame = Event::AnimationFrame(Duration::from_millis(millis));
+        assert!(!host.send(&mut chip, frame).handled);
+        assert_eq!(
+            host.requests.take_invalidation(),
+            if repaints {
+                Invalidation::Rect(bounds)
+            } else {
+                Invalidation::Clean
+            },
+            "frame at {millis} ms"
+        );
+    }
+    // Only a focused chip is drawn with the focus ring.
+    let ring = host.theme.tokens.focus_ring;
+    let has_ring = |canvas: ssw_ui::canvas::RecordingCanvas| {
+        canvas
+            .ops()
+            .any(|op| matches!(op, DrawOp::StrokeRoundedRect { color, .. } if *color == ring))
+    };
+    assert!(!has_ring(host.paint(&chip)));
+    host.focus_on(chip.id());
+    assert!(has_ring(host.paint(&chip)));
+}
+
+#[test]
+fn the_replace_chip_opens_and_closes_the_replace_row() {
+    let (mut host, mut bar, _doc) = setup("text");
+    assert!(!bar.is_replace_open());
+    click_named(&mut host, &mut bar, "Toggle replace");
+    assert!(bar.is_replace_open());
+    host.layout(&mut bar, WINDOW);
+    assert_eq!(bar.panel().height, 80.0);
+    click_named(&mut host, &mut bar, "Toggle replace");
+    assert!(!bar.is_replace_open());
+    host.layout(&mut bar, WINDOW);
+    assert_eq!(bar.panel().height, 40.0);
+}
+
+#[test]
+fn the_bar_measures_one_or_two_rows_and_nothing_while_hidden() {
+    let (mut host, mut bar, _doc) = setup("text");
+    assert_eq!(
+        host.measure(&mut bar, Size::new(800.0, 600.0)),
+        Size::new(520.0, 40.0)
+    );
+    // A narrow editor leaves the margin on both sides; a tiny one leaves nothing.
+    assert_eq!(
+        host.measure(&mut bar, Size::new(300.0, 600.0)),
+        Size::new(276.0, 40.0)
+    );
+    assert_eq!(
+        host.measure(&mut bar, Size::new(10.0, 600.0)),
+        Size::new(0.0, 40.0)
+    );
+    assert_eq!(
+        host.measure(&mut bar, Size::UNBOUNDED),
+        Size::new(520.0, 40.0)
+    );
+    bar.open(true);
+    assert_eq!(
+        host.measure(&mut bar, Size::new(800.0, 600.0)),
+        Size::new(520.0, 80.0)
+    );
+    bar.close();
+    assert_eq!(host.measure(&mut bar, Size::new(800.0, 600.0)), Size::ZERO);
+}
+
+#[test]
+fn the_counter_is_muted_while_a_match_is_current_and_red_without_one() {
+    let (mut host, mut bar, _doc) = setup("one two one");
+    host.text(&mut bar, "one");
+    assert_eq!(bar.counter_text(), "1/2");
+    let tokens = host.theme.tokens;
+    let counter_color = |host: &Host, bar: &FindBar, text: &str| {
+        host.paint(bar).ops().find_map(|op| match op {
+            DrawOp::Text {
+                text: drawn, color, ..
+            } if drawn == text => Some(*color),
+            _ => None,
+        })
+    };
+    assert_eq!(counter_color(&host, &bar, "1/2"), Some(tokens.text_muted));
+    bar.set_pattern("zzz");
+    assert_eq!(counter_color(&host, &bar, "No results"), Some(tokens.error));
+}
+
+#[test]
+fn the_bar_itself_takes_no_accessibility_actions() {
+    let (mut host, mut bar, _doc) = setup("text");
+    let id = bar.id();
+    let mut cx = host.cx(id);
+    for action in [AccessAction::Invoke, AccessAction::Focus] {
+        assert!(!Widget::perform(&mut bar, &mut cx, &action));
+    }
 }

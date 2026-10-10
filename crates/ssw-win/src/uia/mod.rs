@@ -29,12 +29,10 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use thiserror::Error;
-use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, E_OUTOFMEMORY, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::Com::SAFEARRAY;
-use windows::Win32::System::Ole::{
-    SafeArrayAccessData, SafeArrayCreateVector, SafeArrayUnaccessData,
-};
+use windows::Win32::System::Ole::SafeArrayCreateVector;
 use windows::Win32::System::Variant::{VT_I4, VT_R8, VT_UNKNOWN};
 use windows::Win32::UI::Accessibility::{
     IRawElementProviderSimple, UIA_ButtonControlTypeId, UIA_CONTROLTYPE_ID,
@@ -252,37 +250,39 @@ pub(crate) fn safe_array_f64(values: &[f64]) -> windows::core::Result<*mut SAFEA
     })
 }
 
-/// An empty SAFEARRAY of `IUnknown` (no children).
-pub(crate) fn safe_array_empty_unknown() -> windows::core::Result<*mut SAFEARRAY> {
-    // SAFETY: creating a zero-length vector has no preconditions.
-    let array = unsafe { SafeArrayCreateVector(VT_UNKNOWN, 0, 0) };
+/// The result of a SAFEARRAY allocation: `E_OUTOFMEMORY` when the allocator returned null.
+fn allocated(array: *mut SAFEARRAY) -> windows::core::Result<*mut SAFEARRAY> {
     if array.is_null() {
-        Err(Error::from(E_FAIL))
+        Err(Error::from(E_OUTOFMEMORY))
     } else {
         Ok(array)
     }
 }
 
+/// An empty SAFEARRAY of `IUnknown` (no children).
+pub(crate) fn safe_array_empty_unknown() -> windows::core::Result<*mut SAFEARRAY> {
+    // SAFETY: creating a zero-length vector has no preconditions.
+    allocated(unsafe { SafeArrayCreateVector(VT_UNKNOWN, 0, 0) })
+}
+
+/// A new SAFEARRAY vector of `len` elements of type `T` (matching the variant type `vt`) that
+/// `fill` initializes through a pointer to its first element.
 fn safe_array<T>(
     vt: u16,
     len: usize,
     fill: impl FnOnce(*mut T),
 ) -> windows::core::Result<*mut SAFEARRAY> {
     let count = u32::try_from(len).map_err(|_| Error::from(E_FAIL))?;
-    // SAFETY: creating a vector of `count` elements of a plain value type.
-    let array =
-        unsafe { SafeArrayCreateVector(windows::Win32::System::Variant::VARENUM(vt), 0, count) };
-    if array.is_null() {
-        return Err(Error::from(E_FAIL));
-    }
-    let mut data: *mut c_void = std::ptr::null_mut();
-    // SAFETY: `array` was just created and is not shared; AccessData locks it and returns a
-    // pointer to `count` elements of type `T` (matching `vt`), valid until UnaccessData.
-    unsafe { SafeArrayAccessData(array, &mut data) }?;
-    fill(data.cast::<T>());
-    // SAFETY: balances the AccessData call above.
-    unsafe { SafeArrayUnaccessData(array) }?;
-    Ok(array)
+    // SAFETY: creating a vector of `count` elements of the given element type.
+    let array = allocated(unsafe {
+        SafeArrayCreateVector(windows::Win32::System::Variant::VARENUM(vt), 0, count)
+    });
+    array.inspect(|array| {
+        // SAFETY: the vector was just created and nobody else holds it, so its data pointer
+        // (`count` elements of type `T`) can be written without locking it.
+        let data = unsafe { (**array).pvData };
+        fill(data.cast::<T>());
+    })
 }
 
 /// The bridge between the widget tree and UI Automation, one per window.
@@ -368,5 +368,29 @@ impl UiaBridge {
                 None::<&IRawElementProviderSimple>,
             )
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Ole::SafeArrayDestroy;
+
+    #[test]
+    fn a_null_allocation_is_out_of_memory_and_a_real_array_passes_through() {
+        let error = allocated(std::ptr::null_mut()).expect_err("null is a failed allocation");
+        assert_eq!(error.code(), E_OUTOFMEMORY);
+        let array = safe_array_empty_unknown().expect("an empty array");
+        // SAFETY: the array was just created and is destroyed exactly once.
+        unsafe { SafeArrayDestroy(array) }.expect("the array is destroyed");
+    }
+
+    #[test]
+    fn an_array_with_more_elements_than_a_safearray_can_hold_is_refused() {
+        // Refused before anything is allocated or filled.
+        let too_many = u32::MAX as usize + 1;
+        let error =
+            safe_array::<u8>(VT_I4.0, too_many, drop).expect_err("too many elements for a vector");
+        assert_eq!(error.code(), E_FAIL);
     }
 }

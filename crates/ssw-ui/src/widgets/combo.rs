@@ -282,9 +282,10 @@ impl ComboBox {
                 EventResult::handled()
             };
         }
-        let Some(list) = self.popup.as_mut() else {
-            return EventResult::ignored();
-        };
+        let list = self
+            .popup
+            .as_mut()
+            .expect("pointer_open runs while the popup is open");
         let list_id = list.id();
         let result = list.event(&mut cx.for_widget(list_id), &Event::Pointer(*event));
         let row = if down && !list.scrollbar_contains(event.position) {
@@ -343,11 +344,9 @@ impl Widget for ComboBox {
         if self.enabled {
             cx.add_tab_stop();
         }
-        if self.popup.is_some() {
-            let rect = self.popup_rect();
-            if let Some(list) = self.popup.as_mut() {
-                list.place(rect.inset(Insets::symmetric(0.0, POPUP_PADDING)));
-            }
+        let rect = self.popup_rect();
+        if let Some(list) = self.popup.as_mut() {
+            list.place(rect.inset(Insets::symmetric(0.0, POPUP_PADDING)));
         }
     }
 
@@ -843,12 +842,25 @@ mod tests {
             |op| matches!(op, DrawOp::Icon { glyph: g, center, size, .. }
             if *g == glyph::CHEVRON_DOWN && *size == 12.0 && center.x == bounds.right() - 17.0)
         ));
-        assert!(
-            !canvas
+        let stroke_widths = |canvas: &crate::canvas::RecordingCanvas| -> Vec<f32> {
+            canvas
                 .ops()
-                .any(|op| matches!(op, DrawOp::StrokeRoundedRect { width, .. } if *width == 2.0))
+                .filter_map(|op| match op {
+                    DrawOp::StrokeRoundedRect { width, .. } => Some(*width),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(
+            !stroke_widths(&canvas).contains(&2.0),
+            "no focus ring while unfocused"
         );
         harness.focus_widget(&mut combo);
+        let canvas = harness.paint(&combo);
+        assert!(
+            stroke_widths(&canvas).contains(&2.0),
+            "the focused box has a ring"
+        );
         harness.key(&mut combo, vk::F4);
         let canvas = harness.paint(&combo);
         let popup = combo.popup_bounds().expect("popup");
@@ -946,5 +958,26 @@ mod tests {
         );
         let canvas = harness.paint(&combo);
         assert!(canvas.texts().contains(&"Cherry"));
+    }
+
+    #[test]
+    fn kit_combo_with_id_and_animation_frames_ease_the_hover_and_reach_the_popup() {
+        let id = WidgetId::allocate();
+        let mut harness = Harness::new();
+        let mut combo = ComboBox::new("Fruit", fruit(), Some(0)).with_id(id);
+        assert_eq!(combo.id(), id);
+        assert_eq!(harness.node(&combo).id, id);
+        let bounds = harness.place(&mut combo, Point::new(10.0, 10.0));
+        harness.hover(&mut combo, bounds.center());
+        assert!(harness.requests.animation_frame_requested());
+        harness.frame(&mut combo, 16);
+        harness.requests.take_invalidation();
+        harness.frame(&mut combo, 50);
+        assert!(!harness.requests.take_invalidation().is_clean());
+        // With the popup open the frame reaches its list as well.
+        assert!(harness.perform(&mut combo, crate::access::AccessAction::Expand));
+        assert!(combo.is_open());
+        harness.frame(&mut combo, 16);
+        assert!(combo.is_open());
     }
 }

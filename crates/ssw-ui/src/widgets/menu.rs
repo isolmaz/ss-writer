@@ -1066,4 +1066,96 @@ mod tests {
         assert!(!menu.perform_item(&mut cx, new_id, &AccessAction::Invoke));
         assert_eq!(harness.place(&mut menu, Point::ZERO).size(), Size::ZERO);
     }
+
+    #[test]
+    fn kit_menu_item_accessors_report_the_command_and_label() {
+        let item = MenuItem::new(7, "Seven");
+        assert_eq!(item.command(), 7);
+        assert_eq!(item.label(), "Seven");
+    }
+
+    #[test]
+    fn kit_menu_entry_paths_stop_at_the_last_level_they_lead_to() {
+        let menu = file_menu();
+        let root = menu.entries.len();
+        assert_eq!(entries_at(&menu.entries, &[]).len(), root);
+        assert_eq!(entries_at(&menu.entries, &[Some(3)]).len(), 3);
+        // No highlight, a separator or a missing row cannot be descended into.
+        for path in [[None], [Some(2)], [Some(99)]] {
+            assert_eq!(entries_at(&menu.entries, &path).len(), root, "{path:?}");
+        }
+        assert_eq!(
+            entries_at(&menu.entries, &[Some(3), None, Some(0)]).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn kit_menu_pointer_details_hover_twice_padding_and_outside() {
+        let (mut harness, mut menu) = open_menu();
+        let levels = menu.layout(&harness.engine, &harness.theme);
+        let row = levels[0].rows[1].center();
+        assert!(harness.hover(&mut menu, row).handled);
+        assert_eq!(menu.highlighted(), Some((0, 1)));
+        // Hovering the highlighted item again changes nothing.
+        assert!(harness.hover(&mut menu, row).handled);
+        assert_eq!(menu.highlighted(), Some((0, 1)));
+        // Moving over the padding or away from the menu keeps the highlight.
+        let padding = Point::new(row.x, levels[0].rect.y + 1.0);
+        assert!(harness.hover(&mut menu, padding).handled);
+        assert!(harness.hover(&mut menu, Point::new(900.0, 900.0)).handled);
+        assert_eq!(menu.highlighted(), Some((0, 1)));
+        // Pressing the padding neither activates an item nor dismisses the menu.
+        let left = Some(PointerButton::Left);
+        let down = harness.pointer(&mut menu, PointerEventKind::Down, left, padding);
+        assert!(down.handled);
+        assert!(menu.is_open());
+        assert!(menu.take_events().is_empty());
+    }
+
+    #[test]
+    fn kit_menu_without_entries_has_nothing_to_highlight() {
+        let mut harness = Harness::new();
+        let mut menu = Menu::new("Empty", Vec::new());
+        let id = menu.id();
+        menu.open_at(&mut harness.event_cx(id), Point::ZERO);
+        tap(&mut harness, &mut menu, vk::DOWN);
+        tap(&mut harness, &mut menu, vk::UP);
+        assert_eq!(menu.highlighted(), None);
+        assert!(menu.is_open());
+    }
+
+    #[test]
+    fn kit_menu_accelerators_make_room_for_the_submenu_chevron() {
+        let mut harness = Harness::new();
+        let inner = vec![MenuEntry::Item(MenuItem::new(21, "Inner"))];
+        let mut menu = Menu::new(
+            "Share",
+            vec![
+                MenuEntry::Item(MenuItem::new(1, "Plain").accelerator("Ctrl+L")),
+                MenuEntry::Item(
+                    MenuItem::new(2, "More")
+                        .accelerator("Ctrl+M")
+                        .submenu(inner),
+                ),
+            ],
+        );
+        let id = menu.id();
+        menu.open_at(&mut harness.event_cx(id), Point::ZERO);
+        let right = menu.layout(&harness.engine, &harness.theme)[0].rows[0].right();
+        let canvas = harness.paint(&menu);
+        let end_of = |wanted: &str| {
+            canvas.ops().find_map(|op| match op {
+                DrawOp::Text {
+                    text, origin, size, ..
+                } if text == wanted => Some(origin.x + size.width),
+                _ => None,
+            })
+        };
+        let plain = end_of("Ctrl+L").expect("accelerator of the plain item");
+        let with_submenu = end_of("Ctrl+M").expect("accelerator of the submenu item");
+        assert!((plain - (right - TEXT_INSET)).abs() < 1e-3, "{plain}");
+        let expected = right - TEXT_INSET - CHEVRON_COLUMN;
+        assert!((with_submenu - expected).abs() < 1e-3, "{with_submenu}");
+    }
 }

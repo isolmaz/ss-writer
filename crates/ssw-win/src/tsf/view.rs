@@ -579,10 +579,8 @@ impl View {
 
     /// Stores new display attributes of the composition (ACP runs); marks it dirty on change.
     pub(super) fn set_attrs(&mut self, runs: &[(Range<usize>, ImeAttrStyle)]) {
-        let Some(start) = self.composition_start() else {
-            return;
-        };
-        let Some(comp) = self.comp.as_mut() else {
+        let start = self.composition_start();
+        let Some((start, comp)) = start.zip(self.comp.as_mut()) else {
             return;
         };
         let len = comp.units.len();
@@ -977,27 +975,27 @@ mod tests {
             (1..2, ImeAttrStyle::Converted),
             (9..12, ImeAttrStyle::InputError),
         ]);
-        let Some(ImeEvent::Update { text, caret, attrs }) = view.take_update() else {
-            panic!("a dirty composition yields an update");
-        };
-        assert_eq!(text, "かな漢");
-        assert_eq!(caret, 6, "ACP 3 is composition offset 2 = 6 bytes");
+        // ACP 3 is composition offset 2 = 6 bytes.
         assert_eq!(
-            attrs,
-            vec![
-                ImeAttr {
-                    range: 0..3,
-                    style: ImeAttrStyle::Converted
-                },
-                ImeAttr {
-                    range: 3..6,
-                    style: ImeAttrStyle::TargetConverted
-                },
-                ImeAttr {
-                    range: 6..9,
-                    style: ImeAttrStyle::Input
-                },
-            ]
+            view.take_update(),
+            Some(ImeEvent::Update {
+                text: "かな漢".to_owned(),
+                caret: 6,
+                attrs: vec![
+                    ImeAttr {
+                        range: 0..3,
+                        style: ImeAttrStyle::Converted
+                    },
+                    ImeAttr {
+                        range: 3..6,
+                        style: ImeAttrStyle::TargetConverted
+                    },
+                    ImeAttr {
+                        range: 6..9,
+                        style: ImeAttrStyle::Input
+                    },
+                ]
+            })
         );
         assert!(view.take_update().is_none(), "an update is delivered once");
         // Unchanged attributes do not make the composition dirty again.
@@ -1008,15 +1006,17 @@ mod tests {
         assert!(view.take_update().is_none());
         // No attributes at all: the whole string is Input.
         view.set_attrs(&[]);
-        let Some(ImeEvent::Update { attrs, .. }) = view.take_update() else {
-            panic!("removing the attributes changes the composition");
-        };
         assert_eq!(
-            attrs,
-            vec![ImeAttr {
-                range: 0..9,
-                style: ImeAttrStyle::Input
-            }]
+            view.take_update(),
+            Some(ImeEvent::Update {
+                text: "かな漢".to_owned(),
+                caret: 6,
+                attrs: vec![ImeAttr {
+                    range: 0..9,
+                    style: ImeAttrStyle::Input
+                }]
+            }),
+            "removing the attributes changes the composition"
         );
     }
 
@@ -1051,6 +1051,55 @@ mod tests {
             ]
         );
         assert!(ime_attrs(&[], &map, 0).is_empty());
+    }
+
+    #[test]
+    fn attribute_gaps_before_and_between_runs_are_input() {
+        let map = Utf16Map::new("abcdef");
+        let runs = [
+            AttrRun {
+                range: 1..2,
+                style: ImeAttrStyle::Converted,
+            },
+            AttrRun {
+                range: 4..5,
+                style: ImeAttrStyle::TargetConverted,
+            },
+        ];
+        assert_eq!(
+            ime_attrs(&runs, &map, 6),
+            vec![
+                ImeAttr {
+                    range: 0..1,
+                    style: ImeAttrStyle::Input
+                },
+                ImeAttr {
+                    range: 1..2,
+                    style: ImeAttrStyle::Converted
+                },
+                ImeAttr {
+                    range: 2..4,
+                    style: ImeAttrStyle::Input
+                },
+                ImeAttr {
+                    range: 4..5,
+                    style: ImeAttrStyle::TargetConverted
+                },
+                ImeAttr {
+                    range: 5..6,
+                    style: ImeAttrStyle::Input
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn host_bytes_inside_a_scalar_floor_to_that_scalar() {
+        // 'a' is byte 0, the emoji bytes 1..5 (ACPs 1..3), 'b' byte 5.
+        let view = view("a😀b");
+        assert_eq!(view.byte_to_acp(2, false), 1);
+        assert_eq!(view.byte_to_acp(4, false), 1);
+        assert_eq!(view.byte_to_acp(5, false), 3);
     }
 
     #[test]

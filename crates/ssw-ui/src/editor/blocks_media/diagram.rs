@@ -327,14 +327,20 @@ impl BlockLayout for SceneLayout {
     }
 
     fn caret_rect(&self, offset: usize) -> Rect {
-        match (&self.text, self.scene) {
-            (Some(text), _) => text.caret_rect(offset),
-            (None, Some((_, rect))) if offset > self.range.start => {
-                Rect::new(rect.right(), rect.y, 0.0, rect.height)
-            }
-            (None, Some((_, rect))) => Rect::new(rect.x, rect.y, 0.0, rect.height),
-            (None, None) => Rect::new(0.0, 0.0, 0.0, self.height),
+        if let Some(text) = &self.text {
+            return text.caret_rect(offset);
         }
+        // Without a source the scene is all there is (a layout with neither has the empty
+        // rectangle of its height).
+        let rect = self
+            .scene
+            .map_or(Rect::new(0.0, 0.0, 0.0, self.height), |(_, rect)| rect);
+        let x = if offset > self.range.start {
+            rect.right()
+        } else {
+            rect.x
+        };
+        Rect::new(x, rect.y, 0.0, rect.height)
     }
 
     fn selection_rects(&self, range: TextRange) -> Vec<Rect> {

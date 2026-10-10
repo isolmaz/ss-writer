@@ -834,11 +834,8 @@ mod tests {
 
     fn strings() -> TitleStrings {
         let localizer = Localizer::new("en", &[("en", MAIN_FTL), ("en", SHELL_FTL)]);
-        assert!(
-            localizer.diagnostics().is_empty(),
-            "{:?}",
-            localizer.diagnostics()
-        );
+        let diagnostics = localizer.diagnostics();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
         TitleStrings::from_localizer(&localizer)
     }
 
@@ -1268,5 +1265,49 @@ mod tests {
         harness.focus.focus(bar.sidebar.id);
         let canvas = harness.paint(&bar);
         assert!(canvas.is_balanced());
+    }
+
+    #[test]
+    fn a_custom_id_names_the_bar_in_the_access_tree() {
+        let id = WidgetId::allocate();
+        let bar = TitleBar::new(strings()).with_id(id);
+        assert_eq!(bar.id(), id);
+        assert_eq!(Harness::new().node(&bar).id, id);
+    }
+
+    #[test]
+    fn nothing_is_painted_outside_the_damaged_area() {
+        let (mut harness, bar, _) = setup();
+        let away = Rect::new(0.0, 300.0, 100.0, 100.0);
+        assert_eq!(harness.paint_damaged(&bar, Some(away)).ops().count(), 0);
+        assert!(
+            harness
+                .paint_damaged(&bar, Some(bar.bounds()))
+                .ops()
+                .count()
+                > 0
+        );
+    }
+
+    #[test]
+    fn a_tool_button_is_a_square_that_paints_where_damaged_and_eases_its_hover() {
+        let mut harness = Harness::new();
+        let mut button = ToolButton::icon('\u{E700}', "Menu");
+        let bounds = harness.place(&mut button, Point::new(10.0, 10.0));
+        assert_eq!(bounds.size(), Size::new(TOOL_SIZE, TOOL_SIZE));
+        let away = Rect::new(500.0, 500.0, 5.0, 5.0);
+        assert_eq!(harness.paint_damaged(&button, Some(away)).ops().count(), 0);
+        assert!(harness.paint_damaged(&button, Some(bounds)).ops().count() > 0);
+        // Hovering starts an easing; the first frame fixes its start, the next one repaints.
+        harness.hover(&mut button, bounds.center());
+        assert!(harness.requests.animation_frame_requested());
+        harness.frame(&mut button, 16);
+        harness.requests.take_invalidation();
+        harness.frame(&mut button, 50);
+        assert_eq!(
+            harness.requests.take_invalidation(),
+            crate::widget::Invalidation::Rect(bounds)
+        );
+        harness.run_animations(&mut button);
     }
 }

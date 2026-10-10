@@ -12,7 +12,7 @@ pub struct QpcClock {
     origin: i64,
 }
 
-fn counter() -> i64 {
+pub(crate) fn counter() -> i64 {
     let mut value = 0i64;
     // SAFETY: valid out pointer; the call cannot fail on Windows XP and later.
     unsafe {
@@ -21,7 +21,7 @@ fn counter() -> i64 {
     value
 }
 
-fn frequency() -> i64 {
+pub(crate) fn frequency() -> i64 {
     let mut value = 0i64;
     // SAFETY: valid out pointer.
     unsafe {

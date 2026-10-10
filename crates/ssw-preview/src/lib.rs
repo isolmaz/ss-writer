@@ -11,6 +11,8 @@
 //! - [`factory`]: the class factory and the exported COM entry points.
 //! - [`handler`]: the preview handler object (`IPreviewHandler` and friends) and the helpers
 //!   that inspect it in tests.
+//! - [`fault`]: fault injection for the platform-call error paths (feature `fault-injection`,
+//!   tests only).
 //! - [`server`]: the object and lock counts behind `DllCanUnloadNow`.
 //! - [`source`]: reads Explorer's `IStream` with a size cap and decodes the bytes to text.
 //! - [`appearance`]: the colors and font Explorer asks for (`IPreviewHandlerVisuals`) laid over
@@ -26,6 +28,7 @@ mod window;
 
 pub mod appearance;
 pub mod factory;
+pub mod fault;
 pub mod handler;
 pub mod notice;
 pub mod server;

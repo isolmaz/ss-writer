@@ -261,9 +261,7 @@ pub(crate) mod testing {
 
     /// Asserts `op` turns `before` into `after`.
     pub fn check(before: &str, after: &str, op: impl FnOnce(Ctx<'_>) -> Option<Transaction>) {
-        let got =
-            run(before, op).unwrap_or_else(|| panic!("operation not applicable to {before:?}"));
-        assert_eq!(got, after, "from {before:?}");
+        assert_eq!(run(before, op).as_deref(), Some(after), "from {before:?}");
     }
 
     /// Asserts `op` does not apply to `before`.

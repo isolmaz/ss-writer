@@ -120,8 +120,8 @@ impl Sink {
     }
 
     fn push_item(&mut self, spec: ListSpec, item: Item) {
-        while self.open.last().is_some_and(|o| o.level > spec.level) {
-            self.close_level();
+        while let Some(deeper) = self.open.pop_if(|o| o.level > spec.level) {
+            self.close_level(deeper);
         }
         let same_list = self.open.last().is_some_and(|o| {
             o.level == spec.level
@@ -130,8 +130,8 @@ impl Sink {
                 && o.list.paren == spec.paren
         });
         if !same_list {
-            if self.open.last().is_some_and(|o| o.level == spec.level) {
-                self.close_level();
+            if let Some(same_level) = self.open.pop_if(|o| o.level == spec.level) {
+                self.close_level(same_level);
             }
             self.open.push(OpenList {
                 level: spec.level,
@@ -144,30 +144,27 @@ impl Sink {
                 },
             });
         }
-        if let Some(top) = self.open.last_mut() {
-            top.list.items.push(item);
-        }
+        let top = self.open.last_mut().expect("the item's list is open");
+        top.list.items.push(item);
     }
 
     /// Closes the innermost open list: it nests in the last item of the list below, or ends the
     /// run of lists.
-    fn close_level(&mut self) {
-        if let Some(closed) = self.open.pop() {
-            let block = Block::List(closed.list);
-            match self
-                .open
-                .last_mut()
-                .and_then(|parent| parent.list.items.last_mut())
-            {
-                Some(item) => item.blocks.push(block),
-                None => self.blocks.push(block),
-            }
+    fn close_level(&mut self, closed: OpenList) {
+        let block = Block::List(closed.list);
+        match self
+            .open
+            .last_mut()
+            .and_then(|parent| parent.list.items.last_mut())
+        {
+            Some(item) => item.blocks.push(block),
+            None => self.blocks.push(block),
         }
     }
 
     fn close_lists(&mut self) {
-        while !self.open.is_empty() {
-            self.close_level();
+        while let Some(innermost) = self.open.pop() {
+            self.close_level(innermost);
         }
     }
 
@@ -922,19 +919,17 @@ fn code_language(pre: &Handle) -> String {
     String::new()
 }
 
+/// The rows of a table. The HTML parser puts every `<tr>` into a row group (`<tbody>` when the
+/// markup has none), so rows are only looked for there.
 fn table_rows(table: &Handle) -> Vec<Handle> {
     let mut rows = Vec::new();
-    for child in children(table) {
-        match tag(&child) {
-            Some("tr") => rows.push(child),
-            Some("thead" | "tbody" | "tfoot") => {
-                rows.extend(
-                    children(&child)
-                        .into_iter()
-                        .filter(|r| tag(r) == Some("tr")),
-                );
-            }
-            _ => {}
+    for group in children(table) {
+        if matches!(tag(&group), Some("thead" | "tbody" | "tfoot")) {
+            rows.extend(
+                children(&group)
+                    .into_iter()
+                    .filter(|r| tag(r) == Some("tr")),
+            );
         }
     }
     rows
@@ -1132,6 +1127,79 @@ mod tests {
     }
 
     #[test]
+    fn emphasis_next_to_punctuation_parses_back() {
+        use crate::doc::md::probe::{expect, runs};
+        // (html, markdown, runs of equal emphasis the editor's parser finds in the markdown)
+        type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+        let table: [Case; 12] = [
+            (
+                "<p>x<b> bold </b>y</p>",
+                "x **bold** y\n",
+                &[("x ", ""), ("bold", "b"), (" y", "")],
+            ),
+            (
+                "<p>a<b>bold.</b>b</p>",
+                "a**bold**.b\n",
+                &[("a", ""), ("bold", "b"), (".b", "")],
+            ),
+            (
+                "<p>a<b>(bold)</b>b</p>",
+                "a(**bold**)b\n",
+                &[("a(", ""), ("bold", "b"), (")b", "")],
+            ),
+            (
+                "<p>a<b>b</b>c</p>",
+                "a**b**c\n",
+                &[("a", ""), ("b", "b"), ("c", "")],
+            ),
+            (
+                "<p>a<i>b</i>c</p>",
+                "a*b*c\n",
+                &[("a", ""), ("b", "i"), ("c", "")],
+            ),
+            ("<p>a<b>--</b>b</p>", "a--b\n", &[("a--b", "")]),
+            (
+                "<p><b>Note:</b>text</p>",
+                "**Note**:text\n",
+                &[("Note", "b"), (":text", "")],
+            ),
+            (
+                "<p>(<b>bold</b>)</p>",
+                "(**bold**)\n",
+                &[("(", ""), ("bold", "b"), (")", "")],
+            ),
+            (
+                "<p>a<b><i>b.</i></b>c</p>",
+                "a***b***.c\n",
+                &[("a", ""), ("b", "bi"), (".c", "")],
+            ),
+            // marks close before a hard break instead of staying open into the next line, where a
+            // closing delimiter at the line start would not read as one
+            (
+                "<p><b>a<br></b>c</p>",
+                "**a**\\\nc\n",
+                &[("a", "b"), ("\nc", "")],
+            ),
+            (
+                "<p><b>a<br>b</b></p>",
+                "**a**\\\n**b**\n",
+                &[("a", "b"), ("\n", ""), ("b", "b")],
+            ),
+            // white space after the punctuation already makes the closing delimiter valid
+            (
+                "<p><b>a:</b> <a href=\"u\">b</a></p>",
+                "**a:** [b](u)\n",
+                &[("a:", "b"), (" b", "")],
+            ),
+        ];
+        for (html, want, spans) in table {
+            let markdown = md(html);
+            assert_eq!(markdown, want, "{html}");
+            assert_eq!(runs(&markdown), expect(spans), "{html}");
+        }
+    }
+
+    #[test]
     fn markdown_table() {
         let table = [
             (
@@ -1164,6 +1232,12 @@ mod tests {
                  <li><label><span><input type=checkbox></span></label>y</li><li><b>z</b></li>\
                  <li><div><div><div><input type=\"checkbox\"></div></div></div>w</li></ul>",
                 "- [x] x\n- [ ] y\n- **z**\n- w\n",
+            ),
+            (
+                "<ul><li> \n<input type=checkbox checked>x</li></ul>\
+                 <pre class=\"hljs lang-py\">x = 1</pre>\
+                 <p style=\"page-break-after:always\">a</p><p style=\"page-break-before:always\">b</p>",
+                "- [x] x\n\n```py\nx = 1\n```\n\na\n\n<!-- pagebreak -->\n\nb\n",
             ),
             (
                 "<ul>text<li>a</li><p>x</p></ul><ul><ul><li>n</li></ul></ul>",
@@ -1262,6 +1336,69 @@ mod tests {
     }
 
     #[test]
+    fn row_groups_cell_content_and_alignment() {
+        let table = [
+            (
+                "<table><thead><tr><th>h</th></tr></thead><tbody><tr><td>x</td></tr></tbody>\
+                 <tfoot><tr><td>f</td></tr></tfoot></table>",
+                "| h |\n|---|\n| x |\n| f |\n",
+            ),
+            (
+                "<table><tr><td><h2>x</h2></td><td style=\"text-align:end\">y</td></tr></table>",
+                "| x | y |\n|---|---:|\n",
+            ),
+        ];
+        for (html, expected) in table {
+            assert_eq!(md(html), expected, "{html}");
+        }
+    }
+
+    #[test]
+    fn non_content_nodes_and_empty_blocks_are_dropped() {
+        let table = [
+            // comments and doctypes are not content
+            ("<!DOCTYPE html><p>a<!-- c -->b</p>", "ab\n"),
+            // the placeholder break that browsers add after a copied selection is not a break
+            ("<p>a<br class=\"Apple-interchange-newline\">b</p>", "ab\n"),
+            (
+                "<p>H<span style=\"vertical-align:sub\">2</span>O</p>",
+                "H2O\n",
+            ),
+            ("<h1> </h1><h2><br></h2><p>x</p>", "x\n"),
+            ("<ul></ul><ol><li></li></ol><p>x</p>", "x\n"),
+            // a nested list beside the items of a list whose items declare their level
+            (
+                "<ul><li aria-level=\"1\">a</li><ol><li aria-level=\"2\">b</li></ol></ul>",
+                "- a\n  1. b\n",
+            ),
+            // `<pre>` text: `<br>` is a newline, comments and scripts are not text
+            (
+                "<pre>a<br>b<!-- c --><script>x</script></pre>",
+                "```\na\nb\n```\n",
+            ),
+            (
+                "<pre class=\"language-c++\">x</pre><pre class=\"language-a/b\">y</pre>",
+                "```c++\nx\n```\n\n```\ny\n```\n",
+            ),
+        ];
+        for (html, expected) in table {
+            assert_eq!(md(html), expected, "{html}");
+        }
+    }
+
+    #[test]
+    fn every_forced_break_value_starts_a_new_page() {
+        for value in ["always", "page", "left", "right", "recto", "verso"] {
+            let html = format!("<p>a</p><p style=\"break-before:{value}\">b</p>");
+            assert_eq!(md(&html), "a\n\n<!-- pagebreak -->\n\nb\n", "{value}");
+        }
+        assert_eq!(
+            md("<p>a</p><p style=\"break-before:avoid\">b</p>"),
+            "a\n\nb\n"
+        );
+    }
+
+    #[test]
     fn loss_table() {
         let table = [
             (
@@ -1282,6 +1419,10 @@ mod tests {
             (
                 "<ol type=\"i\"><li>a</li></ol>",
                 vec![(LossKind::ListNumberingStyle, 1)],
+            ),
+            (
+                "<ol type=\"I\"><li>a</li></ol><ol type=\"A\"><li>b</li></ol>",
+                vec![(LossKind::ListNumberingStyle, 2)],
             ),
             ("<p>plain</p>", vec![]),
         ];
@@ -1392,15 +1533,21 @@ mod tests {
         let depth = 300;
         let html = format!("{}deep{}", "<div>".repeat(depth), "</div>".repeat(depth));
         assert_eq!(md(&html), "deep\n");
+        // markup flattened past the depth limit that holds no text adds nothing
+        let empty = format!("{}{}", "<div>".repeat(depth), "</div>".repeat(depth));
+        assert_eq!(md(&empty), "");
         let code = format!(
             "<code>{}t{}</code>",
             "<span style=\"font-family:monospace\">".repeat(depth),
             "</span>".repeat(depth)
         );
-        match convert_html_paste(&code, false, "") {
-            HtmlPaste::Markdown(result) => assert!(result.markdown.contains('t')),
-            HtmlPaste::PlainText(text) => panic!("deep markup is not a code block: {text:?}"),
-        }
+        assert!(
+            matches!(
+                convert_html_paste(&code, false, ""),
+                HtmlPaste::Markdown(result) if result.markdown.contains('t')
+            ),
+            "deep markup is converted, not left as plain text"
+        );
     }
 
     #[test]

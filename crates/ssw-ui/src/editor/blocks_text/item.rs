@@ -314,9 +314,6 @@ impl BlockLayout for ItemLayout {
         if point.x < self.marker.width && point.y < self.marker.line {
             return self.marker.hit(point);
         }
-        if self.stack.is_empty() {
-            return self.range.end;
-        }
         self.stack.hit_test(point)
     }
 
@@ -335,9 +332,6 @@ impl BlockLayout for ItemLayout {
     }
 
     fn line_range(&self, offset: usize) -> TextRange {
-        if self.stack.is_empty() {
-            return self.range;
-        }
         let line = self.stack.line_range(offset.max(self.content_start));
         if line.start <= self.content_start {
             TextRange::new(self.range.start, line.end.max(self.range.start))

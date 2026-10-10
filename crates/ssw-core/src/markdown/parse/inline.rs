@@ -4,11 +4,9 @@
 //! Scanning produces a flat token list; emphasis and bracket resolution only annotate it, and
 //! the final nesting is built in one pass, so no token is ever moved.
 
-use smallvec::smallvec;
-
 use crate::markdown::ast::{
     HighlightColor, Image, ImageKind, Inline, InlineKind, Link, LinkKind, Markers, ReferenceForm,
-    WikiLink,
+    WikiLink, marks,
 };
 use crate::markdown::definitions::{Definitions, LabelKind, normalize_label};
 use crate::text::TextRange;
@@ -99,6 +97,13 @@ pub(super) fn parse_inlines(
     p.scan();
     p.process_emphasis(0);
     p.build()
+}
+
+/// The innermost open frame. `build` never pops its base frame, so the stack is never empty.
+fn base_frame_on_top(stack: &mut [Frame]) -> &mut Frame {
+    stack
+        .last_mut()
+        .expect("the base frame of `build` is never popped")
 }
 
 fn leaf_tok(node: Inline) -> Tok {
@@ -224,14 +229,14 @@ impl<'a> Inl<'a> {
             self.toks.push(leaf_tok(leaf(
                 range,
                 content,
-                smallvec![m],
+                marks(&[m]),
                 InlineKind::HardBreak,
             )));
         } else {
             self.toks.push(leaf_tok(leaf(
                 range,
                 range,
-                smallvec![],
+                marks(&[]),
                 InlineKind::SoftBreak,
             )));
         }
@@ -247,7 +252,7 @@ impl<'a> Inl<'a> {
                 self.toks.push(leaf_tok(leaf(
                     range,
                     content,
-                    smallvec![m],
+                    marks(&[m]),
                     InlineKind::HardBreak,
                 )));
                 i + 2
@@ -259,7 +264,7 @@ impl<'a> Inl<'a> {
                 self.toks.push(leaf_tok(leaf(
                     range,
                     content,
-                    smallvec![m],
+                    marks(&[m]),
                     InlineKind::Escape,
                 )));
                 i + 2
@@ -297,8 +302,7 @@ impl<'a> Inl<'a> {
                     {
                         text = text[1..text.len() - 1].to_string();
                     }
-                    let markers: Markers =
-                        smallvec![self.s.range(i, i + n), self.s.range(j, j + n)];
+                    let markers: Markers = marks(&[self.s.range(i, i + n), self.s.range(j, j + n)]);
                     let node = leaf(
                         self.s.range(i, j + n),
                         self.s.range(i + n, j),
@@ -323,7 +327,7 @@ impl<'a> Inl<'a> {
             self.toks.push(leaf_tok(leaf(
                 r,
                 r,
-                smallvec![],
+                marks(&[]),
                 InlineKind::Entity { decoded },
             )));
             i + used
@@ -564,15 +568,12 @@ impl<'a> Inl<'a> {
             Some(p) => (&inner[..p], Some(&inner[p + 1..])),
             None => (inner, None),
         };
-        if left.is_empty() && alias.is_none() {
-            return None;
-        }
         let left_end = i + 2 + left.len();
         let (target, heading, target_end) = match left.find('#') {
             Some(p) => (&left[..p], Some(&left[p + 1..]), i + 2 + p),
             None => (left, None, left_end),
         };
-        let mut markers: Markers = smallvec![self.s.range(i, i + 2)];
+        let mut markers: Markers = marks(&[self.s.range(i, i + 2)]);
         let alias_info = alias.map(|a| (a, self.s.range(left_end + 1, j)));
         if alias.is_some() {
             markers.push(self.s.range(left_end, left_end + 1));
@@ -724,7 +725,7 @@ impl<'a> Inl<'a> {
         self.toks.truncate(tok_idx);
         let range = self.s.range(open_pos, p + 1);
         let markers: Markers =
-            smallvec![self.s.range(open_pos, open_pos + 2), self.s.range(p, p + 1)];
+            marks(&[self.s.range(open_pos, open_pos + 2), self.s.range(p, p + 1)]);
         let content = self.s.range(open_pos + 2, p);
         self.toks.push(leaf_tok(leaf(
             range,
@@ -832,11 +833,11 @@ impl<'a> Inl<'a> {
                 inner.to_string()
             };
             let content = self.s.range(i + 1, end - 1);
-            let text = leaf(content, content, smallvec![], InlineKind::Text);
+            let text = leaf(content, content, marks(&[]), InlineKind::Text);
             let mut node = leaf(
                 self.s.range(i, end),
                 content,
-                smallvec![self.s.range(i, i + 1), self.s.range(end - 1, end)],
+                marks(&[self.s.range(i, i + 1), self.s.range(end - 1, end)]),
                 InlineKind::Link(Link {
                     dest,
                     title: None,
@@ -856,7 +857,7 @@ impl<'a> Inl<'a> {
                 self.toks.push(leaf_tok(leaf(
                     range,
                     range,
-                    smallvec![],
+                    marks(&[]),
                     InlineKind::RawHtml,
                 )));
             }
@@ -871,7 +872,7 @@ impl<'a> Inl<'a> {
             return None;
         }
         let (sv, ev) = scan::tag_attribute(tag, "src")?;
-        let text = std::str::from_utf8(tag).ok()?;
+        let text = &self.s.buf[i..i + tag.len()];
         let attr = |name: &str| scan::tag_attribute(tag, name);
         let alt = match attr("alt") {
             Some((a, e)) => self.s.range(i + a, i + e),
@@ -881,7 +882,7 @@ impl<'a> Inl<'a> {
         Some(leaf(
             range,
             range,
-            smallvec![],
+            marks(&[]),
             InlineKind::Image(Image {
                 dest: scan::unescape(&text[sv..ev]),
                 title: attr("title").map(|(a, e)| scan::unescape(&text[a..e])),
@@ -925,7 +926,7 @@ impl<'a> Inl<'a> {
                         let next_digit = b.get(j + n).is_some_and(u8::is_ascii_digit);
                         if n == 2 || (!prev_ws && !next_digit) {
                             let markers: Markers =
-                                smallvec![self.s.range(i, i + n), self.s.range(j, j + n)];
+                                marks(&[self.s.range(i, i + n), self.s.range(j, j + n)]);
                             let node = leaf(
                                 self.s.range(i, j + n),
                                 self.s.range(start, j),
@@ -1011,11 +1012,11 @@ impl<'a> Inl<'a> {
     }
 
     fn push_autolink(&mut self, content: TextRange, dest: String) {
-        let child = leaf(content, content, smallvec![], InlineKind::Text);
+        let child = leaf(content, content, marks(&[]), InlineKind::Text);
         let mut node = leaf(
             content,
             content,
-            smallvec![],
+            marks(&[]),
             InlineKind::Link(Link {
                 dest,
                 title: None,
@@ -1109,9 +1110,7 @@ impl<'a> Inl<'a> {
         if a >= b {
             return;
         }
-        let Some(frame) = stack.last_mut() else {
-            return;
-        };
+        let frame = base_frame_on_top(stack);
         let range = self.s.range(a, b);
         if frame.last_text_end == Some(a)
             && let Some(last) = frame.children.last_mut()
@@ -1123,29 +1122,28 @@ impl<'a> Inl<'a> {
         }
         frame
             .children
-            .push(leaf(range, range, smallvec![], InlineKind::Text));
+            .push(leaf(range, range, marks(&[]), InlineKind::Text));
         frame.last_text_end = Some(b);
     }
 
     fn close_frame(&self, stack: &mut Vec<Frame>, w: usize) {
-        if stack.len() < 2 {
-            return;
-        }
-        let Some(frame) = stack.pop() else { return };
+        // Every wrap closes the frame its opener pushed, so the base frame is never popped.
+        let frame = stack
+            .pop()
+            .expect("a closing wrap has the frame of its opener");
         let info = &self.wraps[w];
         let range = TextRange::new(info.open.start, info.close.end.max(info.open.start));
         let content = TextRange::new(info.open.end, info.close.start.max(info.open.end));
         let node = Inline {
             range,
             content,
-            markers: smallvec![info.open, info.close],
+            markers: marks(&[info.open, info.close]),
             kind: info.kind.clone(),
             children: frame.children,
         };
-        if let Some(parent) = stack.last_mut() {
-            parent.children.push(node);
-            parent.last_text_end = None;
-        }
+        let parent = base_frame_on_top(stack);
+        parent.children.push(node);
+        parent.last_text_end = None;
     }
 
     fn build(&self) -> Vec<Inline> {
@@ -1157,10 +1155,9 @@ impl<'a> Inl<'a> {
             match tok {
                 Tok::Text(a, b) => self.emit_text(&mut stack, *a, *b),
                 Tok::Leaf(node) => {
-                    if let Some(f) = stack.last_mut() {
-                        f.children.push((**node).clone());
-                        f.last_text_end = None;
-                    }
+                    let f = base_frame_on_top(&mut stack);
+                    f.children.push((**node).clone());
+                    f.last_text_end = None;
                 }
                 Tok::Delim(d) => {
                     let d = &self.delims[*d];
@@ -1194,13 +1191,9 @@ impl<'a> Inl<'a> {
                 Tok::Close(w) => self.close_frame(&mut stack, *w),
             }
         }
-        while stack.len() > 1 {
-            let Some(frame) = stack.pop() else { break };
-            if let Some(parent) = stack.last_mut() {
-                parent.children.extend(frame.children);
-            }
-        }
-        stack.pop().map(|f| f.children).unwrap_or_default()
+        // Wraps open and close in pairs, so only the base frame is left; frames that were left
+        // open would fold into their parents in stack order.
+        stack.into_iter().flat_map(|f| f.children).collect()
     }
 }
 
@@ -1263,11 +1256,8 @@ fn autolink_end(b: &[u8], i: usize) -> Option<usize> {
 /// Length of `s` after dropping the trailing punctuation GFM excludes from autolinks.
 fn trim_autolink(s: &str) -> usize {
     let mut end = s.len();
-    loop {
+    while let Some(last) = s[..end].chars().next_back() {
         let t = &s[..end];
-        let Some(last) = t.chars().next_back() else {
-            return end;
-        };
         match last {
             '?' | '!' | '.' | ',' | ':' | '*' | '_' | '~' | '\'' | '"' => end -= 1,
             ')' => {
@@ -1276,7 +1266,7 @@ fn trim_autolink(s: &str) -> usize {
                 if close > open {
                     end -= 1;
                 } else {
-                    return end;
+                    break;
                 }
             }
             ';' => {
@@ -1291,9 +1281,10 @@ fn trim_autolink(s: &str) -> usize {
                     _ => end -= 1,
                 }
             }
-            _ => return end,
+            _ => break,
         }
     }
+    end
 }
 
 /// `|300` / `|300x200` at the end of `text`: `(index of '|', width, height)`.

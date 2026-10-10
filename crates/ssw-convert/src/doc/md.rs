@@ -125,7 +125,11 @@ fn is_punct(c: char) -> bool {
 /// delimiters when a letter or digit sits on the other side (`**學生—**證` becomes
 /// `**學生**—證`). A run that is punctuation only, or a code span, which cannot give up its
 /// backticks, is written without delimiters in that case.
-fn flank(
+///
+/// `core` has no leading or trailing white space; `before` and `after` are the characters next
+/// to it in the output (`None` or white space when no letter or digit touches the delimiters).
+/// The DOCX, RTF and HTML importers use this same function.
+pub(crate) fn flank(
     core: &str,
     code: bool,
     before: Option<char>,
@@ -153,6 +157,70 @@ fn flank(
     };
     let cut = rest.len() - tail;
     (&core[..head], &rest[..cut], &rest[cut..], cut > 0)
+}
+
+/// Reads emphasis back from Markdown with the editor's parser, for the importer round-trip tests.
+#[cfg(test)]
+pub(crate) mod probe {
+    use ssw_core::markdown::ast::{Inline, InlineKind};
+
+    /// The flag letter of an emphasis node: `b` strong, `i` emphasis, `s` strike, `u` underline,
+    /// `h` highlight.
+    fn flag(kind: &InlineKind) -> Option<char> {
+        match kind {
+            InlineKind::Strong => Some('b'),
+            InlineKind::Emphasis => Some('i'),
+            InlineKind::Strikethrough => Some('s'),
+            InlineKind::Underline => Some('u'),
+            InlineKind::Highlight { .. } => Some('h'),
+            _ => None,
+        }
+    }
+
+    fn walk(src: &str, nodes: &[Inline], flags: &str, out: &mut Vec<(char, String)>) {
+        for node in nodes {
+            let text = match &node.kind {
+                InlineKind::Text => node.range.get(src).unwrap_or("").to_string(),
+                InlineKind::Escape => node.content.get(src).unwrap_or("").to_string(),
+                InlineKind::Entity { decoded } => decoded.clone(),
+                InlineKind::Code { text } => text.clone(),
+                InlineKind::HardBreak | InlineKind::SoftBreak => "\n".to_string(),
+                _ => String::new(),
+            };
+            let own = flags.to_string();
+            out.extend(text.chars().map(|c| (c, own.clone())));
+            let mut inner: Vec<char> = flags.chars().collect();
+            inner.extend(flag(&node.kind));
+            inner.sort_unstable();
+            let inner: String = inner.into_iter().collect();
+            walk(src, &node.children, &inner, out);
+        }
+    }
+
+    /// The text of the first paragraph-like block of `md` grouped into runs of equal emphasis:
+    /// `(text, flags)` with flags sorted alphabetically (`""` for plain text).
+    pub(crate) fn runs(md: &str) -> Vec<(String, String)> {
+        let document = ssw_core::markdown::parse_document(md);
+        let mut chars = Vec::new();
+        for block in &document.blocks {
+            walk(md, &block.inlines, "", &mut chars);
+        }
+        let mut runs: Vec<(String, String)> = Vec::new();
+        for (c, flags) in chars {
+            match runs.last_mut() {
+                Some((text, last)) if *last == flags => text.push(c),
+                _ => runs.push((c.to_string(), flags)),
+            }
+        }
+        runs
+    }
+
+    /// `runs` as owned pairs, for comparing with [`runs`].
+    pub(crate) fn expect(runs: &[(&str, &str)]) -> Vec<(String, String)> {
+        runs.iter()
+            .map(|(text, flags)| ((*text).to_string(), (*flags).to_string()))
+            .collect()
+    }
 }
 
 /// Where inline text is going; decides how breaks and `|` are written.

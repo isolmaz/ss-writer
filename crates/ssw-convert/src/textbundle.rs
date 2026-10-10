@@ -240,9 +240,8 @@ pub fn write_dir(dir: &Path, text: &str, assets: &[Asset]) -> Result<(), TextBun
     std::fs::write(dir.join("text.markdown"), text)?;
     for a in assets {
         let target = dir.join(&a.relative_path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        // a validated asset path always has at least the `assets` folder above it
+        std::fs::create_dir_all(target.parent().unwrap_or(dir))?;
         std::fs::write(target, &a.bytes)?;
     }
     Ok(())
@@ -426,6 +425,43 @@ mod tests {
         assert_eq!((b.text.as_str(), b.assets.len()), ("t", 0));
     }
 
+    /// Makes `link` a directory link to `target`; `false` when the platform refuses.
+    fn link_dir(link: &Path, target: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            // a junction needs no privilege
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    #[test]
+    fn linked_folders_inside_assets_are_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("text.md"), "t").unwrap();
+        let assets = tmp.path().join("assets");
+        std::fs::create_dir(&assets).unwrap();
+        std::fs::write(assets.join("a.bin"), [1u8]).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.bin"), [2u8]).unwrap();
+        assert!(link_dir(&assets.join("link"), outside.path()));
+        let bundle = read_dir(tmp.path()).unwrap();
+        let paths: Vec<&str> = bundle
+            .assets
+            .iter()
+            .map(|a| a.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, ["assets/a.bin"]);
+    }
+
     #[test]
     fn invalid_asset_paths_are_rejected_when_writing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -440,20 +476,11 @@ mod tests {
             "/assets/x",
         ] {
             let assets = [asset(bad, b"x")];
-            assert!(
-                matches!(
-                    write_dir(&tmp.path().join("b"), "t", &assets),
-                    Err(TextBundleError::InvalidAssetPath(p)) if p == bad
-                ),
-                "{bad}"
-            );
-            assert!(
-                matches!(
-                    write_pack("t", &assets),
-                    Err(TextBundleError::InvalidAssetPath(_))
-                ),
-                "{bad}"
-            );
+            let expected = TextBundleError::InvalidAssetPath(bad.to_string()).to_string();
+            let from_dir = write_dir(&tmp.path().join("b"), "t", &assets).unwrap_err();
+            assert_eq!(from_dir.to_string(), expected, "{bad}");
+            let from_pack = write_pack("t", &assets).unwrap_err();
+            assert_eq!(from_pack.to_string(), expected, "{bad}");
         }
     }
 

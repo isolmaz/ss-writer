@@ -291,10 +291,7 @@ mod tests {
         for src in ["# A", "# A\n", "# A\n\n  \n", "# A\n# B\n"] {
             let t = toc(src);
             let ranges = fold_ranges(&t, src);
-            assert!(
-                ranges.iter().all(|r| r.heading != 0),
-                "{src:?} -> {ranges:?}"
-            );
+            assert!(ranges.is_empty(), "{src:?} -> {ranges:?}");
         }
         assert!(fold_ranges(&toc(""), "").is_empty());
         assert!(fold_ranges(&toc("no headings\n"), "no headings\n").is_empty());

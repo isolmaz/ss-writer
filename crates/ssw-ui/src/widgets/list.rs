@@ -853,15 +853,18 @@ mod tests {
         let ninth = list.row_rect(8).center();
         harness.hover(&mut list, ninth);
         let canvas = harness.paint(&list);
+        let text_colors: Vec<crate::geometry::Color> = canvas
+            .ops()
+            .filter_map(|op| match op {
+                DrawOp::Text { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text_colors.len(), 3);
         assert!(
-            canvas
-                .ops()
-                .all(|op| !matches!(op, DrawOp::Text { color, .. } if *color == tokens.text))
-        );
-        assert!(
-            canvas.ops().any(
-                |op| matches!(op, DrawOp::Text { color, .. } if *color == tokens.text_disabled)
-            )
+            text_colors
+                .iter()
+                .all(|color| *color == tokens.text_disabled)
         );
     }
 
@@ -1033,5 +1036,71 @@ mod tests {
         click_with(&mut harness, &mut empty, 0, Modifiers::NONE, 1);
         assert!(empty.selected().is_empty());
         assert_eq!(harness.node(&empty).children.len(), 0);
+    }
+
+    #[test]
+    fn kit_list_with_id_names_the_control() {
+        let id = WidgetId::allocate();
+        let list = ListView::new("Files", names(3), SelectionMode::Single).with_id(id);
+        assert_eq!(list.id(), id);
+        assert_eq!(Harness::new().node(&list).id, id);
+    }
+
+    #[test]
+    fn kit_list_without_items_ignores_navigation() {
+        let mut harness = Harness::new();
+        let mut list = ListView::new("Files", Vec::new(), SelectionMode::Single)
+            .with_motion(Motion::reduced());
+        harness.arrange(&mut list, Rect::new(0.0, 0.0, 200.0, 96.0));
+        harness.focus.focus(list.id());
+        harness.key(&mut list, crate::input::vk::DOWN);
+        harness.key(&mut list, crate::input::vk::END);
+        assert_eq!(list.selected_index(), None);
+    }
+
+    #[test]
+    fn kit_list_paints_only_where_damaged() {
+        let (mut harness, list) = setup(SelectionMode::Single);
+        let away = Rect::new(500.0, 500.0, 5.0, 5.0);
+        assert_eq!(harness.paint_damaged(&list, Some(away)).ops().count(), 0);
+        let over = Rect::new(0.0, 0.0, 200.0, 96.0);
+        assert!(harness.paint_damaged(&list, Some(over)).ops().count() > 0);
+    }
+
+    #[test]
+    fn kit_list_wheel_over_a_list_that_fits_is_left_alone() {
+        let mut harness = Harness::new();
+        let mut list =
+            ListView::new("Files", names(2), SelectionMode::Single).with_motion(Motion::reduced());
+        harness.arrange(&mut list, Rect::new(0.0, 0.0, 200.0, 96.0));
+        let wheel = Event::Wheel(crate::input::WheelEvent {
+            delta: Point::new(0.0, -1.0),
+            precise: false,
+            position: Point::new(50.0, 40.0),
+            mods: Modifiers::NONE,
+        });
+        assert!(!harness.send(&mut list, wheel).handled);
+    }
+
+    #[test]
+    fn kit_list_notched_wheel_eases_the_scroll_and_frames_repaint() {
+        let mut harness = Harness::new();
+        let mut list =
+            ListView::new("Files", names(100), SelectionMode::Single).with_motion(Motion::full());
+        harness.arrange(&mut list, Rect::new(0.0, 0.0, 200.0, 96.0));
+        let wheel = Event::Wheel(crate::input::WheelEvent {
+            delta: Point::new(0.0, -3.0),
+            precise: false,
+            position: Point::new(50.0, 40.0),
+            mods: Modifiers::NONE,
+        });
+        assert!(harness.send(&mut list, wheel).handled);
+        assert!(harness.requests.animation_frame_requested());
+        harness.frame(&mut list, 16);
+        harness.requests.take_invalidation();
+        harness.frame(&mut list, 100);
+        assert!(!harness.requests.take_invalidation().is_clean());
+        harness.run_animations(&mut list);
+        assert!(list.row_rect(0).y < 0.0);
     }
 }

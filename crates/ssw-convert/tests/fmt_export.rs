@@ -9,7 +9,7 @@ use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesStart, Event};
 use ssw_convert::assets::{AssetProvider, NoAssets};
 use ssw_convert::clipboard::{build_cf_html, parse_cf_html};
-use ssw_convert::css::light_theme_css;
+use ssw_convert::css::{Theme, dark_theme_css, light_theme_css};
 use ssw_convert::epub::{EpubOptions, export_epub};
 use ssw_convert::html::{HtmlOptions, render_document, render_fragment};
 use ssw_convert::txt::markdown_to_text;
@@ -153,6 +153,7 @@ fn html_export_escapes_every_special_character() {
     let opts = HtmlOptions {
         title: Some("T\"<&>".into()),
         lang: Some("tr\"><x".into()),
+        ..HtmlOptions::default()
     };
     let doc = render_document("x", &NoAssets, &opts);
     assert!(doc.contains("<html lang=\"tr&quot;&gt;&lt;x\">"), "{doc}");
@@ -230,6 +231,39 @@ fn html_export_renders_highlights_underline_and_page_breaks() {
     let css = light_theme_css();
     assert!(css.contains("mark.hl-purple{background:#E3D0F8}"));
     assert!(css.contains(".page-break{break-after:page"));
+}
+
+#[test]
+fn a_dark_html_export_embeds_the_dark_sheet_and_the_light_one_does_not() {
+    let dark = HtmlOptions {
+        theme: Theme::Dark,
+        ..HtmlOptions::default()
+    };
+    let doc = render_document("# T\n\n> [!TIP]\n> x\n\n==m==", &NoAssets, &dark);
+    assert_eq!(doc.matches("<style>").count(), 1);
+    assert!(doc.contains(dark_theme_css()), "{doc}");
+    assert!(doc.contains("color-scheme:dark"));
+    assert!(doc.contains("body{background:#272727;color:#E4E4E4}"));
+    let light = render_document("# T", &NoAssets, &HtmlOptions::default());
+    assert!(!light.contains("color-scheme:dark") && !light.contains("#272727"));
+    // The body of the document is the same in both themes.
+    assert_eq!(
+        body_of("# T\n\ntext"),
+        main_of(&render_document("# T\n\ntext", &NoAssets, &dark))
+    );
+}
+
+#[test]
+fn a_dark_epub_carries_the_dark_sheet() {
+    let opts = EpubOptions {
+        theme: Theme::Dark,
+        ..EpubOptions::default()
+    };
+    let mut archive = open(export_epub("# T\n\nx", "t.md", &NoAssets, &opts).unwrap());
+    assert_eq!(
+        read_string(&mut archive, "OEBPS/stylesheet.css"),
+        dark_theme_css()
+    );
 }
 
 #[test]
@@ -372,6 +406,7 @@ fn book() -> Archive {
         title: None,
         author: Some("Ada <Lovelace> & Co".into()),
         lang: Some("tr".into()),
+        ..EpubOptions::default()
     };
     open(export_epub(BOOK, "book.md", &Provider, &opts).unwrap())
 }

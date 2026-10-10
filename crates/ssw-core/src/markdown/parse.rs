@@ -15,7 +15,7 @@ use crate::text::TextRange;
 
 use super::ast::{
     Block, BlockKind, CalloutKind, CodeBlock, Document, HtmlBlock, Inline, InlineKind, Markers,
-    MathBlock, Table, TableCell, TableRow, Task,
+    MathBlock, Table, TableCell, TableRow, Task, marks,
 };
 use super::definitions::Definitions;
 use block::{Node, NodeKind};
@@ -116,14 +116,6 @@ impl Converter<'_> {
         let start = self.nodes[id].start;
         let markers: Markers = self.nodes[id].markers.iter().copied().collect();
         match kind {
-            NodeKind::Document => Self::block(
-                TextRange::at(0),
-                TextRange::at(0),
-                Markers::new(),
-                BlockKind::Paragraph,
-                Vec::new(),
-                Vec::new(),
-            ),
             NodeKind::List(data) => {
                 let children = self.children(id);
                 let range = span(&children, start);
@@ -176,7 +168,8 @@ impl Converter<'_> {
                     inlines,
                 )
             }
-            NodeKind::Paragraph => {
+            // The root node has no lines and starts at 0: an empty paragraph at offset 0.
+            NodeKind::Document | NodeKind::Paragraph => {
                 let lines = self.nodes[id].lines.clone();
                 let range = lines_span(&lines, start);
                 let inlines = self.inlines_of_lines(&lines, range);
@@ -315,7 +308,7 @@ impl Converter<'_> {
         }
         let children = self.children(id);
         let content = span(&children, marker.end);
-        let mut markers: Markers = smallvec::smallvec![marker];
+        let mut markers = marks(&[marker]);
         if let Some(t) = &task {
             markers.push(t.checkbox);
         }
@@ -340,8 +333,9 @@ impl Converter<'_> {
         if !matches!(self.nodes[pid].kind, NodeKind::Paragraph) || self.nodes[pid].removed {
             return None;
         }
-        let line = *self.nodes[pid].lines.first()?;
-        let text = line.range.get(self.src)?;
+        // A paragraph that is not removed always has its first line.
+        let line = self.nodes[pid].lines[0];
+        let text = line.range.get(self.src).unwrap_or("");
         let b = text.as_bytes();
         if b.len() < 4 || b[0] != b'[' || b[2] != b']' || !matches!(b[3], b' ' | b'\t') {
             return None;
@@ -354,9 +348,8 @@ impl Converter<'_> {
         let rest = &text[3..];
         let skipped = rest.len() - rest.trim_start_matches([' ', '\t']).len();
         let new_start = line.range.start + 3 + skipped;
-        if new_start >= line.range.end && self.nodes[pid].lines.len() == 1 {
-            return None;
-        }
+        // The paragraph is finalized (last line trimmed), so a lone line with a 4th
+        // whitespace byte always has text after the checkbox.
         let checkbox = TextRange::new(line.range.start, line.range.start + 3);
         if new_start >= line.range.end {
             self.nodes[pid].lines.remove(0);
@@ -415,8 +408,9 @@ impl Converter<'_> {
         if !matches!(self.nodes[pid].kind, NodeKind::Paragraph) || self.nodes[pid].removed {
             return None;
         }
-        let line = *self.nodes[pid].lines.first()?;
-        let text = line.range.get(self.src)?;
+        // A paragraph that is not removed always has its first line.
+        let line = self.nodes[pid].lines[0];
+        let text = line.range.get(self.src).unwrap_or("");
         let rest = text.strip_prefix("[!")?;
         let close = rest.find(']')?;
         let kind = CalloutKind::from_keyword(&rest[..close])?;

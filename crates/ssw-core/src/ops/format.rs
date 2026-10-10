@@ -301,10 +301,7 @@ fn toggle_over_selection(ctx: Ctx<'_>, style: InlineStyle) -> Option<Transaction
 fn unwrap_or_recolor(ctx: Ctx<'_>, style: InlineStyle, nodes: &[&Inline]) -> Transaction {
     let mut edits = Vec::new();
     if let InlineStyle::Highlight(color) = style {
-        let color_of = |n: &Inline| match n.kind {
-            InlineKind::Highlight { color } => color,
-            _ => None,
-        };
+        let color_of = |n: &Inline| n.kind.highlight_color();
         if nodes.iter().any(|n| color_of(n) != color) {
             for node in nodes.iter().filter(|n| color_of(n) != color) {
                 edits.push(Edit::replace(node.markers[0], highlight_open(color)));
@@ -424,7 +421,7 @@ pub fn insert_image(ctx: Ctx<'_>, alt: &str, dest: &str) -> Transaction {
 }
 
 /// Escapes `[` and `]` with backslashes when they are not balanced in `text`.
-pub(crate) fn escape_brackets(text: &str) -> Cow<'_, str> {
+pub fn escape_brackets(text: &str) -> Cow<'_, str> {
     let mut depth = 0i32;
     let mut balanced = true;
     for ch in text.chars() {
@@ -444,7 +441,7 @@ pub(crate) fn escape_brackets(text: &str) -> Cow<'_, str> {
 }
 
 /// A link destination: bare when it is safe, otherwise in angle brackets.
-pub(crate) fn link_destination(url: &str) -> Cow<'_, str> {
+pub fn link_destination(url: &str) -> Cow<'_, str> {
     let plain = !url.is_empty()
         && !url
             .chars()

@@ -137,7 +137,7 @@ fn measure_item(
     shared: &Shared<'_>,
 ) -> Box<dyn BlockLayout> {
     let task = match &item.kind {
-        BlockKind::ListItem { task, .. } => *task,
+        BlockKind::ListItem { task: Some(t), .. } => Some(*t),
         _ => None,
     };
     let shape = match (task, shared.numbers.get(index)) {

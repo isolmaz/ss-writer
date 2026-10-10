@@ -18,6 +18,7 @@ use ssw_core::markdown::definitions::normalize_label;
 use ssw_core::markdown::{parse_document, unescape_markdown};
 
 use crate::assets::{AssetProvider, is_external_url};
+use crate::docx::write::item_task;
 use crate::txt::inline_plain;
 
 /// Page width available to tables, in twips (A4/Letter with 1" margins is about 9000).
@@ -228,7 +229,6 @@ impl<'a> Writer<'a> {
                     );
                 }
             }
-            BlockKind::ListItem { .. } => self.blocks_in(&b.children, quote, depth),
             BlockKind::BlockQuote => {
                 for child in &b.children {
                     self.quoted(child, quote + 1, depth);
@@ -266,15 +266,11 @@ impl<'a> Writer<'a> {
                 self.code(text.trim_end_matches('\n'), indent);
             }
             BlockKind::PageBreak => self.body.push_str("\\page\n"),
-            BlockKind::FrontMatter { .. }
+            // list items are written by `list_item`; the rest is not part of the page
+            BlockKind::ListItem { .. }
+            | BlockKind::FrontMatter { .. }
             | BlockKind::FootnoteDefinition { .. }
             | BlockKind::LinkReferenceDefinition(_) => {}
-        }
-    }
-
-    fn blocks_in(&mut self, blocks: &'a [Block], quote: usize, depth: usize) {
-        for b in blocks {
-            self.block(b, quote, depth);
         }
     }
 
@@ -315,10 +311,7 @@ impl<'a> Writer<'a> {
         depth: usize,
         quote: usize,
     ) {
-        let task = match &item.kind {
-            BlockKind::ListItem { task, .. } => *task,
-            _ => None,
-        };
+        let task = item_task(item);
         let left = 720 * (depth + 1) + quote * 567;
         let mut first = true;
         for child in &item.children {
@@ -445,15 +438,14 @@ impl<'a> Writer<'a> {
     }
 
     fn footnote(&mut self, label: &str) {
-        let def = self.footnote_defs.get(&normalize_label(label)).copied();
+        // the parser only produces a `FootnoteRef` for a label that has a definition
+        let def = self.footnote_defs[&normalize_label(label)];
         let mut text = String::new();
-        if let Some(def) = def {
-            for child in &def.children {
-                if !text.is_empty() {
-                    text.push(' ');
-                }
-                inline_plain(&child.inlines, self.src, " ", false, &mut text);
+        for child in &def.children {
+            if !text.is_empty() {
+                text.push(' ');
             }
+            inline_plain(&child.inlines, self.src, " ", false, &mut text);
         }
         self.body
             .push_str("{\\super\\chftn}{\\footnote\\pard\\plain\\f0\\fs20 {\\super\\chftn} ");
@@ -712,6 +704,40 @@ mod tests {
         for alt in ["[n]", "[g]", "[x]", "[w]"] {
             assert!(out.contains(alt), "{alt}");
         }
+    }
+
+    #[test]
+    fn highlight_colors_use_the_color_table() {
+        let b = body_of("=={red}r== =={orange}o== =={green}g== =={blue}b== =={purple}p==");
+        for wanted in [
+            "{\\highlight3 r}",
+            "{\\highlight4 o}",
+            "{\\highlight5 g}",
+            "{\\highlight6 b}",
+            "{\\highlight7 p}",
+        ] {
+            assert!(b.contains(wanted), "{wanted} in {b}");
+        }
+    }
+
+    #[test]
+    fn escapes_entities_math_and_wiki_links_are_written_as_text() {
+        let b = body_of("a \\* b &amp; c $x$ [[Page]]\n");
+        assert!(b.contains("a * b & c x Page"), "{b}");
+    }
+
+    #[test]
+    fn html_blocks_are_written_as_code_and_html_images_fall_back_to_their_alt() {
+        let b = body_of("<div>hi</div>\n");
+        assert!(b.contains("<div>hi</div>"), "{b}");
+        let out = markdown_to_rtf("see <img src=\"missing.png\" alt=\"the logo\">\n", &Pics);
+        assert!(out.contains("[the logo]"), "{out}");
+    }
+
+    #[test]
+    fn the_test_provider_has_no_math_or_diagrams() {
+        assert!(Pics.math_svg("x", false).is_none());
+        assert!(Pics.mermaid_svg("graph TD").is_none());
     }
 
     #[test]

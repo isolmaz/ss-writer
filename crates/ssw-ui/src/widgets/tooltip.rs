@@ -411,4 +411,31 @@ mod tests {
         tip.paint(&cx, &mut canvas);
         assert!(canvas.recorded().is_empty());
     }
+
+    #[test]
+    fn kit_tooltip_with_id_names_the_control() {
+        let id = WidgetId::allocate();
+        let tip = Tooltip::new("Hint", TARGET).with_id(id);
+        assert_eq!(tip.id(), id);
+        assert_eq!(Harness::new().node(&tip).id, id);
+    }
+
+    #[test]
+    fn kit_tooltip_test_host_forwards_timer_requests() {
+        let mut harness = Harness::new();
+        let first = TimerId::allocate();
+        harness
+            .requests
+            .set_timer(first, Duration::from_millis(500), false);
+        harness.requests.kill_timer(TimerId::allocate());
+        harness.requests.request_animation_frame();
+        // The latest start request is found behind a later stop request.
+        assert_eq!(
+            timer_of(&harness),
+            Some((first, Duration::from_millis(500)))
+        );
+        harness.requests.flush_timers(&mut Discard);
+        assert!(harness.requests.timers().is_empty());
+        assert!(!harness.requests.animation_frame_requested());
+    }
 }

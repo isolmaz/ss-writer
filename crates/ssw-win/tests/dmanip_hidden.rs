@@ -9,8 +9,11 @@
 //! viewport's own `ZoomToRect` (immediate and animated), and `SetContact` is exercised with a
 //! pointer id the system does not know. Real touch and touchpad contacts are manual checks.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+mod support;
+
 use std::time::{Duration, Instant};
+
+use support::MachineLock;
 
 use ssw_ui::geometry::Size;
 use ssw_ui::input::{Modifiers, WheelEvent};
@@ -18,7 +21,8 @@ use ssw_ui::scroll_physics::{Extent, WheelLines};
 use ssw_win::com::{ComGuard, WinError};
 use ssw_win::dmanip::{
     DirectManipulation, DmConfig, DmListener, DmStatus, DmTransform, ScrollDriver, ScrollFrame,
-    ScrollLayout, ZoomRange, client_area_animation, pointer_id, wants_contact, wheel_scroll_lines,
+    ScrollLayout, ZoomRange, client_area_animation, pointer_client_position, pointer_id,
+    pointer_is_pen, wants_contact, wheel_scroll_lines,
 };
 use windows::Win32::Foundation::{ERROR_NOT_FOUND, HINSTANCE, HWND, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -34,13 +38,11 @@ use windows::core::{HRESULT, w};
 const PATIENCE: Duration = Duration::from_secs(8);
 const FRAME: Duration = Duration::from_millis(8);
 
-/// Serializes the tests: one DirectManipulation window at a time in this process.
-static SERIAL: Mutex<()> = Mutex::new(());
-
 /// A fully transparent, click-through, off-screen window of the system `STATIC` class that is
-/// shown without activation. The second field holds the process-wide test lock for as long as
-/// the window lives.
-struct HiddenWindow(HWND, #[allow(dead_code)] MutexGuard<'static, ()>);
+/// shown without activation. The second field holds the machine-wide DirectManipulation lock
+/// (one such window at a time, across the processes of a parallel test run) for as long as the
+/// window lives.
+struct HiddenWindow(HWND, #[allow(dead_code)] MachineLock);
 
 /// Dispatches the messages queued for this thread, as the message loop of the real window does
 /// between frames: DirectManipulation (an STA object) needs the thread to pump to deliver.
@@ -57,7 +59,7 @@ fn pump_messages() {
 
 impl HiddenWindow {
     fn new() -> Self {
-        let guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let guard = MachineLock::acquire("directmanipulation");
         // SAFETY: querying the handle of the current module.
         let instance = unsafe { GetModuleHandleW(None) }
             .map(|module| HINSTANCE(module.0))
@@ -619,6 +621,14 @@ fn pointers_the_system_does_not_know_or_that_cannot_manipulate_are_ignored() {
             .is_err()
     );
     assert!(!driver.has_contact());
+}
+
+#[test]
+fn the_position_of_a_pointer_the_system_does_not_know_is_unavailable() {
+    let window = HiddenWindow::new();
+    assert_eq!(pointer_client_position(window.0, WPARAM(0x7777)), None);
+    // Nor is it a pen: the window leaves unknown pointers to the normal input path.
+    assert!(!pointer_is_pen(WPARAM(0x7777)));
 }
 
 #[test]

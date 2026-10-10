@@ -34,6 +34,10 @@
     <Launch Condition="Installed OR WindowsBuild &gt;= 22621"
             Message="SS Writer requires Windows 11 version 22H2 (build 22621) or later." />
 
+    <!-- The icon of the entry in Settings > Apps (same picture as the one linked into the exe). -->
+    <Icon Id="SSWriter.ico" SourceFile="$(var.AssetsDir)\icons\app.ico" />
+    <Property Id="ARPPRODUCTICON" Value="SSWriter.ico" />
+
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/isolmaz/ss-writer" />
     <Property Id="ARPHELPLINK" Value="https://github.com/isolmaz/ss-writer/issues" />
 

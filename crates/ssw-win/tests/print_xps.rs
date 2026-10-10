@@ -21,8 +21,8 @@ use ssw_win::dwrite::DWriteEngine;
 use ssw_win::gfx::{Driver, GfxDevices};
 use ssw_win::print::{
     PRINT_SCENE_ID_BASE, PrintDialogHost, PrintDialogRequest, PrintSelection, PrintSurface, choose,
-    dialog_ranges, page_plan, page_size_dip, parse_devnames, print_pages, print_to_xps_file,
-    print_with_dialog, printer_target, xps_file_target,
+    dialog_ranges, page_plan, page_size_dip, parse_devnames, print_pages, print_selection_to,
+    print_to_xps_file, print_with_dialog, printer_target, xps_file_target,
 };
 use ssw_win::wic::Wic;
 use windows::Win32::Foundation::{E_INVALIDARG, E_POINTER, HWND};
@@ -521,4 +521,114 @@ fn pages_can_be_printed_into_any_target() {
         assert_eq!(print_pages(&mut rig.surface(), &target, &pages).unwrap(), 2);
     }
     assert_eq!(fixed_pages(file.path()).len(), 2);
+}
+
+#[test]
+fn the_chosen_pages_are_printed_into_the_given_target_with_their_copies() {
+    let mut rig = rig(true);
+    let file = TempFile::new("selection.xps");
+    let pages = vec![
+        (*page(595.0, 842.0)).clone(),
+        (*page(842.0, 595.0)).clone(),
+        (*page(612.0, 792.0)).clone(),
+    ];
+    // Pages 2 and 3, two collated copies: 2 3 2 3.
+    let chosen = selection(vec![2..=3], 2, true);
+    let printed = print_selection_to(&mut rig.surface(), &chosen, pages, || {
+        xps_file_target(file.path())
+    })
+    .unwrap();
+    assert_eq!(printed, 4);
+    let printed_pages = fixed_pages(file.path());
+    assert_eq!(printed_pages.len(), 4);
+    for (markup, (width, height)) in printed_pages.iter().zip([
+        (842.0, 595.0),
+        (612.0, 792.0),
+        (842.0, 595.0),
+        (612.0, 792.0),
+    ]) {
+        approx(page_attribute(markup, "Width"), width * 96.0 / 72.0, 1.0);
+        approx(page_attribute(markup, "Height"), height * 96.0 / 72.0, 1.0);
+    }
+
+    // A target that cannot be opened fails the job before any page is drawn.
+    let error = print_selection_to(&mut rig.surface(), &chosen, Vec::new(), || {
+        Err(WinError::Invalid("no target"))
+    })
+    .unwrap_err();
+    assert_eq!(error.to_string(), "no target");
+}
+
+/// A print dialog that cannot be shown.
+struct BrokenHost;
+
+impl PrintDialogHost for BrokenHost {
+    fn show(
+        &mut self,
+        _owner: HWND,
+        _request: &PrintDialogRequest,
+    ) -> Result<Option<PrintSelection>, WinError> {
+        Err(WinError::Invalid("the dialog could not be shown"))
+    }
+}
+
+#[test]
+fn a_dialog_that_cannot_be_shown_ends_ctrl_p_with_its_error() {
+    let mut rig = rig(true);
+    let owner = HWND::default();
+    let error = choose(&mut BrokenHost, owner, 3).unwrap_err();
+    assert_eq!(error.to_string(), "the dialog could not be shown");
+    let pages = vec![(*page(595.0, 842.0)).clone()];
+    let error =
+        print_with_dialog(&mut BrokenHost, owner, &mut rig.surface(), "doc", pages).unwrap_err();
+    assert_eq!(error.to_string(), "the dialog could not be shown");
+}
+
+/// Every system call of a print job that can fail does, in turn: the job fails with an OS
+/// error, leaves no file behind and frees its scene ids.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_failing_system_call_fails_the_job_and_cleans_up() {
+    use ssw_win::fault;
+
+    let mut rig = rig(true);
+    let file = TempFile::new("sweep.xps");
+    let pages = [page(595.0, 842.0), page(842.0, 595.0)];
+    let mut injected = 0;
+    for call in 0.. {
+        fault::arm(call);
+        let result = print_to_xps_file(&mut rig.surface(), file.path(), &pages);
+        let tripped = fault::tripped();
+        fault::disarm();
+        if !tripped {
+            assert_eq!(result.unwrap(), 2);
+            break;
+        }
+        injected += 1;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, WinError::Os { .. }),
+            "call {call}: {error:?}"
+        );
+        assert!(!file.path().exists(), "call {call}");
+        for index in 0..2 {
+            assert!(
+                rig.assets
+                    .scene(SceneId(PRINT_SCENE_ID_BASE + index))
+                    .is_none(),
+                "call {call}"
+            );
+        }
+    }
+    // The XPS object factory, the print control, its device context and render target, four
+    // calls per page and closing the control.
+    assert!(injected >= 13, "only {injected} calls could fail");
+    assert_eq!(fixed_pages(file.path()).len(), 2);
+
+    // The print system's factory is the first call of a job for a printer.
+    fault::arm(0);
+    let error = printer_target("SS Writer test printer that does not exist", "job").unwrap_err();
+    assert!(fault::tripped());
+    fault::disarm();
+    assert!(matches!(error, WinError::Os { .. }), "{error:?}");
 }

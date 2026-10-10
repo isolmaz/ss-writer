@@ -642,3 +642,16 @@ fn default_scroller_animates_over_an_empty_range() {
     assert!(!scroller.scroll_to(500.0));
     assert!(!scroller.is_animating());
 }
+
+#[test]
+fn a_spring_carried_past_the_end_by_a_fling_loses_its_velocity() {
+    let mut scroller = Scroller::new(true);
+    scroller.set_extent(Extent::new(100.0, 1100.0));
+    scroller.jump_to(990.0);
+    assert!(scroller.fling(2000.0));
+    // The fling's momentum carries into the spring toward the end.
+    assert!(scroller.scroll_to(1000.0));
+    assert!(scroller.tick(FRAME));
+    assert_eq!(scroller.offset(), 1000.0, "clamped at the end of the range");
+    assert_eq!(scroller.velocity(), 0.0, "the wall absorbs the speed");
+}

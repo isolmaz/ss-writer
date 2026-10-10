@@ -341,6 +341,20 @@ mod tests {
     }
 
     #[test]
+    fn offsets_outside_the_reordered_list_do_not_move() {
+        check(
+            "«para\n\n- [ ] a»\n- [ ] b\n- [ ] c",
+            "«para\n\n- [ ] b\n- [ ] c\n- [x] a»",
+            toggle(true),
+        );
+    }
+
+    #[test]
+    fn caret_inside_a_marker_of_an_ordered_item_stays_inside_the_slot_marker() {
+        check("1‸. [ ] a\n2. [ ] b", "1. [ ] b\n2‸. [x] a", toggle(true));
+    }
+
+    #[test]
     fn selection_in_the_gap_between_items_stays_between_the_same_slots() {
         // The selection start moves with item a, its end stays in the gap behind slot 0.
         check("«- [ ] a\n»\n- [ ] b", "- [ ] b\n»\n«- [x] a", toggle(true));

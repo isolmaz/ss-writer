@@ -18,6 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
 use windows::core::{IUnknown, w};
 
 use crate::com::{OsResultExt, WinError};
+use crate::fault::check;
 
 /// What the taskbar button shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,11 +94,12 @@ impl SystemTaskbar {
     /// COM is not initialized on this thread or the shell object cannot be created.
     pub fn new() -> Result<Self, WinError> {
         // SAFETY: `TaskbarList` is the registered class of `ITaskbarList3`.
-        let list: ITaskbarList3 =
-            unsafe { CoCreateInstance(&TaskbarList, None::<&IUnknown>, CLSCTX_INPROC_SERVER) }
-                .ctx("create ITaskbarList3")?;
+        let list: ITaskbarList3 = check(unsafe {
+            CoCreateInstance(&TaskbarList, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+        })
+        .ctx("create ITaskbarList3")?;
         // SAFETY: `list` is a freshly created, valid object.
-        unsafe { list.HrInit() }.ctx("ITaskbarList3::HrInit")?;
+        check(unsafe { list.HrInit() }).ctx("ITaskbarList3::HrInit")?;
         Ok(Self { list })
     }
 }
@@ -111,6 +113,37 @@ impl TaskbarApi for SystemTaskbar {
     fn set_value(&mut self, hwnd: HWND, completed: u64, total: u64) -> windows::core::Result<()> {
         // SAFETY: `list` is valid; the taskbar validates the window handle.
         unsafe { self.list.SetProgressValue(hwnd, completed, total) }
+    }
+}
+
+/// A boxed (or borrowed) api drives the taskbar like the api itself.
+impl<T: TaskbarApi + ?Sized> TaskbarApi for Box<T> {
+    fn set_state(&mut self, hwnd: HWND, state: TBPFLAG) -> windows::core::Result<()> {
+        (**self).set_state(hwnd, state)
+    }
+
+    fn set_value(&mut self, hwnd: HWND, completed: u64, total: u64) -> windows::core::Result<()> {
+        (**self).set_value(hwnd, completed, total)
+    }
+}
+
+/// Makes the [`TaskbarApi`] of a window: [`SystemTaskbars`] in the application, a recording
+/// substitute in tests of the code that owns the taskbar button.
+pub trait TaskbarFactory: std::fmt::Debug {
+    /// A fresh taskbar api for one window.
+    ///
+    /// # Errors
+    /// The api cannot be created (COM is not initialized, no shell).
+    fn create(&self) -> Result<Box<dyn TaskbarApi>, WinError>;
+}
+
+/// The real taskbar: every window gets its own [`SystemTaskbar`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemTaskbars;
+
+impl TaskbarFactory for SystemTaskbars {
+    fn create(&self) -> Result<Box<dyn TaskbarApi>, WinError> {
+        Ok(Box::new(SystemTaskbar::new()?))
     }
 }
 

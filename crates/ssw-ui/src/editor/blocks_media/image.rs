@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use ssw_core::markdown::ast::{Block, BlockKind, Image, ImageKind, Inline, InlineKind};
+use ssw_core::markdown::ast::{Block, Image, ImageKind, Inline, InlineKind};
 use ssw_core::text::{Buffer, TextRange};
 
 use crate::canvas::Canvas;
@@ -44,9 +44,7 @@ impl ImageRenderer {
 
 /// The only inline of a paragraph or `<img>` block, when it is an image.
 fn lone_image(block: &Block) -> Option<(&Inline, &Image)> {
-    if !matches!(block.kind, BlockKind::Paragraph | BlockKind::HtmlBlock(_)) {
-        return None;
-    }
+    // Registered for paragraphs and HTML blocks only (see `register_with`).
     match block.inlines.as_slice() {
         [inline] => match &inline.kind {
             InlineKind::Image(image) => Some((inline, image)),

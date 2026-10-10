@@ -97,9 +97,10 @@ pub fn save_settings(path: &Path, settings: &Settings) -> Result<(), SettingsFil
 /// the settings model cannot produce today, still has a tested path.
 fn write_atomic(path: &Path, text: Result<String, SettingsError>) -> Result<(), SettingsFileError> {
     let text = text?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(io_error(parent))?;
-    }
+    // A path without a parent (the empty path, a drive root) has no folder to create, which
+    // `create_dir_all` accepts for the empty path.
+    let parent = path.parent().unwrap_or(Path::new(""));
+    std::fs::create_dir_all(parent).map_err(io_error(parent))?;
     let temp = with_suffix(path, ".tmp");
     // The file is closed when the closure returns, before the rename.
     std::fs::File::create(&temp)
@@ -130,8 +131,10 @@ mod tests {
         let path = tmp.path().join("settings.json");
         let failure = SettingsError::Serialize(serde_json::Error::custom("not representable"));
         let error = write_atomic(&path, Err(failure)).unwrap_err();
-        assert!(matches!(error, SettingsFileError::Settings(_)), "{error:?}");
-        assert!(error.to_string().contains("not representable"));
+        assert_eq!(
+            error.to_string(),
+            "settings could not be serialized: not representable"
+        );
         assert!(!path.exists());
         assert!(!with_suffix(&path, ".tmp").exists());
     }

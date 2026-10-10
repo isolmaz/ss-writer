@@ -26,6 +26,7 @@ use windows::core::{AgileReference, Error, HSTRING, Interface, factory};
 use windows_collections::IIterable;
 
 use crate::com::{OsResultExt, WinError};
+use crate::fault::check;
 
 /// A file to share and the title the share sheet shows for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,10 +76,11 @@ impl PendingShare {
     /// The path is not absolute, the file does not exist or it cannot be opened.
     pub fn resolve(file: &SharedFile) -> Result<Self, WinError> {
         let path = HSTRING::from(file.path.as_os_str());
-        let operation = StorageFile::GetFileFromPathAsync(&path).ctx("GetFileFromPathAsync")?;
+        let operation =
+            check(StorageFile::GetFileFromPathAsync(&path)).ctx("GetFileFromPathAsync")?;
         // The operation completes on a thread-pool thread, so waiting here cannot deadlock.
         let storage = operation.join().ctx("GetFileFromPathAsync result")?;
-        let file_ref = AgileReference::new(&storage).ctx("AgileReference::new")?;
+        let file_ref = check(AgileReference::new(&storage)).ctx("AgileReference::new")?;
         let title = if file.title.trim().is_empty() {
             file_name(&file.path)
         } else {
@@ -102,18 +104,14 @@ impl PendingShare {
     /// # Errors
     /// The package refuses the data.
     pub fn fill(&self, package: &DataPackage) -> Result<(), WinError> {
-        let storage = self.file.resolve().ctx("AgileReference::resolve")?;
-        package
-            .SetRequestedOperation(DataPackageOperation::Copy)
+        let storage = check(self.file.resolve()).ctx("AgileReference::resolve")?;
+        check(package.SetRequestedOperation(DataPackageOperation::Copy))
             .ctx("SetRequestedOperation")?;
-        package
-            .Properties()
-            .ctx("DataPackage::Properties")?
-            .SetTitle(&HSTRING::from(self.title.as_str()))
-            .ctx("SetTitle")?;
-        let item = storage.cast::<IStorageItem>().ctx("IStorageItem")?;
+        let properties = check(package.Properties()).ctx("DataPackage::Properties")?;
+        check(properties.SetTitle(&HSTRING::from(self.title.as_str()))).ctx("SetTitle")?;
+        let item = check(storage.cast::<IStorageItem>()).ctx("IStorageItem")?;
         let items = IIterable::<IStorageItem>::from(vec![Some(item)]);
-        package.SetStorageItems(&items, true).ctx("SetStorageItems")
+        check(package.SetStorageItems(&items, true)).ctx("SetStorageItems")
     }
 
     /// A new package holding the file ([`PendingShare::fill`]).
@@ -121,7 +119,7 @@ impl PendingShare {
     /// # Errors
     /// The package cannot be created or refuses the data.
     pub fn build(&self) -> Result<DataPackage, WinError> {
-        let package = DataPackage::new().ctx("DataPackage::new")?;
+        let package = check(DataPackage::new()).ctx("DataPackage::new")?;
         self.fill(&package)?;
         Ok(package)
     }
@@ -171,6 +169,19 @@ impl ShareSlot {
     }
 }
 
+/// The `DataRequested` handler of a [`Sharer`]: answers every data request of the system with
+/// the file in `slot` ([`ShareSlot::serve`]); a request that cannot be answered fails with
+/// `E_FAIL`.
+#[must_use]
+pub fn data_requested_handler(
+    slot: ShareSlot,
+) -> TypedEventHandler<DataTransferManager, DataRequestedEventArgs> {
+    TypedEventHandler::new(move |_, args: windows_core::Ref<DataRequestedEventArgs>| {
+        let request: DataRequest = args.ok()?.Request()?;
+        slot.serve(&request).map_err(|_| Error::from(E_FAIL))
+    })
+}
+
 /// The call that opens the share sheet.
 pub trait ShareUi {
     /// Shows the share sheet for `window`.
@@ -182,7 +193,8 @@ pub trait ShareUi {
 
 /// The `IDataTransferManagerInterop` factory of the system.
 fn interop() -> Result<IDataTransferManagerInterop, WinError> {
-    factory::<DataTransferManager, IDataTransferManagerInterop>().ctx("IDataTransferManagerInterop")
+    check(factory::<DataTransferManager, IDataTransferManagerInterop>())
+        .ctx("IDataTransferManagerInterop")
 }
 
 /// The real [`ShareUi`]: `ShowShareUIForWindow`. The sheet is modeless and system-drawn.
@@ -239,17 +251,11 @@ impl<U: ShareUi> Sharer<U> {
     pub fn with_ui(window: HWND, ui: U) -> Result<Self, WinError> {
         let interop = interop()?;
         // SAFETY: `window` is a window handle of this thread; the call only reads it.
-        let manager = unsafe { interop.GetForWindow::<DataTransferManager>(window) }
+        let manager = check(unsafe { interop.GetForWindow::<DataTransferManager>(window) })
             .ctx("IDataTransferManagerInterop::GetForWindow")?;
         let slot = ShareSlot::default();
-        let served = slot.clone();
-        let handler = TypedEventHandler::<DataTransferManager, DataRequestedEventArgs>::new(
-            move |_, args| {
-                let request = args.ok()?.Request()?;
-                served.serve(&request).map_err(|_| Error::from(E_FAIL))
-            },
-        );
-        let token = manager.DataRequested(&handler).ctx("DataRequested")?;
+        let handler = data_requested_handler(slot.clone());
+        let token = check(manager.DataRequested(&handler)).ctx("DataRequested")?;
         Ok(Self {
             window,
             manager,

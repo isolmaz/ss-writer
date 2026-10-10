@@ -532,6 +532,8 @@ mod tests {
         assert_eq!(tree.previous_sibling(id(4)).map(|n| n.id), Some(id(2)));
         assert_eq!(tree.children(id(1)).count(), 2);
         assert_eq!(tree.last_child(id(1)).map(|n| n.id), Some(id(4)));
+        // A walk steps over the child that is not in the tree.
+        assert_eq!(names(&tree.walk()), vec!["List", "a", "c"]);
     }
 
     #[test]

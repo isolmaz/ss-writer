@@ -195,12 +195,11 @@ impl CodeRenderer {
 /// The style ranges (display offsets, without the composition) of `token`, which lies inside
 /// one code row; a composition inside the token splits it.
 fn map_token(token: &Token, starts: &[usize], spans: &[RowSpan]) -> Vec<Token> {
+    // A token lies inside the text the rows were joined into, so its row exists.
     let row = starts
         .partition_point(|&start| start <= token.start)
         .saturating_sub(1);
-    let (Some(&start), Some(span)) = (starts.get(row), spans.get(row)) else {
-        return Vec::new();
-    };
+    let (start, span) = (starts[row], &spans[row]);
     let (from, to) = (token.start - start, token.end - start);
     let at = |relative: usize| span.disp_start + relative;
     let piece = |from: usize, to: usize| Token {

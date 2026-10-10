@@ -117,6 +117,30 @@ fn the_factory_refuses_other_classes_bad_pointers_and_unknown_interfaces() {
 }
 
 #[test]
+fn creating_an_instance_without_an_out_pointer_is_refused_and_makes_nothing() {
+    let _serial = serial();
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let factory = class_factory();
+    let create = Interface::vtable(&factory).CreateInstance;
+    // SAFETY: a live factory and a valid interface id; the null out pointer is the point and is
+    // rejected before anything is created or written.
+    let status = unsafe {
+        create(
+            factory.as_raw(),
+            std::ptr::null_mut(),
+            &IPreviewHandler::IID,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, E_POINTER);
+    assert_eq!(
+        live_objects(),
+        1,
+        "no handler was made, only the factory lives"
+    );
+}
+
+#[test]
 fn the_handler_answers_every_interface_with_one_identity() {
     let _serial = serial();
     let _com = ComGuard::apartment_threaded().unwrap();
@@ -188,6 +212,31 @@ fn the_site_is_kept_returned_and_released() {
         with_site.SetSite(None::<&IUnknown>).unwrap();
         assert!(with_site.GetSite::<IUnknown>().is_err());
     }
+}
+
+#[test]
+fn get_site_refuses_null_pointers_and_keeps_the_site() {
+    let _serial = serial();
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let with_site: IObjectWithSite = new_handler().cast().unwrap();
+    let site: IUnknown = new_handler().cast().unwrap();
+    // SAFETY: plain call with live interface pointers.
+    unsafe { with_site.SetSite(&site) }.unwrap();
+    let get_site = Interface::vtable(&with_site).GetSite;
+    let mut out: *mut c_void = std::ptr::null_mut();
+    // SAFETY: a live object; the null interface id is the point and is rejected up front.
+    let status = unsafe { get_site(with_site.as_raw(), std::ptr::null(), &mut out) };
+    assert_eq!(status, E_POINTER);
+    // SAFETY: a live object and a valid interface id; the null out pointer is the point.
+    let status = unsafe { get_site(with_site.as_raw(), &IUnknown::IID, std::ptr::null_mut()) };
+    assert_eq!(status, E_POINTER);
+    // SAFETY: plain call with a live interface pointer.
+    let kept = unsafe { with_site.GetSite::<IUnknown>() }.unwrap();
+    assert_eq!(
+        kept.as_raw(),
+        site.as_raw(),
+        "the refused calls left the site alone"
+    );
 }
 
 #[test]

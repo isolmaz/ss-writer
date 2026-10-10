@@ -320,10 +320,14 @@ impl ShortcutsPage {
         self.reset_all.set_enabled(self.has_overrides);
     }
 
-    fn start_capture(&mut self, cx: &mut EventCx, add: bool, env: &Env) {
-        let Some(command) = self.selected else {
-            return;
-        };
+    /// The selected command. The buttons that need one are disabled without a selection, so they
+    /// only report while there is one.
+    fn selection(&self) -> CommandId {
+        self.selected
+            .expect("the capture buttons are enabled only with a selection")
+    }
+
+    fn start_capture(&mut self, cx: &mut EventCx, command: CommandId, add: bool, env: &Env) {
         self.capture = Some(Capture { command, add });
         let label = self.label(env, command);
         self.status = Some(Status {
@@ -345,10 +349,13 @@ impl ShortcutsPage {
     /// Takes the key press while capturing: Esc cancels, modifiers alone are ignored,
     /// Ctrl+Alt chords the layout turns into text are refused (spec §11), anything else is
     /// the new shortcut.
-    fn capture_key(&mut self, cx: &mut EventCx, key: &KeyEvent, env: &Env) -> EventResult {
-        let Some(capture) = self.capture else {
-            return EventResult::ignored();
-        };
+    fn capture_key(
+        &mut self,
+        cx: &mut EventCx,
+        capture: Capture,
+        key: &KeyEvent,
+        env: &Env,
+    ) -> EventResult {
         if !key.is_down || MODIFIER_KEYS.contains(&key.vk) {
             return EventResult::handled();
         }
@@ -486,9 +493,9 @@ impl ShortcutsPage {
 
     /// Routes `e`; while capturing, keys never reach the controls.
     pub(crate) fn event(&mut self, cx: &mut EventCx, e: &Event, env: &Env) -> EventResult {
-        if self.capture.is_some() {
+        if let Some(capture) = self.capture {
             match e {
-                Event::Key(key) => return self.capture_key(cx, key, env),
+                Event::Key(key) => return self.capture_key(cx, capture, key, env),
                 Event::Text(_) | Event::Ime(_) => return EventResult::handled(),
                 Event::Pointer(pointer) if pointer.kind == PointerEventKind::Down => {
                     self.end_capture(cx);
@@ -519,16 +526,17 @@ impl ShortcutsPage {
                         .and_then(|index| self.shown.get(index).copied());
                 }
                 ListEvent::Activated(index) => {
-                    self.selected = self.shown.get(index).copied();
-                    self.start_capture(cx, false, env);
+                    let command = self.shown[index];
+                    self.selected = Some(command);
+                    self.start_capture(cx, command, false, env);
                 }
             }
         }
         if self.change.take_activated() {
-            self.start_capture(cx, false, env);
+            self.start_capture(cx, self.selection(), false, env);
         }
         if self.add.take_activated() {
-            self.start_capture(cx, true, env);
+            self.start_capture(cx, self.selection(), true, env);
         }
         let selected = self.selected;
         if self.clear.take_activated()

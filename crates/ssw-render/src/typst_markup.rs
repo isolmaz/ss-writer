@@ -89,7 +89,13 @@ pub fn markdown_to_typst(
     diagrams: &dyn DiagramSvg,
     image_exists: &dyn Fn(&str) -> bool,
 ) -> TypstDocument {
-    let palette = if options.black_text { &BLACK } else { &COLOR };
+    let palette = if options.black_text {
+        &BLACK
+    } else if options.dark() {
+        &DARK
+    } else {
+        &COLOR
+    };
     let mut footnote_defs = HashMap::new();
     for block in doc.iter_blocks() {
         if let BlockKind::FootnoteDefinition { label } = &block.kind {
@@ -196,6 +202,8 @@ pub fn string_literal(text: &str) -> String {
 struct Palette {
     /// Whether callouts get their own accent colors.
     colored: bool,
+    /// Fill of every page; `None` leaves the paper as it is.
+    page: Option<&'static str>,
     text: &'static str,
     link: &'static str,
     accent: &'static str,
@@ -207,10 +215,51 @@ struct Palette {
     zebra: &'static str,
     error: &'static str,
     dim: &'static str,
+    /// The Typst expression of a callout's fill; `accent` is the callout's color.
+    callout_fill: &'static str,
+    /// Accent colors of a note, tip, important, warning and caution callout.
+    callouts: [&'static str; 5],
+    /// Highlight backgrounds: yellow (also the default), red, orange, green, blue, purple.
+    highlights: [&'static str; 6],
 }
+
+impl Palette {
+    /// The accent color of a callout of `kind`.
+    fn callout_accent(&self, kind: CalloutKind) -> &'static str {
+        if !self.colored {
+            return self.accent;
+        }
+        self.callouts[match kind {
+            CalloutKind::Note => 0,
+            CalloutKind::Tip => 1,
+            CalloutKind::Important => 2,
+            CalloutKind::Warning => 3,
+            CalloutKind::Caution => 4,
+        }]
+    }
+
+    /// The background of a highlight of `color`.
+    fn highlight(&self, color: Option<HighlightColor>) -> &'static str {
+        self.highlights[match color {
+            None | Some(HighlightColor::Yellow) => 0,
+            Some(HighlightColor::Red) => 1,
+            Some(HighlightColor::Orange) => 2,
+            Some(HighlightColor::Green) => 3,
+            Some(HighlightColor::Blue) => 4,
+            Some(HighlightColor::Purple) => 5,
+        }]
+    }
+}
+
+/// Light callouts and highlights, shared by the light and the black palette.
+const LIGHT_CALLOUT_FILL: &str = "accent.lighten(92%)";
+const LIGHT_HIGHLIGHTS: [&str; 6] = [
+    "#fff3a3", "#ffc9c9", "#ffd8a8", "#b2f2bb", "#a5d8ff", "#d0bfff",
+];
 
 const COLOR: Palette = Palette {
     colored: true,
+    page: None,
     text: "#1f2328",
     link: "#0969da",
     accent: "#0969da",
@@ -222,11 +271,38 @@ const COLOR: Palette = Palette {
     zebra: "#f6f8fa",
     error: "#cf222e",
     dim: "#6e7781",
+    callout_fill: LIGHT_CALLOUT_FILL,
+    callouts: ["#0969da", "#1a7f37", "#8250df", "#9a6700", "#cf222e"],
+    highlights: LIGHT_HIGHLIGHTS,
+};
+
+/// The colors of the editor's dark theme (`ssw_ui::theme::Theme::dark`) on dark pages: the
+/// surface `#272727` under `#e4e4e4` text, its code, table and callout colors.
+const DARK: Palette = Palette {
+    colored: true,
+    page: Some("#272727"),
+    text: "#e4e4e4",
+    link: "#4493f8",
+    accent: "#4493f8",
+    quote_text: "#9e9e9e",
+    quote_bar: "#3d4045",
+    code_bg: "#303134",
+    inline_bg: "#38393d",
+    rule: "#3d4045",
+    zebra: "#2c2c2c",
+    error: "#ff99a4",
+    dim: "#9e9e9e",
+    callout_fill: "color.mix((accent, 16%), (rgb(\"#272727\"), 84%))",
+    callouts: ["#4493f8", "#3fb950", "#a371f7", "#d29922", "#f85149"],
+    highlights: [
+        "#5e5420", "#6b2a2a", "#6b4620", "#2f5a25", "#254a75", "#5a2f66",
+    ],
 };
 
 /// Everything black or gray (the "black text" export option).
 const BLACK: Palette = Palette {
     colored: false,
+    page: None,
     text: "#000000",
     link: "#000000",
     accent: "#000000",
@@ -238,20 +314,10 @@ const BLACK: Palette = Palette {
     zebra: "#f2f2f2",
     error: "#000000",
     dim: "#404040",
+    callout_fill: LIGHT_CALLOUT_FILL,
+    callouts: ["#000000"; 5],
+    highlights: LIGHT_HIGHLIGHTS,
 };
-
-fn callout_accent(kind: CalloutKind, palette: &Palette) -> &'static str {
-    if !palette.colored {
-        return palette.accent;
-    }
-    match kind {
-        CalloutKind::Note => "#0969da",
-        CalloutKind::Tip => "#1a7f37",
-        CalloutKind::Important => "#8250df",
-        CalloutKind::Warning => "#9a6700",
-        CalloutKind::Caution => "#cf222e",
-    }
-}
 
 fn callout_label(kind: CalloutKind) -> &'static str {
     match kind {
@@ -260,17 +326,6 @@ fn callout_label(kind: CalloutKind) -> &'static str {
         CalloutKind::Important => "Important",
         CalloutKind::Warning => "Warning",
         CalloutKind::Caution => "Caution",
-    }
-}
-
-fn highlight_hex(color: Option<HighlightColor>) -> &'static str {
-    match color {
-        None | Some(HighlightColor::Yellow) => "#fff3a3",
-        Some(HighlightColor::Red) => "#ffc9c9",
-        Some(HighlightColor::Orange) => "#ffd8a8",
-        Some(HighlightColor::Green) => "#b2f2bb",
-        Some(HighlightColor::Blue) => "#a5d8ff",
-        Some(HighlightColor::Purple) => "#d0bfff",
     }
 }
 
@@ -317,12 +372,18 @@ fn preamble(options: &ExportOptions, palette: &Palette) -> String {
     } else {
         format!("#show link: set text(fill: rgb(\"{}\"))", palette.link)
     };
+    let page_fill = palette
+        .page
+        .map(|color| format!(", fill: rgb(\"{color}\")"))
+        .unwrap_or_default();
     // The document title is user text: it is substituted last so that it is never scanned for
     // placeholders.
     let replacements = [
         ("@PAPER@", paper(options.page).to_owned()),
         ("@MARGIN@", number(options.margin_mm())),
         ("@NUMBERING@", numbering.to_owned()),
+        ("@PAGE_FILL@", page_fill),
+        ("@CALLOUT_FILL@", palette.callout_fill.to_owned()),
         ("@FONT@", TEXT_FAMILY.to_owned()),
         ("@MONO@", MONO_FAMILY.to_owned()),
         ("@SIZE@", number(options.base_font_pt())),
@@ -346,7 +407,7 @@ fn preamble(options: &ExportOptions, palette: &Palette) -> String {
 }
 
 /// The preamble template; `@NAME@` placeholders are filled by [`preamble`].
-const PREAMBLE: &str = r#"@DOCUMENT@#set page(paper: "@PAPER@", margin: @MARGIN@mm@NUMBERING@)
+const PREAMBLE: &str = r#"@DOCUMENT@#set page(paper: "@PAPER@", margin: @MARGIN@mm@NUMBERING@@PAGE_FILL@)
 #set text(font: ("@FONT@", "@MONO@"), size: @SIZE@pt, fill: rgb("@TEXT@"))
 #set par(leading: 0.65em, spacing: 1em, justify: false)
 #set list(indent: 0.3em, body-indent: 0.5em, marker: ([•], [–]))
@@ -366,7 +427,7 @@ const PREAMBLE: &str = r#"@DOCUMENT@#set page(paper: "@PAPER@", margin: @MARGIN@
   #set text(fill: rgb("@QUOTE@"))
   #body
 ]
-#let ssw-callout(accent, title, body) = block(width: 100%, fill: accent.lighten(92%), stroke: (left: 3pt + accent), inset: (left: 12pt, right: 10pt, y: 8pt))[
+#let ssw-callout(accent, title, body) = block(width: 100%, fill: @CALLOUT_FILL@, stroke: (left: 3pt + accent), inset: (left: 12pt, right: 10pt, y: 8pt))[
   #text(weight: "bold", fill: accent)[#title]
   #parbreak()
   #body
@@ -433,7 +494,7 @@ impl Converter<'_> {
                     .unwrap_or(callout_label(*kind));
                 format!(
                     "#ssw-callout(rgb({}), {})[\n{}\n]",
-                    string_literal(callout_accent(*kind, self.palette)),
+                    string_literal(self.palette.callout_accent(*kind)),
                     string_literal(title),
                     self.blocks(&block.children)
                 )
@@ -623,7 +684,7 @@ impl Converter<'_> {
             InlineKind::Highlight { color } => {
                 let call = format!(
                     "highlight(fill: rgb({}), radius: 2pt, extent: 1pt)",
-                    string_literal(highlight_hex(*color))
+                    string_literal(self.palette.highlight(*color))
                 );
                 self.wrap(&call, node, out);
             }
@@ -999,6 +1060,7 @@ mod tests {
             base_font_pt: 9.5,
             page_numbers: false,
             black_text: true,
+            light_theme: true,
             include_title: false,
             title: Some("  My \"Doc\"  ".to_owned()),
         };
@@ -1011,6 +1073,81 @@ mod tests {
         assert!(source.contains("size: 9.5pt, fill: rgb(\"#000000\")"));
         assert!(source.contains("#show link: underline\n"));
         assert!(!source.contains("ssw-title["), "{source}");
+    }
+
+    #[test]
+    fn the_dark_theme_fills_the_pages_and_recolors_the_document() {
+        let dark = ExportOptions {
+            light_theme: false,
+            ..ExportOptions::default()
+        };
+        let source = convert_with("x", &dark, &NoDiagrams, &|_| false).source;
+        assert!(
+            source.contains(
+                "#set page(paper: \"a4\", margin: 20mm, numbering: \"1\", number-align: center, \
+                 fill: rgb(\"#272727\"))"
+            ),
+            "{source}"
+        );
+        assert!(
+            source.contains("size: 11pt, fill: rgb(\"#e4e4e4\")"),
+            "{source}"
+        );
+        assert!(source.contains("#show link: set text(fill: rgb(\"#4493f8\"))"));
+        assert!(source.contains("fill: color.mix((accent, 16%), (rgb(\"#272727\"), 84%))"));
+        assert!(
+            !source.contains("lighten") && !source.contains('@'),
+            "{source}"
+        );
+
+        // The light theme keeps the paper as it is.
+        let light = convert("x").source;
+        assert!(!light.contains("fill: rgb(\"#272727\")"), "{light}");
+        assert!(light.contains("fill: accent.lighten(92%)"));
+
+        // Black ink needs light paper: black text wins over the dark theme.
+        let black = ExportOptions {
+            light_theme: false,
+            black_text: true,
+            ..ExportOptions::default()
+        };
+        let source = convert_with("x", &black, &NoDiagrams, &|_| false).source;
+        assert!(
+            !source.contains("#272727") && !source.contains("#e4e4e4"),
+            "{source}"
+        );
+        assert!(source.contains("size: 11pt, fill: rgb(\"#000000\")"));
+    }
+
+    #[test]
+    fn dark_callouts_and_highlights_keep_their_text_readable() {
+        let dark = ExportOptions {
+            light_theme: false,
+            ..ExportOptions::default()
+        };
+        let markdown = "> [!TIP]\n> x\n\n==a== =={red}b== =={orange}c== =={green}d== \
+                        =={blue}e== =={purple}f==";
+        let source = convert_with(markdown, &dark, &NoDiagrams, &|_| false).source;
+        assert!(
+            source.contains("#ssw-callout(rgb(\"#3fb950\"), \"Tip\")"),
+            "{source}"
+        );
+        for color in [
+            "#5e5420", "#6b2a2a", "#6b4620", "#2f5a25", "#254a75", "#5a2f66",
+        ] {
+            let call = format!("highlight(fill: rgb(\"{color}\"), radius: 2pt, extent: 1pt)");
+            assert!(source.contains(&call), "{color} in {source}");
+        }
+        for kind in ["NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION"] {
+            let source =
+                convert_with(&format!("> [!{kind}]\n> x"), &dark, &NoDiagrams, &|_| false).source;
+            let accent = source
+                .split("#ssw-callout(rgb(\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .expect("a callout");
+            assert!(DARK.callouts.contains(&accent), "{kind}: {accent}");
+        }
     }
 
     #[test]
@@ -1377,13 +1514,19 @@ mod tests {
             );
         }
         // Other languages never reach the diagram renderer.
+        let requests = seen.borrow().len();
         let doc = convert_with(
             "```rust\nx\n```",
             &ExportOptions::default(),
-            &|_: &str| -> Option<String> { panic!("not a diagram") },
+            &diagrams,
             &|_| false,
         );
+        assert_eq!(seen.borrow().len(), requests);
         assert!(doc.files.is_empty());
+        assert_eq!(
+            content(&doc.source),
+            "#raw(\"x\", block: true, lang: \"rust\")"
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ use windows::Win32::UI::Shell::{
 use windows::core::{HRESULT, HSTRING, Interface, PCWSTR};
 
 use super::failed;
+use crate::fault::check;
 
 const SERVICE: &str = "dialogs";
 
@@ -160,19 +161,30 @@ impl DialogHost for SystemDialogHost {
         owner: Option<HWND>,
     ) -> windows::core::Result<Vec<IShellItem>> {
         // SAFETY: modal dialog shown on the calling thread; `dialog` is a live COM object.
-        match unsafe { dialog.Show(owner) } {
-            Ok(()) => chosen_items(dialog),
-            Err(error) if is_cancelled(error.code()) => Ok(Vec::new()),
-            Err(error) => Err(error),
-        }
+        let shown = unsafe { dialog.Show(owner) };
+        items_after_show(dialog, shown)
     }
 
     fn task_dialog(&mut self, config: &TASKDIALOGCONFIG) -> windows::core::Result<i32> {
         let mut pressed = 0i32;
         // SAFETY: the caller keeps the configuration and every string/array it points to alive
         // for the (modal) call.
-        unsafe { TaskDialogIndirect(config, Some(&mut pressed), None, None) }?;
-        Ok(pressed)
+        let shown = unsafe { TaskDialogIndirect(config, Some(&mut pressed), None, None) };
+        // The command id only means something when the dialog was shown.
+        shown.and(Ok(pressed))
+    }
+}
+
+/// What a dialog returns once `Show` ended with `shown`: its items, nothing when the user
+/// cancelled, the error otherwise.
+fn items_after_show(
+    dialog: &IFileDialog,
+    shown: windows::core::Result<()>,
+) -> windows::core::Result<Vec<IShellItem>> {
+    match shown {
+        Ok(()) => chosen_items(dialog),
+        Err(error) if is_cancelled(error.code()) => Ok(Vec::new()),
+        Err(error) => Err(error),
     }
 }
 
@@ -182,13 +194,15 @@ fn chosen_items(dialog: &IFileDialog) -> windows::core::Result<Vec<IShellItem>> 
     if let Ok(open) = dialog.cast::<IFileOpenDialog>() {
         // SAFETY: live COM objects; the array is enumerated by index within its count.
         unsafe {
-            let results = open.GetResults()?;
-            let count = results.GetCount()?;
-            (0..count).map(|index| results.GetItemAt(index)).collect()
+            let results = check(open.GetResults())?;
+            let count = check(results.GetCount())?;
+            (0..count)
+                .map(|index| check(results.GetItemAt(index)))
+                .collect()
         }
     } else {
         // SAFETY: live COM object.
-        Ok(vec![unsafe { dialog.GetResult() }?])
+        Ok(vec![check(unsafe { dialog.GetResult() })?])
     }
 }
 
@@ -196,7 +210,7 @@ fn chosen_items(dialog: &IFileDialog) -> windows::core::Result<Vec<IShellItem>> 
 fn item_path(item: &IShellItem) -> windows::core::Result<PathBuf> {
     // SAFETY: the display name is a CoTaskMem string that is copied and then freed.
     unsafe {
-        let name = item.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let name = check(item.GetDisplayName(SIGDN_FILESYSPATH))?;
         let path = PathBuf::from(OsString::from_wide(name.as_wide()));
         CoTaskMemFree(Some(name.0.cast_const().cast()));
         Ok(path)
@@ -229,13 +243,13 @@ fn configure(
         .collect();
     // SAFETY: the filter strings (`wide`) outlive the calls; `dialog` is a live COM object.
     unsafe {
-        let current = dialog.GetOptions()?;
-        dialog.SetOptions(current | options)?;
+        let current = check(dialog.GetOptions())?;
+        check(dialog.SetOptions(current | options))?;
         if !title.is_empty() {
-            dialog.SetTitle(&HSTRING::from(title))?;
+            check(dialog.SetTitle(&HSTRING::from(title)))?;
         }
         if !raw.is_empty() {
-            dialog.SetFileTypes(&raw)?;
+            check(dialog.SetFileTypes(&raw))?;
         }
         if let Some(dir) = initial_dir
             && let Ok(folder) = SHCreateItemFromParsingName::<_, _, IShellItem>(
@@ -243,7 +257,7 @@ fn configure(
                 None::<&IBindCtx>,
             )
         {
-            dialog.SetFolder(&folder)?;
+            check(dialog.SetFolder(&folder))?;
         }
     }
     Ok(())
@@ -294,9 +308,9 @@ fn create_dialog<T: Interface>(
     class: &windows::core::GUID,
 ) -> Result<(T, IFileDialog), ServiceError> {
     // SAFETY: standard COM activation of an in-proc common dialog.
-    let dialog: T = unsafe { CoCreateInstance(class, None, CLSCTX_INPROC_SERVER) }
+    let dialog: T = check(unsafe { CoCreateInstance(class, None, CLSCTX_INPROC_SERVER) })
         .map_err(|error| failed(SERVICE, error))?;
-    let base = dialog.cast().map_err(|error| failed(SERVICE, error))?;
+    let base = check(dialog.cast()).map_err(|error| failed(SERVICE, error))?;
     Ok((dialog, base))
 }
 
@@ -335,11 +349,11 @@ impl<H: DialogHost> Dialogs for WindowsDialogs<H> {
         // SAFETY: live COM object; the strings are copied by the call.
         unsafe {
             if let Some(name) = &options.suggested_name {
-                base.SetFileName(&HSTRING::from(name.as_str()))
+                check(base.SetFileName(&HSTRING::from(name.as_str())))
                     .map_err(|error| failed(SERVICE, error))?;
             }
             if let Some(extension) = &options.default_extension {
-                base.SetDefaultExtension(&HSTRING::from(extension.as_str()))
+                check(base.SetDefaultExtension(&HSTRING::from(extension.as_str())))
                     .map_err(|error| failed(SERVICE, error))?;
             }
         }
@@ -498,5 +512,21 @@ mod tests {
         assert!(chosen_items(&open_base).is_err());
         let (_save, save_base) = create_dialog::<IFileSaveDialog>(&FileSaveDialog).unwrap();
         assert!(chosen_items(&save_base).is_err());
+    }
+
+    #[test]
+    fn the_outcome_of_showing_a_dialog_is_items_nothing_or_the_error() {
+        use windows::Win32::Foundation::E_FAIL;
+
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let (_open, dialog) = create_dialog::<IFileOpenDialog>(&FileOpenDialog).unwrap();
+        // The user cancelled: not a failure, just no items.
+        let cancelled = items_after_show(&dialog, Err(CANCELLED.into()));
+        assert!(cancelled.unwrap().is_empty());
+        // Any other failure is reported as it is.
+        let failed = items_after_show(&dialog, Err(E_FAIL.into())).unwrap_err();
+        assert_eq!(failed.code(), E_FAIL);
+        // Accepted, but nothing was ever chosen: the dialog has no result to read.
+        assert!(items_after_show(&dialog, Ok(())).is_err());
     }
 }

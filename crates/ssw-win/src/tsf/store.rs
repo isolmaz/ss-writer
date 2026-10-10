@@ -312,14 +312,11 @@ impl Store {
 
     fn after_unlock(&self) {
         self.flush_notifications();
+        // The document is unlocked here: a sink callback in `flush_notifications` that requests
+        // a lock gets it granted and released inside the request, and drains the queue itself.
         let queued = self.queued.replace(LockKind::None);
         if queued != LockKind::None {
-            if self.lock.get() == LockKind::None {
-                let _ = self.grant(queued);
-            } else {
-                // Someone re-entered and holds the lock: they drain the queue on release.
-                self.queued.set(queued);
-            }
+            let _ = self.grant(queued);
         }
     }
 
@@ -808,25 +805,37 @@ impl Store {
         Some(comp.selection)
     }
 
-    /// The display attributes TSF reports for the composition (ACP runs).
+    /// The display attributes TSF reports for the composition (ACP runs); ignored when no
+    /// composition is active.
     pub(super) fn display_attributes(&self, runs: &[(Range<usize>, ImeAttrStyle)]) {
-        if self.is_composing() {
-            self.with_view(|view| view.set_attrs(runs));
-        }
+        self.with_view(|view| view.set_attrs(runs));
     }
 
-    /// Sends the composition string, caret and attributes to the host if they changed.
+    /// Sends the composition string, caret and attributes to the host if they changed. The view
+    /// is valid whenever a composition exists, and `take_update` is `None` without one.
     fn flush_composition(&self) {
-        if !self
-            .view
-            .borrow()
-            .composition()
-            .is_some_and(|comp| comp.dirty)
-        {
-            return;
-        }
-        if let Some(update) = self.with_view(|view| view.take_update()) {
+        let update = self.view.borrow_mut().take_update();
+        if let Some(update) = update {
             self.echoing(|| self.host.ime(update));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::E_FAIL;
+
+    #[test]
+    fn lock_kinds_map_to_the_flags_on_lock_granted_receives() {
+        assert_eq!(LockKind::None.flags().0, 0);
+        assert_eq!(LockKind::Read.flags().0, 2);
+        assert_eq!(LockKind::ReadWrite.flags().0, 6);
+    }
+
+    #[test]
+    fn a_session_result_is_the_error_code_or_zero() {
+        assert_eq!(hr_of(Ok(())), HRESULT(0));
+        assert_eq!(hr_of(Err(error(E_FAIL))), E_FAIL);
     }
 }

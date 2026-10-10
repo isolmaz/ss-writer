@@ -19,6 +19,12 @@ Commands:
                            THIRD-PARTY-NOTICES.txt and winget manifests
   docs-check [--strict]    spec <-> keymap <-> features.toml <-> README <-> .ftl sync check;
                            --strict turns warnings (missing README lines) into failures
+  icons                    rasterize assets/icons/*.svg into the multi-size assets/icons/*.ico
+                           files that crates/ssw-app/build.rs embeds into SSWriter.exe
+  perf [--runs N] [--write-docs]
+                           release build, fixtures in target/perf, every performance scenario N times
+                           (default 5, off-screen window, fresh profile per run), report in
+                           target/perf/report.md; --write-docs fills docs/performance.md too
   help                     this text
 ";
 
@@ -38,6 +44,19 @@ pub enum Command {
         /// Fail on warnings too.
         strict: bool,
     },
+    /// `icons`.
+    Icons,
+    /// `perf`.
+    Perf(PerfArgs),
+}
+
+/// Arguments of `perf`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PerfArgs {
+    /// Runs of every scenario.
+    pub runs: usize,
+    /// Replace the results section of `docs/performance.md`.
+    pub write_docs: bool,
 }
 
 /// Arguments of `mutants`.
@@ -70,6 +89,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Error> 
         "mutants" => parse_mutants(args),
         "dist" => parse_dist(args),
         "docs-check" => parse_docs_check(args),
+        "icons" => no_more_args(args).map(|()| Command::Icons),
+        "perf" => parse_perf(args),
         other => Err(Error::Usage(format!("unknown command `{other}`"))),
     }
 }
@@ -146,6 +167,32 @@ fn parse_dist(mut args: impl Iterator<Item = String>) -> Result<Command, Error> 
     }))
 }
 
+/// Runs of every scenario of `perf` unless `--runs` says otherwise.
+pub const DEFAULT_PERF_RUNS: usize = 5;
+
+fn parse_perf(mut args: impl Iterator<Item = String>) -> Result<Command, Error> {
+    let mut runs = DEFAULT_PERF_RUNS;
+    let mut write_docs = false;
+    while let Some(arg) = args.next() {
+        let (flag, inline) = split_flag(&arg);
+        match (flag, inline) {
+            ("--write-docs", None) => write_docs = true,
+            ("--runs", _) => {
+                let raw = flag_value(flag, inline, &mut args)?;
+                runs = raw
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        Error::Usage(format!("`{flag}` needs a positive integer, got `{raw}`"))
+                    })?;
+            }
+            _ => return Err(unknown_argument(&arg)),
+        }
+    }
+    Ok(Command::Perf(PerfArgs { runs, write_docs }))
+}
+
 fn parse_docs_check(args: impl Iterator<Item = String>) -> Result<Command, Error> {
     let mut strict = false;
     for arg in args {
@@ -175,6 +222,7 @@ mod tests {
     #[test]
     fn simple_commands() {
         assert_eq!(parse_strs(&["coverage"]).unwrap(), Command::Coverage);
+        assert_eq!(parse_strs(&["icons"]).unwrap(), Command::Icons);
         assert_eq!(parse_strs(&["help"]).unwrap(), Command::Help);
         assert_eq!(parse_strs(&["--help"]).unwrap(), Command::Help);
         assert_eq!(
@@ -247,10 +295,45 @@ mod tests {
     }
 
     #[test]
+    fn perf_defaults_to_five_runs_and_takes_runs_and_write_docs() {
+        assert_eq!(
+            parse_strs(&["perf"]).unwrap(),
+            Command::Perf(PerfArgs {
+                runs: DEFAULT_PERF_RUNS,
+                write_docs: false
+            })
+        );
+        assert_eq!(
+            parse_strs(&["perf", "--runs", "2", "--write-docs"]).unwrap(),
+            Command::Perf(PerfArgs {
+                runs: 2,
+                write_docs: true
+            })
+        );
+        assert_eq!(
+            parse_strs(&["perf", "--runs=9"]).unwrap(),
+            Command::Perf(PerfArgs {
+                runs: 9,
+                write_docs: false
+            })
+        );
+        for bad in [
+            &["perf", "--runs", "0"][..],
+            &["perf", "--runs", "x"][..],
+            &["perf", "--runs"][..],
+            &["perf", "--bogus"][..],
+            &["perf", "--write-docs=1"][..],
+        ] {
+            assert!(matches!(parse_strs(bad), Err(Error::Usage(_))), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn unknown_and_missing_commands_and_stray_arguments() {
         assert!(usage_message(parse_strs(&[])).contains("missing command"));
         assert!(usage_message(parse_strs(&["screenshots"])).contains("screenshots"));
         assert!(usage_message(parse_strs(&["coverage", "--x"])).contains("--x"));
+        assert!(usage_message(parse_strs(&["icons", "--size"])).contains("--size"));
         assert!(usage_message(parse_strs(&["docs-check", "--loose"])).contains("--loose"));
     }
 }

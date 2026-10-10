@@ -25,9 +25,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
     TrackPopupMenuEx, WM_NULL,
 };
-use windows::core::{HSTRING, PCSTR, PWSTR, w};
+use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
 use crate::com::{OsResultExt, WinError};
+use crate::fault::check;
 use crate::keyboard::key_name;
 
 /// The mark in front of a menu item.
@@ -219,9 +220,10 @@ impl NativeMenu {
 
     fn build_level(model: &MenuModel) -> Result<Self, WinError> {
         // SAFETY: creates an empty popup menu, owned by the returned value.
-        let hmenu = unsafe { CreatePopupMenu() }.ctx("CreatePopupMenu")?;
-        // From here on `menu` owns the handle, so an early return destroys it.
-        let menu = Self { hmenu };
+        let created = unsafe { CreatePopupMenu() };
+        // From here on `menu` owns the handle, so an early return (also a failure injected
+        // right after the call) destroys it.
+        let menu = check(created.map(|hmenu| Self { hmenu })).ctx("CreatePopupMenu")?;
         for (index, entry) in model.entries.iter().enumerate() {
             menu.insert(index as u32, entry)?;
         }
@@ -273,7 +275,7 @@ impl NativeMenu {
         info.dwTypeData = PWSTR(text.as_ptr().cast_mut());
         // SAFETY: `self.hmenu` is a valid menu; `info` is fully initialized and its string
         // (`text`) and submenu (`child`) outlive the call.
-        unsafe { InsertMenuItemW(self.hmenu, index, true, &raw const info) }
+        check(unsafe { InsertMenuItemW(self.hmenu, index, true, &raw const info) })
             .ctx("InsertMenuItemW")?;
         if let Some(level) = child {
             // The parent menu owns the submenu now and destroys it with itself.
@@ -438,24 +440,37 @@ const MODE_FORCE_LIGHT: i32 = 3;
 /// Applies `theme` to the native menus of this process (uxtheme ordinals 135 and 136). Returns
 /// false when the system does not export them: menus then stay light.
 pub fn apply_menu_theme(theme: MenuTheme) -> bool {
+    apply_theme_exports(
+        w!("uxtheme.dll"),
+        SET_PREFERRED_APP_MODE,
+        FLUSH_MENU_THEMES,
+        theme,
+    )
+}
+
+/// [`apply_menu_theme`] with the library and the ordinals of its two exports given: false when
+/// the library does not load or lacks an export, in which case nothing is called.
+fn apply_theme_exports(
+    library: PCWSTR,
+    set_mode_ordinal: u16,
+    flush_ordinal: u16,
+    theme: MenuTheme,
+) -> bool {
     let mode = match theme {
         MenuTheme::System => MODE_ALLOW_DARK,
         MenuTheme::Light => MODE_FORCE_LIGHT,
         MenuTheme::Dark => MODE_FORCE_DARK,
     };
-    // SAFETY: loads a system library by name; released below.
-    let Ok(uxtheme) = (unsafe { LoadLibraryW(w!("uxtheme.dll")) }) else {
+    // SAFETY: loads a library by name; released below.
+    let Ok(uxtheme) = (unsafe { LoadLibraryW(library) }) else {
         return false;
     };
     // SAFETY: an ordinal is passed as a pointer-sized value below 0x10000, which is how
     // `GetProcAddress` takes ordinals; the module stays loaded until `FreeLibrary` below.
     let (set_mode, flush) = unsafe {
         (
-            GetProcAddress(
-                uxtheme,
-                PCSTR(usize::from(SET_PREFERRED_APP_MODE) as *const u8),
-            ),
-            GetProcAddress(uxtheme, PCSTR(usize::from(FLUSH_MENU_THEMES) as *const u8)),
+            GetProcAddress(uxtheme, PCSTR(usize::from(set_mode_ordinal) as *const u8)),
+            GetProcAddress(uxtheme, PCSTR(usize::from(flush_ordinal) as *const u8)),
         )
     };
     let applied = match (set_mode, flush) {
@@ -476,4 +491,41 @@ pub fn apply_menu_theme(theme: MenuTheme) -> bool {
     // SAFETY: balances the `LoadLibraryW` above; the functions are not used afterwards.
     let _ = unsafe { FreeLibrary(uxtheme) };
     applied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_library_that_does_not_load_or_lacks_an_export_applies_nothing() {
+        // No such library.
+        assert!(!apply_theme_exports(
+            w!("ssw-no-such-library.dll"),
+            SET_PREFERRED_APP_MODE,
+            FLUSH_MENU_THEMES,
+            MenuTheme::Dark
+        ));
+        // Neither ordinal is exported.
+        assert!(!apply_theme_exports(
+            w!("uxtheme.dll"),
+            0xFFF0,
+            0xFFF1,
+            MenuTheme::Dark
+        ));
+        // Only the one that sets the mode exists: nothing is called, the mode stays.
+        assert!(!apply_theme_exports(
+            w!("uxtheme.dll"),
+            SET_PREFERRED_APP_MODE,
+            0xFFF1,
+            MenuTheme::Dark
+        ));
+        // Only the flush exists.
+        assert!(!apply_theme_exports(
+            w!("uxtheme.dll"),
+            0xFFF0,
+            FLUSH_MENU_THEMES,
+            MenuTheme::Dark
+        ));
+    }
 }

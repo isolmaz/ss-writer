@@ -877,10 +877,9 @@ mod tests {
     }
 
     fn grid_of(text: &str) -> CellTable {
-        match model(text, 0) {
-            TableModel::Cells(table) => table,
-            other => panic!("expected a grid table, got {other:?}"),
-        }
+        let model = model(text, 0);
+        assert_eq!(model.raw_reason(), None, "expected a grid table: {model:?}");
+        model.table().clone()
     }
 
     #[test]
@@ -1504,9 +1503,8 @@ mod tests {
         let tx = format_table(doc.ctx()).expect("not yet aligned");
         doc.apply(tx).expect("apply");
         assert!(matches!(doc.ast().blocks[0].kind, BlockKind::Table(_)));
-        match TableModel::from_ast(doc.ast(), doc.buffer(), 3) {
-            Some(TableModel::Cells(table)) => assert_eq!(table.columns(), 2),
-            other => panic!("expected a grid table, got {other:?}"),
-        }
+        let rendered = TableModel::from_ast(doc.ast(), doc.buffer(), 3).expect("a table at 3");
+        assert_eq!(rendered.raw_reason(), None, "expected a grid table");
+        assert_eq!(rendered.table().columns(), 2);
     }
 }

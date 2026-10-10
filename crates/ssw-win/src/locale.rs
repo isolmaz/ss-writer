@@ -16,6 +16,9 @@ use crate::com::{from_wide, to_wide};
 const LOCALE_ALLOW_NEUTRAL_NAMES: u32 = 0x0800_0000;
 const SORT_DEFAULT: u32 = 0;
 
+/// The locale used when Windows names none.
+const FALLBACK_TAG: &str = "en-US";
+
 /// Binary prefixes used for file sizes.
 const SIZE_UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
 
@@ -35,7 +38,12 @@ pub fn tag_from_langid(langid: u16) -> Option<String> {
 pub fn ui_language() -> String {
     // SAFETY: pure query.
     let langid = unsafe { GetUserDefaultUILanguage() };
-    tag_from_langid(langid).unwrap_or_else(|| "en-US".to_owned())
+    tag_or_fallback(langid)
+}
+
+/// [`tag_from_langid`], or [`FALLBACK_TAG`] for an id without a locale name.
+fn tag_or_fallback(langid: u16) -> String {
+    tag_from_langid(langid).unwrap_or_else(|| FALLBACK_TAG.to_owned())
 }
 
 /// The NLS `Grouping` value for an `SGROUPING` string: `"3;0"` -> 3, `"3;2;0"` -> 32,
@@ -77,10 +85,16 @@ impl Locale {
         let mut buffer = [0u16; LOCALE_NAME_MAX_LENGTH as usize];
         // SAFETY: the buffer is writable for its full length.
         let written = unsafe { GetUserDefaultLocaleName(&mut buffer) };
+        Self::named_by_system(written, &buffer)
+    }
+
+    /// The locale `GetUserDefaultLocaleName` wrote into `buffer`; it returns 0 characters when
+    /// the user has none, which is [`FALLBACK_TAG`].
+    fn named_by_system(written: i32, buffer: &[u16]) -> Self {
         if written > 0 {
-            Self::new(&from_wide(&buffer))
+            Self::new(&from_wide(buffer))
         } else {
-            Self::new("en-US")
+            Self::new(FALLBACK_TAG)
         }
     }
 
@@ -103,11 +117,18 @@ impl Locale {
     /// Formats a decimal string (`-?digits[.digits]`) with the locale's separators and
     /// `digits` fraction digits.
     fn format_numeric(&self, value: &str, digits: u32) -> Option<String> {
-        let mut decimal = to_wide(&self.info(LOCALE_SDECIMAL)?);
-        let mut thousand = to_wide(&self.info(LOCALE_STHOUSAND)?);
-        let grouping = grouping_value(&self.info(LOCALE_SGROUPING)?);
-        let leading_zero = self.info(LOCALE_ILZERO)?.parse().unwrap_or(1);
-        let negative_order = self.info(LOCALE_INEGNUMBER)?.parse().unwrap_or(1);
+        // The five settings or none: a locale the system knows has them all.
+        let ((((decimal, thousand), grouping), leading_zero), negative_order) = self
+            .info(LOCALE_SDECIMAL)
+            .zip(self.info(LOCALE_STHOUSAND))
+            .zip(self.info(LOCALE_SGROUPING))
+            .zip(self.info(LOCALE_ILZERO))
+            .zip(self.info(LOCALE_INEGNUMBER))?;
+        let mut decimal = to_wide(&decimal);
+        let mut thousand = to_wide(&thousand);
+        let grouping = grouping_value(&grouping);
+        let leading_zero = leading_zero.parse().unwrap_or(1);
+        let negative_order = negative_order.parse().unwrap_or(1);
         let format = NUMBERFMTW {
             NumDigits: digits,
             LeadingZero: leading_zero,
@@ -215,7 +236,27 @@ mod tests {
         assert_eq!(tag_from_langid(0x0409).as_deref(), Some("en-US"));
         assert_eq!(tag_from_langid(0x0407).as_deref(), Some("de-DE"));
         assert_eq!(tag_from_langid(0xFFFF), None);
-        assert!(ui_language().contains('-') || ui_language().len() >= 2);
+        let ui = ui_language();
+        assert!(
+            ui.len() >= 2 && ui.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "{ui}"
+        );
+    }
+
+    #[test]
+    fn a_language_without_a_locale_name_falls_back_to_american_english() {
+        assert_eq!(tag_or_fallback(0x041F), "tr-TR");
+        assert_eq!(tag_or_fallback(0xFFFF), "en-US");
+    }
+
+    #[test]
+    fn the_user_locale_comes_from_what_the_system_wrote() {
+        let written = to_wide("tr-TR");
+        // The count includes the terminating NUL, as the system's does.
+        assert_eq!(Locale::named_by_system(6, &written).tag(), "tr-TR");
+        // Nothing written: the buffer's content is not a locale.
+        assert_eq!(Locale::named_by_system(0, &written).tag(), "en-US");
+        assert!(!Locale::user_default().tag().is_empty());
     }
 
     #[test]

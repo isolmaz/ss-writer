@@ -8,13 +8,23 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use editor_common::{Harness, KEY_A, KEY_C, KEY_V, KEY_X, KEY_Z};
+use editor_common::{Harness, KEY_A, KEY_C, KEY_V, KEY_X, KEY_Z, TOP, close};
 use ssw_core::command::CommandId;
 use ssw_core::edit::Selection;
-use ssw_ui::editor::EditorEvent;
-use ssw_ui::input::{Modifiers, vk};
-use ssw_ui::services::{ClipboardContent, MemoryClipboard};
-use ssw_ui::widgets::SharedClipboard;
+use ssw_core::markdown::ast::{Alignment, BlockKind};
+use ssw_core::ops::format::InlineStyle;
+use ssw_core::settings::ListIndent;
+use ssw_core::text::TextRange;
+use ssw_ui::canvas::{DrawOp, RecordingCanvas};
+use ssw_ui::editor::{DocumentKind, EditorEvent, EditorStrings, EditorView};
+use ssw_ui::geometry::{Point, Rect};
+use ssw_ui::input::{
+    Cursor, Event, ImeEvent, Modifiers, PointerButton, PointerEvent, PointerEventKind, WheelEvent,
+    vk,
+};
+use ssw_ui::services::{ClipboardContent, MemoryClipboard, TimerId};
+use ssw_ui::widget::{LayoutCx, PaintCx, Widget};
+use ssw_ui::widgets::{Control, SharedClipboard};
 
 fn ctrl() -> Modifiers {
     Modifiers::CTRL
@@ -384,4 +394,685 @@ fn the_clipboard_commands_copy_cut_and_paste_source_text() {
     // Nothing selected: copy does nothing.
     h.set_caret(0);
     assert!(!h.view.execute(CommandId::EditCopy));
+}
+
+// ----- plain-text documents -------------------------------------------------------------------
+
+fn plain(text: &str) -> Harness {
+    let mut h = Harness::new(text);
+    h.config(|config| config.document_kind = DocumentKind::PlainText);
+    h
+}
+
+#[test]
+fn plain_text_documents_delete_by_character_word_and_selection() {
+    let mut h = plain("one two three");
+    h.set_caret(3);
+    h.press(vk::DELETE);
+    assert_eq!(h.text(), "onetwo three");
+    h.key(vk::DELETE, ctrl());
+    assert_eq!(
+        h.text(),
+        "onethree",
+        "Ctrl+Delete removes up to the next word"
+    );
+    h.set_caret(8);
+    h.key(vk::BACK, ctrl());
+    assert_eq!(
+        h.text(),
+        "",
+        "Ctrl+Backspace removes the word before the caret"
+    );
+
+    let mut h = plain("one two three");
+    h.view.set_selection(Selection::new(0, 3));
+    h.press(vk::BACK);
+    assert_eq!(h.text(), " two three", "a selection is deleted whole");
+
+    // At the edges of the text there is nothing to delete.
+    let mut h = plain("ab");
+    h.set_caret(2);
+    h.press(vk::DELETE);
+    assert_eq!(h.text(), "ab");
+    assert_eq!(h.selection(), Selection::caret(2));
+    h.set_caret(0);
+    h.press(vk::BACK);
+    assert_eq!(h.text(), "ab");
+    assert_eq!(h.selection(), Selection::caret(0));
+}
+
+#[test]
+fn plain_text_tab_follows_the_indent_setting_and_shift_tab_strips_it() {
+    for (indent, unit) in [
+        (ListIndent::Two, "  "),
+        (ListIndent::Four, "    "),
+        (ListIndent::Tab, "\t"),
+    ] {
+        let mut h = plain("x");
+        h.config(|config| config.list_indent = indent);
+        h.press(vk::TAB);
+        assert_eq!(h.text(), format!("{unit}x"), "{indent:?}");
+        h.key(vk::TAB, Modifiers::SHIFT);
+        assert_eq!(h.text(), "x", "{indent:?}: Shift+Tab removes one indent");
+    }
+    // Fewer spaces than the unit: only those go.
+    let mut h = plain("  x");
+    h.config(|config| config.list_indent = ListIndent::Four);
+    h.key(vk::TAB, Modifiers::SHIFT);
+    assert_eq!(h.text(), "x");
+    // Nothing to remove: the key is consumed and the text stays.
+    assert!(h.key(vk::TAB, Modifiers::SHIFT).handled);
+    assert_eq!(h.text(), "x");
+}
+
+#[test]
+fn an_ime_composition_replaces_the_selection_of_a_plain_text_document() {
+    let mut h = plain("hello world");
+    h.view.set_selection(Selection::new(0, 5));
+    h.ime(ImeEvent::Update {
+        text: "か".into(),
+        caret: 3,
+        attrs: Vec::new(),
+    });
+    assert_eq!(
+        h.text(),
+        " world",
+        "the selected text made room for the composition"
+    );
+    h.ime(ImeEvent::Commit("か".into()));
+    assert_eq!(h.text(), "か world");
+}
+
+// ----- keys and timers ------------------------------------------------------------------------
+
+#[test]
+fn timers_of_other_widgets_are_not_ours() {
+    let mut h = Harness::new("abc");
+    assert!(!h.event(Event::Timer(TimerId::new(u64::MAX))).handled);
+}
+
+#[test]
+fn word_back_and_the_line_edges_extend_with_shift() {
+    let mut h = Harness::new("one two three");
+    h.set_caret(13);
+    h.key(vk::LEFT, ctrl());
+    assert_eq!(h.selection(), Selection::caret(8), "start of the last word");
+    h.key(vk::HOME, Modifiers::SHIFT);
+    assert_eq!(h.selection(), Selection::new(8, 0));
+    h.key(vk::END, Modifiers::SHIFT);
+    assert_eq!(h.selection(), Selection::new(8, 13));
+}
+
+// ----- folded text ----------------------------------------------------------------------------
+
+fn folded() -> Harness {
+    let mut h = Harness::new("# H\n\nbody\n");
+    // Everything after the heading line is inside its folded section.
+    h.view.set_folds(vec![TextRange::new(4, 10)], vec![0]);
+    h.arrange();
+    h
+}
+
+#[test]
+fn a_caret_inside_a_folded_section_stays_put_and_scrolls_nothing() {
+    let mut h = folded();
+    h.view.set_selection(Selection::caret(6));
+    for key in [vk::DOWN, vk::HOME] {
+        assert!(h.press(key).handled);
+        assert_eq!(
+            h.selection(),
+            Selection::caret(6),
+            "no caret rectangle to move from"
+        );
+    }
+    h.view.go_to(Selection::caret(7));
+    h.arrange();
+    assert_eq!(h.view.scroll_y(), 0.0, "nothing to scroll to");
+}
+
+#[test]
+fn pointing_below_a_document_that_ends_in_a_fold_places_no_caret() {
+    let mut h = folded();
+    h.set_caret(1);
+    let below = Point::new(200.0, 190.0);
+    let result = h.pointer(PointerEventKind::Down, below, 1, Modifiers::NONE);
+    assert!(result.handled && result.request_focus);
+    assert_eq!(h.selection(), Selection::caret(1));
+    assert_eq!(
+        h.view.offset_at(below),
+        None,
+        "the block under the point is folded away"
+    );
+    h.pointer(PointerEventKind::Up, below, 0, Modifiers::NONE);
+
+    let right = h.event(Event::Pointer(PointerEvent::mouse(
+        PointerEventKind::Down,
+        Some(PointerButton::Right),
+        below,
+    )));
+    assert!(!right.handled, "no context menu below the text");
+
+    // A drag that runs below the text keeps its selection.
+    h.pointer(
+        PointerEventKind::Down,
+        h.first_line_point(1),
+        1,
+        Modifiers::NONE,
+    );
+    h.pointer(PointerEventKind::Move, below, 0, Modifiers::NONE);
+    assert_eq!(h.selection(), Selection::caret(1));
+}
+
+#[test]
+fn a_view_that_was_never_laid_out_has_nothing_visible_and_estimates_folds_as_empty() {
+    let mut h = Harness::new("# H\n\nbody\n");
+    h.view = EditorView::new(h.doc.clone(), h.clock.clone());
+    assert!(h.view.visible_range().is_none());
+    h.view.set_folds(vec![TextRange::new(4, 10)], vec![0]);
+    h.arrange();
+    assert!(h.view.visible_range().is_some());
+}
+
+// ----- accessors and stale state --------------------------------------------------------------
+
+#[test]
+fn the_view_describes_itself_and_takes_new_strings() {
+    let mut h = Harness::new("one two\n");
+    let printed = format!("{:?}", h.view);
+    assert!(printed.contains("zoom_percent: 100"), "{printed}");
+    assert!(printed.contains("typewriter: false"), "{printed}");
+
+    let strings = EditorStrings {
+        name: "Document".to_owned(),
+        ..EditorStrings::default()
+    };
+    h.view.set_strings(strings);
+    assert_eq!(h.access().name, "Document");
+
+    h.view.set_selection(Selection::new(0, 3));
+    assert_eq!(h.view.selected_text(), "one");
+    // Switching a mode to the state it has changes nothing.
+    h.view.set_typewriter(false);
+    assert!(!h.view.typewriter());
+    h.view.set_focus_mode(true);
+    assert!(h.view.focus_mode());
+}
+
+#[test]
+fn rectangles_wait_for_the_layout_of_an_edited_document() {
+    let mut h = Harness::new("one\n");
+    assert!(h.view.rect_at(1).is_some());
+    h.type_text("x");
+    assert!(
+        h.view.rect_at(1).is_none(),
+        "the layout is older than the text"
+    );
+    h.arrange();
+    assert!(h.view.rect_at(1).is_some());
+}
+
+#[test]
+fn dropping_nothing_or_removing_nothing_is_refused() {
+    let mut h = Harness::new("one two\n");
+    assert!(!h.view.drop_text(h.first_line_point(2), ""));
+    assert!(!h.view.remove_range(TextRange::new(2, 2)));
+    assert!(!h.view.remove_range(TextRange::new(0, 999)));
+    assert_eq!(h.text(), "one two\n");
+}
+
+#[test]
+fn an_unbounded_space_measures_the_column_and_a_default_height() {
+    let mut h = Harness::new("a\n");
+    let column = h.view.config().column_width();
+    let id = h.view.id();
+    let mut cx = LayoutCx::new(id, &h.theme, 1.0, &h.engine, &mut h.focus, &mut h.requests);
+    let size = h.view.measure(
+        &mut cx,
+        ssw_ui::geometry::Size::new(f32::INFINITY, f32::INFINITY),
+    );
+    assert!(close(size.width, column + 48.0), "{size:?}");
+    assert!(close(size.height, 600.0), "{size:?}");
+}
+
+// ----- painting -------------------------------------------------------------------------------
+
+fn paint_damaged(h: &Harness, damage: Rect) -> RecordingCanvas {
+    let mut canvas = RecordingCanvas::new();
+    let cx = PaintCx::new(
+        h.view.id(),
+        &h.theme,
+        1.0,
+        &h.engine,
+        &h.focus,
+        &h.capture,
+        Some(damage),
+    );
+    h.view.paint(&cx, &mut canvas);
+    assert!(canvas.is_balanced());
+    canvas
+}
+
+#[test]
+fn only_blocks_in_the_damaged_area_are_painted() {
+    let h = Harness::new("a\n\nb\n\nc\n");
+    assert!(
+        paint_damaged(&h, Rect::new(1000.0, 1000.0, 10.0, 10.0))
+            .recorded()
+            .is_empty(),
+        "damage elsewhere paints nothing"
+    );
+    let top = paint_damaged(&h, Rect::new(0.0, 0.0, 400.0, 40.0));
+    assert_eq!(
+        top.texts(),
+        ["a"],
+        "the blocks below the damage are skipped"
+    );
+}
+
+fn highlight_fills(canvas: &RecordingCanvas) -> Vec<ssw_ui::geometry::Color> {
+    canvas
+        .ops()
+        .filter_map(|op| match op {
+            DrawOp::FillRoundedRect { color, .. } => Some(*color),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn search_matches_are_highlighted_and_the_current_one_stands_out() {
+    let mut h = Harness::new("ab\n\nab\n");
+    let (current, other) = {
+        let palette = &h.theme.tokens.highlight;
+        (palette.orange.background, palette.yellow.background)
+    };
+    h.view
+        .set_search_highlights(vec![TextRange::new(0, 2), TextRange::new(4, 6)], Some(0));
+    assert_eq!(highlight_fills(&h.paint()), [current, other]);
+    // The same request again changes nothing.
+    h.view
+        .set_search_highlights(vec![TextRange::new(0, 2), TextRange::new(4, 6)], Some(0));
+    assert_eq!(highlight_fills(&h.paint()), [current, other]);
+    // A current index past the matches means none is current.
+    h.view
+        .set_search_highlights(vec![TextRange::new(0, 2), TextRange::new(4, 6)], Some(9));
+    assert_eq!(highlight_fills(&h.paint()), [other, other]);
+}
+
+// ----- pointer and wheel ----------------------------------------------------------------------
+
+fn wheel_at(h: &mut Harness, position: Point, delta: Point, mods: Modifiers) -> bool {
+    h.event(Event::Wheel(WheelEvent {
+        delta,
+        precise: true,
+        position,
+        mods,
+    }))
+    .handled
+}
+
+#[test]
+fn wheels_outside_the_view_and_zero_zoom_wheels_do_nothing() {
+    let mut h = Harness::new("abc\n");
+    h.events();
+    let outside = Point::new(500.0, 500.0);
+    assert!(!wheel_at(
+        &mut h,
+        outside,
+        Point::new(0.0, -1.0),
+        Modifiers::NONE
+    ));
+    assert!(h.wheel(0.0, false, Modifiers::CTRL).handled);
+    assert_eq!(h.view.zoom_percent(), 100);
+    assert!(h.events().is_empty(), "no zoom event without a zoom step");
+}
+
+#[test]
+fn shift_wheel_scrolls_unwrapped_text_sideways() {
+    let mut h = plain(&format!("{}\n", "x".repeat(100)));
+    h.config(|config| config.wrap = false);
+    let text_x = |h: &Harness| {
+        h.paint()
+            .recorded()
+            .iter()
+            .find_map(|entry| match &entry.op {
+                DrawOp::Text { .. } => entry.bounds.map(|bounds| bounds.x),
+                _ => None,
+            })
+            .expect("the line is drawn")
+    };
+    assert!(close(text_x(&h), 24.0));
+    assert!(wheel_at(
+        &mut h,
+        Point::new(100.0, 100.0),
+        Point::new(0.0, -20.0),
+        Modifiers::SHIFT
+    ));
+    h.arrange();
+    assert!(close(text_x(&h), 4.0), "scrolled 20 DIPs: {}", text_x(&h));
+}
+
+#[test]
+fn pointer_events_the_view_does_not_own_are_ignored() {
+    let mut h = Harness::new("a\n\nb\n");
+    let inside = h.first_line_point(0);
+    // Leaving after hovering, and moving out of the view, end the hover.
+    h.pointer(PointerEventKind::Move, inside, 0, Modifiers::NONE);
+    h.requests.take_invalidation();
+    assert!(
+        !h.pointer(PointerEventKind::Leave, inside, 0, Modifiers::NONE)
+            .handled
+    );
+    assert!(
+        !h.requests.take_invalidation().is_clean(),
+        "the hover highlight is repainted away"
+    );
+    h.pointer(PointerEventKind::Move, inside, 0, Modifiers::NONE);
+    h.requests.take_invalidation();
+    let outside = Point::new(500.0, 500.0);
+    assert!(
+        !h.pointer(PointerEventKind::Move, outside, 0, Modifiers::NONE)
+            .handled
+    );
+    assert!(!h.requests.take_invalidation().is_clean());
+    // With nothing hovered, leaving or moving out of the view repaints nothing.
+    h.pointer(PointerEventKind::Leave, inside, 0, Modifiers::NONE);
+    assert!(h.requests.take_invalidation().is_clean());
+    h.pointer(PointerEventKind::Move, outside, 0, Modifiers::NONE);
+    assert!(h.requests.take_invalidation().is_clean());
+    // A press outside, and buttons other than the left and right ones.
+    assert!(
+        !h.pointer(PointerEventKind::Down, outside, 1, Modifiers::NONE)
+            .handled
+    );
+    let up = PointerEvent::mouse(PointerEventKind::Up, Some(PointerButton::Right), inside);
+    assert!(!h.event(Event::Pointer(up)).handled);
+    let right_outside =
+        PointerEvent::mouse(PointerEventKind::Down, Some(PointerButton::Right), outside);
+    assert!(!h.event(Event::Pointer(right_outside)).handled);
+}
+
+#[test]
+fn the_unwrapped_view_scrolls_back_to_a_caret_left_of_it() {
+    let mut h = plain(&format!("{}\n", "x".repeat(100)));
+    h.config(|config| config.wrap = false);
+    h.press(vk::END);
+    h.arrange();
+    h.press(vk::HOME);
+    h.arrange();
+    let text_x = |h: &Harness| {
+        h.paint()
+            .recorded()
+            .iter()
+            .find_map(|entry| match &entry.op {
+                DrawOp::Text { .. } => entry.bounds.map(|bounds| bounds.x),
+                _ => None,
+            })
+            .expect("the line is drawn")
+    };
+    assert!(
+        close(text_x(&h), 24.0),
+        "the line starts at the column again: {}",
+        text_x(&h)
+    );
+    // A caret that stays inside the visible part leaves the view where it is.
+    h.press(vk::RIGHT);
+    h.press(vk::RIGHT);
+    h.arrange();
+    assert!(
+        close(text_x(&h), 24.0),
+        "the visible caret needs no scrolling: {}",
+        text_x(&h)
+    );
+}
+
+#[test]
+fn the_cursor_follows_gutter_widgets_and_ctrl_over_links() {
+    let mut h = Harness::new("# Title\n\nbody\n");
+    h.set_caret(12);
+    let at = |x: f32| Point::new(x, TOP + 26.0);
+    // The fold chevron is a button, the rest of the gutter is not.
+    h.pointer(
+        PointerEventKind::Move,
+        at(h.left - 12.0),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Hand));
+    // Between the chevron and the column: still the gutter (the column starts at x = 24).
+    h.pointer(PointerEventKind::Move, at(h.left - 1.0), 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Arrow));
+
+    let mut h = Harness::new("see [link](http://x.test)\n");
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(5),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+    h.pointer(PointerEventKind::Move, h.first_line_point(5), 0, ctrl());
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Hand));
+}
+
+#[test]
+fn dragging_by_words_and_paragraphs_extends_by_whole_units() {
+    let mut h = Harness::new("one two three\n\nfour five\n");
+    h.pointer(
+        PointerEventKind::Down,
+        h.first_line_point(5),
+        2,
+        Modifiers::NONE,
+    );
+    assert_eq!(
+        h.selection(),
+        Selection::new(4, 7),
+        "the double-clicked word"
+    );
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(10),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(
+        h.selection(),
+        Selection::new(4, 13),
+        "extended to the end of a word"
+    );
+    // Moving within the same word selects the same text and reports nothing.
+    h.events();
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(11),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.selection(), Selection::new(4, 13));
+    assert!(h.events().is_empty());
+    h.pointer(
+        PointerEventKind::Up,
+        h.first_line_point(10),
+        0,
+        Modifiers::NONE,
+    );
+
+    h.pointer(
+        PointerEventKind::Down,
+        h.first_line_point(1),
+        3,
+        Modifiers::NONE,
+    );
+    let below = Point::new(h.left + 1.0, TOP + 28.0 + 8.0 + 14.0);
+    h.pointer(PointerEventKind::Move, below, 0, Modifiers::NONE);
+    let selection = h.selection();
+    assert_eq!(selection.anchor, 0);
+    assert!(
+        selection.head >= 24,
+        "through the second paragraph: {selection:?}"
+    );
+}
+
+#[test]
+fn the_autoscroll_follows_the_pointer_while_it_stays_at_the_edge() {
+    let text: String = (0..100).map(|i| format!("para {i}\n\n")).collect();
+    let mut h = Harness::new(&text);
+    h.pointer(
+        PointerEventKind::Down,
+        h.first_line_point(1),
+        1,
+        Modifiers::NONE,
+    );
+    h.pointer(
+        PointerEventKind::Move,
+        Point::new(100.0, 230.0),
+        0,
+        Modifiers::NONE,
+    );
+    let timers = h.requests.timers().len();
+    h.pointer(
+        PointerEventKind::Move,
+        Point::new(120.0, 260.0),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(
+        h.requests.timers().len(),
+        timers,
+        "the running timer is reused"
+    );
+}
+
+// ----- commands -------------------------------------------------------------------------------
+
+#[test]
+fn inline_format_commands_wrap_the_selection_in_their_markers() {
+    let mut italic = Harness::new("word");
+    italic.view.set_selection(Selection::new(0, 4));
+    assert!(italic.view.execute(CommandId::FormatItalic));
+    assert!(italic.view.style_active(InlineStyle::Italic));
+
+    for (command, expected) in [
+        (CommandId::FormatUnderline, "~word~"),
+        (CommandId::FormatStrikethrough, "~~word~~"),
+        (CommandId::FormatHighlight, "==word=="),
+        (CommandId::FormatHighlightRed, "=={red}word=="),
+        (CommandId::FormatHighlightOrange, "=={orange}word=="),
+        (CommandId::FormatHighlightYellow, "=={yellow}word=="),
+        (CommandId::FormatHighlightGreen, "=={green}word=="),
+        (CommandId::FormatHighlightBlue, "=={blue}word=="),
+        (CommandId::FormatHighlightPurple, "=={purple}word=="),
+        (CommandId::FormatInlineCode, "`word`"),
+        (CommandId::FormatMath, "$word$"),
+    ] {
+        let mut h = Harness::new("word");
+        h.view.set_selection(Selection::new(0, 4));
+        assert!(h.view.execute(command), "{command:?}");
+        assert_eq!(h.text(), expected, "{command:?}");
+    }
+}
+
+#[test]
+fn block_format_commands_insert_and_convert_blocks() {
+    let has = |h: &Harness, wanted: fn(&BlockKind) -> bool| {
+        h.doc
+            .borrow()
+            .ast()
+            .blocks
+            .iter()
+            .any(|block| wanted(&block.kind))
+    };
+    let mut h = Harness::new("text");
+    h.set_caret(4);
+    assert!(h.view.execute(CommandId::FormatDivider));
+    assert!(
+        has(&h, |kind| matches!(kind, BlockKind::ThematicBreak)),
+        "{:?}",
+        h.text()
+    );
+    let mut h = Harness::new("text");
+    h.set_caret(4);
+    assert!(h.view.execute(CommandId::FormatPageBreak));
+    assert!(
+        has(&h, |kind| matches!(kind, BlockKind::PageBreak)),
+        "{:?}",
+        h.text()
+    );
+    let mut h = Harness::new("text");
+    h.set_caret(4);
+    assert!(h.view.execute(CommandId::FormatFootnote));
+    assert_eq!(h.text().matches("[^1]").count(), 2, "{:?}", h.text());
+
+    let mut h = Harness::new("text");
+    h.set_caret(2);
+    assert!(h.view.execute(CommandId::FormatNumberedList));
+    assert_eq!(h.text(), "1. text");
+    let mut h = Harness::new("text");
+    h.set_caret(2);
+    assert!(h.view.execute(CommandId::FormatCallout));
+    assert!(h.text().starts_with("> [!NOTE]"), "{:?}", h.text());
+    let mut h = Harness::new("text");
+    h.set_caret(2);
+    assert!(h.view.execute(CommandId::FormatMathBlock));
+    assert!(h.text().contains("$$"), "{:?}", h.text());
+}
+
+#[test]
+fn table_commands_edit_rows_columns_and_alignment() {
+    const SAMPLE: &str = "| Name | Qty |\n|:-----|----:|\n| Apple | 3 |\n| Pear | 12 |\n";
+    let run = |command: CommandId| {
+        let mut h = Harness::new(SAMPLE);
+        h.set_caret(h.text().find("Apple").expect("Apple"));
+        assert!(h.view.execute(command), "{command:?}");
+        let doc = h.doc.borrow();
+        let BlockKind::Table(table) = doc.ast().blocks[0].kind.clone() else {
+            panic!("{command:?} left no table: {:?}", doc.text());
+        };
+        table
+    };
+    assert_eq!(run(CommandId::TableInsertRowBelow).rows.len(), 3);
+    assert_eq!(run(CommandId::TableDeleteRow).rows.len(), 1);
+    assert_eq!(run(CommandId::TableInsertColumnLeft).header.cells.len(), 3);
+    assert_eq!(run(CommandId::TableInsertColumnRight).header.cells.len(), 3);
+    assert_eq!(run(CommandId::TableDeleteColumn).header.cells.len(), 1);
+    for (command, alignment) in [
+        (CommandId::TableAlignLeft, Alignment::Left),
+        (CommandId::TableAlignCenter, Alignment::Center),
+        (CommandId::TableAlignRight, Alignment::Right),
+    ] {
+        assert_eq!(run(command).alignments[0], alignment, "{command:?}");
+    }
+}
+
+#[test]
+fn the_mode_commands_toggle_and_report_the_modes() {
+    let mut h = Harness::new("a\n");
+    h.events();
+    assert!(h.view.execute(CommandId::ViewTypewriterMode));
+    assert!(h.view.typewriter());
+    assert_eq!(
+        h.events(),
+        [EditorEvent::ModesChanged {
+            typewriter: true,
+            focus: false
+        }]
+    );
+    assert!(h.view.execute(CommandId::ViewFocusMode));
+    assert!(h.view.focus_mode());
+    assert_eq!(
+        h.events(),
+        [EditorEvent::ModesChanged {
+            typewriter: true,
+            focus: true
+        }]
+    );
+}
+
+#[test]
+fn pasting_needs_a_clipboard_with_text() {
+    let mut h = Harness::new("abc");
+    assert!(!h.view.execute(CommandId::EditPaste), "no clipboard");
+    let _clip = clipboard(&mut h);
+    assert!(!h.view.execute(CommandId::EditPaste), "an empty clipboard");
+    assert_eq!(h.text(), "abc");
 }

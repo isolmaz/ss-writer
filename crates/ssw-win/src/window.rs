@@ -33,7 +33,7 @@ use windows::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient, ValidateRect
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
-use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
     TRACKMOUSEEVENT_FLAGS, TrackMouseEvent,
@@ -58,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSELEAVE, WM_NCMOUSEMOVE, WM_PAINT, WM_POINTERDOWN,
     WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
@@ -68,8 +68,9 @@ use crate::chrome::{self, CaptionButton, ChromeState, paint_caption_buttons};
 use crate::com::{OsResultExt, WinError, to_wide};
 use crate::dpi::{
     DEFAULT_DPI, dip_to_px, dpi_from_wparam, min_track_size_px, point_px_to_dip, scale_for_dpi,
-    size_px_to_dip, top_resize_band_px,
+    size_px_to_dip, top_resize_band_px, window_dpi,
 };
+use crate::fault::check;
 use crate::gfx::{GfxDevices, WindowSurface};
 use crate::services::timers::TimerTable;
 use crate::theme::{SystemTheme, Win32Settings, is_theme_change, read_system_theme};
@@ -457,18 +458,16 @@ pub fn text_from_char(unit: u16, pending_high: &mut Option<u16>) -> Option<Strin
         *pending_high = Some(unit);
         return None;
     }
-    let decoded = if (0xDC00..0xE000).contains(&unit) {
+    // A high surrogate and a low one always make one scalar value, and a unit that is no
+    // surrogate is one by itself: the lossless conversion never replaces anything.
+    let text = if (0xDC00..0xE000).contains(&unit) {
         let high = pending_high.take()?;
-        char::decode_utf16([high, unit]).next()?.ok()
+        String::from_utf16_lossy(&[high, unit])
     } else {
         *pending_high = None;
-        char::from_u32(u32::from(unit))
-    }?;
-    if decoded.is_control() {
-        None
-    } else {
-        Some(decoded.to_string())
-    }
+        String::from_utf16_lossy(&[unit])
+    };
+    (!text.chars().any(char::is_control)).then_some(text)
 }
 
 /// A wheel message as a [`WheelEvent`]; `delta` is the signed `WHEEL_DELTA` multiple
@@ -512,41 +511,56 @@ fn instance() -> HINSTANCE {
         .unwrap_or_default()
 }
 
+/// Whether this process registered the window classes (they stay registered).
+static REGISTERED: AtomicBool = AtomicBool::new(false);
+
 fn register_classes() -> Result<(), WinError> {
-    static REGISTERED: AtomicBool = AtomicBool::new(false);
     if REGISTERED.load(Ordering::Acquire) {
         return Ok(());
     }
-    let register = |name: PCWSTR,
-                    proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-                    style|
-     -> Result<(), WinError> {
-        let class = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            // No CS_HREDRAW / CS_VREDRAW: they force a full invalidate on every resize.
-            style,
-            lpfnWndProc: Some(proc),
-            hInstance: instance(),
-            // SAFETY: loading a stock cursor.
-            hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
-            lpszClassName: name,
-            ..Default::default()
-        };
-        // SAFETY: the class structure is fully initialized and outlives the call.
-        let atom = unsafe { RegisterClassExW(&class) };
-        // SAFETY: reads the calling thread's last error right after the failed call.
-        if atom == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS {
-            return Err(WinError::from_os(
-                "RegisterClassExW",
-                windows::core::Error::from_thread(),
-            ));
-        }
+    register_all().inspect(|()| REGISTERED.store(true, Ordering::Release))
+}
+
+/// Registers the window classes of this module (again, when a registration is not known).
+fn register_all() -> Result<(), WinError> {
+    register_class(CLASS_NAME, wndproc, CS_DBLCLKS)?;
+    register_class(MESSAGE_CLASS_NAME, message_proc, WNDCLASS_STYLES(0))
+}
+
+/// Makes the next window creation register the classes again (tests: the registration is
+/// process-wide, whatever other tests of the process did before).
+#[cfg(all(test, feature = "fault-injection"))]
+fn forget_registered_classes() {
+    REGISTERED.store(false, Ordering::Release);
+}
+
+/// Registers the window class `name`; a class this process registered before counts as done.
+fn register_class(
+    name: PCWSTR,
+    proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    style: WNDCLASS_STYLES,
+) -> Result<(), WinError> {
+    let class = WNDCLASSEXW {
+        cbSize: size_of::<WNDCLASSEXW>() as u32,
+        // No CS_HREDRAW / CS_VREDRAW: they force a full invalidate on every resize.
+        style,
+        lpfnWndProc: Some(proc),
+        hInstance: instance(),
+        // SAFETY: loading a stock cursor.
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        lpszClassName: name,
+        ..Default::default()
+    };
+    // SAFETY: the class structure is fully initialized and outlives the call.
+    let atom = unsafe { RegisterClassExW(&class) };
+    // SAFETY: reads the calling thread's last error right after the failed call.
+    let refused = atom == 0 && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS;
+    let outcome = if refused {
+        Err(windows::core::Error::from_thread())
+    } else {
         Ok(())
     };
-    register(CLASS_NAME, wndproc, CS_DBLCLKS)?;
-    register(MESSAGE_CLASS_NAME, message_proc, Default::default())?;
-    REGISTERED.store(true, Ordering::Release);
-    Ok(())
+    check(outcome).ctx("RegisterClassExW")
 }
 
 thread_local! {
@@ -596,6 +610,15 @@ pub fn send_message(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> isize
     result.0
 }
 
+/// Posts a message to the queue of one of this process's own windows (the performance scenarios
+/// type into their own window this way: no synthetic input reaches the system). Returns whether
+/// the message was queued.
+pub fn post_message(hwnd: HWND, msg: u32, wparam: usize, lparam: isize) -> bool {
+    // SAFETY: a plain post of values the receiving procedure interprets itself (callers pass
+    // no pointers); posting to a stale handle merely fails.
+    unsafe { PostMessageW(Some(hwnd), msg, WPARAM(wparam), LPARAM(lparam)) }.is_ok()
+}
+
 unsafe extern "system" fn message_proc(
     hwnd: HWND,
     msg: u32,
@@ -620,7 +643,7 @@ impl MessageWindow {
     pub fn new() -> Result<Self, WinError> {
         register_classes()?;
         // SAFETY: creates a message-only window with a registered class.
-        let hwnd = unsafe {
+        let created = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 MESSAGE_CLASS_NAME,
@@ -635,9 +658,10 @@ impl MessageWindow {
                 Some(instance()),
                 None,
             )
-        }
-        .ctx("create message window")?;
-        Ok(Self { hwnd })
+        };
+        // The window belongs to the value from here on: a failure injected after the call
+        // destroys it again.
+        check(created.map(|hwnd| Self { hwnd })).ctx("create message window")
     }
 
     #[must_use]
@@ -682,6 +706,7 @@ struct WindowState {
 
 /// Work to do after the state borrow of a message is released (window functions that send
 /// messages back into the procedure).
+#[derive(Debug, PartialEq)]
 enum After {
     None,
     SetRect(RECT),
@@ -929,11 +954,10 @@ impl WindowState {
                     return (None, After::None);
                 };
                 let original_top = params.rgrc[0].top;
+                // The class has no CS_HREDRAW / CS_VREDRAW, so the answer is always 0 (no
+                // valid-rectangle flags): there is nothing to pass on.
                 // SAFETY: default processing computes the standard frame insets.
-                let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-                if result.0 != 0 {
-                    return (Some(result), After::None);
-                }
+                let _ = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
                 // Give the caption back to the client area.
                 // SAFETY: the same non-null `NCCALCSIZE_PARAMS` as above; the earlier reference
                 // is no longer used.
@@ -1182,6 +1206,7 @@ impl WindowState {
                 }
             }
             WM_CHAR => {
+                crate::perf::input_received();
                 let unit = (wparam.0 & 0xFFFF) as u16;
                 if let Some(text) = text_from_char(unit, &mut self.pending_high_surrogate) {
                     self.dispatch(Event::Text(TextInput(text)));
@@ -1266,9 +1291,8 @@ fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
             let create = &*(lparam.0 as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
             let cell = &*(create.lpCreateParams as *const RefCell<WindowState>);
-            if let Ok(mut state) = cell.try_borrow_mut() {
-                state.hwnd = hwnd;
-            }
+            // Nothing holds the state while the window is created.
+            cell.borrow_mut().hwnd = hwnd;
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
     }
@@ -1390,7 +1414,7 @@ impl WindowHost {
         let title = HSTRING::from(options.title.as_str());
         // SAFETY: the creation parameter is the address of the `RefCell` inside the `Rc`,
         // which `WindowHost` keeps alive until after the window is destroyed.
-        let hwnd = unsafe {
+        let created = unsafe {
             CreateWindowExW(
                 ex_style,
                 CLASS_NAME,
@@ -1405,19 +1429,17 @@ impl WindowHost {
                 Some(instance()),
                 Some(Rc::as_ptr(&state).cast()),
             )
-        }
-        .ctx("CreateWindowExW")?;
-        // From here on `host` owns the window: every early return below destroys it, so the
-        // window procedure can never meet the state pointer after the `Rc` is gone.
-        let host = Self { hwnd, state };
-        let dpi = {
-            // SAFETY: plain query on the window just created.
-            let dpi = unsafe { GetDpiForWindow(hwnd) };
-            if dpi == 0 { DEFAULT_DPI } else { dpi }
         };
+        // From here on `host` owns the window: every early return below destroys it (also a
+        // failure injected right after the call), so the window procedure can never meet the
+        // state pointer after the `Rc` is gone.
+        let host = check(created.map(|hwnd| Self { hwnd, state })).ctx("CreateWindowExW")?;
+        let hwnd = host.hwnd;
+        crate::perf::mark(crate::perf::MARK_WINDOW_CREATED);
+        let dpi = window_dpi(hwnd);
         let mut client = RECT::default();
         // SAFETY: valid out pointer.
-        unsafe { GetClientRect(hwnd, &mut client) }.ctx("GetClientRect")?;
+        check(unsafe { GetClientRect(hwnd, &mut client) }).ctx("GetClientRect")?;
         {
             let mut borrowed = host.state.borrow_mut();
             borrowed.hwnd = hwnd;
@@ -1426,6 +1448,7 @@ impl WindowHost {
         }
         apply_dark_mode(hwnd, options.dark);
         set_dwm_i32(hwnd, DWMWA_SYSTEMBACKDROP_TYPE.0, DWMSBT_TABBEDWINDOW.0);
+        crate::perf::mark(crate::perf::MARK_BACKDROP_APPLIED);
         set_dwm_i32(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE.0, DWMWCP_ROUND.0);
         let margins = MARGINS {
             cxLeftWidth: -1,
@@ -1435,8 +1458,9 @@ impl WindowHost {
         };
         // SAFETY: valid window and margins; re-running NCCALCSIZE applies the custom frame.
         unsafe {
-            DwmExtendFrameIntoClientArea(hwnd, &margins).ctx("DwmExtendFrameIntoClientArea")?;
-            SetWindowPos(
+            check(DwmExtendFrameIntoClientArea(hwnd, &margins))
+                .ctx("DwmExtendFrameIntoClientArea")?;
+            check(SetWindowPos(
                 hwnd,
                 None,
                 0,
@@ -1444,12 +1468,12 @@ impl WindowHost {
                 0,
                 0,
                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            )
+            ))
             .ctx("SetWindowPos")?;
         }
         let mut client = RECT::default();
         // SAFETY: valid out pointer.
-        unsafe { GetClientRect(hwnd, &mut client) }.ctx("GetClientRect")?;
+        check(unsafe { GetClientRect(hwnd, &mut client) }).ctx("GetClientRect")?;
         host.state.borrow_mut().size_px = (client.right - client.left, client.bottom - client.top);
         Ok(host)
     }
@@ -1695,8 +1719,9 @@ pub fn run_loop(mut idle: impl FnMut() -> Option<Duration>) -> i32 {
 #[must_use]
 pub fn wheel_scroll_lines() -> u32 {
     let mut lines = 3u32;
+    // A failing call leaves `lines` at its default of 3.
     // SAFETY: `lines` is a valid u32 out buffer.
-    let ok = unsafe {
+    let _ = unsafe {
         windows::Win32::UI::WindowsAndMessaging::SystemParametersInfoW(
             SPI_GETWHEELSCROLLLINES,
             0,
@@ -1704,7 +1729,7 @@ pub fn wheel_scroll_lines() -> u32 {
             windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         )
     };
-    if ok.is_ok() { lines } else { 3 }
+    lines
 }
 
 /// Pixel size of a DIP length at the window's DPI.
@@ -1912,7 +1937,7 @@ mod tests {
         for msg in [WM_SETFOCUS, WM_KILLFOCUS] {
             let (result, after) = feed(&host, msg, 0, 0);
             assert_eq!(result, Some(0));
-            assert!(matches!(after, After::None));
+            assert_eq!(after, After::None);
         }
         let wheel = (120u32 as isize) << 16;
         send(&host, WM_MOUSEWHEEL, (wheel as usize) & !0xFFFF, 0);
@@ -2012,7 +2037,7 @@ mod tests {
         // non-client activation (frame state, no focus change) goes through the procedure.
         let (result, after) = feed(&host, WM_ACTIVATE, usize::from(WA_INACTIVE as u16), 0);
         assert_eq!(result, None, "default processing stays with the procedure");
-        assert!(matches!(after, After::None));
+        assert_eq!(after, After::None);
         assert!(!host.info().active);
         feed(&host, WM_ACTIVATE, 1, 0);
         assert!(host.info().active);
@@ -2023,7 +2048,7 @@ mod tests {
         // A pointer message for a pointer that does not exist is left to default processing.
         let (result, after) = feed(&host, WM_POINTERDOWN, 0xFFFE, 0);
         assert_eq!(result, None);
-        assert!(matches!(after, After::None));
+        assert_eq!(after, After::None);
         assert!(host.state.borrow().chrome.pressed.is_none());
         send(&host, WM_SETTINGCHANGE, 0, 0);
         assert_eq!(log.borrow().themes, 0);
@@ -2492,5 +2517,428 @@ mod tests {
             assert!(!cursor_resource(cursor).is_null());
         }
         let _ = DrawOp::Save;
+    }
+
+    /// A handler that implements only what the trait requires.
+    struct Minimal;
+
+    impl WindowHandler for Minimal {
+        fn on_event(&mut self, _info: &WindowInfo, _event: Event) {}
+        fn on_paint(&mut self, _info: &WindowInfo, canvas: &mut dyn Canvas) {
+            canvas.fill_rect(
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                ssw_ui::geometry::Color::BLACK,
+            );
+        }
+    }
+
+    #[test]
+    fn the_provided_handler_methods_do_nothing_and_accept_the_default_answers() {
+        let (host, _log) = host(true, false);
+        let info = host.info();
+        let mut handler = Minimal;
+        let top_left = Point::new(300.0, 10.0);
+        assert_eq!(
+            handler.hit_test(top_left, &info),
+            default_hit_region(top_left, info.size_dip().width)
+        );
+        handler.on_event(&info, Event::Timer(ssw_ui::services::TimerId::new(1)));
+        let mut canvas = ssw_ui::canvas::RecordingCanvas::default();
+        handler.on_paint(&info, &mut canvas);
+        handler.on_resize(&info);
+        handler.on_activate(&info, true);
+        handler.on_theme_changed(&info, &read_system_theme(&Win32Settings));
+        handler.on_wake(&info);
+        assert!(
+            handler.on_close_requested(&info),
+            "closing is allowed by default"
+        );
+        handler.on_destroy(&info);
+        assert_eq!(
+            handler.on_message(&info, WM_APP, WPARAM(0), LPARAM(0)),
+            None,
+            "messages are not answered by default"
+        );
+    }
+
+    /// A handler that answers one private message before the window translates anything.
+    struct Answering;
+
+    impl WindowHandler for Answering {
+        fn on_event(&mut self, _info: &WindowInfo, _event: Event) {}
+        fn on_paint(&mut self, _info: &WindowInfo, _canvas: &mut dyn Canvas) {}
+        fn on_message(
+            &mut self,
+            _info: &WindowInfo,
+            msg: u32,
+            _wparam: WPARAM,
+            _lparam: LPARAM,
+        ) -> Option<LRESULT> {
+            (msg == WM_APP + 7).then_some(LRESULT(7))
+        }
+    }
+
+    #[test]
+    fn a_handler_answer_to_a_message_ends_the_translation() {
+        let options = WindowOptions {
+            title: "answering".to_owned(),
+            rect: Some((-32000, -32000, 800, 600)),
+            dark: false,
+            no_activate: true,
+        };
+        let host = WindowHost::create(&options, Box::new(Answering), Theme::light(DEFAULT_ACCENT))
+            .unwrap();
+        let (result, after) = feed(&host, WM_APP + 7, 0, 0);
+        assert_eq!(result, Some(7));
+        assert_eq!(after, After::None);
+        // Another message goes on to the window's own translation: an unknown timer is ours.
+        let (result, _) = feed(&host, WM_TIMER, 0xDEAD, 0);
+        assert_eq!(result, Some(0));
+        // The handler's own answer reaches the sender through the real window procedure.
+        assert_eq!(send_message(host.hwnd(), WM_APP + 7, 0, 0), 7);
+    }
+
+    #[test]
+    fn a_wake_handle_made_from_a_window_wakes_it_until_it_is_gone() {
+        let (host, log) = host(true, false);
+        let wake = WakeHandle::new(host.hwnd());
+        assert_eq!(wake, host.wake_handle());
+        assert!(wake.wake());
+        let mut message = MSG::default();
+        // SAFETY: takes the posted wake-up message of our own window off this thread's queue.
+        let found =
+            unsafe { PeekMessageW(&mut message, Some(host.hwnd()), WM_WAKE, WM_WAKE, PM_REMOVE) };
+        assert!(found.as_bool());
+        assert_eq!(
+            log.borrow().wakes,
+            0,
+            "the message was removed, not dispatched"
+        );
+        assert_eq!(send_message(host.hwnd(), WM_WAKE, 0, 0), 0);
+        assert_eq!(log.borrow().wakes, 1);
+    }
+
+    #[test]
+    fn caption_button_releases_choose_the_window_command() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GWL_STYLE, GetWindowLongPtrW, HTCAPTION, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, WS_MAXIMIZE,
+        };
+
+        let (host, _log) = host(true, false);
+        let press = |hit: u32| feed(&host, WM_NCLBUTTONDOWN, hit as usize, 0);
+        let release = |hit: u32| feed(&host, WM_NCLBUTTONUP, hit as usize, 0);
+
+        // A press on the caption itself is left to the system.
+        let (result, after) = press(HTCAPTION);
+        assert_eq!(result, None);
+        assert_eq!(after, After::None);
+
+        press(HTMINBUTTON);
+        let (result, after) = release(HTMINBUTTON);
+        assert_eq!(result, Some(0));
+        assert_eq!(after, After::Show(SW_MINIMIZE.0));
+
+        press(HTMAXBUTTON);
+        let (_, after) = release(HTMAXBUTTON);
+        assert_eq!(after, After::Show(SW_MAXIMIZE.0));
+
+        // Pressed on one button, released on another: swallowed, nothing happens.
+        press(HTMINBUTTON);
+        let (result, after) = release(HTCLOSE);
+        assert_eq!(result, Some(0));
+        assert_eq!(after, After::None);
+        // Released without a press: the system sees it.
+        let (result, after) = release(HTCLOSE);
+        assert_eq!(result, None);
+        assert_eq!(after, After::None);
+
+        // A maximized window restores instead (the style bit is what `IsZoomed` reads; the
+        // window is never shown).
+        // SAFETY: plain style changes of our own hidden window, undone below.
+        let style = unsafe { GetWindowLongPtrW(host.hwnd(), GWL_STYLE) };
+        // SAFETY: sets the maximize bit on our own hidden window; restored below.
+        unsafe { SetWindowLongPtrW(host.hwnd(), GWL_STYLE, style | WS_MAXIMIZE.0 as isize) };
+        press(HTMAXBUTTON);
+        let (_, after) = release(HTMAXBUTTON);
+        // SAFETY: restores the style read above.
+        unsafe { SetWindowLongPtrW(host.hwnd(), GWL_STYLE, style) };
+        assert_eq!(after, After::Show(SW_RESTORE.0));
+    }
+
+    #[test]
+    fn a_maximized_frame_gives_the_caption_back_and_keeps_the_monitor_overhang() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GWL_STYLE, GetWindowLongPtrW, WINDOWPOS, WS_MAXIMIZE,
+        };
+
+        let (host, _log) = host(true, false);
+        // Without the parameter block the message is left to the system.
+        let (result, after) = feed(&host, WM_NCCALCSIZE, 1, 0);
+        assert_eq!(result, None);
+        assert_eq!(after, After::None);
+
+        let mut position = WINDOWPOS::default();
+        let mut params = NCCALCSIZE_PARAMS::default();
+        params.rgrc[0] = RECT {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 600,
+        };
+        params.lppos = &mut position;
+        // Restored: the client area starts at the top of the window (the caption is ours).
+        let (result, _) = feed(&host, WM_NCCALCSIZE, 1, (&raw mut params) as isize);
+        assert_eq!(result, Some(0));
+        assert_eq!(params.rgrc[0].top, 0);
+
+        // SAFETY: plain style changes of our own hidden window, undone below.
+        let style = unsafe { GetWindowLongPtrW(host.hwnd(), GWL_STYLE) };
+        // SAFETY: sets the maximize bit on our own hidden window; restored below.
+        unsafe { SetWindowLongPtrW(host.hwnd(), GWL_STYLE, style | WS_MAXIMIZE.0 as isize) };
+        params.rgrc[0] = RECT {
+            left: 0,
+            top: 0,
+            right: 800,
+            bottom: 600,
+        };
+        let (result, _) = feed(&host, WM_NCCALCSIZE, 1, (&raw mut params) as isize);
+        // SAFETY: restores the style read above.
+        unsafe { SetWindowLongPtrW(host.hwnd(), GWL_STYLE, style) };
+        assert_eq!(result, Some(0));
+        // A maximized window overhangs the monitor by its frame: the client area starts below
+        // the overhang.
+        let dpi = host.info().dpi;
+        // SAFETY: pure metric queries.
+        let overhang = unsafe {
+            GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi)
+                + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+        };
+        assert!(overhang > 0);
+        assert_eq!(params.rgrc[0].top, overhang);
+    }
+
+    #[test]
+    fn a_window_that_is_gone_ignores_the_requests_to_show_it_and_has_no_placement() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+        let (host, _log) = host(true, false);
+        // A live (never shown) window answers the queries.
+        let (_, _, width, height) = host.normal_placement().unwrap();
+        assert_eq!((width, height), (800, 600));
+        let origin = host.client_to_screen(0, 0);
+        let moved = host.client_to_screen(10, 20);
+        assert_eq!((moved.0 - origin.0, moved.1 - origin.1), (10, 20));
+        assert!(format!("{host:?}").starts_with("WindowHost { hwnd: HWND("));
+
+        // Once it is destroyed its handle is stale and the queries find no window. (The show
+        // and raise requests are never tried on a stale handle: the system may already have
+        // given that handle value to another program's window.)
+        host.destroy();
+        assert_eq!(host.normal_placement(), None);
+        assert_eq!(host.client_to_screen(10, 20), (10, 20));
+        // SAFETY: plain query.
+        assert!(!unsafe { IsWindowVisible(host.hwnd()) }.as_bool());
+    }
+
+    #[test]
+    fn classes_register_once_and_an_unnamed_one_is_refused() {
+        register_class(CLASS_NAME, wndproc, CS_DBLCLKS).unwrap();
+        // The same class again is the class already there.
+        register_class(CLASS_NAME, wndproc, CS_DBLCLKS).unwrap();
+        let refused = register_class(PCWSTR::null(), wndproc, CS_DBLCLKS).unwrap_err();
+        assert!(
+            refused.to_string().starts_with("RegisterClassExW failed"),
+            "{refused}"
+        );
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn every_failing_system_call_of_creating_windows_is_reported_under_its_own_name() {
+        use crate::fault::{all_failed, failed_step, sweep};
+
+        let steps = sweep(|| {
+            forget_registered_classes();
+            failed_step(MessageWindow::new())
+        });
+        assert_eq!(
+            steps,
+            all_failed(&[
+                "RegisterClassExW",
+                "RegisterClassExW",
+                "create message window"
+            ])
+        );
+        let steps = sweep(|| {
+            forget_registered_classes();
+            let options = WindowOptions {
+                title: "sweep".to_owned(),
+                rect: Some((-32000, -32000, 400, 300)),
+                dark: false,
+                no_activate: true,
+            };
+            failed_step(WindowHost::create(
+                &options,
+                Box::new(Minimal),
+                Theme::light(DEFAULT_ACCENT),
+            ))
+        });
+        assert_eq!(
+            steps,
+            all_failed(&[
+                "RegisterClassExW",
+                "RegisterClassExW",
+                "CreateWindowExW",
+                "GetClientRect",
+                "DwmExtendFrameIntoClientArea",
+                "SetWindowPos",
+                "GetClientRect",
+            ])
+        );
+    }
+
+    /// Gives `host` fresh graphics (generation 1), releasing the ones it had.
+    #[cfg(feature = "fault-injection")]
+    fn attach(host: &WindowHost) {
+        host.state.borrow_mut().graphics = None;
+        let devices = crate::gfx::GfxDevices::create(1).unwrap();
+        let wic = crate::wic::Wic::new().unwrap();
+        let engine = crate::dwrite::DWriteEngine::new().unwrap();
+        let assets = CanvasAssets::new(crate::canvas::ImageStore::new(wic), engine);
+        host.attach_graphics(devices, assets).unwrap();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn a_surface_that_cannot_be_built_leaves_the_window_without_graphics() {
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, _log) = host(true, false);
+        let devices = crate::gfx::GfxDevices::create(1).unwrap();
+        let wic = crate::wic::Wic::new().unwrap();
+        let engine = crate::dwrite::DWriteEngine::new().unwrap();
+        let assets = CanvasAssets::new(crate::canvas::ImageStore::new(wic), engine);
+        crate::fault::arm(0);
+        let error = host.attach_graphics(devices, assets).unwrap_err();
+        crate::fault::disarm();
+        assert!(
+            error.to_string().starts_with("DXGI adapter failed"),
+            "{error}"
+        );
+        assert_eq!(host.graphics_generation(), None);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn a_lost_device_is_replaced_and_the_frame_is_painted_again_on_the_new_one() {
+        use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, log) = host(true, false);
+        attach(&host);
+
+        // A frame that fails with a lost device: new devices, and the frame is drawn again.
+        let paints = log.borrow().paints;
+        crate::fault::arm_with(0, DXGI_ERROR_DEVICE_REMOVED);
+        host.state.borrow_mut().paint();
+        crate::fault::disarm();
+        assert_eq!(host.graphics_generation(), Some(2));
+        assert_eq!(log.borrow().paints, paints + 1);
+
+        // A swap chain that cannot be resized because the device is lost: same recovery,
+        // and the new surface has the new size.
+        crate::fault::arm_with(0, DXGI_ERROR_DEVICE_REMOVED);
+        host.state.borrow_mut().resize(300, 200);
+        crate::fault::disarm();
+        assert_eq!(host.graphics_generation(), Some(3));
+        assert_eq!(host.info().size_px, (300, 200));
+
+        // Any other resize failure keeps the devices.
+        crate::fault::arm(0);
+        host.state.borrow_mut().resize(310, 210);
+        crate::fault::disarm();
+        assert_eq!(host.graphics_generation(), Some(3));
+
+        // Recovery with no devices to be made leaves the window without graphics, and without
+        // graphics there is nothing to recover.
+        crate::fault::arm_from(0);
+        host.state.borrow_mut().recover_graphics();
+        crate::fault::disarm();
+        assert_eq!(host.graphics_generation(), None);
+        host.state.borrow_mut().recover_graphics();
+        assert_eq!(host.graphics_generation(), None);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn recovery_ends_without_graphics_when_the_new_surface_cannot_be_built() {
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, _log) = host(true, false);
+        // One failing call per run: the first calls are the device creation (the software
+        // fallback takes over), the rest build the surface (nothing takes over).
+        let mut generations = Vec::new();
+        for call in 0.. {
+            attach(&host);
+            crate::fault::arm(call);
+            host.state.borrow_mut().recover_graphics();
+            let hit = crate::fault::tripped();
+            crate::fault::disarm();
+            if !hit {
+                break;
+            }
+            generations.push(host.graphics_generation());
+        }
+        let mut expected = vec![Some(2); 5];
+        expected.extend([None; 10]);
+        assert_eq!(generations, expected);
+    }
+
+    #[test]
+    fn a_minimized_size_message_changes_nothing_and_a_missing_size_block_is_left_alone() {
+        let (host, log) = host(true, false);
+        let size = host.info().size_px;
+        let resizes = log.borrow().resizes.len();
+        let (result, after) = feed(&host, WM_SIZE, SIZE_MINIMIZED as usize, 0);
+        assert_eq!(result, Some(0));
+        assert_eq!(after, After::None);
+        assert_eq!(host.info().size_px, size);
+        assert_eq!(log.borrow().resizes.len(), resizes);
+        let (result, after) = feed(&host, WM_GETMINMAXINFO, 0, 0);
+        assert_eq!(result, Some(0));
+        assert_eq!(after, After::None);
+    }
+
+    #[test]
+    fn nothing_is_painted_while_painting_or_without_a_client_area() {
+        let (host, _log) = host(true, false);
+        host.state.borrow_mut().painting = true;
+        host.state.borrow_mut().paint();
+        assert!(
+            host.state.borrow().painting,
+            "a paint in progress owns the flag"
+        );
+        host.state.borrow_mut().painting = false;
+        for size in [(0, 10), (10, 0)] {
+            host.state.borrow_mut().size_px = size;
+            host.state.borrow_mut().paint();
+            assert!(!host.state.borrow().painting);
+        }
+    }
+
+    #[test]
+    fn system_keys_and_foreign_timers_are_left_alone_or_ignored() {
+        let (host, log) = host(true, false);
+        // System keys (Alt+F4, Alt+Space) keep their default behavior after the handler saw them.
+        let before = log.borrow().events.len();
+        for msg in [WM_SYSKEYDOWN, WM_SYSKEYUP] {
+            let (result, after) = feed(&host, msg, 0x7C, 0);
+            assert_eq!(result, None);
+            assert_eq!(after, After::None);
+        }
+        assert_eq!(log.borrow().events.len(), before + 2);
+        // A timer this window never set (a stale tick) is swallowed without an event.
+        let (result, after) = feed(&host, WM_TIMER, 0xDEAD, 0);
+        assert_eq!(result, Some(0));
+        assert_eq!(after, After::None);
+        assert_eq!(log.borrow().events.len(), before + 2);
     }
 }

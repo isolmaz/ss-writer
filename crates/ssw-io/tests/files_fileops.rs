@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use ssw_io::fileops::{
     self, FileOpError, MAX_NAME_UTF16, NameError, NameStyle, copy_into, copy_tree, duplicate,
     free_name, move_into, new_file, new_folder, new_untitled_file, new_untitled_folder,
-    reveal_in_explorer, validate_name,
+    validate_name,
 };
 use ssw_io::fs::{FaultFs, FileSystem, FsError, FsFailure, FsOp, RealFs, win32};
 
@@ -592,6 +592,64 @@ fn other_rename_failures_are_passed_on_untouched() {
 }
 
 #[test]
+fn duplicate_copy_and_move_report_the_failing_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let file = dir.path().join("a.md");
+    touch(&file, "a");
+    let fault = FaultFs::new();
+
+    // Looking for a free name fails.
+    let copy_name = dir.path().join("a copy.md");
+    fault.fail_for_path(FsOp::Metadata, &copy_name, FsFailure::AccessDenied, 1);
+    assert_eq!(
+        duplicate(&fault, &file),
+        Err(FileOpError::Fs(FsError::AccessDenied(copy_name)))
+    );
+    let clash = out.join("a.md");
+    fault.fail_for_path(FsOp::Metadata, &clash, FsFailure::AccessDenied, 2);
+    assert_eq!(
+        copy_into(&fault, &file, &out),
+        Err(FileOpError::Fs(FsError::AccessDenied(clash.clone())))
+    );
+    assert_eq!(
+        move_into(&fault, &file, &out),
+        Err(FileOpError::Fs(FsError::AccessDenied(clash.clone())))
+    );
+    assert!(file.exists());
+    assert!(names(&out).is_empty());
+
+    // The copy itself fails.
+    fault.fail(FsOp::CopyFile, FsFailure::DiskFull, 1);
+    assert_eq!(
+        copy_into(&fault, &file, &out),
+        Err(FileOpError::Fs(FsError::DiskFull(clash)))
+    );
+    assert!(names(&out).is_empty());
+
+    // A folder that has to be copied across volumes: the copy fails, then (with the copy
+    // done) the removal of the original fails and both trees stay.
+    let docs = dir.path().join("docs");
+    sample_tree(&docs);
+    fault.fail(FsOp::Rename, FsFailure::Code(win32::NOT_SAME_DEVICE), 1);
+    fault.fail(FsOp::CopyFile, FsFailure::DiskFull, 1);
+    assert!(matches!(
+        move_into(&fault, &docs, &out),
+        Err(FileOpError::Fs(FsError::DiskFull(_)))
+    ));
+    assert!(docs.exists());
+    fault.fail(FsOp::Rename, FsFailure::Code(win32::NOT_SAME_DEVICE), 1);
+    fault.fail(FsOp::DeleteFile, FsFailure::AccessDenied, 1);
+    assert!(matches!(
+        move_into(&fault, &docs, &out),
+        Err(FileOpError::Fs(FsError::AccessDenied(_)))
+    ));
+    assert!(docs.join("top.md").exists());
+    assert!(out.join("docs (2)").join("top.md").exists());
+}
+
+#[test]
 fn recycling_removes_files_and_folders_from_disk() {
     let dir = tempfile::tempdir().unwrap();
     let bin = RecycleBinGuard::new();
@@ -628,14 +686,4 @@ fn recycling_reports_missing_items_and_failures() {
         Err(FsError::AccessDenied(file.clone()))
     );
     assert!(file.exists());
-}
-
-#[test]
-fn revealing_a_missing_path_is_an_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let ghost = dir.path().join("not-there").join("ghost.md");
-    assert_eq!(
-        reveal_in_explorer(&ghost),
-        Err(FsError::NotFound(ghost.clone()))
-    );
 }

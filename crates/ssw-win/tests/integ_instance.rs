@@ -314,3 +314,19 @@ fn acquire_fails_when_the_window_class_is_taken_and_keeps_the_mutex_free() {
     unsafe { UnregisterClassW(&class, Some(module)) }.unwrap();
     let _first = primary(&config, None);
 }
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn acquire_reports_a_mutex_the_system_refuses_and_leaves_nothing_behind() {
+    let config = unique_config();
+    ssw_win::fault::arm(0);
+    let error = config.acquire(None).unwrap_err();
+    assert!(ssw_win::fault::tripped());
+    ssw_win::fault::disarm();
+    assert!(
+        error.to_string().starts_with("CreateMutexW failed"),
+        "{error}"
+    );
+    // The refusal changed nothing: this process still becomes the first instance.
+    let _first = primary(&config, None);
+}

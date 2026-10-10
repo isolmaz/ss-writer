@@ -6,7 +6,7 @@
 //! [`DWriteLayout::draw`]); backgrounds are computed as rectangles the canvas paints first.
 
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ops::Range;
@@ -35,10 +35,11 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteInMemoryFontFileLoader, IDWriteInlineObject, IDWriteInlineObject_Impl,
     IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer,
 };
-use windows::core::{BOOL, HRESULT, HSTRING, IUnknown, Interface, implement};
+use windows::core::{BOOL, HRESULT, HSTRING, IUnknown, implement};
 use windows_numerics::Vector2;
 
 use crate::com::{OsResultExt, WinError};
+use crate::fault::check;
 use crate::fonts::{self, CASCADIA_MONO};
 
 /// `HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)`: what DirectWrite answers to a "count only"
@@ -145,26 +146,21 @@ impl DWriteEngine {
             // at, belong to this engine alone. On the process-wide shared factory every
             // engine (every test thread) would register another loader there, and that
             // loader would stay registered after the engine and its font bytes are gone.
-            let factory: IDWriteFactory5 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED)
+            let factory: IDWriteFactory5 = check(DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED))
                 .ctx("create DirectWrite factory")?;
-            let loader = factory
-                .CreateInMemoryFontFileLoader()
+            let loader = check(factory.CreateInMemoryFontFileLoader())
                 .ctx("create in-memory font loader")?;
-            factory
-                .RegisterFontFileLoader(&loader)
-                .ctx("register in-memory font loader")?;
-            let builder = factory
-                .CreateFontSetBuilder()
-                .ctx("create font set builder")?;
-            let base: IDWriteFactory3 = factory.cast().ctx("query IDWriteFactory3")?;
-            let system = base.GetSystemFontSet().ctx("system font set")?;
-            builder.AddFontSet(&system).ctx("add system fonts")?;
+            check(factory.RegisterFontFileLoader(&loader)).ctx("register in-memory font loader")?;
+            let builder = check(factory.CreateFontSetBuilder()).ctx("create font set builder")?;
+            let base: &IDWriteFactory3 = (&factory).into();
+            let system = check(base.GetSystemFontSet()).ctx("system font set")?;
+            check(builder.AddFontSet(&system)).ctx("add system fonts")?;
             let mut bundled = 0;
             for font in &fonts {
                 let bytes = font.as_slice();
-                let Ok(length) = u32::try_from(bytes.len()) else {
-                    continue;
-                };
+                // Font files cannot exceed 4 GiB (sfnt offsets are 32 bit): DirectWrite is
+                // shown, and rejects, the first 4 GiB of a longer blob.
+                let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
                 let file = loader.CreateInMemoryFontFileReference(
                     &factory,
                     bytes.as_ptr().cast::<c_void>(),
@@ -176,12 +172,11 @@ impl DWriteEngine {
                     bundled += 1;
                 }
             }
-            let set = builder.CreateFontSet().ctx("create font set")?;
-            let collection = base
-                .CreateFontCollectionFromFontSet(&set)
-                .ctx("create font collection")?
-                .cast::<IDWriteFontCollection>()
-                .ctx("query IDWriteFontCollection")?;
+            let set = check(builder.CreateFontSet()).ctx("create font set")?;
+            let collection: IDWriteFontCollection =
+                check(base.CreateFontCollectionFromFontSet(&set))
+                    .ctx("create font collection")?
+                    .into();
             Ok(Self {
                 inner: Rc::new(EngineInner {
                     factory,
@@ -239,22 +234,20 @@ impl DWriteEngine {
         let family = HSTRING::from(self.resolve_family(family));
         // SAFETY: valid factory, collection and NUL-terminated names.
         unsafe {
-            self.inner
-                .factory
-                .CreateTextFormat(
-                    &family,
-                    &self.inner.collection,
-                    DWRITE_FONT_WEIGHT(i32::from(weight)),
-                    if italic {
-                        DWRITE_FONT_STYLE_ITALIC
-                    } else {
-                        DWRITE_FONT_STYLE_NORMAL
-                    },
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    size,
-                    &HSTRING::from("en-us"),
-                )
-                .ctx("create text format")
+            check(self.inner.factory.CreateTextFormat(
+                &family,
+                &self.inner.collection,
+                DWRITE_FONT_WEIGHT(i32::from(weight)),
+                if italic {
+                    DWRITE_FONT_STYLE_ITALIC
+                } else {
+                    DWRITE_FONT_STYLE_NORMAL
+                },
+                DWRITE_FONT_STRETCH_NORMAL,
+                size,
+                &HSTRING::from("en-us"),
+            ))
+            .ctx("create text format")
         }
     }
 
@@ -442,7 +435,6 @@ pub struct DWriteLayout {
     backgrounds: Vec<(Rect, Color)>,
     objects: Vec<(u64, Rect)>,
     newline_pad: f32,
-    effects_dirty: Cell<bool>,
 }
 
 impl std::fmt::Debug for DWriteLayout {
@@ -488,24 +480,23 @@ impl DWriteLayout {
         // UTF-16 text, and out buffers sized as the API requires.
         unsafe {
             if unlimited {
-                format
-                    .SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)
+                check(format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP))
                     .ctx("disable word wrapping")?;
             }
-            let layout = engine
-                .factory()
-                .CreateTextLayout(&units, &format, width, LAYOUT_HEIGHT)
-                .ctx("create text layout")?;
+            let layout = check(engine.factory().CreateTextLayout(
+                &units,
+                &format,
+                width,
+                LAYOUT_HEIGHT,
+            ))
+            .ctx("create text layout")?;
             let total = units.len();
             if total > 0 {
                 if base.underline {
-                    layout
-                        .SetUnderline(true, range16(0, total))
-                        .ctx("base underline")?;
+                    check(layout.SetUnderline(true, range16(0, total))).ctx("base underline")?;
                 }
                 if base.strikethrough {
-                    layout
-                        .SetStrikethrough(true, range16(0, total))
+                    check(layout.SetStrikethrough(true, range16(0, total)))
                         .ctx("base strikethrough")?;
                 }
             }
@@ -517,28 +508,27 @@ impl DWriteLayout {
                 }
                 let span = range16(start, end);
                 let style = &styled.style;
-                layout
-                    .SetFontFamilyName(&HSTRING::from(engine.resolve_family(&style.family)), span)
-                    .ctx("range family")?;
-                layout.SetFontSize(style.size, span).ctx("range size")?;
-                layout
-                    .SetFontWeight(DWRITE_FONT_WEIGHT(i32::from(style.weight.0)), span)
-                    .ctx("range weight")?;
-                layout
-                    .SetFontStyle(
-                        if style.italic {
-                            DWRITE_FONT_STYLE_ITALIC
-                        } else {
-                            DWRITE_FONT_STYLE_NORMAL
-                        },
+                check(
+                    layout.SetFontFamilyName(
+                        &HSTRING::from(engine.resolve_family(&style.family)),
                         span,
-                    )
-                    .ctx("range style")?;
-                layout
-                    .SetUnderline(style.underline, span)
-                    .ctx("range underline")?;
-                layout
-                    .SetStrikethrough(style.strikethrough, span)
+                    ),
+                )
+                .ctx("range family")?;
+                check(layout.SetFontSize(style.size, span)).ctx("range size")?;
+                check(layout.SetFontWeight(DWRITE_FONT_WEIGHT(i32::from(style.weight.0)), span))
+                    .ctx("range weight")?;
+                check(layout.SetFontStyle(
+                    if style.italic {
+                        DWRITE_FONT_STYLE_ITALIC
+                    } else {
+                        DWRITE_FONT_STYLE_NORMAL
+                    },
+                    span,
+                ))
+                .ctx("range style")?;
+                check(layout.SetUnderline(style.underline, span)).ctx("range underline")?;
+                check(layout.SetStrikethrough(style.strikethrough, span))
                     .ctx("range strikethrough")?;
             }
 
@@ -573,13 +563,12 @@ impl DWriteLayout {
                     baseline: placed.object.baseline,
                 }
                 .into();
-                layout
-                    .SetInlineObject(&slot, range16(placed.at16, placed.end16))
+                check(layout.SetInlineObject(&slot, range16(placed.at16, placed.end16)))
                     .ctx("set inline object")?;
             }
 
             let mut metrics = DWRITE_TEXT_METRICS::default();
-            layout.GetMetrics(&mut metrics).ctx("text metrics")?;
+            check(layout.GetMetrics(&mut metrics)).ctx("text metrics")?;
             let lines = read_lines(&layout, &map, total, metrics.height)?;
 
             let mut built = Self {
@@ -593,7 +582,6 @@ impl DWriteLayout {
                 backgrounds: Vec::new(),
                 objects: Vec::new(),
                 newline_pad: base.size * NEWLINE_PAD_EM,
-                effects_dirty: Cell::new(false),
             };
             built.resolve_styles(base, ranges);
             built.place_objects(&accepted);
@@ -660,13 +648,7 @@ impl DWriteLayout {
             let Some((x, y, _)) = self.position16(*at16, false) else {
                 continue;
             };
-            let line = self
-                .lines
-                .iter()
-                .rev()
-                .find(|line| line.top <= y + LINE_EPSILON)
-                .or_else(|| self.lines.first());
-            let Some(line) = line else { continue };
+            let line = self.lines[self.line_at(y)];
             self.objects.push((
                 object.id,
                 Rect::new(
@@ -684,10 +666,10 @@ impl DWriteLayout {
         let (mut x, mut y) = (0.0f32, 0.0f32);
         let mut metrics = DWRITE_HIT_TEST_METRICS::default();
         // SAFETY: valid out pointers for the live layout.
-        unsafe {
+        check(unsafe {
             self.layout
                 .HitTestTextPosition(position as u32, trailing, &mut x, &mut y, &mut metrics)
-        }
+        })
         .ok()?;
         Some((x, y, metrics.height))
     }
@@ -710,20 +692,17 @@ impl DWriteLayout {
         start: u32,
         length: u32,
     ) -> Result<(), WinError> {
-        let effect: Option<IUnknown> = match brush {
-            Some(brush) => Some(brush.cast().ctx("brush as IUnknown")?),
-            None => None,
-        };
+        let effect: Option<&IUnknown> = brush.map(Into::into);
         // SAFETY: valid layout; the range lies inside the text.
-        unsafe {
+        check(unsafe {
             self.layout.SetDrawingEffect(
-                effect.as_ref(),
+                effect,
                 DWRITE_TEXT_RANGE {
                     startPosition: start,
                     length,
                 },
             )
-        }
+        })
         .ctx("set drawing effect")
     }
 
@@ -743,11 +722,7 @@ impl DWriteLayout {
         brush_for: &mut dyn FnMut(Color) -> Result<ID2D1SolidColorBrush, WinError>,
     ) -> Result<(), WinError> {
         let default_brush = brush_for(default_color)?;
-        let total = self.map.utf16_len() as u32;
         if self.runs.is_empty() {
-            if self.effects_dirty.replace(false) {
-                self.set_effect(None, 0, total)?;
-            }
             self.draw_once(target, origin, &default_brush);
             return Ok(());
         }
@@ -796,7 +771,6 @@ impl DWriteLayout {
         hidden: &ID2D1SolidColorBrush,
         brush_for: &mut dyn FnMut(Color) -> Result<ID2D1SolidColorBrush, WinError>,
     ) -> Result<(), WinError> {
-        self.effects_dirty.set(true);
         self.set_effect(None, 0, self.map.utf16_len() as u32)?;
         for run in &self.runs {
             if run.shift == shift {
@@ -826,21 +800,22 @@ impl DWriteLayout {
         }
     }
 
-    /// The line whose box contains the vertical position `y`.
-    fn line_containing(&self, y: f32) -> Option<usize> {
+    /// The line a vertical position belongs to: the last line that starts at most
+    /// [`LINE_EPSILON`] below it (the first line for positions above the text). Every layout has
+    /// at least one line.
+    fn line_at(&self, y: f32) -> usize {
         self.lines
             .iter()
-            .position(|line| y >= line.top - LINE_EPSILON && y < line.top + line.height)
+            .rposition(|line| line.top <= y + LINE_EPSILON)
+            .unwrap_or(0)
     }
 
     /// The caret rectangle of a UTF-16 position: its x from DirectWrite, its vertical extent the
     /// box of the line it is on (the full, uniform line height).
     fn caret_at16(&self, position: usize, trailing: bool) -> Option<Rect> {
         let (x, y, height) = self.position16(position, trailing)?;
-        Some(self.line_containing(y + height / 2.0).map_or_else(
-            || Rect::new(x, y, 0.0, height),
-            |index| Rect::new(x, self.lines[index].top, 0.0, self.lines[index].height),
-        ))
+        let line = self.lines[self.line_at(y + height / 2.0)];
+        Some(Rect::new(x, line.top, 0.0, line.height))
     }
 }
 
@@ -851,7 +826,7 @@ impl DWriteLayout {
 unsafe fn cluster_starts(layout: &IDWriteTextLayout, total: usize) -> Result<Vec<usize>, WinError> {
     let mut count = 0u32;
     // SAFETY: see the function contract; a null buffer asks only for the count.
-    let probe = unsafe { layout.GetClusterMetrics(None, &mut count) };
+    let probe = check(unsafe { layout.GetClusterMetrics(None, &mut count) });
     if let Err(error) = probe
         && error.code() != E_NOT_SUFFICIENT_BUFFER
     {
@@ -859,7 +834,8 @@ unsafe fn cluster_starts(layout: &IDWriteTextLayout, total: usize) -> Result<Vec
     }
     let mut clusters = vec![DWRITE_CLUSTER_METRICS::default(); count as usize];
     // SAFETY: the buffer holds `count` entries.
-    unsafe { layout.GetClusterMetrics(Some(&mut clusters), &mut count) }.ctx("cluster metrics")?;
+    check(unsafe { layout.GetClusterMetrics(Some(&mut clusters), &mut count) })
+        .ctx("cluster metrics")?;
     let mut starts = Vec::with_capacity(clusters.len() + 1);
     let mut position = 0usize;
     for cluster in clusters.iter().take(count as usize) {
@@ -878,7 +854,7 @@ unsafe fn cluster_starts(layout: &IDWriteTextLayout, total: usize) -> Result<Vec
 unsafe fn raw_lines(layout: &IDWriteTextLayout) -> Result<Vec<DWRITE_LINE_METRICS>, WinError> {
     let mut count = 0u32;
     // SAFETY: see the function contract; a null buffer asks only for the count.
-    let probe = unsafe { layout.GetLineMetrics(None, &mut count) };
+    let probe = check(unsafe { layout.GetLineMetrics(None, &mut count) });
     if let Err(error) = probe
         && error.code() != E_NOT_SUFFICIENT_BUFFER
     {
@@ -886,7 +862,7 @@ unsafe fn raw_lines(layout: &IDWriteTextLayout) -> Result<Vec<DWRITE_LINE_METRIC
     }
     let mut raw = vec![DWRITE_LINE_METRICS::default(); count as usize];
     // SAFETY: the buffer holds `count` entries.
-    unsafe { layout.GetLineMetrics(Some(&mut raw), &mut count) }.ctx("line metrics")?;
+    check(unsafe { layout.GetLineMetrics(Some(&mut raw), &mut count) }).ctx("line metrics")?;
     raw.truncate(count as usize);
     Ok(raw)
 }
@@ -926,11 +902,13 @@ unsafe fn set_uniform_line_height(
         below = below.max(placed.object.size.height - placed.object.baseline);
     }
     // SAFETY: a valid layout; the method and sizes are plain values.
-    unsafe { layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, above + below, above) }
-        .ctx("set line spacing")
+    check(unsafe {
+        layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, above + below, above)
+    })
+    .ctx("set line spacing")
 }
 
-/// Converts DirectWrite line metrics, adding the empty last line after a trailing hard break.
+/// The lines of `layout` (see [`convert_lines`]).
 ///
 /// # Safety
 /// `layout` must be a valid layout of `total` UTF-16 units.
@@ -942,9 +920,21 @@ unsafe fn read_lines(
 ) -> Result<Vec<LineMetrics>, WinError> {
     // SAFETY: see the function contract.
     let raw = unsafe { raw_lines(layout) }?;
+    Ok(convert_lines(&raw, map, total, layout_height))
+}
+
+/// Converts DirectWrite line metrics to byte offsets, adding the empty last line after a
+/// trailing hard break and the one line of an empty text when DirectWrite reports none, so a
+/// layout always has a line to put a caret on.
+fn convert_lines(
+    raw: &[DWRITE_LINE_METRICS],
+    map: &Utf16Map,
+    total: usize,
+    layout_height: f32,
+) -> Vec<LineMetrics> {
     let mut lines = Vec::with_capacity(raw.len() + 1);
     let (mut top, mut start16) = (0.0f32, 0usize);
-    for line in &raw {
+    for line in raw {
         let end16 = start16 + line.length as usize;
         let start = map.utf16_to_byte_floor(start16);
         let end = map.utf16_to_byte_floor(end16);
@@ -960,8 +950,7 @@ unsafe fn read_lines(
         top += line.height;
         start16 = end16;
     }
-    let ends_with_break = lines.last().is_some_and(|line| line.newline_len > 0);
-    if let Some(last) = lines.last().copied().filter(|_| ends_with_break) {
+    if let Some(last) = lines.last().copied().filter(|line| line.newline_len > 0) {
         lines.push(LineMetrics {
             top: last.top + last.height,
             height: last.height,
@@ -981,7 +970,7 @@ unsafe fn read_lines(
             newline_len: 0,
         });
     }
-    Ok(lines)
+    lines
 }
 
 impl TextLayout for DWriteLayout {
@@ -1006,10 +995,10 @@ impl TextLayout for DWriteLayout {
         let mut inside = BOOL(0);
         let mut metrics = DWRITE_HIT_TEST_METRICS::default();
         // SAFETY: valid out pointers for the live layout.
-        let hit = unsafe {
+        let hit = check(unsafe {
             self.layout
                 .HitTestPoint(point.x, point.y, &mut trailing, &mut inside, &mut metrics)
-        };
+        });
         let inside = inside.as_bool();
         if hit.is_err() {
             return HitTest {
@@ -1088,7 +1077,7 @@ impl TextLayout for DWriteLayout {
         }
         let mut count = 0u32;
         // SAFETY: a null buffer asks only for the count.
-        let probe = unsafe {
+        let probe = check(unsafe {
             self.layout.HitTestTextRange(
                 from as u32,
                 (to - from) as u32,
@@ -1097,7 +1086,7 @@ impl TextLayout for DWriteLayout {
                 None,
                 &mut count,
             )
-        };
+        });
         if let Err(error) = probe
             && error.code() != E_NOT_SUFFICIENT_BUFFER
         {
@@ -1105,7 +1094,7 @@ impl TextLayout for DWriteLayout {
         }
         let mut metrics = vec![DWRITE_HIT_TEST_METRICS::default(); count as usize];
         // SAFETY: the buffer holds `count` entries.
-        let filled = unsafe {
+        let filled = check(unsafe {
             self.layout.HitTestTextRange(
                 from as u32,
                 (to - from) as u32,
@@ -1114,16 +1103,14 @@ impl TextLayout for DWriteLayout {
                 Some(&mut metrics),
                 &mut count,
             )
-        };
+        });
         if filled.is_err() {
             return Vec::new();
         }
         let mut per_line: Vec<(usize, Rect)> = Vec::new();
         for metric in metrics.iter().take(count as usize) {
             let rect = Rect::new(metric.left, metric.top, metric.width, metric.height);
-            let Some(line) = self.line_containing(metric.top + metric.height / 2.0) else {
-                continue;
-            };
+            let line = self.line_at(metric.top + metric.height / 2.0);
             match per_line.iter_mut().find(|(index, _)| *index == line) {
                 Some((_, existing)) => *existing = existing.union(rect),
                 None => per_line.push((line, rect)),
@@ -1159,7 +1146,12 @@ impl TextLayout for DWriteLayout {
 mod tests {
     use super::*;
     use crate::com::ComGuard;
+    use crate::gfx::{WicTarget, d2d_factory};
+    use crate::wic::Wic;
     use ssw_ui::text::FontWeight;
+    use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
+    use windows::Win32::Graphics::DirectWrite::DWRITE_BREAK_CONDITION_MUST_BREAK;
+    use windows::core::Interface;
 
     fn engine() -> (ComGuard, DWriteEngine) {
         let com = ComGuard::apartment_threaded().unwrap();
@@ -1176,11 +1168,12 @@ mod tests {
 
     /// Byte offsets of the grapheme-ish clusters used by the round-trip tests.
     fn assert_round_trip(layout: &dyn TextLayout, starts: &[usize]) {
+        let text = layout.text();
         for &offset in starts {
             let caret = layout.caret_rect(offset, false);
             let probe = Point::new(caret.x + 1.0, caret.y + caret.height / 2.0);
             let hit = layout.hit_test_point(probe);
-            assert_eq!(hit.offset, offset, "offset {offset} in {:?}", layout.text());
+            assert_eq!(hit.offset, offset, "offset {offset} in {text:?}");
             assert!(hit.inside);
             assert!(hit.length > 0);
         }
@@ -1195,7 +1188,7 @@ mod tests {
         assert!(!engine.has_family("No Such Family 12345"));
         // An unknown family resolves to an installed stand-in.
         let stand_in = engine.resolve_family("No Such Family 12345");
-        assert!(engine.has_family(&stand_in) || stand_in == "No Such Family 12345");
+        assert!(engine.has_family(&stand_in), "{stand_in}");
         let rejected =
             DWriteEngine::with_fonts(vec![FontBytes::Shared(Arc::from(&b"not a font"[..]))])
                 .unwrap();
@@ -1488,7 +1481,8 @@ mod tests {
             assert!((line.height - 28.0).abs() < 0.05, "{line:?}");
             assert!((line.top - 28.0 * index as f32).abs() < 0.2, "{line:?}");
         }
-        assert!((tall.size().height - 84.0).abs() < 0.2, "{:?}", tall.size());
+        let size = tall.size();
+        assert!((size.height - 84.0).abs() < 0.2, "{size:?}");
         // Half of the extra space goes above the text.
         let expected = natural_line.baseline + (28.0 - natural_line.height) / 2.0;
         let line = tall.line_metrics(0).unwrap();
@@ -1540,5 +1534,506 @@ mod tests {
         assert_eq!(size, 13.0);
         assert!(engine.text_format("Segoe UI", 0.0, 400, true).is_err());
         assert_eq!(FontBytes::Static(b"ab").as_slice(), b"ab");
+    }
+
+    const RED: Color = Color::from_rgb_u32(0xFF0000);
+    const BLUE: Color = Color::from_rgb_u32(0x0000FF);
+
+    #[test]
+    fn engines_and_layouts_describe_their_state_when_debugged() {
+        let (_com, engine) = engine();
+        let text = format!("{engine:?}");
+        assert!(text.contains("bundled_fonts: 1"), "{text}");
+        let layout = engine
+            .create_layout("a\nb", &style(16.0), &[], &[], f32::INFINITY)
+            .unwrap();
+        let text = format!("{layout:?}");
+        assert!(text.contains(r#"text: "a\nb""#), "{text}");
+        assert!(text.contains("lines: 2"), "{text}");
+    }
+
+    #[test]
+    fn the_collection_holds_the_bundled_family_next_to_the_system_ones() {
+        let (_com, engine) = engine();
+        let collection = engine.collection();
+        let mut index = 0u32;
+        let mut exists = BOOL(0);
+        // SAFETY: valid out pointers on a live collection.
+        unsafe {
+            collection.FindFamilyName(&HSTRING::from("Cascadia Mono"), &mut index, &mut exists)
+        }
+        .unwrap();
+        assert!(exists.as_bool());
+        // SAFETY: plain getter on a live collection.
+        let families = unsafe { collection.GetFontFamilyCount() };
+        assert!(families > 1, "{families} families");
+        assert!(index < families);
+    }
+
+    #[test]
+    fn inline_slots_have_no_overhang_and_accept_missing_break_outputs() {
+        let slot: IDWriteInlineObject = InlineSlot {
+            width: 12.0,
+            height: 8.0,
+            baseline: 6.0,
+        }
+        .into();
+        // SAFETY: plain getters on a live inline object.
+        let metrics = unsafe { slot.GetMetrics() }.unwrap();
+        // SAFETY: as above.
+        let overhang = unsafe { slot.GetOverhangMetrics() }.unwrap();
+        assert_eq!(
+            (metrics.width, metrics.height, metrics.baseline),
+            (12.0, 8.0, 6.0)
+        );
+        assert_eq!(overhang, DWRITE_OVERHANG_METRICS::default());
+        // Either output pointer, or both, may be null: only the given ones are written.
+        let mut before = DWRITE_BREAK_CONDITION_MUST_BREAK;
+        let mut after = DWRITE_BREAK_CONDITION_MUST_BREAK;
+        // SAFETY: valid or null out pointers.
+        unsafe { slot.GetBreakConditions(&mut before, std::ptr::null_mut()) }.unwrap();
+        assert_eq!(
+            (before, after),
+            (
+                DWRITE_BREAK_CONDITION_NEUTRAL,
+                DWRITE_BREAK_CONDITION_MUST_BREAK
+            )
+        );
+        // SAFETY: valid or null out pointers.
+        unsafe { slot.GetBreakConditions(std::ptr::null_mut(), &mut after) }.unwrap();
+        assert_eq!(after, DWRITE_BREAK_CONDITION_NEUTRAL);
+        // SAFETY: valid or null out pointers.
+        unsafe { slot.GetBreakConditions(std::ptr::null_mut(), std::ptr::null_mut()) }.unwrap();
+    }
+
+    #[test]
+    fn line_metrics_gain_the_lines_directwrite_does_not_report() {
+        let line = |length: u32, newline: u32| DWRITE_LINE_METRICS {
+            length,
+            newlineLength: newline,
+            height: 20.0,
+            baseline: 15.0,
+            ..Default::default()
+        };
+        // Two lines that both end in a break: the empty line after the last one is added.
+        let lines = convert_lines(
+            &[line(3, 1), line(3, 1)],
+            &Utf16Map::new("ab\ncd\n"),
+            6,
+            20.0,
+        );
+        assert_eq!(
+            lines,
+            [
+                LineMetrics {
+                    top: 0.0,
+                    height: 20.0,
+                    baseline: 15.0,
+                    start: 0,
+                    end: 3,
+                    newline_len: 1,
+                },
+                LineMetrics {
+                    top: 20.0,
+                    height: 20.0,
+                    baseline: 35.0,
+                    start: 3,
+                    end: 6,
+                    newline_len: 1,
+                },
+                LineMetrics {
+                    top: 40.0,
+                    height: 20.0,
+                    baseline: 55.0,
+                    start: 6,
+                    end: 6,
+                    newline_len: 0,
+                },
+            ]
+        );
+        // A last line without a break is the end.
+        let lines = convert_lines(&[line(3, 1), line(2, 0)], &Utf16Map::new("ab\ncd"), 5, 20.0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!((lines[1].start, lines[1].end), (3, 5));
+        // No lines at all: one empty line as tall as the layout.
+        assert_eq!(
+            convert_lines(&[], &Utf16Map::new(""), 0, 18.0),
+            [LineMetrics {
+                top: 0.0,
+                height: 18.0,
+                baseline: 18.0,
+                start: 0,
+                end: 0,
+                newline_len: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn positions_belong_to_the_line_that_starts_above_them() {
+        let (_com, engine) = engine();
+        let layout = engine
+            .create_layout("a\nb\nc", &style(16.0), &[], &[], f32::INFINITY)
+            .unwrap();
+        let second = layout.lines[1];
+        assert_eq!(layout.line_at(-40.0), 0, "above the text");
+        assert_eq!(layout.line_at(second.top + 1.0), 1);
+        assert_eq!(
+            layout.line_at(second.top - 0.25),
+            1,
+            "within the tolerance of the next line's top"
+        );
+        assert_eq!(layout.line_at(1.0e6), 2, "below the text");
+    }
+
+    #[test]
+    fn ranges_inside_a_scalar_are_empty_and_pieces_of_a_line_merge() {
+        let (_com, engine) = engine();
+        // Bytes 1..3 of the emoji (bytes 1..5) are inside one UTF-16 pair: no characters.
+        let emoji = lay(&engine, "a😀", f32::INFINITY);
+        assert!(emoji.range_rects(1..3).is_empty());
+        // Left-to-right text around a right-to-left run is more than one box for DirectWrite,
+        // formatting runs of one line are too: the range covers the line in a single rectangle.
+        let text = "ab \u{5D0}\u{5D1} cd";
+        let mixed = lay(&engine, text, f32::INFINITY);
+        let rects = mixed.range_rects(0..text.len());
+        assert_eq!(rects.len(), 1);
+        assert!(rects[0].x.abs() < 1.5, "{rects:?}");
+        assert!(
+            (rects[0].right() - mixed.size().width).abs() < 1.5,
+            "{rects:?}"
+        );
+        let big = StyledRange {
+            range: 2..4,
+            style: TextStyle::new("Segoe UI", 40.0).with_weight(FontWeight::BOLD),
+        };
+        let styled = engine.layout("abcdef", &style(16.0), &[big], &[], f32::INFINITY);
+        let rects = styled.range_rects(0..6);
+        assert_eq!(rects.len(), 1);
+        assert!(rects[0].x.abs() < 1.5, "{rects:?}");
+        assert!(
+            (rects[0].right() - styled.size().width).abs() < 1.5,
+            "{rects:?}"
+        );
+    }
+
+    /// A layout with a colored run, a colored raised run and a raised run without a color.
+    fn runs_layout(engine: &DWriteEngine) -> DWriteLayout {
+        let ranges = [
+            StyledRange {
+                range: 0..1,
+                style: style(16.0).with_color(RED),
+            },
+            StyledRange {
+                range: 2..3,
+                style: style(16.0).with_color(BLUE).with_baseline_shift(6.0),
+            },
+            StyledRange {
+                range: 3..4,
+                style: style(16.0).with_baseline_shift(6.0),
+            },
+        ];
+        engine
+            .create_layout("abcdef", &style(16.0), &ranges, &[], f32::INFINITY)
+            .unwrap()
+    }
+
+    fn solid_brush(
+        target: &ID2D1RenderTarget,
+        color: Color,
+    ) -> Result<ID2D1SolidColorBrush, WinError> {
+        let d2d = D2D1_COLOR_F {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+            a: color.a,
+        };
+        // SAFETY: valid target and color pointer.
+        unsafe { target.CreateSolidColorBrush(&d2d, None) }.ctx("test brush")
+    }
+
+    /// Number of clearly red pixels of the target.
+    fn reddish(target: &WicTarget) -> usize {
+        let image = target.pixels().unwrap();
+        (0..image.height)
+            .flat_map(|y| (0..image.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let [b, g, r, _] = image.pixel(x, y).unwrap();
+                r > g.saturating_add(60) && r > b.saturating_add(60)
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_refused_brush_aborts_the_draw_and_the_layout_draws_again() {
+        let (_com, engine) = engine();
+        let wic = Wic::new().unwrap();
+        let factory = d2d_factory(false).unwrap();
+        let target = WicTarget::new(&factory, &wic, 80, 40, 96.0).unwrap();
+        let layout = runs_layout(&engine);
+        let mut refused_call = 1;
+        loop {
+            let mut calls = 0;
+            let outcome = target.paint(Some(Color::WHITE), |render_target| {
+                layout.draw(
+                    render_target,
+                    Point::new(2.0, 2.0),
+                    Color::BLACK,
+                    &mut |color| {
+                        calls += 1;
+                        if calls == refused_call {
+                            Err(WinError::Invalid("brush refused"))
+                        } else {
+                            solid_brush(render_target, color)
+                        }
+                    },
+                )
+            });
+            if calls < refused_call {
+                outcome.unwrap();
+                break;
+            }
+            assert_eq!(outcome.unwrap_err().to_string(), "brush refused");
+            refused_call += 1;
+        }
+        assert_eq!(
+            refused_call, 5,
+            "brushes: default, transparent, one per colored run and pass"
+        );
+        assert!(reddish(&target) > 0, "the red run is drawn");
+    }
+
+    /// Fault injection: every checked system call of an operation fails in turn.
+    #[cfg(feature = "fault-injection")]
+    mod faults {
+        use super::*;
+        use crate::fault;
+
+        /// Runs `operation` with the checked call number `n` failing; whether it was reached.
+        fn armed<R>(n: u32, operation: impl FnOnce() -> R) -> (R, bool) {
+            fault::arm(n);
+            let outcome = operation();
+            let reached = fault::tripped();
+            fault::disarm();
+            (outcome, reached)
+        }
+
+        /// Fails the checked calls of `run` one after the other (`run(n)` makes call `n` fail
+        /// and tells whether it got there), hands every failed outcome to `on_failure` and
+        /// returns the outcome of the first run that was not affected.
+        fn sweep<R>(mut run: impl FnMut(u32) -> (R, bool), mut on_failure: impl FnMut(R)) -> R {
+            let mut n = 0;
+            loop {
+                let (outcome, reached) = run(n);
+                if !reached {
+                    return outcome;
+                }
+                on_failure(outcome);
+                n += 1;
+            }
+        }
+
+        /// The failed operation an OS error names ("{context} failed: {source}").
+        fn context(error: &WinError) -> String {
+            let text = error.to_string();
+            text.split(" failed: ").next().unwrap().to_owned()
+        }
+
+        #[test]
+        fn engine_creation_reports_every_failing_call() {
+            let _com = ComGuard::apartment_threaded().unwrap();
+            let mut contexts = Vec::new();
+            let engine = sweep(
+                |n| {
+                    armed(n, || {
+                        DWriteEngine::with_fonts(vec![FontBytes::Static(CASCADIA_MONO)])
+                    })
+                },
+                |outcome| contexts.push(context(&outcome.unwrap_err())),
+            );
+            assert_eq!(
+                contexts,
+                [
+                    "create DirectWrite factory",
+                    "create in-memory font loader",
+                    "register in-memory font loader",
+                    "create font set builder",
+                    "system font set",
+                    "add system fonts",
+                    "create font set",
+                    "create font collection",
+                ]
+            );
+            assert_eq!(engine.unwrap().bundled_font_count(), 1);
+        }
+
+        #[test]
+        fn a_failing_text_format_is_reported() {
+            let (_com, engine) = engine();
+            let mut contexts = Vec::new();
+            let format = sweep(
+                |n| armed(n, || engine.text_format("Segoe UI", 12.0, 400, false)),
+                |outcome| contexts.push(context(&outcome.unwrap_err())),
+            );
+            assert_eq!(contexts, ["create text format"]);
+            assert!(format.is_ok());
+        }
+
+        #[test]
+        fn a_failing_call_while_building_a_layout_is_reported_or_costs_only_its_geometry() {
+            let (_com, engine) = engine();
+            let base = style(16.0)
+                .with_underline(true)
+                .with_strikethrough(true)
+                .with_line_height(LineHeight::Multiple(1.5));
+            let ranges = [StyledRange {
+                range: 1..3,
+                style: TextStyle::new("Segoe UI", 20.0)
+                    .with_weight(FontWeight::BOLD)
+                    .with_italic(true)
+                    .with_underline(true)
+                    .with_strikethrough(true)
+                    .with_background(Color::from_rgb_u32(0xFFFF00)),
+            }];
+            let objects = [InlineObject {
+                at: 2,
+                size: Size::new(10.0, 12.0),
+                baseline: 9.0,
+                id: 7,
+            }];
+            let mut contexts = Vec::new();
+            let mut degraded = 0;
+            let layout = sweep(
+                |n| {
+                    armed(n, || {
+                        engine.create_layout("abcd", &base, &ranges, &objects, f32::INFINITY)
+                    })
+                },
+                |outcome| match outcome {
+                    Err(error) => contexts.push(context(&error)),
+                    Ok(layout) => {
+                        // A failed hit test only loses the rectangle derived from it.
+                        assert!(
+                            layout.backgrounds().is_empty()
+                                != layout.inline_object_rect(7).is_none()
+                        );
+                        degraded += 1;
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                contexts,
+                [
+                    "create text format",
+                    "disable word wrapping",
+                    "create text layout",
+                    "base underline",
+                    "base strikethrough",
+                    "range family",
+                    "range size",
+                    "range weight",
+                    "range style",
+                    "range underline",
+                    "range strikethrough",
+                    "count clusters",
+                    "cluster metrics",
+                    "count lines",
+                    "line metrics",
+                    "set line spacing",
+                    "set inline object",
+                    "text metrics",
+                    "count lines",
+                    "line metrics",
+                ]
+            );
+            // The two calls of the background's range rectangles and the object's position.
+            assert_eq!(degraded, 3);
+            assert_eq!(layout.backgrounds().len(), 1);
+            assert!(layout.inline_object_rect(7).is_some());
+        }
+
+        #[test]
+        fn failing_hit_tests_fall_back_to_the_line_boxes() {
+            let (_com, engine) = engine();
+            let layout = engine
+                .create_layout("ab\ncd", &style(16.0), &[], &[], f32::INFINITY)
+                .unwrap();
+            let (first, last) = (
+                layout.line_metrics(0).unwrap(),
+                layout.line_metrics(1).unwrap(),
+            );
+            // A caret inside the text falls back to the start of the first line, a caret after
+            // the text to the start of the last line.
+            let (caret, reached) = armed(0, || layout.caret_rect(1, false));
+            assert!(reached);
+            assert_eq!(caret, Rect::new(0.0, first.top, 0.0, first.height));
+            let (caret, reached) = armed(0, || layout.caret_rect(5, false));
+            assert!(reached);
+            assert_eq!(caret, Rect::new(0.0, last.top, 0.0, last.height));
+            let (hit, reached) = armed(0, || layout.hit_test_point(Point::new(3.0, 3.0)));
+            assert!(reached);
+            assert_eq!(
+                hit,
+                HitTest {
+                    offset: 0,
+                    trailing: false,
+                    inside: false,
+                    length: 0,
+                }
+            );
+            // The count probe and the fill of the rectangles may each fail.
+            let mut failures = 0;
+            let rects = sweep(
+                |n| armed(n, || layout.range_rects(0..2)),
+                |rects| {
+                    assert!(rects.is_empty());
+                    failures += 1;
+                },
+            );
+            assert_eq!(failures, 2);
+            assert_eq!(rects.len(), 1);
+        }
+
+        #[test]
+        fn failing_effects_abort_the_draw_and_failing_hit_tests_only_shrink_the_clip() {
+            let (_com, engine) = engine();
+            let wic = Wic::new().unwrap();
+            let factory = d2d_factory(false).unwrap();
+            let target = WicTarget::new(&factory, &wic, 80, 40, 96.0).unwrap();
+            let layout = runs_layout(&engine);
+            let (mut aborted, mut shrunk) = (0, 0);
+            sweep(
+                |n| {
+                    let mut reached = false;
+                    let outcome = target.paint(Some(Color::WHITE), |render_target| {
+                        let (outcome, injected) = armed(n, || {
+                            layout.draw(
+                                render_target,
+                                Point::new(2.0, 2.0),
+                                Color::BLACK,
+                                &mut |color| solid_brush(render_target, color),
+                            )
+                        });
+                        reached = injected;
+                        outcome
+                    });
+                    (outcome, reached)
+                },
+                |outcome| match outcome {
+                    Err(error) => {
+                        assert_eq!(context(&error), "set drawing effect");
+                        aborted += 1;
+                    }
+                    Ok(()) => shrunk += 1,
+                },
+            )
+            .unwrap();
+            // Effects: one reset and one per run in the unshifted pass (4), a reset and the
+            // runs that are hidden or colored in the raised pass (3); the raised runs' two
+            // rectangle lookups of two calls each only shrink the clip.
+            assert_eq!((aborted, shrunk), (7, 4));
+            assert!(reddish(&target) > 0, "the layout still draws");
+        }
     }
 }

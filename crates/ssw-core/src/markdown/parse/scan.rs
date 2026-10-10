@@ -231,10 +231,8 @@ pub(super) fn skip_spaces_and_newline(b: &[u8], mut i: usize) -> usize {
     i
 }
 
+/// Position of the first `needle` at or after `from` (callers keep `from <= b.len()`).
 fn find_seq(b: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
-    if from > b.len() {
-        return None;
-    }
     b[from..]
         .windows(needle.len())
         .position(|w| w == needle)

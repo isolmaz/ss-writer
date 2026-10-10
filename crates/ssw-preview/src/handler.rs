@@ -43,6 +43,7 @@ use windows::core::{BOOL, Error, GUID, HRESULT, IUnknown, Interface, Ref, Result
 
 use crate::appearance::Visuals;
 use crate::content::PreviewContent;
+use crate::fault;
 use crate::notice;
 use crate::server::ObjectToken;
 use crate::source::{MAX_PREVIEW_BYTES, decode_text, is_mermaid_name, read_stream, stream_name};
@@ -209,7 +210,7 @@ impl IPreviewHandler_Impl for PreviewHandler_Impl {
                     .as_deref()
                     .ok_or_else(|| Error::from(E_UNEXPECTED))?;
                 let system = read_system_theme(&Win32Settings);
-                let engine = DWriteEngine::new().map_err(to_error)?;
+                let engine = fault::check(DWriteEngine::new()).map_err(to_error)?;
                 PreviewContent::new(text, state.kind, &state.visuals, &system, engine)
             };
             let window = PreviewWindow::create(parent, state.rect, content, state.frame())
@@ -389,4 +390,30 @@ pub fn scroll_offset(handler: &IPreviewHandler) -> Option<f32> {
 /// A new preview handler, the object a class factory hands out.
 pub(crate) fn new_handler() -> IUnknown {
     PreviewHandler::new().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::Foundation::E_ACCESSDENIED;
+
+    use super::*;
+
+    #[test]
+    fn a_panic_in_a_handler_call_becomes_e_unexpected_and_results_pass_through() {
+        let panicked = guarded::<u32>(|| panic!("a bug in a COM method"));
+        assert_eq!(panicked.unwrap_err().code(), E_UNEXPECTED);
+        assert_eq!(guarded(|| Ok(7)).unwrap(), 7);
+        let failed = guarded::<u32>(|| Err(Error::from(E_FAIL)));
+        assert_eq!(failed.unwrap_err().code(), E_FAIL);
+    }
+
+    #[test]
+    fn os_failures_keep_their_code_and_every_other_failure_is_e_fail() {
+        let os = WinError::from_os("CreateWindowExW", Error::from(E_ACCESSDENIED));
+        assert_eq!(to_error(os).code(), E_ACCESSDENIED);
+        let lost = WinError::DeviceLost { context: "Present" };
+        assert_eq!(to_error(lost).code(), E_FAIL);
+        let invalid = WinError::Invalid("no preview is showing");
+        assert_eq!(to_error(invalid).code(), E_FAIL);
+    }
 }

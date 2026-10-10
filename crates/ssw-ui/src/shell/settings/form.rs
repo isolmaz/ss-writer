@@ -823,3 +823,134 @@ fn is_disabled(input: &Input) -> bool {
         Input::Button(control) => !control.is_enabled(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canvas::{DrawOp, RecordingCanvas};
+    use crate::geometry::Color;
+    use crate::widgets::button::ButtonKind;
+    use crate::widgets::testkit::Harness;
+
+    fn button_form() -> Form<u8> {
+        let row = |key: u8, label: &str, button: &str| {
+            Row::new(
+                key,
+                label.to_owned(),
+                None,
+                Input::Button(Button::new(ButtonKind::Standard, button)),
+            )
+        };
+        Form::new(vec![
+            row(1, "First action", "Run"),
+            row(2, "Second action", "Stop"),
+        ])
+    }
+
+    fn laid_out(harness: &mut Harness, form: &mut Form<u8>) {
+        let mut cx = LayoutCx::new(
+            WidgetId::allocate(),
+            &harness.theme,
+            1.0,
+            &harness.engine,
+            &mut harness.focus,
+            &mut harness.requests,
+        );
+        form.layout(&mut cx, Rect::new(0.0, 0.0, 600.0, 400.0));
+    }
+
+    fn label_color(harness: &Harness, form: &Form<u8>, label: &str) -> Option<Color> {
+        let cx = PaintCx::new(
+            WidgetId::allocate(),
+            &harness.theme,
+            1.0,
+            &harness.engine,
+            &harness.focus,
+            &harness.capture,
+            None,
+        );
+        let mut canvas = RecordingCanvas::new();
+        form.paint(&cx, &mut canvas);
+        canvas.ops().find_map(|op| match op {
+            DrawOp::Text { text, color, .. } if text == label => Some(*color),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_disabled_button_row_draws_its_label_dimmed() {
+        let mut harness = Harness::new();
+        let mut form = button_form();
+        laid_out(&mut harness, &mut form);
+        let tokens = harness.theme.tokens;
+        assert_eq!(
+            label_color(&harness, &form, "First action"),
+            Some(tokens.text)
+        );
+        form.set_enabled(1, false);
+        assert_eq!(
+            label_color(&harness, &form, "First action"),
+            Some(tokens.text_disabled)
+        );
+        assert_eq!(
+            label_color(&harness, &form, "Second action"),
+            Some(tokens.text)
+        );
+        form.set_enabled(1, true);
+        assert_eq!(
+            label_color(&harness, &form, "First action"),
+            Some(tokens.text)
+        );
+    }
+
+    #[test]
+    fn enabling_an_unknown_row_changes_nothing() {
+        let mut harness = Harness::new();
+        let mut form = button_form();
+        laid_out(&mut harness, &mut form);
+        form.set_enabled(99, false);
+        let tokens = harness.theme.tokens;
+        for label in ["First action", "Second action"] {
+            assert_eq!(label_color(&harness, &form, label), Some(tokens.text));
+        }
+    }
+
+    #[test]
+    fn a_wheel_over_an_open_drop_down_scrolls_its_list_not_the_page() {
+        let items = (0..12).map(|index| format!("Font {index}")).collect();
+        let mut form = Form::new(vec![Row::new(
+            1u8,
+            "Font".to_owned(),
+            None,
+            Input::Choice(Box::new(ComboBox::new("Font", items, Some(0)))),
+        )]);
+        let mut harness = Harness::new();
+        laid_out(&mut harness, &mut form);
+        let mut scroll = FormScroll::new("Page", Motion::reduced());
+        let viewport = Rect::new(0.0, 0.0, 600.0, 400.0);
+        {
+            let mut cx = LayoutCx::new(
+                WidgetId::allocate(),
+                &harness.theme,
+                1.0,
+                &harness.engine,
+                &mut harness.focus,
+                &mut harness.requests,
+            );
+            scroll.arrange(&mut cx, viewport, 1000.0);
+        }
+        let combo = form.rows[0].input.control_mut();
+        assert!(harness.perform(combo, AccessAction::Expand));
+        let popup = form.open_popup().expect("the drop-down is open");
+        let wheel = Event::Wheel(WheelEvent {
+            delta: Point::new(0.0, -2.0),
+            precise: false,
+            position: popup.center(),
+            mods: crate::input::Modifiers::NONE,
+        });
+        let id = WidgetId::allocate();
+        let mut cx = harness.event_cx(id);
+        assert!(scroll.event(&mut cx, &mut form, &wheel).handled);
+        assert_eq!(scroll.bar.offset(), 0.0);
+    }
+}

@@ -10,13 +10,14 @@ use settings_support::{Host, localizer};
 use ssw_core::settings::{ExportFormat, ExportSettings, PageSize};
 use ssw_ui::access::{AccessAction, Role};
 use ssw_ui::canvas::DrawOp;
-use ssw_ui::geometry::{Color, Point, Rect};
+use ssw_ui::geometry::{Color, Point, Rect, Size};
 use ssw_ui::input::{
     Event, Modifiers, PointerButton, PointerEvent, PointerEventKind, TextInput, vk,
 };
 use ssw_ui::services::MemoryClipboard;
 use ssw_ui::shell::export_dialog::{ExportDialog, ExportEvent, ExportOptions, ExportRequest};
 use ssw_ui::shell::settings::FieldId;
+use ssw_ui::widget::{LayoutCx, Widget};
 use ssw_ui::widgets::anim::Motion;
 
 const WINDOW: Rect = Rect::new(0.0, 0.0, 900.0, 700.0);
@@ -285,6 +286,75 @@ fn cancel_and_escape_dismiss_the_dialog() {
     host.layout(&mut dialog);
     host.key(&mut dialog, vk::ESCAPE, Modifiers::NONE);
     assert_eq!(dialog.take_events(), [ExportEvent::Cancel]);
+}
+
+#[test]
+fn the_format_list_is_the_control_to_focus_when_the_dialog_opens() {
+    let (dialog, host) = defaults();
+    let list = host.node(&dialog, Role::List, "Format");
+    assert_eq!(dialog.focus_id(), list.id);
+}
+
+#[test]
+fn the_dialog_measures_as_the_window_it_covers() {
+    let (mut dialog, mut host) = defaults();
+    let id = dialog_id(&dialog);
+    let mut cx = LayoutCx::new(
+        id,
+        &host.theme,
+        1.0,
+        &host.engine,
+        &mut host.focus,
+        &mut host.requests,
+    );
+    let window = Size::new(900.0, 700.0);
+    assert_eq!(dialog.measure(&mut cx, window), window);
+    // Without a window to cover it wants the widest panel plus the 24 DIPs margin on each side.
+    assert_eq!(
+        dialog.measure(&mut cx, Size::UNBOUNDED),
+        Size::new(808.0, 348.0)
+    );
+    let unbounded_width = Size::new(f32::INFINITY, 700.0);
+    assert_eq!(
+        dialog.measure(&mut cx, unbounded_width),
+        Size::new(808.0, 700.0)
+    );
+    let unbounded_height = Size::new(900.0, f32::INFINITY);
+    assert_eq!(
+        dialog.measure(&mut cx, unbounded_height),
+        Size::new(900.0, 348.0)
+    );
+}
+
+#[test]
+fn the_debug_form_reports_the_choices_and_whether_the_dialog_is_open() {
+    let (mut dialog, mut host) = defaults();
+    let open = format!("{dialog:?}");
+    assert!(open.starts_with("ExportDialog {"), "{open}");
+    assert!(open.contains("format: Pdf"), "{open}");
+    assert!(open.contains("open: true"), "{open}");
+    press(&mut dialog, &mut host, "Cancel");
+    let closed = format!("{dialog:?}");
+    assert!(closed.contains("open: false"), "{closed}");
+}
+
+#[test]
+fn assistive_technology_invokes_the_export_and_cancel_buttons() {
+    let (mut dialog, mut host) = defaults();
+    let cancel = host.node(&dialog, Role::Button, "Cancel");
+    assert!(host.perform(&mut dialog, cancel.id, AccessAction::Invoke));
+    assert_eq!(dialog.take_events(), [ExportEvent::Cancel]);
+    dialog.open();
+    host.layout(&mut dialog);
+    let export = host.node(&dialog, Role::Button, "Export");
+    assert!(host.perform(&mut dialog, export.id, AccessAction::Invoke));
+    assert_eq!(
+        dialog.take_events(),
+        [ExportEvent::Export(ExportRequest {
+            format: ExportFormat::Pdf,
+            options: ExportOptions::from(&ExportSettings::default()),
+        })]
+    );
 }
 
 fn dialog_id(dialog: &ExportDialog) -> ssw_ui::widget::WidgetId {

@@ -9,11 +9,12 @@ use ssw_core::command::CommandId;
 use ssw_core::document::Document;
 use ssw_core::toc::Toc;
 use ssw_ui::access::{AccessAction, Role};
-use ssw_ui::geometry::{Point, Rect};
-use ssw_ui::input::{Event, Modifiers, WheelEvent, vk};
+use ssw_ui::canvas::DrawOp;
+use ssw_ui::geometry::{Point, Rect, Size};
+use ssw_ui::input::{Event, Modifiers, PointerEventKind, WheelEvent, vk};
 use ssw_ui::shell::palette::{CommandPalette, ShortcutLabels};
 use ssw_ui::shell::quick_open::{QuickOpen, QuickOpenEvent, QuickOpenMode};
-use ssw_ui::widget::WidgetId;
+use ssw_ui::widget::{Widget, WidgetId};
 use ssw_ui::widgets::Control;
 use ssw_ui::widgets::anim::Motion;
 
@@ -425,4 +426,77 @@ fn new_shortcuts_appear_without_reopening() {
     assert!(quick.list().rows().iter().any(|row| !row.detail.is_empty()));
     quick.refresh_shortcuts(&Nothing);
     assert!(quick.list().rows().iter().all(|row| row.detail.is_empty()));
+}
+
+#[test]
+fn the_overlay_measures_its_panel_and_nothing_while_hidden() {
+    let (mut host, mut quick) = setup(QuickOpenMode::Files);
+    let panel = host.measure(&mut quick, Size::new(800.0, 600.0));
+    assert_eq!(panel.width, 560.0);
+    assert!(panel.height > 0.0);
+    // A narrow window leaves the padding on both sides; an unbounded one gets the widest panel.
+    assert_eq!(
+        host.measure(&mut quick, Size::new(300.0, 600.0)),
+        Size::new(284.0, panel.height)
+    );
+    assert_eq!(host.measure(&mut quick, Size::UNBOUNDED), panel);
+    quick.close();
+    assert_eq!(
+        host.measure(&mut quick, Size::new(800.0, 600.0)),
+        Size::ZERO
+    );
+}
+
+#[test]
+fn the_pointer_highlights_the_hovered_row_until_it_moves_away_or_leaves() {
+    let (mut host, mut quick) = setup(QuickOpenMode::Files);
+    let hover = host.theme.tokens.hover_bg;
+    let list = quick.list().bounds();
+    let hovered_rows = |host: &Host, quick: &QuickOpen| {
+        host.paint(quick)
+            .ops_in(list)
+            .into_iter()
+            .filter(|op| matches!(op, DrawOp::FillRoundedRect { color, .. } if *color == hover))
+            .count()
+    };
+    assert_eq!(hovered_rows(&host, &quick), 0);
+    let row = quick.list().row_rect(2).expect("row 2").center();
+    // The overlay is modal: a pointer over its panel is always taken.
+    assert!(
+        host.pointer(&mut quick, PointerEventKind::Move, row)
+            .handled
+    );
+    assert_eq!(hovered_rows(&host, &quick), 1);
+    // Moving above the list clears the highlight; so does leaving the overlay.
+    let above = Point::new(row.x, quick.list().bounds().y - 10.0);
+    host.pointer(&mut quick, PointerEventKind::Move, above);
+    assert_eq!(hovered_rows(&host, &quick), 0);
+    host.pointer(&mut quick, PointerEventKind::Move, row);
+    assert_eq!(hovered_rows(&host, &quick), 1);
+    host.pointer(&mut quick, PointerEventKind::Leave, row);
+    assert_eq!(hovered_rows(&host, &quick), 0);
+    host.pointer(&mut quick, PointerEventKind::Leave, row);
+    assert_eq!(hovered_rows(&host, &quick), 0);
+    // Releasing the button over a row chooses nothing.
+    assert!(host.pointer(&mut quick, PointerEventKind::Up, row).handled);
+    assert!(quick.take_events().is_empty());
+}
+
+#[test]
+fn clicking_the_query_box_takes_the_focus_back() {
+    let (mut host, mut quick) = setup(QuickOpenMode::Files);
+    host.focus.blur();
+    let at = quick.input().bounds().center();
+    host.click(&mut quick, at);
+    assert_eq!(host.focus.focused(), Some(quick.input().id()));
+}
+
+#[test]
+fn the_overlay_itself_takes_no_accessibility_actions() {
+    let (mut host, mut quick) = setup(QuickOpenMode::Files);
+    let id = quick.id();
+    let mut cx = host.cx(id);
+    for action in [AccessAction::Invoke, AccessAction::Focus] {
+        assert!(!Widget::perform(&mut quick, &mut cx, &action));
+    }
 }

@@ -8,8 +8,9 @@ use ssw_core::command::CommandId;
 use ssw_core::keymap::{KeyChord, Keymap, vk as key};
 use ssw_core::settings::{Settings, SettingsSection};
 use ssw_ui::access::{AccessAction, Role};
-use ssw_ui::geometry::{Point, Rect};
-use ssw_ui::input::{Event, Modifiers, TextInput, vk};
+use ssw_ui::canvas::DrawOp;
+use ssw_ui::geometry::{Color, Point, Rect};
+use ssw_ui::input::{Event, Modifiers, PointerEvent, PointerEventKind, TextInput, vk};
 use ssw_ui::shell::settings::{SettingsChange, SettingsEvent, SettingsWindow};
 
 const WINDOW: Rect = Rect::new(0.0, 0.0, 900.0, 640.0);
@@ -396,4 +397,38 @@ fn the_page_is_one_tree_with_its_controls() {
     assert!(host.has_node(&window, Role::List, "Commands and their shortcuts"));
     let canvas = host.paint(&window);
     assert!(canvas.texts().contains(&"Shortcuts"));
+}
+
+#[test]
+fn the_status_line_is_drawn_in_the_color_of_its_tone() {
+    let (mut window, mut host) = open(Settings::default());
+    select(&mut window, &mut host, "italic", "Italic — Ctrl+I");
+    let tokens = host.theme.tokens;
+    let status_color = |host: &Host, window: &SettingsWindow| -> Option<Color> {
+        let status = window.shortcut_status()?.to_owned();
+        host.paint(window).ops().find_map(|op| match op {
+            DrawOp::Text { text, color, .. } if *text == status => Some(*color),
+            _ => None,
+        })
+    };
+    // Nothing to say yet.
+    assert_eq!(status_color(&host, &window), None);
+    // The prompt, then the refusal, then the confirmation.
+    press_button(&mut window, &mut host, "Change");
+    assert_eq!(status_color(&host, &window), Some(tokens.accent));
+    host.key(&mut window, key::Q, Modifiers::CTRL | Modifiers::ALT);
+    assert_eq!(status_color(&host, &window), Some(tokens.error));
+    host.key(&mut window, key::W, Modifiers::CTRL | Modifiers::ALT);
+    assert_eq!(status_color(&host, &window), Some(tokens.text_muted));
+}
+
+#[test]
+fn pointer_movement_does_not_end_a_capture() {
+    let (mut window, mut host) = open(Settings::default());
+    select(&mut window, &mut host, "bold", "Bold — Ctrl+B");
+    press_button(&mut window, &mut host, "Change");
+    let moved = PointerEvent::mouse(PointerEventKind::Move, None, Point::new(5.0, 5.0));
+    host.event(&mut window, Event::Pointer(moved));
+    assert!(window.is_capturing_shortcut());
+    assert_eq!(window.capturing_command(), Some(CommandId::FormatBold));
 }

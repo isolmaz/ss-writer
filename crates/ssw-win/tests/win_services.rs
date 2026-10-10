@@ -13,25 +13,29 @@ use ssw_ui::services::{
 };
 use ssw_win::com::{ComGuard, WinError};
 use ssw_win::services::clock::QpcClock;
-use ssw_win::services::dialogs::{DialogHost, DialogStrings, WindowsDialogs};
+use ssw_win::services::dialogs::{DialogHost, DialogStrings, SystemDialogHost, WindowsDialogs};
 use ssw_win::services::service_error;
 use ssw_win::services::shell::{ItemIdList, ShellHost, WindowsShell};
-use windows::Win32::Foundation::{E_FAIL, HWND};
+use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, E_UNEXPECTED, ERROR_CANCELLED, HWND, S_OK};
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx};
 use windows::Win32::UI::Controls::{TASKDIALOG_BUTTON, TASKDIALOGCONFIG};
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOLDERID_RecycleBinFolder,
     FileOperation, IEnumShellItems, IFileOperation, IFileOperationProgressSink, KF_FLAG_DEFAULT,
     SHGetKnownFolderItem, SIGDN_NORMALDISPLAY,
 };
 use windows::Win32::UI::Shell::{
-    FOS_ALLOWMULTISELECT, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, IFileDialog, IShellItem,
-    SEE_MASK_NOASYNC, SHCreateItemFromParsingName, SHELLEXECUTEINFOW, SIGDN_FILESYSPATH,
+    FDAP, FILEOPENDIALOGOPTIONS, FOS_ALLOWMULTISELECT, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
+    IFileDialog, IFileDialog_Impl, IFileDialogEvents, IFileOpenDialog, IFileOpenDialog_Impl,
+    IModalWindow_Impl, IShellItem, IShellItemArray, IShellItemFilter, SEE_MASK_NOASYNC,
+    SHCreateItemFromParsingName, SHCreateShellItemArrayFromShellItem, SHELLEXECUTEINFOW,
+    SIGDN_FILESYSPATH,
 };
-use windows::core::{HSTRING, IUnknown};
+use windows::core::{GUID, HRESULT, HSTRING, IUnknown, Interface, PCWSTR, PWSTR, Ref, implement};
 
 /// A unique token for the names of items a test recycles; purges exactly the Recycle Bin items
 /// carrying the token (permanently, without UI) on drop, also when the test fails halfway.
@@ -458,6 +462,291 @@ fn message_boxes_hand_the_planned_buttons_to_the_task_dialog() {
     assert!(failed(&error, "dialogs"), "{error}");
 }
 
+#[test]
+fn every_icon_is_handed_to_the_task_dialog_except_the_plain_question() {
+    let icons = [
+        (Some(MessageBoxIcon::Information), true),
+        (Some(MessageBoxIcon::Warning), true),
+        (Some(MessageBoxIcon::Error), true),
+        (Some(MessageBoxIcon::Question), false),
+        (None, false),
+    ];
+    for (icon, has_icon) in icons {
+        let (mut dialogs, seen) = scripted(Vec::new(), 1, false);
+        let result = dialogs
+            .message_box(&MessageBoxOptions {
+                icon,
+                buttons: MessageBoxButtons::Ok,
+                ..MessageBoxOptions::default()
+            })
+            .unwrap();
+        assert_eq!(result, MessageBoxResult::Ok);
+        let tasks = seen.borrow().tasks.clone();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].has_icon, has_icon, "{icon:?}");
+    }
+}
+
+/// What a file dialog that is never shown answers to `Show`, `GetResult` and `GetResults`.
+struct Script {
+    answer: HRESULT,
+    item: Option<IShellItem>,
+    results: Option<IShellItemArray>,
+}
+
+/// The methods of a file dialog the code under test never calls on a dialog it did not create.
+macro_rules! unsupported {
+    ($($name:ident($($arg:ident: $kind:ty),*) -> $result:ty;)*) => {
+        $(
+            fn $name(&self $(, $arg: $kind)*) -> windows::core::Result<$result> {
+                Err(E_NOTIMPL.into())
+            }
+        )*
+    };
+}
+
+/// The `IModalWindow` and `IFileDialog` implementation of a scripted file dialog.
+macro_rules! scripted_file_dialog {
+    ($fake:ident) => {
+        impl IModalWindow_Impl for $fake {
+            fn Show(&self, _owner: HWND) -> windows::core::Result<()> {
+                self.script.answer.ok()
+            }
+        }
+
+        impl IFileDialog_Impl for $fake {
+            unsupported! {
+                SetFileTypes(_count: u32, _specs: *const COMDLG_FILTERSPEC) -> ();
+                SetFileTypeIndex(_index: u32) -> ();
+                GetFileTypeIndex() -> u32;
+                Advise(_events: Ref<IFileDialogEvents>) -> u32;
+                Unadvise(_cookie: u32) -> ();
+                SetOptions(_options: FILEOPENDIALOGOPTIONS) -> ();
+                GetOptions() -> FILEOPENDIALOGOPTIONS;
+                SetDefaultFolder(_folder: Ref<IShellItem>) -> ();
+                SetFolder(_folder: Ref<IShellItem>) -> ();
+                GetFolder() -> IShellItem;
+                GetCurrentSelection() -> IShellItem;
+                SetFileName(_name: &PCWSTR) -> ();
+                GetFileName() -> PWSTR;
+                SetTitle(_title: &PCWSTR) -> ();
+                SetOkButtonLabel(_text: &PCWSTR) -> ();
+                SetFileNameLabel(_label: &PCWSTR) -> ();
+                AddPlace(_place: Ref<IShellItem>, _where: FDAP) -> ();
+                SetDefaultExtension(_extension: &PCWSTR) -> ();
+                Close(_result: HRESULT) -> ();
+                SetClientGuid(_guid: *const GUID) -> ();
+                ClearClientData() -> ();
+                SetFilter(_filter: Ref<IShellItemFilter>) -> ();
+            }
+
+            fn GetResult(&self) -> windows::core::Result<IShellItem> {
+                self.script.item.clone().ok_or_else(|| E_UNEXPECTED.into())
+            }
+        }
+    };
+}
+
+/// An open dialog (`IFileOpenDialog`: a list of results).
+#[implement(IFileOpenDialog)]
+struct ScriptedOpenDialog {
+    script: Script,
+}
+
+scripted_file_dialog!(ScriptedOpenDialog_Impl);
+
+impl IFileOpenDialog_Impl for ScriptedOpenDialog_Impl {
+    fn GetResults(&self) -> windows::core::Result<IShellItemArray> {
+        self.script
+            .results
+            .clone()
+            .ok_or_else(|| E_UNEXPECTED.into())
+    }
+
+    fn GetSelectedItems(&self) -> windows::core::Result<IShellItemArray> {
+        Err(E_NOTIMPL.into())
+    }
+}
+
+/// A save dialog (only `IFileDialog`: a single result).
+#[implement(IFileDialog)]
+struct ScriptedSaveDialog {
+    script: Script,
+}
+
+scripted_file_dialog!(ScriptedSaveDialog_Impl);
+
+fn open_dialog_answering(answer: HRESULT, file: Option<&Path>) -> IFileDialog {
+    let results = file.map(|file| {
+        // SAFETY: a live shell item of an existing file.
+        unsafe { SHCreateShellItemArrayFromShellItem::<_, IShellItemArray>(&item_for(file)) }
+            .unwrap()
+    });
+    let dialog: IFileOpenDialog = ScriptedOpenDialog {
+        script: Script {
+            answer,
+            item: None,
+            results,
+        },
+    }
+    .into();
+    dialog.cast().unwrap()
+}
+
+fn save_dialog_answering(answer: HRESULT, file: Option<&Path>) -> IFileDialog {
+    ScriptedSaveDialog {
+        script: Script {
+            answer,
+            item: file.map(item_for),
+            results: None,
+        },
+    }
+    .into()
+}
+
+#[test]
+fn the_system_host_shows_a_dialog_and_reads_the_items_the_user_chose() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let file = temp_file("chosen.md");
+    let chosen = Some(file.as_path());
+    let cancelled = HRESULT::from_win32(ERROR_CANCELLED.0);
+
+    // An open dialog hands out its result list, a save dialog its single result.
+    let accepted = SystemDialogHost
+        .pick(&open_dialog_answering(S_OK, chosen), None)
+        .unwrap();
+    assert_eq!(
+        accepted.iter().map(path_of).collect::<Vec<_>>(),
+        std::slice::from_ref(&file)
+    );
+    let saved = SystemDialogHost
+        .pick(&save_dialog_answering(S_OK, chosen), None)
+        .unwrap();
+    assert_eq!(
+        saved.iter().map(path_of).collect::<Vec<_>>(),
+        std::slice::from_ref(&file)
+    );
+
+    // Dismissing the dialog is no failure; any other outcome is reported as it is.
+    for dialog in [
+        open_dialog_answering(cancelled, chosen),
+        save_dialog_answering(cancelled, chosen),
+    ] {
+        assert!(SystemDialogHost.pick(&dialog, None).unwrap().is_empty());
+    }
+    for dialog in [
+        open_dialog_answering(E_FAIL, chosen),
+        save_dialog_answering(E_FAIL, chosen),
+    ] {
+        let error = SystemDialogHost.pick(&dialog, None).unwrap_err();
+        assert_eq!(error.code(), E_FAIL);
+    }
+    // Accepted without any result to read: the failure of the read, not an empty answer.
+    for dialog in [
+        open_dialog_answering(S_OK, None),
+        save_dialog_answering(S_OK, None),
+    ] {
+        let error = SystemDialogHost.pick(&dialog, None).unwrap_err();
+        assert_eq!(error.code(), E_UNEXPECTED);
+    }
+    std::fs::remove_file(file).unwrap();
+}
+
+/// Runs `run` once per system call it makes, each time failing that call, until a run makes no
+/// more calls than the armed one (it then succeeds). Every failure must be reported as a
+/// failure of the `dialogs` service. Returns how many calls could fail.
+#[cfg(feature = "fault-injection")]
+fn fail_each_call<T: std::fmt::Debug>(mut run: impl FnMut() -> Result<T, ServiceError>) -> u32 {
+    use ssw_win::fault;
+
+    for call in 0.. {
+        fault::arm(call);
+        let result = run();
+        let tripped = fault::tripped();
+        fault::disarm();
+        if !tripped {
+            result.unwrap();
+            return call;
+        }
+        let error = result.unwrap_err();
+        assert!(failed(&error, "dialogs"), "call {call}: {error:?}");
+    }
+    unreachable!("the loop ends with the first run that trips nothing")
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_failing_system_call_fails_the_dialog_instead_of_showing_it() {
+    use ssw_win::fault;
+
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let file = temp_file("sweep.md");
+    let (mut dialogs, seen) = scripted(vec![file.clone()], 0, false);
+    let filters = vec![FileFilter {
+        name: "Markdown".to_owned(),
+        extensions: vec!["md".to_owned()],
+    }];
+    let open = OpenFileOptions {
+        title: "Open".to_owned(),
+        filters: filters.clone(),
+        allow_multiple: true,
+        initial_dir: Some(std::env::temp_dir()),
+    };
+    // Create, cast, five calls that configure the dialog, then reading the path of the item.
+    assert_eq!(fail_each_call(|| dialogs.open_file(&open)), 8);
+    assert_eq!(
+        seen.borrow().files.len(),
+        2,
+        "shown by the run that failed to read the path of the item and by the one that did not fail"
+    );
+    let save = SaveFileOptions {
+        title: "Save".to_owned(),
+        filters,
+        suggested_name: Some("draft.md".to_owned()),
+        default_extension: Some("md".to_owned()),
+        initial_dir: Some(std::env::temp_dir()),
+    };
+    assert_eq!(fail_each_call(|| dialogs.save_file(&save)), 10);
+    let folder = PickFolderOptions {
+        title: "Folder".to_owned(),
+        initial_dir: Some(std::env::temp_dir()),
+    };
+    assert_eq!(fail_each_call(|| dialogs.pick_folder(&folder)), 7);
+
+    // The system host reads the result of an open dialog with three calls and that of a save
+    // dialog with one; every one of them can fail.
+    let chosen = Some(file.as_path());
+    for (dialog, calls) in [
+        (open_dialog_answering(S_OK, chosen), 3),
+        (save_dialog_answering(S_OK, chosen), 1),
+    ] {
+        for call in 0..calls {
+            fault::arm(call);
+            let error = SystemDialogHost.pick(&dialog, None).unwrap_err();
+            assert!(fault::tripped(), "call {call}");
+            fault::disarm();
+            assert_eq!(error.code(), E_FAIL);
+        }
+        fault::arm(calls);
+        assert_eq!(SystemDialogHost.pick(&dialog, None).unwrap().len(), 1);
+        assert!(!fault::tripped());
+        fault::disarm();
+    }
+
+    // Dialogs of the system fail the same way before anything could be shown.
+    let strings = DialogStrings {
+        save: "Kaydet".to_owned(),
+        dont_save: "Kaydetme".to_owned(),
+    };
+    let mut system = WindowsDialogs::new(None, strings);
+    fault::arm(0);
+    let error = system.open_file(&OpenFileOptions::default()).unwrap_err();
+    assert!(fault::tripped());
+    fault::disarm();
+    assert!(failed(&error, "dialogs"), "{error:?}");
+    std::fs::remove_file(file).unwrap();
+}
+
 /// Records what it was asked to run and answers with a scripted result.
 struct ScriptedShell {
     executed: Executed,
@@ -605,6 +894,24 @@ fn recycling_moves_a_file_to_the_bin_and_the_test_purges_it_again() {
         "exactly this test's item was in the Recycle Bin"
     );
     assert_eq!(bin.purge().unwrap(), 0, "nothing of the test stays behind");
+}
+
+/// A shell that cannot create its file operation fails before anything is moved.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_file_operation_that_cannot_be_created_recycles_nothing() {
+    use ssw_win::fault;
+
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let file = temp_file("keep.md");
+    let (mut shell, _, _) = shell(false);
+    fault::arm(0);
+    let error = shell.recycle(&file).unwrap_err();
+    assert!(fault::tripped());
+    fault::disarm();
+    assert!(failed(&error, "shell"), "{error:?}");
+    assert!(file.exists(), "the file stayed where it was");
+    std::fs::remove_file(file).unwrap();
 }
 
 #[test]

@@ -1,13 +1,9 @@
 //! File operations behind the sidebar context menu (spec §5): rename with Windows name
-//! validation, duplicate, new file/folder, Recycle Bin delete, copy/move with conflict naming,
-//! reveal in Explorer.
+//! validation, duplicate, new file/folder, Recycle Bin delete, copy/move with conflict naming.
 
 use std::path::{Path, PathBuf};
 
-use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
-use windows::core::PCWSTR;
-
-use crate::fs::{FileSystem, FsError, wide, win, win32};
+use crate::fs::{FileSystem, FsError, win32};
 use crate::watch::path_key;
 
 /// Longest file name Windows accepts, in UTF-16 units.
@@ -343,22 +339,4 @@ pub fn move_into(
 /// [`FsError::NotFound`] for missing items, [`FsError::AccessDenied`] when the shell aborts.
 pub fn recycle(fs: &dyn FileSystem, paths: &[PathBuf]) -> Result<(), FsError> {
     fs.recycle(paths)
-}
-
-/// Opens an Explorer window with `path` selected.
-///
-/// # Errors
-/// [`FsError::NotFound`] when `path` does not exist, shell errors otherwise.
-pub fn reveal_in_explorer(path: &Path) -> Result<(), FsError> {
-    let name = wide(path);
-    // SAFETY: `name` is NUL-terminated and outlives the call; a null result means "not found".
-    let pidl = unsafe { ILCreateFromPathW(PCWSTR(name.as_ptr())) };
-    if pidl.is_null() {
-        return Err(FsError::NotFound(path.to_path_buf()));
-    }
-    // SAFETY: `pidl` is a valid absolute item id list; zero child items selects the item itself.
-    let result = unsafe { SHOpenFolderAndSelectItems(pidl, None, 0) };
-    // SAFETY: `pidl` was allocated by `ILCreateFromPathW` and is freed exactly once.
-    unsafe { ILFree(Some(pidl.cast_const())) };
-    win(result, path)
 }

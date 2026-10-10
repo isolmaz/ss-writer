@@ -13,19 +13,14 @@ use crate::text::{FontWeight, TextLayout, TextStyle};
 
 use super::{Ctx, style};
 
-/// What a [`TextBlock`] is called to assistive technology.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Label {
-    Paragraph,
-    Heading(u8),
-    Named(String),
-}
-
 /// A block of text: a paragraph, a heading or the source of a block shown as text.
 pub(super) struct TextBlock {
     layout: Box<dyn TextLayout>,
     display: Display,
-    label: Label,
+    /// What the block is called to assistive technology. Blocks shown as text (HTML, front
+    /// matter, divider markers) name themselves; paragraphs and headings inside a container are
+    /// described by the container, so they have none.
+    label: Option<String>,
     /// Where the IME composition is inserted.
     composition_at: Option<usize>,
     color: Color,
@@ -42,7 +37,7 @@ pub(super) fn paragraph(ctx: &Ctx<'_>, block: &Block) -> TextBlock {
     let cx = ctx.cx;
     let base = style(cx, &cx.config.text_font, cx.config.body_size());
     let gap = GapPolicy::Marker { reveal: ctx.shown };
-    TextBlock::inline(ctx, block, &base, gap, Label::Paragraph)
+    TextBlock::inline(ctx, block, &base, gap)
 }
 
 /// A heading of `level` (1–6) inside a container: sized and weighted as at top level, without
@@ -56,18 +51,12 @@ pub(super) fn heading(ctx: &Ctx<'_>, block: &Block, level: u8) -> TextBlock {
     let gap = GapPolicy::Marker {
         reveal: cx.reveal.touches(block.range),
     };
-    TextBlock::inline(ctx, block, &base, gap, Label::Heading(level))
+    TextBlock::inline(ctx, block, &base, gap)
 }
 
 impl TextBlock {
     /// The inline content of `block` laid out in `ctx.cx.width`.
-    fn inline(
-        ctx: &Ctx<'_>,
-        block: &Block,
-        base: &TextStyle,
-        gap: GapPolicy,
-        label: Label,
-    ) -> Self {
+    fn inline(ctx: &Ctx<'_>, block: &Block, base: &TextStyle, gap: GapPolicy) -> Self {
         let cx = ctx.cx;
         let source = cx.buffer.slice(block.range);
         let composition = cx.composition.filter(|comp| block.range.touches(comp.at));
@@ -89,7 +78,7 @@ impl TextBlock {
         Self {
             layout,
             display,
-            label,
+            label: None,
             composition_at: composition.map(|comp| comp.at),
             color: ctx.color,
             origin: Point::ZERO,
@@ -108,7 +97,7 @@ impl TextBlock {
         color: Color,
         pad: f32,
         card: bool,
-        label: Label,
+        label: String,
     ) -> Self {
         let source = cx.buffer.slice(range);
         let composition = cx.composition.filter(|comp| range.touches(comp.at));
@@ -118,7 +107,7 @@ impl TextBlock {
         Self {
             layout,
             display,
-            label,
+            label: Some(label),
             composition_at: composition.map(|comp| comp.at),
             color,
             origin: Point::new(pad, pad),
@@ -191,15 +180,14 @@ impl BlockLayout for TextBlock {
     fn line_range(&self, offset: usize) -> TextRange {
         let map = &self.display.map;
         let display = self.display_offset(offset);
-        let Some(line) = self
-            .layout
+        // `line_for_offset` always names an existing line; the default is the empty line.
+        self.layout
             .line_metrics(self.layout.line_for_offset(display))
-        else {
-            return TextRange::at(offset);
-        };
-        let start = map.display_to_source(line.start);
-        let end = map.display_to_source(line.content_end());
-        TextRange::new(start, end.max(start))
+            .map_or(TextRange::at(offset), |line| {
+                let start = map.display_to_source(line.start);
+                let end = map.display_to_source(line.content_end());
+                TextRange::new(start, end.max(start))
+            })
     }
 
     fn link_at(&self, point: Point) -> Option<LinkTarget> {
@@ -212,11 +200,7 @@ impl BlockLayout for TextBlock {
             .map(|link| link.target.clone())
     }
 
-    fn access_label(&self, strings: &EditorStrings) -> String {
-        match &self.label {
-            Label::Paragraph => strings.paragraph.clone(),
-            Label::Heading(level) => strings.heading_names[usize::from(*level - 1)].clone(),
-            Label::Named(name) => name.clone(),
-        }
+    fn access_label(&self, _strings: &EditorStrings) -> String {
+        self.label.clone().unwrap_or_default()
     }
 }

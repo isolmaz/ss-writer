@@ -59,20 +59,6 @@ pub struct DisplayMap {
 }
 
 impl DisplayMap {
-    /// A map that shows `src` unchanged (display length `src.len()`).
-    #[must_use]
-    pub fn identity(src: TextRange) -> Self {
-        Self {
-            segments: vec![Segment {
-                src,
-                disp: TextRange::new(0, src.len()),
-                kind: SegmentKind::Shown,
-            }],
-            src,
-            len: src.len(),
-        }
-    }
-
     /// A map over `segments` (in source order), for blocks that build their display text from
     /// non-contiguous source lines (code and math inside quotes and lists). `src` is the source
     /// range covered and `len` the length of the display text.
@@ -529,8 +515,10 @@ pub fn build(params: &DisplayParams<'_>) -> Display {
     };
     b.walk_all(params.inlines, &Fmt::default(), params.gap);
     b.fill_to(params.range.end, params.gap);
-    if b.composition.is_none() && params.composition.is_some() {
-        b.insert_composition();
+    if b.composition.is_none()
+        && let Some(comp) = params.composition
+    {
+        b.insert_composition(comp);
     }
     let len = b.text.len();
     Display {
@@ -552,13 +540,12 @@ pub fn build(params: &DisplayParams<'_>) -> Display {
 impl Builder<'_> {
     fn src_text(&self, range: TextRange) -> &str {
         let origin = self.p.range.start;
-        let (Some(start), Some(end)) = (
-            range.start.checked_sub(origin),
-            range.end.checked_sub(origin),
-        ) else {
-            return "";
-        };
-        self.p.src.get(start..end).unwrap_or("")
+        range
+            .start
+            .checked_sub(origin)
+            .zip(range.end.checked_sub(origin))
+            .and_then(|(start, end)| self.p.src.get(start..end))
+            .unwrap_or("")
     }
 
     fn style(&self, fmt: &Fmt) -> TextStyle {
@@ -606,10 +593,7 @@ impl Builder<'_> {
         (start < range.end).then(|| TextRange::new(start, range.end))
     }
 
-    fn insert_composition(&mut self) {
-        let Some(comp) = self.p.composition else {
-            return;
-        };
+    fn insert_composition(&mut self, comp: &Composition) {
         let start = self.text.len();
         self.text.push_str(&comp.text);
         let end = self.text.len();
@@ -648,14 +632,16 @@ impl Builder<'_> {
             let at = self.text.len();
             return at..at;
         };
-        let at = self.p.composition.map(|comp| comp.at);
         let start = self.text.len();
-        match at {
-            Some(at) if self.composition.is_none() && (range.start..=range.end).contains(&at) => {
+        match self.p.composition {
+            Some(comp)
+                if self.composition.is_none() && (range.start..=range.end).contains(&comp.at) =>
+            {
+                let at = comp.at;
                 if range.start < at {
                     self.push_shown(TextRange::new(range.start, at), style);
                 }
-                self.insert_composition();
+                self.insert_composition(comp);
                 if at < range.end {
                     self.cursor = at;
                     self.push_shown(TextRange::new(at, range.end), style);
@@ -1227,5 +1213,167 @@ mod tests {
                 .ops()
                 .any(|op| matches!(op, DrawOp::StrokeLine { .. }))
         );
+    }
+
+    #[test]
+    fn an_object_the_layout_did_not_place_is_not_drawn() {
+        let info = ObjectInfo {
+            visual: ObjectVisual::Scene(crate::canvas::SceneId(7)),
+            size: Size::new(30.0, 20.0),
+            baseline: 15.0,
+        };
+        let d = display("a $x^2$ b", None, &Fixed(ObjectState::Ready(info)), None);
+        assert_eq!(d.object_draws.len(), 1);
+        // A layout built without the reservations knows no rectangle for the object.
+        let engine = MonoTextEngine::new(10.0);
+        let layout = engine.layout(&d.text, &TextStyle::new("Body", 10.0), &[], &[], 400.0);
+        let mut canvas = RecordingCanvas::new();
+        d.paint_front(layout.as_ref(), &mut canvas, Color::BLACK);
+        assert_eq!(canvas.ops().count(), 0);
+    }
+
+    #[test]
+    fn underline_strikethrough_and_colored_highlights_style_their_content() {
+        let d = display("~u~ ~~s~~", None, &NoObjects, None);
+        assert_eq!(d.text, "u s");
+        let underline = d
+            .styles
+            .iter()
+            .find(|s| s.range == (0..1))
+            .expect("underline run");
+        assert!(underline.style.underline && !underline.style.strikethrough);
+        let strike = d
+            .styles
+            .iter()
+            .find(|s| s.range == (2..3))
+            .expect("strikethrough run");
+        assert!(strike.style.strikethrough && !strike.style.underline);
+
+        let source = "=={red}a== =={orange}b== =={green}c== =={blue}d== =={purple}e== ==f==";
+        let d = display(source, None, &NoObjects, None);
+        assert_eq!(d.text, "a b c d e f");
+        let tokens = Theme::light(DEFAULT_ACCENT).tokens;
+        let expected = [
+            HighlightColor::Red,
+            HighlightColor::Orange,
+            HighlightColor::Green,
+            HighlightColor::Blue,
+            HighlightColor::Purple,
+            HighlightColor::Yellow,
+        ]
+        .map(|color| tokens.highlight.get(color).background);
+        let pills: Vec<Color> = d.pills.iter().map(|pill| pill.color).collect();
+        assert_eq!(pills, expected);
+    }
+
+    #[test]
+    fn a_touched_footnote_reference_shows_its_source_unraised() {
+        let source = "x[^1]\n\n[^1]: n";
+        let away = display(source, None, &NoObjects, None);
+        assert_eq!(away.text, "x1");
+        assert!(away.styles.iter().any(|s| s.style.baseline_shift > 0.0));
+        let touched = display(source, Some((3, 3)), &NoObjects, None);
+        assert_eq!(touched.text, "x[^1]");
+        assert!(touched.styles.iter().all(|s| s.style.baseline_shift == 0.0));
+        assert_eq!(touched.links[0].target, LinkTarget::Footnote("1".into()));
+    }
+
+    #[test]
+    fn raw_text_takes_a_composition_at_its_offset() {
+        let comp = Composition {
+            at: 13,
+            text: "かな".into(),
+            caret: 4,
+            attrs: vec![],
+        };
+        let d = raw("abcdef", TextRange::new(10, 16), Some(&comp));
+        assert_eq!(d.text, "abcかなdef");
+        let shown = d.composition.as_ref().expect("composition");
+        assert_eq!(shown.range, 3..9);
+        assert_eq!(shown.caret, 6, "a caret inside a character floors to it");
+        assert_eq!(d.map.source_to_display(13), 3, "before the composition");
+        assert_eq!(d.map.source_to_display(14), 10);
+        assert_eq!(d.map.display_to_source(10), 14);
+
+        let elsewhere = Composition { at: 99, ..comp };
+        let d = raw("abcdef", TextRange::new(10, 16), Some(&elsewhere));
+        assert_eq!(d.text, "abcdef");
+        assert!(d.composition.is_none());
+    }
+
+    #[test]
+    fn an_atomic_segment_maps_display_offsets_to_its_nearer_source_end() {
+        let segment = |src: (usize, usize), disp: (usize, usize), kind| Segment {
+            src: TextRange::new(src.0, src.1),
+            disp: TextRange::new(disp.0, disp.1),
+            kind,
+        };
+        let map = DisplayMap::from_segments(
+            vec![
+                segment((0, 2), (0, 2), SegmentKind::Shown),
+                segment((2, 8), (2, 6), SegmentKind::Atomic),
+                segment((8, 10), (6, 8), SegmentKind::Shown),
+            ],
+            TextRange::new(0, 10),
+            8,
+        );
+        assert_eq!(map.display_to_source(3), 2, "nearer the start");
+        assert_eq!(map.display_to_source(5), 8, "nearer the end");
+        assert_eq!(map.display_to_source(7), 9, "past the atomic segment");
+    }
+
+    #[test]
+    fn nodes_overlapping_text_already_shown_add_nothing() {
+        let doc = Document::new("abcdef");
+        let block = &doc.ast().blocks[0];
+        let text = doc.buffer().slice(block.range).into_owned();
+        let node = |kind, range: (usize, usize), markers: &[(usize, usize)]| Inline {
+            kind,
+            range: TextRange::new(range.0, range.1),
+            content: TextRange::new(range.0, range.1),
+            markers: markers
+                .iter()
+                .map(|marker| TextRange::new(marker.0, marker.1))
+                .collect(),
+            children: Vec::new(),
+        };
+        // The whole text first; then a text node, an entity and a strong element inside it.
+        let inlines = vec![
+            block.inlines[0].clone(),
+            node(InlineKind::Text, (1, 3), &[]),
+            node(
+                InlineKind::Entity {
+                    decoded: "&".into(),
+                },
+                (2, 4),
+                &[],
+            ),
+            node(InlineKind::Strong, (2, 4), &[(2, 3), (3, 4)]),
+        ];
+        let theme = Theme::light(DEFAULT_ACCENT);
+        let base = TextStyle::new("Body", 10.0);
+        let mono: Arc<str> = Arc::from("Mono");
+        let reveal = Reveal::new(false, Vec::new());
+        let params = DisplayParams {
+            src: &text,
+            range: block.range,
+            inlines: &inlines,
+            tokens: &theme.tokens,
+            base: &base,
+            mono_family: &mono,
+            reveal: &reveal,
+            gap: GapPolicy::Raw,
+            objects: &NoObjects,
+            max_width: 400.0,
+            composition: None,
+        };
+        let d = build(&params);
+        assert_eq!(d.text, "abcdef", "nothing is shown twice");
+        assert_eq!(
+            d.map.segments().len(),
+            1,
+            "and nothing is hidden or replaced"
+        );
+        assert!(format!("{params:?}").contains("max_width: 400.0"));
     }
 }

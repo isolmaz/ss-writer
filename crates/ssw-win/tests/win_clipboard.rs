@@ -1,14 +1,16 @@
 //! Clipboard round trips on this process.
 //!
 //! The clipboard is process-global state that belongs to the user, so every test runs inside a
-//! [`ClipboardSession`]: it takes a process-wide lock (tests of this binary run in parallel),
+//! [`ClipboardSession`]: it takes a machine-wide lock (tests run in parallel, in one process or
+//! one process each),
 //! copies every restorable format of the user's clipboard before the test touches it, and puts
 //! them all back when it is dropped, also when the test panics. A clipboard that stays busy
 //! (another process holds it) is retried with a short backoff; when it cannot be read the test
 //! fails instead of overwriting contents it could not save.
 
+mod support;
+
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use ssw_ui::services::{Clipboard, ClipboardContent, ClipboardFormat};
@@ -16,6 +18,7 @@ use ssw_win::com::ComGuard;
 use ssw_win::services::clipboard::{FORMAT_VSCODE_EDITOR_DATA, WindowsClipboard, decode_text};
 use ssw_win::wic::{DecodedImage, Wic};
 use ssw_win::window::MessageWindow;
+use support::MachineLock;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{
     CloseEnhMetaFile, CreateEnhMetaFileW, DeleteEnhMetaFile, GetEnhMetaFileBits, HENHMETAFILE,
@@ -26,7 +29,7 @@ use windows::Win32::System::DataExchange::{
     RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalReAlloc, GlobalSize, GlobalUnlock,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -43,9 +46,6 @@ const CUSTOM_FORMAT: &str = "ssw-win-test-custom-format";
 
 /// How many times a busy clipboard is retried (about 1.3 s in total).
 const OPEN_ATTEMPTS: u32 = 60;
-
-/// Serializes the tests that touch the clipboard.
-static EXCLUSIVE: Mutex<()> = Mutex::new(());
 
 /// The clipboard, open on this thread; closed when dropped, so a panic never leaves it locked.
 struct OpenClipboardGuard;
@@ -265,15 +265,16 @@ fn restore(owner: HWND, snapshot: &Snapshot) -> windows::core::Result<Vec<u32>> 
 struct ClipboardSession {
     saved: Snapshot,
     owner: MessageWindow,
-    /// Released last, so the next test starts only after the user's contents are back.
-    _exclusive: MutexGuard<'static, ()>,
+    /// Released last, so the next test (of any process) starts only after the user's contents
+    /// are back.
+    _exclusive: MachineLock,
 }
 
 impl ClipboardSession {
     /// Waits for the other clipboard tests, then saves the user's clipboard. Panics (before
     /// anything was touched) when the clipboard cannot be read.
     fn begin() -> Self {
-        let exclusive = EXCLUSIVE.lock().unwrap_or_else(PoisonError::into_inner);
+        let exclusive = MachineLock::acquire("clipboard");
         let owner = MessageWindow::new().unwrap();
         let saved = capture(owner.hwnd())
             .expect("the clipboard stayed busy: refusing to overwrite it without a backup");
@@ -414,6 +415,178 @@ fn clipboard_round_trip_preserves_the_users_clipboard() {
     assert!(clipboard.formats().unwrap().is_empty());
 }
 
+/// Keeps the clipboard open on a thread of its own until dropped: to every other thread (the
+/// test's) it is "in use by another application".
+struct ClipboardHolder {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ClipboardHolder {
+    fn start() -> Self {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (opened, ready) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _open = OpenClipboardGuard::open(HWND::default()).expect("the holder opens it");
+            opened.send(()).unwrap();
+            let _ = released.recv();
+        });
+        ready.recv().unwrap();
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for ClipboardHolder {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[test]
+fn a_clipboard_another_application_keeps_open_is_unavailable() {
+    use ssw_ui::services::ServiceError;
+
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let session = ClipboardSession::begin();
+    let mut clipboard = WindowsClipboard::new(session.owner(), Wic::new().unwrap());
+    clipboard
+        .set(ClipboardContent::from_text("before"))
+        .unwrap();
+    let holder = ClipboardHolder::start();
+    let unavailable = ServiceError::Unavailable {
+        service: "clipboard",
+    };
+    assert_eq!(clipboard.text().unwrap_err(), unavailable);
+    assert_eq!(clipboard.html().unwrap_err(), unavailable);
+    assert_eq!(clipboard.rtf().unwrap_err(), unavailable);
+    assert_eq!(clipboard.image().unwrap_err(), unavailable);
+    assert_eq!(clipboard.files().unwrap_err(), unavailable);
+    assert_eq!(clipboard.formats().unwrap_err(), unavailable);
+    assert_eq!(clipboard.custom(CUSTOM_FORMAT).unwrap_err(), unavailable);
+    assert_eq!(clipboard.vscode_mode().unwrap_err(), unavailable);
+    assert_eq!(clipboard.clear().unwrap_err(), unavailable);
+    assert_eq!(
+        clipboard
+            .set(ClipboardContent::from_text("blocked"))
+            .unwrap_err(),
+        unavailable
+    );
+    drop(holder);
+    // The refused calls changed nothing, and the clipboard works again once it is released.
+    assert_eq!(clipboard.text().unwrap().as_deref(), Some("before"));
+}
+
+#[test]
+fn a_format_the_system_refuses_fails_the_copy() {
+    use ssw_ui::services::ServiceError;
+
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let session = ClipboardSession::begin();
+    let mut clipboard = WindowsClipboard::new(session.owner(), Wic::new().unwrap());
+    // A format name longer than a registered clipboard format name can be.
+    let too_long = "x".repeat(300);
+    let error = clipboard
+        .set(ClipboardContent {
+            custom: vec![(too_long, vec![1, 2, 3])],
+            ..ClipboardContent::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ServiceError::Failed {
+                service: "clipboard",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn data_other_applications_put_on_the_clipboard_is_read_defensively() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let session = ClipboardSession::begin();
+    let owner = session.owner();
+    let clipboard = WindowsClipboard::new(owner, Wic::new().unwrap());
+    let empty_format = register("ssw-win-test-empty-block");
+    {
+        let _open = OpenClipboardGuard::open(owner).unwrap();
+        // SAFETY: the clipboard is open; it owns the handles it is given.
+        unsafe {
+            EmptyClipboard().unwrap();
+            // The system refuses a block of no bytes, so the clipboard is given one byte and
+            // the block is discarded afterwards (which this process may do to what it put
+            // there): a discarded block cannot be locked.
+            let block = GlobalAlloc(GMEM_MOVEABLE, 1).unwrap();
+            SetClipboardData(empty_format, Some(HANDLE(block.0))).unwrap();
+            let _ = GlobalReAlloc(block, 0, GMEM_MOVEABLE.0);
+        }
+        // A standard format nobody here handles (CF_TIFF).
+        assert!(put_memory(6, b"tiff"));
+    }
+    assert_eq!(clipboard.custom("ssw-win-test-empty-block").unwrap(), None);
+    assert_eq!(
+        clipboard.formats().unwrap(),
+        vec![ClipboardFormat::Custom(
+            "ssw-win-test-empty-block".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn an_image_that_is_only_a_dib_is_offered_as_a_png() {
+    use ssw_ui::services::ServiceError;
+    use ssw_win::services::clipboard::build_dib;
+
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let session = ClipboardSession::begin();
+    let owner = session.owner();
+    let wic = Wic::new().unwrap();
+    let clipboard = WindowsClipboard::new(owner, wic.clone());
+    let image = DecodedImage {
+        width: 2,
+        height: 1,
+        bgra: vec![0, 0, 255, 255, 255, 0, 0, 255],
+    };
+    let put_dib = |bytes: &[u8]| {
+        let _open = OpenClipboardGuard::open(owner).unwrap();
+        // SAFETY: the clipboard is open.
+        unsafe { EmptyClipboard() }.unwrap();
+        assert!(put_memory(8, bytes));
+    };
+
+    put_dib(&build_dib(&image));
+    let png = clipboard.image().unwrap().unwrap();
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    let decoded = wic.decode(&png).unwrap();
+    assert_eq!((decoded.width, decoded.height), (2, 1));
+    assert_eq!(decoded.pixel(0, 0), Some([0, 0, 255, 255]));
+    assert_eq!(decoded.pixel(1, 0), Some([255, 0, 0, 255]));
+
+    // Not a DIB at all, and a header without the pixels it announces.
+    for broken in [vec![1_u8; 10], build_dib(&image)[..40].to_vec()] {
+        put_dib(&broken);
+        let error = clipboard.image().unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ServiceError::Failed {
+                    service: "clipboard",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+}
+
 #[test]
 fn restoring_a_snapshot_brings_back_text_a_custom_format_and_a_metafile() {
     let _com = ComGuard::apartment_threaded().unwrap();
@@ -471,4 +644,103 @@ fn restoring_a_snapshot_brings_back_text_a_custom_format_and_a_metafile() {
     // An empty snapshot (the user had nothing on the clipboard) restores to an empty clipboard.
     assert!(restore(owner, &Snapshot::default()).unwrap().is_empty());
     assert!(clipboard.formats().unwrap().is_empty());
+}
+
+#[test]
+fn an_image_that_is_not_a_png_fails_the_copy_after_its_bytes_were_offered() {
+    use ssw_ui::services::ServiceError;
+
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let session = ClipboardSession::begin();
+    let mut clipboard = WindowsClipboard::new(session.owner(), Wic::new().unwrap());
+    let error = clipboard
+        .set(ClipboardContent {
+            image: Some(b"this is not a picture".to_vec()),
+            ..ClipboardContent::default()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ServiceError::Failed {
+                service: "clipboard",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+/// Every system call of a copy that can fail does, in turn: the copy reports it as a failure of
+/// the clipboard service, and the clipboard keeps working afterwards.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_failing_system_call_fails_the_copy_and_the_clipboard_stays_usable() {
+    use ssw_ui::services::ServiceError;
+    use ssw_win::fault;
+
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let session = ClipboardSession::begin();
+    let wic = Wic::new().unwrap();
+    let png = wic
+        .encode_png(&DecodedImage {
+            width: 1,
+            height: 1,
+            bgra: vec![0, 0, 255, 255],
+        })
+        .unwrap();
+    let mut clipboard = WindowsClipboard::new(session.owner(), wic);
+    let content = ClipboardContent {
+        text: Some("copied".to_owned()),
+        html: Some("<b>copied</b>".to_owned()),
+        rtf: Some(r"{\rtf1 copied}".to_owned()),
+        image: Some(png),
+        files: vec![PathBuf::from(r"C:\ssw-win-test\copied.md")],
+        custom: vec![(CUSTOM_FORMAT.to_owned(), vec![1, 2, 3])],
+    };
+
+    let mut injected = 0;
+    for call in 0.. {
+        fault::arm(call);
+        let result = clipboard.set(content.clone());
+        let tripped = fault::tripped();
+        fault::disarm();
+        if !tripped {
+            result.unwrap();
+            break;
+        }
+        injected += 1;
+        let error = result.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ServiceError::Failed {
+                    service: "clipboard",
+                    ..
+                }
+            ),
+            "call {call}: {error:?}"
+        );
+    }
+    // Emptying the clipboard, then the memory block of each of the seven formats offered
+    // (text, HTML, RTF, PNG, DIB, file list, custom).
+    assert!(injected >= 8, "only {injected} calls could fail");
+    assert_eq!(clipboard.text().unwrap().as_deref(), Some("copied"));
+    assert_eq!(
+        clipboard.custom(CUSTOM_FORMAT).unwrap(),
+        Some(vec![1, 2, 3])
+    );
+
+    // A clear that fails is reported, and the clipboard works afterwards. (The injected failure
+    // replaces the result of `EmptyClipboard` after it ran, so what the clipboard holds
+    // meanwhile says nothing about a real failure; only the error and the next copy do.)
+    fault::arm(0);
+    let error = clipboard.clear().unwrap_err();
+    assert!(fault::tripped());
+    fault::disarm();
+    assert!(matches!(error, ServiceError::Failed { .. }), "{error:?}");
+    clipboard
+        .set(ClipboardContent::from_text("copied again"))
+        .unwrap();
+    assert_eq!(clipboard.text().unwrap().as_deref(), Some("copied again"));
 }

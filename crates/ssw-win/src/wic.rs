@@ -15,7 +15,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::core::{GUID, Interface};
 
-use crate::com::{OsResultExt, WinError};
+use crate::com::{OsResultExt, WinError, delivered};
+use crate::fault::check;
 
 /// Pixels of a decoded image: 32-bit BGRA with premultiplied alpha, rows top to bottom.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,9 +58,10 @@ impl Wic {
     /// Fails when WIC is unavailable.
     pub fn new() -> Result<Self, WinError> {
         // SAFETY: standard in-process COM activation of the WIC factory.
-        let factory =
-            unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }
-                .ctx("create WIC factory")?;
+        let factory = check(unsafe {
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+        })
+        .ctx("create WIC factory")?;
         Ok(Self { factory })
     }
 
@@ -78,15 +80,15 @@ impl Wic {
         // SAFETY: the stream only borrows `bytes`, which outlives every use below; all COM
         // calls receive valid interface pointers and correctly sized buffers.
         unsafe {
-            let stream = self.factory.CreateStream().ctx("WIC CreateStream")?;
-            stream
-                .InitializeFromMemory(bytes)
-                .ctx("WIC stream from memory")?;
-            let decoder = self
-                .factory
-                .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
-                .ctx("WIC decoder")?;
-            let frame = decoder.GetFrame(0).ctx("WIC frame")?;
+            let stream = check(self.factory.CreateStream()).ctx("WIC CreateStream")?;
+            check(stream.InitializeFromMemory(bytes)).ctx("WIC stream from memory")?;
+            let decoder = check(self.factory.CreateDecoderFromStream(
+                &stream,
+                std::ptr::null(),
+                WICDecodeMetadataCacheOnDemand,
+            ))
+            .ctx("WIC decoder")?;
+            let frame = check(decoder.GetFrame(0)).ctx("WIC frame")?;
             self.convert_frame(&frame)
         }
     }
@@ -99,27 +101,21 @@ impl Wic {
     ) -> Result<DecodedImage, WinError> {
         // SAFETY: see the function contract; buffers are sized from the reported dimensions.
         unsafe {
-            let converter = self
-                .factory
-                .CreateFormatConverter()
-                .ctx("WIC format converter")?;
-            converter
-                .Initialize(
-                    frame,
-                    &GUID_WICPixelFormat32bppPBGRA,
-                    WICBitmapDitherTypeNone,
-                    None,
-                    0.0,
-                    WICBitmapPaletteTypeCustom,
-                )
-                .ctx("WIC convert to PBGRA")?;
+            let converter =
+                check(self.factory.CreateFormatConverter()).ctx("WIC format converter")?;
+            check(converter.Initialize(
+                frame,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            ))
+            .ctx("WIC convert to PBGRA")?;
             let (mut width, mut height) = (0u32, 0u32);
-            converter
-                .GetSize(&mut width, &mut height)
-                .ctx("WIC GetSize")?;
+            check(converter.GetSize(&mut width, &mut height)).ctx("WIC GetSize")?;
             let mut bgra = vec![0u8; (width as usize) * (height as usize) * 4];
-            converter
-                .CopyPixels(std::ptr::null(), width * 4, &mut bgra)
+            check(converter.CopyPixels(std::ptr::null(), width * 4, &mut bgra))
                 .ctx("WIC CopyPixels")?;
             Ok(DecodedImage {
                 width,
@@ -176,31 +172,25 @@ impl Wic {
         // from the image dimensions; the HGLOBAL is locked only while copied out.
         unsafe {
             let stream: IStream =
-                CreateStreamOnHGlobal(Default::default(), true).ctx("PNG memory stream")?;
-            let encoder = self
-                .factory
-                .CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())
-                .ctx("PNG encoder")?;
-            encoder
-                .Initialize(&stream, WICBitmapEncoderNoCache)
-                .ctx("PNG encoder init")?;
+                check(CreateStreamOnHGlobal(Default::default(), true)).ctx("PNG memory stream")?;
+            let encoder = check(
+                self.factory
+                    .CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null()),
+            )
+            .ctx("PNG encoder")?;
+            check(encoder.Initialize(&stream, WICBitmapEncoderNoCache)).ctx("PNG encoder init")?;
             let mut frame = None;
             let mut options: Option<IPropertyBag2> = None;
-            encoder
-                .CreateNewFrame(&mut frame, &mut options)
-                .ctx("PNG new frame")?;
-            let frame = frame.ok_or(WinError::Invalid("PNG encoder returned no frame"))?;
-            frame.Initialize(options.as_ref()).ctx("PNG frame init")?;
-            frame
-                .SetSize(image.width, image.height)
-                .ctx("PNG frame size")?;
+            let created = check(encoder.CreateNewFrame(&mut frame, &mut options));
+            let frame = delivered(created, frame).ctx("PNG new frame")?;
+            check(frame.Initialize(options.as_ref())).ctx("PNG frame init")?;
+            check(frame.SetSize(image.width, image.height)).ctx("PNG frame size")?;
             let mut format: GUID = GUID_WICPixelFormat32bppBGRA;
-            frame.SetPixelFormat(&mut format).ctx("PNG pixel format")?;
-            frame
-                .WritePixels(image.height, image.width * 4, &straight)
+            check(frame.SetPixelFormat(&mut format)).ctx("PNG pixel format")?;
+            check(frame.WritePixels(image.height, image.width * 4, &straight))
                 .ctx("PNG write pixels")?;
-            frame.Commit().ctx("PNG frame commit")?;
-            encoder.Commit().ctx("PNG commit")?;
+            check(frame.Commit()).ctx("PNG frame commit")?;
+            check(encoder.Commit()).ctx("PNG commit")?;
             read_stream(&stream)
         }
     }
@@ -215,15 +205,15 @@ unsafe fn read_stream(stream: &IStream) -> Result<Vec<u8>, WinError> {
     // length is the stream's own size, which never exceeds the allocation.
     unsafe {
         let mut stat = STATSTG::default();
-        stream.Stat(&mut stat, STATFLAG_NONAME).ctx("stream stat")?;
-        let length =
-            usize::try_from(stat.cbSize).map_err(|_| WinError::Invalid("stream too large"))?;
-        let hglobal = GetHGlobalFromStream(stream).ctx("stream HGLOBAL")?;
-        if GlobalSize(hglobal) < length {
+        check(stream.Stat(&mut stat, STATFLAG_NONAME)).ctx("stream stat")?;
+        let hglobal = check(GetHGlobalFromStream(stream)).ctx("stream HGLOBAL")?;
+        if (GlobalSize(hglobal) as u64) < stat.cbSize {
             return Err(WinError::Invalid(
                 "memory stream is shorter than its length",
             ));
         }
+        // The block holds that many bytes, so the length fits `usize`.
+        let length = stat.cbSize as usize;
         let pointer = GlobalLock(hglobal) as *const u8;
         if pointer.is_null() {
             return Err(WinError::Invalid("memory stream could not be locked"));
@@ -322,17 +312,114 @@ mod tests {
             height: 0,
             bgra: Vec::new(),
         };
-        assert!(matches!(wic.encode_png(&empty), Err(WinError::Invalid(_))));
+        let refused = "cannot encode an empty or inconsistent image";
+        assert_eq!(wic.encode_png(&empty).unwrap_err().to_string(), refused);
         let short = DecodedImage {
             width: 2,
             height: 2,
             bgra: vec![0; 4],
         };
-        assert!(matches!(wic.encode_png(&short), Err(WinError::Invalid(_))));
-        assert!(matches!(
-            wic.bitmap_from_bgra(2, 2, &[0; 3]),
-            Err(WinError::Invalid(_))
-        ));
+        assert_eq!(wic.encode_png(&short).unwrap_err().to_string(), refused);
+        assert_eq!(
+            wic.bitmap_from_bgra(2, 2, &[0; 3]).unwrap_err().to_string(),
+            "pixel buffer does not match the image size"
+        );
+    }
+
+    #[test]
+    fn a_pixel_the_buffer_does_not_hold_is_none() {
+        // The size claims 2x2 pixels; the buffer holds only the first one.
+        let truncated = DecodedImage {
+            width: 2,
+            height: 2,
+            bgra: vec![1, 2, 3, 4],
+        };
+        assert_eq!(truncated.pixel(0, 0), Some([1, 2, 3, 4]));
+        assert_eq!(truncated.pixel(1, 1), None);
+    }
+
+    #[test]
+    fn a_memory_stream_whose_block_cannot_be_read_is_refused() {
+        use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
+        use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalReAlloc};
+
+        let _com = ComGuard::apartment_threaded().unwrap();
+        // An empty stream owns a block of no bytes, which cannot be locked.
+        // SAFETY: a null handle makes the stream allocate its own block, freed with the stream.
+        let empty = unsafe { CreateStreamOnHGlobal(HGLOBAL::default(), true) }.unwrap();
+        // SAFETY: `empty` was created by `CreateStreamOnHGlobal`.
+        let error = unsafe { read_stream(&empty) }.unwrap_err();
+        assert_eq!(error.to_string(), "memory stream could not be locked");
+
+        // SAFETY: the block is the caller's (`false`): the stream never frees it; it is freed
+        // below after the stream is gone. It shrinks behind the stream's back, which still
+        // reports the old length.
+        let (stream, block) = unsafe {
+            let block = GlobalAlloc(GMEM_MOVEABLE, 256).unwrap();
+            let stream = CreateStreamOnHGlobal(block, false).unwrap();
+            (stream, GlobalReAlloc(block, 1, GMEM_MOVEABLE.0).unwrap())
+        };
+        // SAFETY: `stream` was created by `CreateStreamOnHGlobal`.
+        let error = unsafe { read_stream(&stream) }.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "memory stream is shorter than its length"
+        );
+        drop(stream);
+        // SAFETY: `block` is the live allocation made above, freed once.
+        // (`GlobalFree` returns NULL on success, which its `Result` wrapper reports as an error.)
+        let _ = unsafe { GlobalFree(Some(block)) };
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn every_failing_step_of_the_wic_operations_is_reported_under_its_own_name() {
+        use crate::fault::{all_failed, failed_step, sweep};
+
+        let _com = ComGuard::apartment_threaded().unwrap();
+        let steps = sweep(|| failed_step(Wic::new()));
+        assert_eq!(steps, all_failed(&["create WIC factory"]));
+
+        let wic = Wic::new().unwrap();
+        let image = sample();
+        let png = wic.encode_png(&image).unwrap();
+        let steps = sweep(|| failed_step(wic.decode(&png)));
+        assert_eq!(
+            steps,
+            all_failed(&[
+                "WIC CreateStream",
+                "WIC stream from memory",
+                "WIC decoder",
+                "WIC frame",
+                "WIC format converter",
+                "WIC convert to PBGRA",
+                "WIC GetSize",
+                "WIC CopyPixels",
+            ])
+        );
+        let steps = sweep(|| failed_step(wic.encode_png(&image)));
+        assert_eq!(
+            steps,
+            all_failed(&[
+                "PNG memory stream",
+                "PNG encoder",
+                "PNG encoder init",
+                "PNG new frame",
+                "PNG frame init",
+                "PNG frame size",
+                "PNG pixel format",
+                "PNG write pixels",
+                "PNG frame commit",
+                "PNG commit",
+                "stream stat",
+                "stream HGLOBAL",
+            ])
+        );
+        // The operations are unharmed by the failures they survived.
+        assert_eq!(
+            wic.decode(&png).unwrap().pixel(0, 0),
+            Some([0, 0, 255, 255])
+        );
     }
 
     #[test]

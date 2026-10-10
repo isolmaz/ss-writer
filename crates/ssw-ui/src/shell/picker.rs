@@ -577,6 +577,213 @@ impl RowList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canvas::{DrawOp, RecordingCanvas};
+    use crate::input::Modifiers;
+    use crate::widgets::testkit::Harness;
+
+    fn list_of(rows: Vec<Row>, height: f32) -> RowList {
+        let mut list = RowList::new("Results", 10);
+        list.set_rows(rows);
+        list.arrange(Rect::new(10.0, 20.0, 200.0, height));
+        list
+    }
+
+    fn plain(count: usize) -> Vec<Row> {
+        (0..count).map(|n| Row::new(format!("row {n}"))).collect()
+    }
+
+    fn header(label: &str) -> Row {
+        Row {
+            header: true,
+            ..Row::new(label)
+        }
+    }
+
+    fn press(list: &mut RowList, key: u16) -> RowKey {
+        list.key(&KeyEvent::press(key, Modifiers::NONE))
+    }
+
+    fn wheel(list: &mut RowList, at: Point, dy: f32, precise: bool) -> bool {
+        list.wheel(&WheelEvent {
+            delta: Point::new(0.0, dy),
+            precise,
+            position: at,
+            mods: Modifiers::NONE,
+        })
+    }
+
+    fn paint(harness: &Harness, list: &RowList, damage: Option<Rect>) -> RecordingCanvas {
+        let mut canvas = RecordingCanvas::new();
+        let cx = PaintCx::new(
+            list.id(),
+            &harness.theme,
+            1.0,
+            &harness.engine,
+            &harness.focus,
+            &harness.capture,
+            damage,
+        );
+        list.paint(&cx, &mut canvas);
+        canvas
+    }
+
+    fn count_fills(canvas: &RecordingCanvas, color: crate::geometry::Color) -> usize {
+        canvas
+            .ops()
+            .filter(|op| matches!(op, DrawOp::FillRoundedRect { color: c, .. } if *c == color))
+            .count()
+    }
+
+    #[test]
+    fn a_new_list_selects_its_first_row_and_reports_its_size() {
+        let list = list_of(plain(3), 96.0);
+        assert_eq!(list.len(), 3);
+        assert!(!list.is_empty());
+        assert_eq!(list.rows()[1].label, "row 1");
+        assert_eq!(list.selected(), Some(0));
+        assert_eq!(RowList::new("Empty", 4).len(), 0);
+    }
+
+    #[test]
+    fn headers_that_cannot_collapse_are_skipped_by_selection() {
+        let rows = vec![header("One"), Row::new("a"), header("Two"), Row::new("b")];
+        let mut list = list_of(rows, 128.0);
+        assert_eq!(list.selected(), Some(1));
+        assert!(!list.select(0) && !list.select(2) && !list.select(9));
+        assert_eq!(list.selected(), Some(1));
+        // Stepping passes the header and wraps around in both directions.
+        assert!(list.step(1));
+        assert_eq!(list.selected(), Some(3));
+        assert!(list.step(1));
+        assert_eq!(list.selected(), Some(1));
+        assert!(list.step(-1));
+        assert_eq!(list.selected(), Some(3));
+    }
+
+    #[test]
+    fn a_list_without_selectable_rows_never_selects() {
+        let mut list = list_of(vec![header("One"), header("Two")], 64.0);
+        assert_eq!(list.selected(), None);
+        assert!(!list.step(1) && !list.step(-1));
+        assert_eq!(press(&mut list, vk::DOWN), RowKey::Moved);
+        assert_eq!(press(&mut list, vk::END), RowKey::Moved);
+        assert_eq!(list.selected(), None);
+        assert_eq!(press(&mut list, vk::RETURN), RowKey::Ignored);
+        let mut empty = list_of(Vec::new(), 64.0);
+        assert!(!empty.step(1));
+        assert_eq!(press(&mut empty, vk::HOME), RowKey::Moved);
+        assert_eq!(empty.selected(), None);
+    }
+
+    #[test]
+    fn navigation_keys_move_by_row_page_and_to_the_ends() {
+        let mut list = list_of(plain(8), 96.0);
+        assert_eq!(list.capacity(), 3);
+        assert_eq!(press(&mut list, vk::END), RowKey::Moved);
+        assert_eq!((list.selected(), list.first_visible()), (Some(7), 5));
+        assert_eq!(press(&mut list, vk::HOME), RowKey::Moved);
+        assert_eq!((list.selected(), list.first_visible()), (Some(0), 0));
+        press(&mut list, vk::PAGE_DOWN);
+        assert_eq!(list.selected(), Some(3));
+        press(&mut list, vk::PAGE_UP);
+        assert_eq!(list.selected(), Some(0));
+        assert_eq!(press(&mut list, vk::RETURN), RowKey::Activate(0));
+        assert_eq!(press(&mut list, vk::F3), RowKey::Ignored);
+        // Modified keys belong to the owner.
+        let ctrl_down = KeyEvent::press(vk::DOWN, Modifiers::CTRL);
+        assert_eq!(list.key(&ctrl_down), RowKey::Ignored);
+        assert_eq!(list.selected(), Some(0));
+    }
+
+    #[test]
+    fn the_wheel_scrolls_whole_rows_only_over_the_list() {
+        let mut list = list_of(plain(8), 96.0);
+        let inside = Point::new(50.0, 50.0);
+        assert!(!wheel(&mut list, Point::new(500.0, 500.0), -64.0, true));
+        assert_eq!(list.first_visible(), 0);
+        // A precise wheel scrolls by the distance, a notched one three rows per notch.
+        assert!(wheel(&mut list, inside, -64.0, true));
+        assert_eq!(list.first_visible(), 2);
+        assert!(wheel(&mut list, inside, -1.0, false));
+        assert_eq!(list.first_visible(), 5);
+        assert!(!wheel(&mut list, inside, -1.0, false));
+        assert_eq!(list.first_visible(), 5);
+        assert_eq!(list.selected(), Some(0));
+    }
+
+    #[test]
+    fn only_rows_in_view_can_be_hit_or_clicked() {
+        let mut list = list_of(plain(1), 96.0);
+        assert_eq!(list.hit(Point::new(20.0, 30.0)), Some(0));
+        assert_eq!(list.hit(Point::new(500.0, 500.0)), None);
+        // Inside the bounds but below the last row.
+        let blank = Point::new(20.0, 20.0 + 2.0 * ROW_HEIGHT);
+        assert_eq!(list.hit(blank), None);
+        assert_eq!(list.click(blank), None);
+        assert_eq!(list.click(Point::new(500.0, 500.0)), None);
+        assert_eq!(list.click(Point::new(20.0, 30.0)), Some(RowClick::Item(0)));
+    }
+
+    #[test]
+    fn hovering_highlights_selectable_rows_only() {
+        let harness = Harness::new();
+        let hover = harness.theme.tokens.hover_bg;
+        let mut list = list_of(plain(3), 96.0);
+        assert_eq!(count_fills(&paint(&harness, &list, None), hover), 0);
+        assert!(list.hover_at(Point::new(20.0, 20.0 + 1.5 * ROW_HEIGHT)));
+        assert!(!list.hover_at(Point::new(20.0, 20.0 + 1.6 * ROW_HEIGHT)));
+        assert_eq!(count_fills(&paint(&harness, &list, None), hover), 1);
+        assert!(list.clear_hover());
+        assert!(!list.clear_hover());
+        assert_eq!(count_fills(&paint(&harness, &list, None), hover), 0);
+        // A header that cannot collapse is not a target.
+        let mut grouped = list_of(vec![header("One"), Row::new("a")], 64.0);
+        assert!(grouped.hover_at(Point::new(20.0, 30.0)));
+        assert_eq!(count_fills(&paint(&harness, &grouped, None), hover), 0);
+    }
+
+    #[test]
+    fn painting_follows_the_damage_and_the_focus() {
+        let mut harness = Harness::new();
+        let list = list_of(plain(3), 96.0);
+        let away = Rect::new(500.0, 500.0, 10.0, 10.0);
+        assert_eq!(paint(&harness, &list, Some(away)).ops().count(), 0);
+        assert!(paint(&harness, &list, Some(list.bounds())).ops().count() > 0);
+        let ring = harness.theme.tokens.focus_ring;
+        let rings = |canvas: &RecordingCanvas| {
+            canvas
+                .ops()
+                .filter(
+                    |op| matches!(op, DrawOp::StrokeRoundedRect { color, .. } if *color == ring),
+                )
+                .count()
+        };
+        assert_eq!(rings(&paint(&harness, &list, None)), 0);
+        harness.focus.begin_tab_order();
+        harness.focus.add_tab_stop(list.id());
+        harness.focus.commit_tab_order();
+        assert!(harness.focus.focus(list.id()));
+        assert_eq!(rings(&paint(&harness, &list, None)), 1);
+    }
+
+    #[test]
+    fn collapsible_headers_show_a_chevron_for_their_state() {
+        let harness = Harness::new();
+        let group = |label: &str, expanded: bool| Row {
+            expanded: Some(expanded),
+            ..header(label)
+        };
+        let list = list_of(vec![group("Closed", false), group("Open", true)], 64.0);
+        let canvas = paint(&harness, &list, None);
+        let glyphs: Vec<char> = canvas
+            .ops()
+            .filter_map(|op| match op {
+                DrawOp::Icon { glyph, .. } => Some(*glyph),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(glyphs, [glyph::CHEVRON_RIGHT, glyph::CHEVRON_DOWN]);
+    }
 
     #[test]
     fn highlight_ranges_merge_adjacent_characters_in_bytes() {

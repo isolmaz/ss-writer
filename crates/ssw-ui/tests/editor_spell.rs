@@ -10,13 +10,14 @@ use std::rc::Rc;
 
 use editor_common::{ADVANCE, COLUMN_LEFT, Harness, TOP, close};
 use ssw_core::command::CommandId;
+use ssw_core::edit::Selection;
 use ssw_core::text::TextRange;
 use ssw_ui::canvas::{DrawOp, RecordingCanvas};
 use ssw_ui::editor::EditorEvent;
 use ssw_ui::editor::block::{BlockClass, ParagraphRenderer};
 use ssw_ui::editor::spell::{self, SpellCheck, SpellProvider, SpellRenderer, SpellStrings};
 use ssw_ui::geometry::{Point, Rect, Size};
-use ssw_ui::input::{Event, Modifiers, PointerButton, PointerEvent, PointerEventKind};
+use ssw_ui::input::{Cursor, Event, Modifiers, PointerButton, PointerEvent, PointerEventKind, vk};
 
 /// The words of `text` (letters, digits and apostrophes) as byte ranges.
 fn words(text: &str) -> Vec<Range<usize>> {
@@ -510,4 +511,50 @@ fn a_wrapper_can_be_put_around_any_renderer() {
         .register(BlockClass::Paragraph, Rc::new(renderer));
     let canvas = h.paint();
     assert_eq!(squiggles(&h, &canvas).len(), 1);
+}
+
+#[test]
+fn a_paragraph_without_checkable_text_gets_no_squiggles() {
+    let (h, _dictionary, _spell) = editor("`xyzzy`\n", &[]);
+    let canvas = h.paint();
+    assert!(squiggles(&h, &canvas).is_empty());
+}
+
+#[test]
+fn a_checked_paragraph_still_answers_selection_lines_links_cursor_and_description() {
+    let (mut h, _dictionary, _spell) =
+        editor("see [link](http://x.test) here\n", &["see", "link", "here"]);
+    // The selection is drawn through the wrapped layout.
+    h.view.set_selection(Selection::new(0, 3));
+    let selection_color = h.theme.tokens.selection_bg;
+    let canvas = h.paint();
+    assert!(
+        canvas.recorded().iter().any(|entry| {
+            matches!(&entry.op, DrawOp::FillRect { color, .. } if *color == selection_color)
+                && entry
+                    .bounds
+                    .is_some_and(|b| close(b.x, COLUMN_LEFT) && close(b.width, 3.0 * ADVANCE))
+        }),
+        "a selection rectangle over the first three characters"
+    );
+    // End goes to the end of the line.
+    h.set_caret(0);
+    h.press(vk::END);
+    assert_eq!(h.selection(), Selection::caret(30));
+    // The link is found and shows the hand with Ctrl held.
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(5),
+        0,
+        Modifiers::CTRL,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Hand));
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(5),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+    assert_eq!(h.access().description, "Paragraph");
 }

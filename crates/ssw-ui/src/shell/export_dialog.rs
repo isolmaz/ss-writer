@@ -282,6 +282,12 @@ impl ExportDialog {
         dialog
     }
 
+    /// The control that should have the keyboard focus when the dialog opens: the format list.
+    #[must_use]
+    pub fn focus_id(&self) -> WidgetId {
+        self.formats.id()
+    }
+
     /// The format that will be exported.
     #[must_use]
     pub fn format(&self) -> ExportFormat {
@@ -392,8 +398,8 @@ impl ExportDialog {
                 (OptionKey::BlackText, Change::Toggled(on)) => self.options.black_text = on,
                 (OptionKey::LightTheme, Change::Toggled(on)) => self.options.light_theme = on,
                 (OptionKey::IncludeTitle, Change::Toggled(on)) => self.options.include_title = on,
-                (_, Change::Submitted) => submit = true,
-                _ => {}
+                // Only Enter in a text box is left: no other control reports anything else.
+                (_, change) => submit |= change == Change::Submitted,
             }
         }
         self.export.set_enabled(self.can_export());

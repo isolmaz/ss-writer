@@ -210,6 +210,14 @@ fn each_face_is_registered_once_per_scene() {
 }
 
 #[test]
+fn zero_width_strokes_are_dropped_and_visible_ones_kept() {
+    let hairless = scene_of(&format!("{PAGE}#line(length: 20pt, stroke: 0pt)"));
+    assert!(strokes(&hairless).is_empty());
+    let visible = scene_of(&format!("{PAGE}#line(length: 20pt, stroke: 1pt)"));
+    assert_eq!(strokes(&visible).len(), 1);
+}
+
+#[test]
 fn rectangles_become_fill_and_stroke() {
     let scene = scene_of(&format!(
         "{PAGE}#rect(width: 40pt, height: 20pt, fill: rgb(\"#ff0000\"), stroke: 2pt + rgb(\"#0000ff\"))"

@@ -234,12 +234,19 @@ pub(super) fn pad_truncated(bytes: &[u8]) -> Option<Vec<u8>> {
     if !(7..=16).contains(&shift) {
         return None;
     }
-    let ssz = 1usize << shift;
-    let n_fat = u32::from_le_bytes([bytes[0x2C], bytes[0x2D], bytes[0x2E], bytes[0x2F]]) as usize;
-    let want = ssz.checked_mul(1usize.checked_add(n_fat.checked_mul(ssz / 4)?)?)?;
-    if want <= bytes.len() || want > MAX_PAD {
+    let ssz = 1u64 << shift;
+    let n_fat = u64::from(u32::from_le_bytes([
+        bytes[0x2C],
+        bytes[0x2D],
+        bytes[0x2E],
+        bytes[0x2F],
+    ]));
+    // At most (1 + 2^32 * 2^14) * 2^16 < 2^63: fits in `u64` whatever the header says.
+    let want = ssz * (1 + n_fat * (ssz / 4));
+    if want <= bytes.len() as u64 || want > MAX_PAD as u64 {
         return None;
     }
+    let want = want as usize;
     let mut v = Vec::with_capacity(want);
     v.extend_from_slice(bytes);
     v.resize(want, 0);
@@ -421,10 +428,13 @@ pub(super) mod tests {
         ];
         for (ident, nfib, expect) in cases {
             let w = fib_bytes(ident, nfib, 0, 14, 22, &[]);
-            match Fib::parse(&w) {
-                Err(ImportError::UnsupportedVersion(m)) => assert!(m.contains(expect), "{m}"),
-                other => panic!("{other:?}"),
-            }
+            assert!(
+                matches!(
+                    Fib::parse(&w),
+                    Err(ImportError::UnsupportedVersion(m)) if m.contains(expect)
+                ),
+                "{ident:#06x}/{nfib:#06x} should be refused as {expect}"
+            );
         }
         assert!(matches!(
             Fib::parse(&fib_bytes(0x1234, 0x00C1, 0, 14, 22, &[])),
@@ -506,13 +516,14 @@ pub(super) mod tests {
             (b"<!DOCTYPE html>", "HTML"),
         ];
         for (input, want) in cases {
-            match load(input) {
-                Err(ImportError::WrongFormat { expected, detected }) => {
-                    assert_eq!((expected, detected), ("DOC", want));
-                }
-                Err(other) => panic!("{other:?}"),
-                Ok(_) => panic!("accepted {input:?}"),
-            }
+            assert_eq!(
+                load(input).err(),
+                Some(ImportError::WrongFormat {
+                    expected: "DOC",
+                    detected: want
+                }),
+                "{input:?}"
+            );
         }
         assert_eq!(
             load(&[0xDB, 0xA5, 0, 1, 2, 3, 4, 5, 6, 7, 8]).err(),

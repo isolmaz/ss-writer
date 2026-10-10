@@ -265,14 +265,14 @@ impl SourceText {
     pub fn line_range(&self, offset: usize) -> TextRange {
         let map = &self.display.map;
         let display = self.display_offset(offset);
-        let Some(line) = self
-            .layout
+        // `line_for_offset` always names an existing line; the collapsed range is only the
+        // contract's answer for a layout without one.
+        self.layout
             .line_metrics(self.layout.line_for_offset(display))
-        else {
-            return TextRange::at(offset);
-        };
-        let start = map.display_to_source(line.start);
-        let end = map.display_to_source(line.content_end());
-        TextRange::new(start, end.max(start))
+            .map_or(TextRange::at(offset), |line| {
+                let start = map.display_to_source(line.start);
+                let end = map.display_to_source(line.content_end());
+                TextRange::new(start, end.max(start))
+            })
     }
 }

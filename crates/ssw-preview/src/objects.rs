@@ -221,10 +221,12 @@ mod tests {
     }
 
     fn ready(state: ObjectState) -> ObjectInfo {
-        match state {
-            ObjectState::Ready(info) => info,
-            other => panic!("expected a ready object, got {other:?}"),
+        let mut info = None;
+        if let ObjectState::Ready(ready) = state {
+            info = Some(ready);
         }
+        assert!(info.is_some(), "expected a ready object, got {state:?}");
+        info.unwrap()
     }
 
     #[test]
@@ -249,12 +251,13 @@ mod tests {
             "{first:?}"
         );
         assert!(first.baseline > 0.0 && first.baseline <= first.size.height);
-        let ObjectVisual::Scene(id) = first.visual else {
-            panic!("a formula is a scene");
-        };
         let fresh = objects.take_fresh();
         assert_eq!(fresh.len(), 1);
-        assert_eq!(fresh[0].0, id);
+        assert_eq!(
+            first.visual,
+            ObjectVisual::Scene(fresh[0].0),
+            "a formula is the scene that was typeset"
+        );
         assert_eq!(fresh[0].1.size.width, first.size.width);
         assert_eq!(
             ready(objects.object(&math)),

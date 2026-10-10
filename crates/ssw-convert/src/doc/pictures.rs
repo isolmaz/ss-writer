@@ -84,11 +84,13 @@ fn walk(d: &[u8], mut p: usize, end: usize, depth: u8, out: &mut Option<Blip>) {
     if depth > 6 {
         return;
     }
+    // `end <= d.len()` holds for every caller (`locate` slices `d` at `end`; records only recurse
+    // into their own body), so the 8-byte record header below is always in bounds.
     while p + 8 <= end && !matches!(out, Some(Blip::Bitmap { .. })) {
-        let (Some(vi), Some(ty), Some(len)) = (u16le(d, p), u16le(d, p + 2), u32le(d, p + 4))
-        else {
-            return;
-        };
+        let hdr = &d[p..p + 8];
+        let vi = u16::from_le_bytes([hdr[0], hdr[1]]);
+        let ty = u16::from_le_bytes([hdr[2], hdr[3]]);
+        let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
         let (ver, inst) = (vi & 0xF, vi >> 4);
         let body = p + 8;
         let body_end = body.saturating_add(len as usize);
@@ -335,12 +337,8 @@ mod tests {
             let kind = &png[o + 4..o + 8];
             let body = &png[o + 8..o + 8 + len];
             let crc = u32::from_be_bytes(png[o + 8 + len..o + 12 + len].try_into().unwrap());
-            assert_eq!(
-                crc,
-                crc32(&png[o + 4..o + 8 + len]),
-                "crc of {}",
-                String::from_utf8_lossy(kind)
-            );
+            let name = String::from_utf8_lossy(kind);
+            assert_eq!(crc, crc32(&png[o + 4..o + 8 + len]), "crc of {name}");
             match kind {
                 b"IHDR" => {
                     dims = (
@@ -562,7 +560,7 @@ mod tests {
         let gif = *b"GIF89a--";
         let tif = [b'I', b'I', 42, 0];
         type BlipCase<'a> = (u16, u16, usize, &'a [u8], bool, Picture);
-        let cases: [BlipCase<'_>; 8] = [
+        let cases: [BlipCase<'_>; 11] = [
             (
                 0x64,
                 0xF01D,
@@ -622,9 +620,28 @@ mod tests {
             (0x64, 0xF01A, 0x3D4, &[1, 2, 3], false, Picture::Vector),
             (0x64, 0xF01B, 0x216, &[1, 2, 3], true, Picture::Vector),
             (0x64, 0xF01F, 0x7A8, &[1, 2, 3], false, Picture::Unreadable),
+            // the two-UID variants of DIB and TIFF blips
+            (0x64, 0xF01F, 0x7A9, &[1, 2, 3], false, Picture::Unreadable),
+            (
+                0x64,
+                0xF029,
+                0x6E5,
+                &tif,
+                true,
+                Picture::Image {
+                    ext: "tif",
+                    bytes: tif.to_vec(),
+                },
+            ),
+            // a blip record whose instance does not name a known format yields nothing
+            (0x64, 0xF01E, 0x123, &png, false, Picture::Unreadable),
         ];
         for (mm, ty, inst, payload, fbse, want) in cases {
-            let uids = if matches!(inst, 0x46B | 0x6E1) { 2 } else { 1 };
+            let uids = if matches!(inst, 0x46B | 0x6E1 | 0x7A9 | 0x6E5) {
+                2
+            } else {
+                1
+            };
             let rec = pic_record(mm, ty, inst as u16, uids, payload, fbse);
             let mut data = vec![0xEE; 7];
             data.extend_from_slice(&rec);
@@ -633,10 +650,15 @@ mod tests {
         // DIB payloads become PNG
         let d = dib(1, 1, 24, 0, &[], &[], &[1, 2, 3, 0]);
         let rec = pic_record(0x64, 0xF01F, 0x7A8, 1, &d, false);
-        match extract(&rec, 0) {
-            Picture::Image { ext: "png", bytes } => assert_eq!(decode(&bytes).2, vec![0, 3, 2, 1]),
-            other => panic!("{other:?}"),
-        }
+        let png = dib_to_png(&d).unwrap();
+        assert_eq!(decode(&png).2, vec![0, 3, 2, 1]);
+        assert_eq!(
+            extract(&rec, 0),
+            Picture::Image {
+                ext: "png",
+                bytes: png
+            }
+        );
     }
 
     #[test]

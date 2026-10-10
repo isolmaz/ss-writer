@@ -698,11 +698,11 @@ mod tests {
     #[test]
     fn section_titles_exist_in_english() {
         for section in SettingsSection::ALL {
-            let prefix = format!("{} =", section.label_id());
+            let id = section.label_id();
+            let prefix = format!("{id} =");
             assert!(
                 MAIN_FTL.lines().any(|l| l.starts_with(&prefix)),
-                "missing ftl message {}",
-                section.label_id()
+                "missing ftl message {id}"
             );
         }
     }

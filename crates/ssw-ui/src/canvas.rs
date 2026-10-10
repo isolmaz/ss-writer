@@ -730,7 +730,16 @@ mod tests {
                 .close()
                 .arc_to(Point::new(1.0, 1.0), Size::new(1.0, 1.0), 0.0, false, false);
         assert_eq!(closed.verbs()[3], PathVerb::MoveTo(Point::ZERO));
-        assert!(matches!(closed.verbs()[4], PathVerb::ArcTo { .. }));
+        assert_eq!(
+            closed.verbs()[4],
+            PathVerb::ArcTo {
+                to: Point::new(1.0, 1.0),
+                radii: Size::new(1.0, 1.0),
+                rotation_degrees: 0.0,
+                large_arc: false,
+                sweep_clockwise: false,
+            }
+        );
     }
 
     #[test]

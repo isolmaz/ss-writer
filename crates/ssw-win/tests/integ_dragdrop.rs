@@ -4,13 +4,14 @@
 //! Escape table, and `start_drag` runs a whole drag through a loop that drives the target.
 //! `DoDragDrop` (modal, pointer-driven) is never called.
 
+mod support;
+
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use ssw_win::com::{ComGuard, WinError};
 use ssw_win::dragdrop::{
@@ -19,6 +20,7 @@ use ssw_win::dragdrop::{
     drag_progress, drop_source, drop_target, files_share_volume, start_drag,
 };
 use ssw_win::services::clipboard::{FORMAT_HTML, build_cf_html, build_hdrop, encode_text};
+use support::MachineLock;
 use windows::Win32::Foundation::{
     DATA_S_SAMEFORMATETC, DRAGDROP_E_ALREADYREGISTERED, DRAGDROP_E_NOTREGISTERED,
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_DVASPECT,
@@ -49,19 +51,17 @@ use windows::core::{BOOL, HRESULT, HSTRING, implement, w};
 /// `GetDriveTypeW` answer of a local fixed disk.
 const DRIVE_FIXED: u32 = 3;
 
-/// Serializes the tests that drive a drop target: the shell's drag helper keeps process-wide
-/// drag state, and real drags never overlap (there is one pointer).
-static DRAGS: Mutex<()> = Mutex::new(());
-
-/// OLE initialized on the test's thread while holding [`DRAGS`]. Bind it first in a test: it is
-/// then dropped after every COM object of the test (OLE goes first, then the lock).
+/// OLE initialized on the test's thread while holding the machine-wide drag lock (the shell's
+/// drag helper keeps drag state, and real drags never overlap: there is one pointer), also
+/// across the processes of a parallel test run. Bind it first in a test: it is then dropped
+/// after every COM object of the test (OLE goes first, then the lock).
 struct OleSession {
     _ole: OleGuard,
-    _lock: MutexGuard<'static, ()>,
+    _lock: MachineLock,
 }
 
 fn ole() -> OleSession {
-    let lock = DRAGS.lock().unwrap_or_else(PoisonError::into_inner);
+    let lock = MachineLock::acquire("dragdrop");
     OleSession {
         _ole: OleGuard::initialize().unwrap(),
         _lock: lock,

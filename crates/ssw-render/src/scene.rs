@@ -512,6 +512,15 @@ pub enum Paint {
 }
 
 impl Paint {
+    /// Color stops of a gradient; `None` for a solid color.
+    pub fn stops(&self) -> Option<&[GradientStop]> {
+        match self {
+            Paint::Solid(_) => None,
+            Paint::Linear(gradient) => Some(gradient.stops.as_slice()),
+            Paint::Radial(gradient) => Some(gradient.stops.as_slice()),
+        }
+    }
+
     /// Same paint with all colors' alpha multiplied by `opacity`.
     pub fn with_opacity(&self, opacity: f32) -> Paint {
         let scale = |stops: &[GradientStop]| -> Vec<GradientStop> {
@@ -759,6 +768,38 @@ impl SceneItem {
         }
     }
 
+    /// The group, when this item is one.
+    pub fn as_group(&self) -> Option<&Group> {
+        match self {
+            SceneItem::Group(group) => Some(group),
+            _ => None,
+        }
+    }
+
+    /// The fill, when this item is one.
+    pub fn as_fill(&self) -> Option<&Fill> {
+        match self {
+            SceneItem::Fill(fill) => Some(fill),
+            _ => None,
+        }
+    }
+
+    /// The stroke, when this item is one.
+    pub fn as_stroke(&self) -> Option<&Stroke> {
+        match self {
+            SceneItem::Stroke(stroke) => Some(stroke),
+            _ => None,
+        }
+    }
+
+    /// The glyph run, when this item is one.
+    pub fn as_glyphs(&self) -> Option<&Glyphs> {
+        match self {
+            SceneItem::Glyphs(run) => Some(run),
+            _ => None,
+        }
+    }
+
     /// Rewrites font references (`map[old.0]` is the new reference).
     fn remap_fonts(&mut self, map: &[FontRef]) {
         match self {
@@ -976,6 +1017,17 @@ mod tests {
         axis.move_to(0.0, 0.0);
         axis.cubic_to(0.0, 1.0, 0.0, 2.0, 0.0, 3.0);
         assert_eq!(axis.bounds(), Some(Rect::new(0.0, 0.0, 0.0, 3.0)));
+        // x control points 0, 2, 2, 0 cancel the cubic term: a parabola peaking at x = 1.5.
+        let mut parabola = Path::new();
+        parabola.move_to(0.0, 0.0);
+        parabola.cubic_to(2.0, 0.0, 2.0, 0.0, 0.0, 0.0);
+        let b = parabola.bounds().expect("bounds");
+        assert!(rect_close(b, 0.0, 0.0, 1.5, 0.0), "{b:?}");
+        // x control points 0, 1, 2, 4 give a strictly increasing cubic: no real extremum.
+        let mut monotone = Path::new();
+        monotone.move_to(0.0, 0.0);
+        monotone.cubic_to(1.0, 0.0, 2.0, 0.0, 4.0, 0.0);
+        assert_eq!(monotone.bounds(), Some(Rect::new(0.0, 0.0, 4.0, 0.0)));
         // Quadratic with the control point outside only on one axis, and with t outside (0, 1).
         let mut q2 = Path::new();
         q2.move_to(0.0, 0.0);
@@ -1156,15 +1208,9 @@ mod tests {
         let _unused = outer.add_font(Arc::new(FontData::new(vec![1u8], 0)));
         outer.embed(&inner, Transform::translate(5.0, 5.0));
         assert_eq!(outer.fonts.len(), 2);
-        let SceneItem::Group(g) = &outer.items[0] else {
-            panic!("embed must add a group");
-        };
-        let SceneItem::Group(g2) = &g.items[0] else {
-            panic!("nested group expected");
-        };
-        let SceneItem::Glyphs(run) = &g2.items[0] else {
-            panic!("glyph run expected");
-        };
+        let g = outer.items[0].as_group().expect("embed must add a group");
+        let g2 = g.items[0].as_group().expect("nested group expected");
+        let run = g2.items[0].as_glyphs().expect("glyph run expected");
         assert_eq!(run.font, FontRef(1));
         assert_eq!(g.transform, Transform::translate(5.0, 5.0));
 
@@ -1231,13 +1277,11 @@ mod tests {
         });
         for paint in [linear, radial] {
             let faded = paint.with_opacity(0.5);
-            let stops = match &faded {
-                Paint::Linear(g) => &g.stops,
-                Paint::Radial(g) => &g.stops,
-                Paint::Solid(_) => panic!("gradient expected"),
-            };
+            let stops = faded.stops().expect("gradient expected");
+            assert_eq!(stops.len(), 2);
             assert!(stops.iter().all(|s| s.color.a == 128));
         }
+        assert!(Paint::Solid(Color::BLACK).stops().is_none());
         assert_eq!(
             Paint::Solid(Color::BLACK).with_opacity(0.0),
             Paint::Solid(Color::TRANSPARENT)
@@ -1254,6 +1298,53 @@ mod tests {
         assert_eq!(LineCap::default(), LineCap::Butt);
         assert_eq!(LineJoin::default(), LineJoin::Miter);
         assert_eq!(SpreadMode::default(), SpreadMode::Pad);
+    }
+
+    #[test]
+    fn scene_item_accessors_match_only_their_variant() {
+        let glyphs = SceneItem::Glyphs(Glyphs {
+            font: FontRef(0),
+            size: 10.0,
+            glyphs: Vec::new(),
+            width: 0.0,
+            paint: solid(),
+        });
+        let stroke = SceneItem::Stroke(Stroke {
+            path: Path::new(),
+            paint: solid(),
+            width: 2.0,
+            cap: LineCap::Butt,
+            join: LineJoin::Miter,
+            dash: None,
+            miter_limit: 4.0,
+        });
+        let group = SceneItem::Group(Group::new(Vec::new()));
+        let filled = fill(Path::new());
+        // The payload is returned intact.
+        assert_eq!(stroke.as_stroke().map(|s| s.width), Some(2.0));
+        assert_eq!(glyphs.as_glyphs().map(|g| g.size), Some(10.0));
+        // Each accessor yields exactly its own variant.
+        let items = [&group, &filled, &stroke, &glyphs];
+        let variants: Vec<[bool; 4]> = items
+            .iter()
+            .map(|item| {
+                [
+                    item.as_group().is_some(),
+                    item.as_fill().is_some(),
+                    item.as_stroke().is_some(),
+                    item.as_glyphs().is_some(),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            variants,
+            [
+                [true, false, false, false],
+                [false, true, false, false],
+                [false, false, true, false],
+                [false, false, false, true],
+            ]
+        );
     }
 
     #[test]

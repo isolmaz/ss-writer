@@ -29,6 +29,7 @@ use ssw_win::theme::SystemTheme;
 use ssw_win::wic::{DecodedImage, Wic};
 
 use crate::appearance::Visuals;
+use crate::fault;
 use crate::objects::PreviewObjects;
 
 /// `A` and `C`: the only letter keys the preview answers (select all, copy).
@@ -289,26 +290,26 @@ impl PreviewContent {
             i32::try_from(height_px).unwrap_or(i32::MAX),
         );
         self.resize(size_px, dpi);
-        let wic = Wic::new()?;
-        let factory = d2d_factory(false)?;
-        let target = WicTarget::new(&factory, &wic, width_px, height_px, dpi as f32)?;
-        let mut assets = CanvasAssets::with_scene_renderer(
-            ImageStore::new(wic.clone()),
-            self.engine.clone(),
-            wic,
-        )?;
+        let wic = fault::check(Wic::new())?;
+        let factory = fault::check(d2d_factory(false))?;
+        let target = WicTarget::new(&factory, &wic, width_px, height_px, dpi as f32);
+        let target = fault::check(target)?;
+        let images = ImageStore::new(wic.clone());
+        let assets = CanvasAssets::with_scene_renderer(images, self.engine.clone(), wic);
+        let mut assets = fault::check(assets)?;
         // Layout first: it typesets the scenes of everything visible.
         let _ = self.layout();
         for (id, scene) in self.objects.all_scenes() {
             assets.register_scene(id, scene);
         }
         let mut resources = TargetResources::new(factory, 1);
-        target.paint(Some(self.background()), |render_target| {
+        let painted = target.paint(Some(self.background()), |render_target| {
             let mut canvas = D2dCanvas::new(render_target, &assets, &mut resources);
             self.paint(&mut canvas);
             canvas.finish()
-        })?;
-        target.pixels()
+        });
+        fault::check(painted)?;
+        fault::check(target.pixels())
     }
 }
 
@@ -436,6 +437,19 @@ mod tests {
     }
 
     #[test]
+    fn losing_a_focus_the_view_never_had_changes_nothing() {
+        let _com = com();
+        let mut c = content(TEXT, DocumentKind::Markdown);
+        c.set_focused(false);
+        assert!(
+            !c.event(&key(vk::DOWN, Modifiers::NONE)).handled,
+            "still not focused"
+        );
+        c.set_focused(true);
+        assert!(c.event(&key(vk::DOWN, Modifiers::NONE)).handled);
+    }
+
+    #[test]
     fn the_wheel_scrolls_and_asks_for_one_repaint() {
         let _com = com();
         let text: String = (0..60).map(|i| format!("Paragraph {i}\n\n")).collect();
@@ -506,6 +520,21 @@ mod tests {
             corner[..3].iter().all(|&channel| channel.abs_diff(16) <= 3),
             "{corner:?}"
         );
+    }
+
+    #[test]
+    fn the_debug_form_reports_the_size_and_scale_of_the_laid_out_view() {
+        let _com = com();
+        let mut c = content("x\n", DocumentKind::Markdown);
+        c.resize((400, 200), 192);
+        let shown = format!("{c:?}");
+        assert!(shown.starts_with("PreviewContent {"), "{shown}");
+        assert!(shown.contains("scale: 2.0"), "{shown}");
+        assert!(
+            shown.contains(&format!("size: {:?}", Size::new(200.0, 100.0))),
+            "{shown}"
+        );
+        assert!(shown.contains("view: "), "{shown}");
     }
 
     #[test]

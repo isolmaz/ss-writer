@@ -42,36 +42,24 @@ mod tests {
         let bounds = Rect::new(10.0, 10.0, 80.0, 32.0);
         let mut canvas = RecordingCanvas::new();
         paint(&mut canvas, bounds, 4.0, &theme);
-        let ops: Vec<&DrawOp> = canvas.ops().collect();
-        assert_eq!(ops.len(), 2);
-        match ops[0] {
-            DrawOp::StrokeRoundedRect {
-                rect,
-                radii,
-                color,
-                width,
-            } => {
-                assert_eq!(*rect, Rect::new(9.0, 9.0, 82.0, 34.0));
-                assert_eq!(*radii, CornerRadii::uniform(5.0));
-                assert_eq!(*color, theme.tokens.focus_ring);
-                assert_eq!(*width, 2.0);
-            }
-            other => panic!("unexpected op {other:?}"),
-        }
-        match ops[1] {
-            DrawOp::StrokeRoundedRect {
-                rect,
-                radii,
-                color,
-                width,
-            } => {
-                assert_eq!(*rect, Rect::new(10.5, 10.5, 79.0, 31.0));
-                assert_eq!(*radii, CornerRadii::uniform(3.5));
-                assert_eq!(*color, theme.tokens.surface);
-                assert_eq!(*width, 1.0);
-            }
-            other => panic!("unexpected op {other:?}"),
-        }
+        let ops: Vec<DrawOp> = canvas.ops().cloned().collect();
+        assert_eq!(
+            ops,
+            [
+                DrawOp::StrokeRoundedRect {
+                    rect: Rect::new(9.0, 9.0, 82.0, 34.0),
+                    radii: CornerRadii::uniform(5.0),
+                    color: theme.tokens.focus_ring,
+                    width: 2.0,
+                },
+                DrawOp::StrokeRoundedRect {
+                    rect: Rect::new(10.5, 10.5, 79.0, 31.0),
+                    radii: CornerRadii::uniform(3.5),
+                    color: theme.tokens.surface,
+                    width: 1.0,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -79,10 +67,14 @@ mod tests {
         let theme = Theme::dark(DEFAULT_ACCENT);
         let mut canvas = RecordingCanvas::new();
         paint(&mut canvas, Rect::new(0.0, 0.0, 10.0, 10.0), 0.0, &theme);
-        let inner = canvas.ops().nth(1).cloned();
-        match inner {
-            Some(DrawOp::StrokeRoundedRect { radii, .. }) => assert!(radii.is_zero()),
-            other => panic!("unexpected op {other:?}"),
-        }
+        assert_eq!(
+            canvas.ops().nth(1),
+            Some(&DrawOp::StrokeRoundedRect {
+                rect: Rect::new(0.5, 0.5, 9.0, 9.0),
+                radii: CornerRadii::uniform(0.0),
+                color: theme.tokens.surface,
+                width: 1.0,
+            })
+        );
     }
 }

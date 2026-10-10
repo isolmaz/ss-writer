@@ -125,6 +125,8 @@ define_commands! {
     FileSave = File, "file.save", "cmd-file-save";
     FileSaveAs = File, "file.save_as", "cmd-file-save-as";
     FileSaveBackToWord = File, "file.save_back_to_word", "cmd-file-save-back-to-word";
+    FileVersionHistory = File, "file.version_history", "cmd-file-version-history";
+    FileExport = File, "file.export", "cmd-file-export";
     FilePrint = File, "file.print", "cmd-file-print";
     FileShare = File, "file.share", "cmd-file-share";
     FileExit = File, "file.exit", "cmd-file-exit";
@@ -316,7 +318,7 @@ mod tests {
     fn string_ids_round_trip_and_are_unique() {
         let mut seen = HashSet::new();
         for cmd in CommandId::all() {
-            assert!(seen.insert(cmd.as_str()), "duplicate id {}", cmd.as_str());
+            seen.insert(cmd.as_str());
             assert_eq!(cmd.as_str().parse::<CommandId>(), Ok(cmd));
             assert_eq!(cmd.to_string(), cmd.as_str());
         }
@@ -353,20 +355,17 @@ mod tests {
     #[test]
     fn every_command_and_group_has_an_english_message() {
         let ids = ftl_message_ids(MAIN_FTL);
-        for cmd in CommandId::all() {
-            assert!(
-                ids.contains(cmd.label_id()),
-                "missing ftl message {}",
-                cmd.label_id()
-            );
-        }
-        for group in CommandGroup::ALL {
-            assert!(
-                ids.contains(group.label_id()),
-                "missing ftl message {}",
-                group.label_id()
-            );
-        }
+        let missing_commands: Vec<&str> = CommandId::all()
+            .map(CommandId::label_id)
+            .filter(|label| !ids.contains(label))
+            .collect();
+        assert_eq!(missing_commands, Vec::<&str>::new());
+        let missing_groups: Vec<&str> = CommandGroup::ALL
+            .iter()
+            .map(|group| group.label_id())
+            .filter(|label| !ids.contains(label))
+            .collect();
+        assert_eq!(missing_groups, Vec::<&str>::new());
     }
 
     #[test]
@@ -387,6 +386,8 @@ mod tests {
             "file.open_folder",
             "file.save",
             "file.save_as",
+            "file.version_history",
+            "file.export",
             "file.print",
             "file.share",
             "tab.new",

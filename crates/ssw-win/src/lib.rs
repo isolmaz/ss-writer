@@ -29,6 +29,8 @@
 //! - [`dragdrop`]: OLE drop target (files, text, HTML; copy / move / link rules) and the drag
 //!   source side for dragging data out.
 //! - [`share`]: the Windows share sheet (`DataTransferManager`) for a file.
+//! - [`perf`]: the performance recorder behind `--perf-report` (marks, frame timings, input
+//!   latency; inert until enabled).
 
 pub mod assoc;
 pub mod canvas;
@@ -39,12 +41,14 @@ pub mod dmanip;
 pub mod dpi;
 pub mod dragdrop;
 pub mod dwrite;
+pub mod fault;
 pub mod fonts;
 pub mod gfx;
 pub mod instance;
 pub mod jumplist;
 pub mod locale;
 pub mod menus;
+pub mod perf;
 pub mod print;
 pub mod scene_render;
 pub mod services;

@@ -1676,4 +1676,170 @@ mod tests {
             Invalidation::Rect(buttons[0].bounds)
         );
     }
+
+    #[test]
+    fn contexts_describe_themselves_and_snap_to_device_pixels() {
+        let mut host = Host::new();
+        let widget = id(1);
+        let before = format!("{:?}", host.requests.invalidation());
+        {
+            let mut layout = LayoutCx::new(
+                widget,
+                &host.theme,
+                1.5,
+                &host.text,
+                &mut host.focus,
+                &mut host.requests,
+            );
+            let printed = format!("{layout:?}");
+            assert!(
+                printed.contains("LayoutCx") && printed.contains("scale: 1.5"),
+                "{printed}"
+            );
+            assert_eq!(layout.snap(10.2), 10.0, "15.3 device pixels round to 15");
+            layout.invalidate(Rect::new(0.0, 0.0, 5.0, 5.0));
+        }
+        assert_ne!(format!("{:?}", host.requests.invalidation()), before);
+
+        let mut buttons = three_buttons();
+        host.layout(&mut buttons);
+        let at = buttons[0].bounds.center();
+        host.pointer(
+            &mut buttons,
+            PointerEventKind::Down,
+            Some(PointerButton::Left),
+            at,
+        );
+        {
+            let paint = PaintCx::new(
+                buttons[0].id,
+                &host.theme,
+                1.0,
+                &host.text,
+                &host.focus,
+                &host.capture,
+                None,
+            );
+            assert!(
+                paint.has_pointer_capture(),
+                "the pressed button holds the pointer"
+            );
+            assert_eq!(paint.snap(2.4), 2.0);
+            let printed = format!("{paint:?}");
+            assert!(
+                printed.contains("PaintCx") && printed.contains("damage: None"),
+                "{printed}"
+            );
+        }
+        {
+            let event = EventCx::new(
+                widget,
+                &host.theme,
+                2.0,
+                &host.text,
+                &mut host.focus,
+                &mut host.capture,
+                &mut host.requests,
+            );
+            let printed = format!("{event:?}");
+            assert!(
+                printed.contains("EventCx") && printed.contains("scale: 2.0"),
+                "{printed}"
+            );
+        }
+        let access = AccessCx::new(widget, &host.theme, 2.0, &host.text, &host.focus);
+        let printed = format!("{access:?}");
+        assert!(
+            printed.contains("AccessCx") && printed.contains("scale: 2.0"),
+            "{printed}"
+        );
+    }
+
+    fn background(host: &Host, button: &TestButton) -> Color {
+        let mut canvas = RecordingCanvas::new();
+        let cx = PaintCx::new(
+            button.id,
+            &host.theme,
+            1.0,
+            &host.text,
+            &host.focus,
+            &host.capture,
+            None,
+        );
+        button.paint(&cx, &mut canvas);
+        canvas
+            .ops()
+            .find_map(|op| match op {
+                DrawOp::FillRoundedRect { color, .. } => Some(*color),
+                _ => None,
+            })
+            .expect("a background")
+    }
+
+    #[test]
+    fn the_test_button_paints_hover_and_pressed_backgrounds_and_ignores_strays() {
+        let mut host = Host::new();
+        let mut buttons = three_buttons();
+        host.layout(&mut buttons);
+        let center = buttons[0].bounds.center();
+        assert_eq!(background(&host, &buttons[0]), host.theme.tokens.surface);
+
+        host.pointer(&mut buttons, PointerEventKind::Move, None, center);
+        assert_eq!(background(&host, &buttons[0]), host.theme.tokens.hover_bg);
+        host.pointer(
+            &mut buttons,
+            PointerEventKind::Down,
+            Some(PointerButton::Left),
+            center,
+        );
+        assert_eq!(background(&host, &buttons[0]), host.theme.tokens.pressed_bg);
+        host.pointer(
+            &mut buttons,
+            PointerEventKind::Up,
+            Some(PointerButton::Left),
+            center,
+        );
+        assert_eq!(buttons[0].clicks, 1);
+
+        let deliver = |host: &mut Host, button: &mut TestButton, kind, at| {
+            let event = Event::Pointer(PointerEvent::mouse(kind, None, at));
+            let mut cx = EventCx::new(
+                button.id,
+                &host.theme,
+                1.0,
+                &host.text,
+                &mut host.focus,
+                &mut host.capture,
+                &mut host.requests,
+            );
+            button.event(&mut cx, &event)
+        };
+        let far = Point::new(-100.0, -100.0);
+        assert!(buttons[0].hovered);
+        assert!(!deliver(&mut host, &mut buttons[0], PointerEventKind::Leave, far).handled);
+        assert!(!buttons[0].hovered, "leaving ends the hover");
+        assert!(!deliver(&mut host, &mut buttons[0], PointerEventKind::Leave, far).handled);
+        let moved = deliver(&mut host, &mut buttons[0], PointerEventKind::Move, far);
+        assert!(!moved.handled, "a move elsewhere is not the button's");
+    }
+
+    #[test]
+    fn the_test_host_ignores_events_for_widgets_it_does_not_know() {
+        let mut host = Host::new();
+        let mut buttons = three_buttons();
+        host.layout(&mut buttons);
+        let center = buttons[0].bounds.center();
+        host.capture.capture(id(999));
+        assert!(
+            !host
+                .pointer(&mut buttons, PointerEventKind::Move, None, center)
+                .handled
+        );
+
+        host.focus.begin_tab_order();
+        host.focus.add_tab_stop(id(999));
+        host.focus.commit_tab_order();
+        assert!(host.focus.focus(id(999)));
+        assert!(!host.key(&mut buttons, vk::SPACE).handled);
+    }
 }

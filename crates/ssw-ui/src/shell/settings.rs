@@ -109,6 +109,8 @@ pub enum SettingsEvent {
     BrowseFolder(FieldId),
     /// Advanced → Open logs folder.
     OpenLogsFolder,
+    /// Advanced → Open settings.json: open the file in the editor.
+    OpenSettingsFile,
     /// Advanced → Reset settings: confirm with the user, then replace the settings with
     /// [`SettingsWindow::set_settings`].
     ResetSettings,
@@ -119,6 +121,7 @@ pub enum SettingsEvent {
 enum RowKey {
     Field(FieldId),
     OpenLogs,
+    OpenFile,
     Reset,
 }
 
@@ -264,6 +267,12 @@ fn build_form(
             env.motion,
             RowKey::OpenLogs,
             "settings-advanced-open-logs",
+        ));
+        rows.push(action_row(
+            loc,
+            env.motion,
+            RowKey::OpenFile,
+            "settings-advanced-open-file",
         ));
         rows.push(action_row(
             loc,
@@ -564,6 +573,7 @@ impl SettingsWindow {
         for (key, change) in changes {
             match key {
                 RowKey::OpenLogs => self.events.push(SettingsEvent::OpenLogsFolder),
+                RowKey::OpenFile => self.events.push(SettingsEvent::OpenSettingsFile),
                 RowKey::Reset => self.events.push(SettingsEvent::ResetSettings),
                 RowKey::Field(field) => self.commit(field, change),
             }
@@ -731,10 +741,10 @@ impl Widget for SettingsWindow {
         self.nav.access(&cx.for_widget(self.nav.id()), out);
         let children = if self.section == SettingsSection::Shortcuts {
             self.shortcuts.access(cx, out)
-        } else if let Some(form) = self.form(self.section) {
-            self.scroll.access(cx, out, form)
         } else {
-            Vec::new()
+            // Every page but Shortcuts is a form.
+            self.form(self.section)
+                .map_or_else(Vec::new, |form| self.scroll.access(cx, out, form))
         };
         out.insert(
             AccessNode::new(
@@ -766,10 +776,9 @@ impl Widget for SettingsWindow {
             handled = if self.section == SettingsSection::Shortcuts {
                 let env = shortcut_env(&self.loc, &self.env);
                 self.shortcuts.perform(cx, a, &env)
-            } else if let Some(form) = find_form_mut(&mut self.forms, self.section) {
-                self.scroll.perform(cx, form, a)
             } else {
-                false
+                find_form_mut(&mut self.forms, self.section)
+                    .is_some_and(|form| self.scroll.perform(cx, form, a))
             };
         }
         self.harvest(cx);
@@ -780,9 +789,7 @@ impl Widget for SettingsWindow {
 impl SettingsWindow {
     /// Routes `e` to the scroll bar and the controls of the current page.
     fn route_to_form(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
-        match find_form_mut(&mut self.forms, self.section) {
-            Some(form) => self.scroll.event(cx, form, e),
-            None => EventResult::ignored(),
-        }
+        find_form_mut(&mut self.forms, self.section)
+            .map_or_else(EventResult::ignored, |form| self.scroll.event(cx, form, e))
     }
 }

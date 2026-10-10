@@ -66,7 +66,11 @@ impl ImportResult {
                 existing.detail = detail;
             }
         } else {
-            self.losses.push(Loss { kind, count, detail });
+            self.losses.push(Loss {
+                kind,
+                count,
+                detail,
+            });
         }
     }
 
@@ -86,7 +90,10 @@ pub enum ImportError {
     #[error("unsupported format version: {0}")]
     UnsupportedVersion(String),
     #[error("the file is not a {expected} document (looks like {detected})")]
-    WrongFormat { expected: &'static str, detected: &'static str },
+    WrongFormat {
+        expected: &'static str,
+        detected: &'static str,
+    },
     #[error("the document is corrupt: {0}")]
     Corrupt(String),
     #[error("the document exceeds the size limit: {0}")]

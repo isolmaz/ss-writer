@@ -1,0 +1,17 @@
+## 📱 iOS alpha four
+
+Biggest alpha update!
+
+- Animate on sending message and delete
+- Set online/offline
+- Show all users when @ is typed
+- Swipe to reply (fixing its bugs in a patch tomorrow)
+- Improved colors for chat bubbles
+- Added tabs for direct messages and threads
+- Fixed emoji messages to be bigger
+- Fixed rendering code and hashtags
+- Added support for forwarded messages and nudges
+
+[Get it from TestFlight.](https://testflight.apple.com/join/yKKmzbhD)
+
+## Smaller improvements

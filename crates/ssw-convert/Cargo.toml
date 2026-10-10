@@ -20,7 +20,6 @@ quick-xml = "0.42"
 cfb = "0.15"
 encoding_rs = "0.8"
 base64 = "0.22"
-epub-builder = "0.8"
 html5ever = "0.35"
 markup5ever_rcdom = "0.35"
 

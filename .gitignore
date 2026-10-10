@@ -3,3 +3,4 @@
 *.profdata
 /lcov.info
 /dist
+/.briefs

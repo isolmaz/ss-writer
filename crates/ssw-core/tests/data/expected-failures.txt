@@ -1,0 +1,33 @@
+# Examples (CommonMark number or gfm-N) that deliberately differ from the reference output.
+# Format: <id> <reason>. See DEVIATIONS in src/markdown/mod.rs.
+59 Setext headings are not supported (DEVIATIONS: no Setext headings)
+80 Setext headings are not supported (DEVIATIONS: no Setext headings)
+81 Setext headings are not supported (DEVIATIONS: no Setext headings)
+82 Setext headings are not supported (DEVIATIONS: no Setext headings)
+83 Setext headings are not supported (DEVIATIONS: no Setext headings)
+84 Setext headings are not supported (DEVIATIONS: no Setext headings)
+86 Setext headings are not supported (DEVIATIONS: no Setext headings)
+89 Setext headings are not supported (DEVIATIONS: no Setext headings)
+90 Setext headings are not supported (DEVIATIONS: no Setext headings)
+91 Setext headings are not supported (DEVIATIONS: no Setext headings)
+95 Setext headings are not supported (DEVIATIONS: no Setext headings)
+96 Setext headings are not supported (DEVIATIONS: no Setext headings)
+98 front matter at the start of the document is a FrontMatter block, not a thematic break
+102 Setext headings are not supported (DEVIATIONS: no Setext headings)
+103 Setext headings are not supported (DEVIATIONS: no Setext headings)
+115 Setext headings are not supported (DEVIATIONS: no Setext headings)
+141 Setext headings are not supported (DEVIATIONS: no Setext headings)
+215 Setext headings are not supported (DEVIATIONS: no Setext headings)
+300 Setext headings are not supported (DEVIATIONS: no Setext headings)
+548 [[x]] is a wikilink even when a reference definition exists
+559 [[x]] is a wikilink even when a reference definition exists
+590 [[x]] is a wikilink even when a reference definition exists
+602 GFM extended autolinks (bare www./http(s)/e-mail) are linked
+608 GFM extended autolinks (bare www./http(s)/e-mail) are linked
+611 GFM extended autolinks (bare www./http(s)/e-mail) are linked
+612 GFM extended autolinks (bare www./http(s)/e-mail) are linked
+gfm-17 single-tilde ~x~ is underline (GFM: strikethrough)
+gfm-18 single-tilde ~x~ is underline (GFM: strikethrough)
+gfm-23 footnote section and backrefs are not rendered by the test HTML renderer
+gfm-24 footnote section and backrefs are not rendered by the test HTML renderer
+gfm-25 footnote section and backrefs are not rendered by the test HTML renderer

@@ -1382,6 +1382,7 @@ fn settled(app: &UiApp, platform: &Platform, request: &ObjectRequest<'_>) -> Obj
     }
 }
 
+#[track_caller]
 fn ready(state: ObjectState) -> ssw_ui::editor::object::ObjectInfo {
     match state {
         ObjectState::Ready(info) => info,

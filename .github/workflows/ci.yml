@@ -15,6 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  NEXTEST_PROFILE: ci
 
 defaults:
   run:

@@ -592,8 +592,32 @@ pub fn outdent_items(ctx: Ctx<'_>) -> Option<Transaction> {
                 edits.push(Edit::delete(TextRange::new(origin, origin + remove)));
             }
         }
+        // The item joins the list of its parent: a bullet between numbered items (or the
+        // other way round) would split that list in three.
+        if let Some(parent) = root.parent {
+            let own = ctx.slice(root.marker());
+            let parents = ctx.slice(parent.markers[0]);
+            let own_ordered = own.as_bytes()[0].is_ascii_digit();
+            let parent_ordered = parents.as_bytes()[0].is_ascii_digit();
+            if own_ordered != parent_ordered {
+                let marker = if parent_ordered {
+                    format!("1{}", &parents[parents.len() - 1..])
+                } else {
+                    parents.into_owned()
+                };
+                edits.push(Edit::replace(root.marker(), marker));
+            }
+        }
     }
+    edits.sort_by_key(|e| (e.range.start, e.range.end));
     (!edits.is_empty()).then(|| finish_mapped(ctx, edits))
+}
+
+/// True when the selection's head lies in a list item (Tab then indents instead of inserting
+/// a tab character).
+#[must_use]
+pub fn in_item(ctx: Ctx<'_>) -> bool {
+    item_around(ctx, ctx.selection.head).is_some()
 }
 
 /// Moves a phantom item out to the level of the item it sits in (it then follows that item as
@@ -817,6 +841,29 @@ mod tests {
             indent_items(c, ListIndent::Align)
         });
         check("1. a\n   1. b‸\n2. c", "1. a\n2. b‸\n3. c", outdent_items);
+    }
+
+    #[test]
+    fn outdent_takes_the_marker_kind_of_the_list_it_joins() {
+        check("1. a\n   - b‸\n2. c", "1. a\n2. b‸\n3. c", outdent_items);
+        check("1) a\n   - [ ] b‸", "1) a\n2) [ ] b‸", outdent_items);
+        check("- a\n  1. b‸\n- c", "- a\n- b‸\n- c", outdent_items);
+        check(
+            "* a\n  1. b‸\n     1. d",
+            "* a\n* b‸\n   1. d",
+            outdent_items,
+        );
+        // A top-level item has no list to join.
+        check("  1. a‸", "1. a‸", outdent_items);
+    }
+
+    #[test]
+    fn in_item_follows_the_caret() {
+        let (text, selection) = parse_marked("- a‸\n\nplain");
+        let ast = parse_document(&text);
+        let buffer = crate::text::Buffer::from_text(&text);
+        assert!(in_item(Ctx::new(&buffer, &ast, selection)));
+        assert!(!in_item(Ctx::new(&buffer, &ast, Selection::caret(8))));
     }
 
     #[test]

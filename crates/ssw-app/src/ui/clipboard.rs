@@ -56,8 +56,8 @@ use ssw_io::fs::{FileSystem, FsError};
 use ssw_ui::editor::EditorView;
 use ssw_ui::input::KeyEvent;
 use ssw_ui::services::{
-    Clipboard, ClipboardContent, ClipboardFormat, MessageBoxButtons, MessageBoxIcon,
-    MessageBoxOptions, ServiceError,
+    Clipboard, ClipboardContent, ClipboardFormat, FileFilter, MessageBoxButtons, MessageBoxIcon,
+    MessageBoxOptions, OpenFileOptions, ServiceError,
 };
 use ssw_win::services::clipboard::{FORMAT_VSCODE_EDITOR_DATA, parse_vscode_mode};
 
@@ -73,6 +73,12 @@ const ASSET_MARKER: &str = "ssw-paste-assets";
 
 /// The naming template used when the settings hold one without a number.
 const DEFAULT_TEMPLATE: &str = "image-{n}";
+
+/// Extensions the Format → Image dialog filters on (those `image_mime_for_path` knows, so a
+/// chosen file is inserted as a picture, never as an attachment chip).
+const IMAGE_EXTENSIONS: [&str; 11] = [
+    "png", "jpg", "jpeg", "jpe", "gif", "svg", "webp", "bmp", "tif", "tiff", "ico",
+];
 
 /// The largest local picture a copy embeds in its HTML and RTF.
 pub const MAX_EMBEDDED_IMAGE: u64 = 8 * 1024 * 1024;
@@ -654,6 +660,55 @@ impl Controller {
             editor.paste_markdown(&image);
             true
         })
+    }
+
+    /// Format → Image: asks for picture files and inserts them like pasted files (copied into
+    /// the attachment folder unless they already lie inside the document's folder or the
+    /// workspace). A cancelled dialog changes nothing.
+    pub(super) fn insert_image_file(&self, cell: &Rc<WindowCell>) -> bool {
+        let context = {
+            let view = cell.view.borrow();
+            view.active_tab().map(|tab| {
+                (
+                    Rc::clone(&tab.entry),
+                    tab.workspace.clone(),
+                    tab.editor.is_read_only(),
+                )
+            })
+        };
+        let Some((entry, workspace, read_only)) = context else {
+            return false;
+        };
+        if read_only || entry.mode() != DocMode::Markdown {
+            return true;
+        }
+        let options = OpenFileOptions {
+            title: self.i18n().text("clipboard-insert-image-title"),
+            filters: vec![
+                FileFilter {
+                    name: self.i18n().text("clipboard-filter-images"),
+                    extensions: IMAGE_EXTENSIONS
+                        .iter()
+                        .map(|ext| (*ext).to_owned())
+                        .collect(),
+                },
+                FileFilter {
+                    name: self.i18n().text("window-filter-all"),
+                    extensions: vec!["*".to_owned()],
+                },
+            ],
+            allow_multiple: true,
+            initial_dir: entry
+                .path()
+                .and_then(|path| path.parent().map(Path::to_path_buf)),
+        };
+        let files = self.dialogs.borrow_mut().open_file(&options);
+        match files {
+            Ok(Some(files)) if !files.is_empty() => {
+                self.paste_files(cell, &entry, workspace.as_deref(), &files)
+            }
+            _ => true,
+        }
     }
 
     /// Pastes copied files: pictures as images (copied into the attachment folder unless they

@@ -1251,6 +1251,78 @@ fn the_link_command_opens_the_link_popup_and_unhandled_commands_are_reported() {
 }
 
 #[test]
+fn insert_date_puts_todays_long_date_at_the_caret() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let (year, month, day) = ssw_win::locale::local_today();
+        let expected = ssw_win::locale::Locale::user_default()
+            .format_date_long(year, month, day)
+            .unwrap();
+        rig.select(Selection::caret(8));
+        assert!(handled(&rig.cmd(CommandId::EditInsertDate)));
+        assert_eq!(rig.text(), format!("# Notes\n{expected}"));
+        assert!(rig.entry().is_dirty());
+
+        // A plain-text document takes the date as it is (no Markdown escape).
+        std::fs::write(rig.work.join("plain.txt"), "1\n").unwrap();
+        rig.open("plain.txt");
+        assert!(handled(&rig.cmd(CommandId::EditInsertDate)));
+        assert_eq!(rig.text(), format!("{expected}1\n"));
+
+        // Nothing to insert into without a tab.
+        let empty = rig.empty_window();
+        assert!(matches!(
+            rig.cmd_in(&empty, CommandId::EditInsertDate),
+            Dispatch::Unhandled
+        ));
+    });
+}
+
+#[test]
+fn format_image_asks_for_pictures_and_inserts_them_like_pasted_files() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let window = rig.window();
+        rig.select(Selection::caret(8));
+        // Cancelling changes nothing.
+        rig.services.answer(DialogKind::OpenFile, Answer::Cancel);
+        assert!(handled(&rig.cmd(CommandId::FormatImage)));
+        assert_eq!(rig.text(), "# Notes\n");
+        let log = rig.services.dialog_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].title, text_of("clipboard-insert-image-title"));
+
+        // A picture next to the document is linked where it is.
+        rig.services.answer(
+            DialogKind::OpenFile,
+            Answer::Paths(vec![rig.work.join("pic.png")]),
+        );
+        assert!(handled(&rig.cmd(CommandId::FormatImage)));
+        assert_eq!(rig.text(), "# Notes\n![](pic.png)");
+        assert!(!rig.work.join("pic-1.png").exists());
+
+        // A read-only editor and a plain-text document are left alone.
+        window
+            .view
+            .borrow_mut()
+            .active_editor_mut()
+            .unwrap()
+            .set_read_only(true);
+        assert!(handled(&rig.cmd(CommandId::FormatImage)));
+        assert_eq!(rig.text(), "# Notes\n![](pic.png)");
+        std::fs::write(rig.work.join("plain.txt"), "1\n").unwrap();
+        rig.open("plain.txt");
+        assert!(handled(&rig.cmd(CommandId::FormatImage)));
+        assert_eq!(rig.text(), "1\n");
+        assert_eq!(rig.services.dialog_log().len(), 2);
+
+        let empty = rig.empty_window();
+        assert!(matches!(
+            rig.cmd_in(&empty, CommandId::FormatImage),
+            Dispatch::Unhandled
+        ));
+    });
+}
+
+#[test]
 fn search_commands_open_the_find_bar_go_to_line_and_the_folder_search() {
     with_rig(NO_AUTOSAVE, |rig| {
         let window = rig.window();

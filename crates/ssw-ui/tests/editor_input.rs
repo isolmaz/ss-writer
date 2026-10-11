@@ -359,6 +359,10 @@ fn insert_date_link_image_and_pastes_use_the_ops() {
     let mut h = Harness::new("");
     h.view.insert_date("1. March 2026");
     assert_eq!(h.text(), "1\\. March 2026");
+    let mut h = Harness::new("");
+    h.config(|config| config.document_kind = DocumentKind::PlainText);
+    h.view.insert_date("1. March 2026");
+    assert_eq!(h.text(), "1. March 2026", "no escape in plain text");
     let mut h = Harness::new("see word");
     h.view.set_selection(Selection::new(4, 8));
     h.view.set_link("word", "https://x.y");
@@ -1007,6 +1011,19 @@ fn block_format_commands_insert_and_convert_blocks() {
         has(&h, |kind| matches!(kind, BlockKind::PageBreak)),
         "{:?}",
         h.text()
+    );
+    let mut h = Harness::new("text");
+    h.set_caret(4);
+    assert!(h.view.execute(CommandId::FormatTable));
+    assert!(
+        has(&h, |kind| matches!(kind, BlockKind::Table(_))),
+        "{:?}",
+        h.text()
+    );
+    assert_eq!(
+        h.selection(),
+        Selection::caret(8),
+        "in the first header cell"
     );
     let mut h = Harness::new("text");
     h.set_caret(4);

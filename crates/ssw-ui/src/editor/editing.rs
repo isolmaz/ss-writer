@@ -572,7 +572,7 @@ impl EditorView {
             } else {
                 table::next_cell(ctx)
                     .or_else(|| lists::indent_items(ctx, indent))
-                    .or_else(|| Some(typing::insert_text(ctx, "\t")))
+                    .or_else(|| (!lists::in_item(ctx)).then(|| typing::insert_text(ctx, "\t")))
             }
         });
     }

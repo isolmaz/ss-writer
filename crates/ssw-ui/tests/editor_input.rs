@@ -147,6 +147,16 @@ fn tab_in_a_paragraph_inserts_a_tab() {
 }
 
 #[test]
+fn tab_in_an_item_that_cannot_indent_inserts_nothing() {
+    // The first item has no sibling to nest under; a tab character in its text is no indent.
+    let mut h = Harness::new("- ab\n- c");
+    h.set_caret(3);
+    h.press(vk::TAB);
+    assert_eq!(h.text(), "- ab\n- c");
+    assert_eq!(h.selection(), Selection::caret(3));
+}
+
+#[test]
 fn tab_moves_between_table_cells() {
     let mut h = Harness::new("| a | b |\n|---|---|\n| 1 | 2 |\n");
     h.set_caret(2);

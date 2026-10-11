@@ -635,6 +635,14 @@ fn dropping_nothing_or_removing_nothing_is_refused() {
 }
 
 #[test]
+fn removing_an_item_of_a_numbered_list_renumbers_the_rest() {
+    let mut h = Harness::new("1. a\n2. b\n3. c\n");
+    assert!(h.view.remove_range(TextRange::new(5, 10)));
+    assert_eq!(h.text(), "1. a\n2. c\n");
+    assert_eq!(h.view.selection(), Selection::caret(5));
+}
+
+#[test]
 fn an_unbounded_space_measures_the_column_and_a_default_height() {
     let mut h = Harness::new("a\n");
     let column = h.view.config().column_width();

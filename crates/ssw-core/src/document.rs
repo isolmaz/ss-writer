@@ -476,6 +476,23 @@ mod tests {
     }
 
     #[test]
+    fn typing_in_an_ordered_list_item_undoes_in_one_step() {
+        // The repeated `l` is where a keystroke edit used to slip away from the caret there.
+        let mut doc = Document::new("1. hello");
+        doc.set_selections(Selection::caret(6), &[]);
+        for i in 0..2 {
+            let tx = crate::ops::typing::insert_text(doc.ctx(), "l");
+            doc.apply_typing(tx, ms(i * 50)).expect("typing");
+        }
+        assert_eq!(doc.text(), "1. hellllo");
+        assert_eq!(doc.primary_selection(), Selection::caret(8));
+        doc.undo().expect("undo");
+        assert_eq!(doc.text(), "1. hello");
+        assert_eq!(doc.primary_selection(), Selection::caret(6));
+        assert!(!doc.can_undo());
+    }
+
+    #[test]
     fn commands_break_typing_runs_and_are_single_steps() {
         let mut doc = Document::new("");
         doc.apply_typing(insert(0, "a"), ms(0)).expect("typing");

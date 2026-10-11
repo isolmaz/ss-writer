@@ -11,15 +11,20 @@ use super::lists::{
 use super::{Ctx, container_prefix_len};
 
 /// Replaces the selection with `text` (a typed character, an IME result); the caret ends
-/// after it.
+/// after it. Ordered lists the edit touches are renumbered.
 pub fn insert_text(ctx: Ctx<'_>, text: &str) -> Transaction {
     let range = ctx.selection.range();
     let caret = range.start + text.len();
-    ctx.transaction(vec![Edit::replace(range, text)], Selection::caret(caret))
+    finish(
+        ctx,
+        vec![Edit::replace(range, text)],
+        Selection::caret(caret),
+    )
 }
 
 /// Backspace: deletes the selection, removes a list marker the caret sits behind, or deletes the
-/// grapheme before the caret. `None` at the start of the document.
+/// grapheme before the caret. `None` at the start of the document. Ordered lists the edit
+/// touches are renumbered.
 pub fn backspace(ctx: Ctx<'_>) -> Option<Transaction> {
     if !ctx.selection.is_caret() {
         return Some(delete_selection(ctx));
@@ -30,7 +35,8 @@ pub fn backspace(ctx: Ctx<'_>) -> Option<Transaction> {
     let head = ctx.selection.head;
     let previous = ctx.buffer.prev_grapheme_boundary(head);
     (previous < head).then(|| {
-        ctx.transaction(
+        finish(
+            ctx,
             vec![Edit::delete(TextRange::new(previous, head))],
             Selection::caret(previous),
         )
@@ -38,7 +44,7 @@ pub fn backspace(ctx: Ctx<'_>) -> Option<Transaction> {
 }
 
 /// Delete: deletes the selection or the grapheme after the caret. `None` at the end of the
-/// document.
+/// document. Ordered lists the edit touches are renumbered.
 pub fn delete_forward(ctx: Ctx<'_>) -> Option<Transaction> {
     if !ctx.selection.is_caret() {
         return Some(delete_selection(ctx));
@@ -46,7 +52,8 @@ pub fn delete_forward(ctx: Ctx<'_>) -> Option<Transaction> {
     let head = ctx.selection.head;
     let next = ctx.buffer.next_grapheme_boundary(head);
     (next > head).then(|| {
-        ctx.transaction(
+        finish(
+            ctx,
             vec![Edit::delete(TextRange::new(head, next))],
             Selection::caret(head),
         )
@@ -55,7 +62,11 @@ pub fn delete_forward(ctx: Ctx<'_>) -> Option<Transaction> {
 
 fn delete_selection(ctx: Ctx<'_>) -> Transaction {
     let range = ctx.selection.range();
-    ctx.transaction(vec![Edit::delete(range)], Selection::caret(range.start))
+    finish(
+        ctx,
+        vec![Edit::delete(range)],
+        Selection::caret(range.start),
+    )
 }
 
 /// Keeps quote markers and blanks, turns every other character into a blank: the prefix that
@@ -490,17 +501,55 @@ mod tests {
     }
 
     #[test]
+    fn edits_that_change_the_item_count_renumber_the_list() {
+        // A deleted or cut item, a joined line, a typed marker: the numbers follow.
+        check("1. a\n«2. b\n»3. c", "1. a\n‸2. c", delete_forward);
+        check("1. a\n«2. b\n»3. c", "1. a\n‸2. c", backspace);
+        check("1. a‸\n2. b\n3. c", "1. a‸2. b\n2. c", delete_forward);
+        check("1. a\n2. b‸\n3. c", "1. a\n2. b‸3. c", delete_forward);
+        check("1. a\n2‸\n3. b", "1. a\n2.‸\n3. b", |c| {
+            Some(insert_text(c, "."))
+        });
+        check("1. a\n2.‸\n3. b", "1. a\n2. ‸\n3. b", |c| {
+            Some(insert_text(c, " "))
+        });
+        // The first item keeps its number: it starts the list.
+        check("1‸. a\n2. b", "10‸. a\n11. b", |c| {
+            Some(insert_text(c, "0"))
+        });
+        // Outside ordered lists the edit is the plain one.
+        check("- a\n«- b\n»- c", "- a\n‸- c", delete_forward);
+    }
+
+    #[test]
     fn keystroke_transactions_classify_as_typing() {
         use crate::undo::{TypingKind, typing_kind};
-        let kind = |before: &str, op: fn(Ctx<'_>) -> Option<Transaction>| {
+        let keystroke = |before: &str, op: fn(Ctx<'_>) -> Option<Transaction>| {
             let (text, selection) = parse_marked(before);
             let buffer = crate::text::Buffer::from_text(&text);
             let ast = crate::markdown::parse_document(&text);
-            let tx = op(Ctx::new(&buffer, &ast, selection)).expect("applies");
-            typing_kind(&tx)
+            op(Ctx::new(&buffer, &ast, selection)).expect("applies")
+        };
+        let kind = |before: &str, op: fn(Ctx<'_>) -> Option<Transaction>| {
+            typing_kind(&keystroke(before, op))
         };
         assert_eq!(kind("ab‸", backspace), Some(TypingKind::DeleteBackward));
         assert_eq!(kind("a‸b", delete_forward), Some(TypingKind::DeleteForward));
         assert_eq!(kind("«ab»", backspace), None);
+
+        // In an ordered list item the edit stays the one the key made, at the caret, also
+        // between repeated letters: undo only groups keystrokes it classifies as typing.
+        let tx = keystroke("1. h‸llo", |c| Some(insert_text(c, "l")));
+        assert_eq!(tx.edits, [Edit::insert(4, "l")]);
+        assert_eq!(tx.selection_after, Selection::caret(5));
+        assert_eq!(typing_kind(&tx), Some(TypingKind::Insert));
+        let tx = keystroke("1. hel‸lo", backspace);
+        assert_eq!(tx.edits, [Edit::delete(TextRange::new(5, 6))]);
+        assert_eq!(tx.selection_after, Selection::caret(5));
+        assert_eq!(typing_kind(&tx), Some(TypingKind::DeleteBackward));
+        let tx = keystroke("1. he‸llo", delete_forward);
+        assert_eq!(tx.edits, [Edit::delete(TextRange::new(5, 6))]);
+        assert_eq!(tx.selection_after, Selection::caret(5));
+        assert_eq!(typing_kind(&tx), Some(TypingKind::DeleteForward));
     }
 }

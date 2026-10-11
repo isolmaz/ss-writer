@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Starting SS Writer no longer opens an empty console window next to the editor.
 - Underline on struck text (and strikethrough on underlined text) produced three tildes, which Markdown shows as plain tildes; the second command then kept adding tildes. The two styles now replace each other, as `~x~` and `~~x~~` cannot nest.
 - Shift+Tab on a bullet nested in a numbered list (or a numbered item nested in a bullet list) left a marker of the wrong kind that split the list in three; the item now takes the marker of the list it joins. Tab in a list item that cannot be indented inserted a tab character into its text.
+- Format → Quote with the caret in a callout removed the `>` of that line alone and left a broken callout; it now removes the whole callout (a title stays as a line of text).
 
 ## [0.1.0] - 2026-10-10
 

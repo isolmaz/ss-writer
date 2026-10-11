@@ -4,7 +4,7 @@
 //! can be stored per file). After every change of the document the set is applied to the
 //! editor again as source ranges ([`EditorView::set_folds`]); when the number of headings did
 //! not change, the folds follow their headings by position, so retitling a folded heading
-//! keeps it folded.
+//! keeps it folded. A tab with nothing folded does no work on an edit.
 
 use ssw_core::document::Document;
 use ssw_core::folding::{FoldSet, fold_key, fold_ranges};
@@ -18,7 +18,8 @@ pub struct TabFolds {
     set: FoldSet,
     /// Outline indices of the folded headings at the last application.
     folded: Vec<usize>,
-    /// Number of headings at the last application.
+    /// Number of headings at the last application that had folds; only read while something
+    /// is folded.
     headings: usize,
     /// Document version the editor's fold ranges belong to.
     version: Option<u64>,
@@ -28,7 +29,7 @@ impl TabFolds {
     /// Folds the headings that start at `offsets` (the stored view state of the file).
     #[must_use]
     pub fn from_offsets(document: &Document, offsets: &[usize]) -> Self {
-        let toc = outline(document);
+        let (toc, _) = outline(document);
         let keys = toc
             .entries()
             .iter()
@@ -44,7 +45,7 @@ impl TabFolds {
     /// Source offsets of the folded headings, for the stored view state.
     #[must_use]
     pub fn offsets(&self, document: &Document) -> Vec<usize> {
-        let toc = outline(document);
+        let (toc, _) = outline(document);
         toc.entries()
             .iter()
             .enumerate()
@@ -61,9 +62,17 @@ impl TabFolds {
         }
     }
 
+    /// Applies the folds to `editor`, a new view of the document (a new tab, or a tab that moved
+    /// to another window): unlike [`TabFolds::sync`] it applies them even when the document did
+    /// not change since they were last applied.
+    pub fn attach(&mut self, editor: &mut EditorView) {
+        let version = editor.document().borrow().version();
+        self.apply(editor, self.version != Some(version));
+    }
+
     /// Flips the heading block starting at `heading_start` (the gutter chevron).
     pub fn toggle(&mut self, editor: &mut EditorView, heading_start: usize) {
-        let toc = outline(&editor.document().borrow());
+        let (toc, _) = outline(&editor.document().borrow());
         if let Some(index) = toc
             .entries()
             .iter()
@@ -77,9 +86,8 @@ impl TabFolds {
     /// View → Fold all.
     pub fn fold_all(&mut self, editor: &mut EditorView) {
         {
-            let document = editor.document().borrow();
-            let toc = outline(&document);
-            let ranges = fold_ranges(&toc, &document.text());
+            let (toc, text) = outline(&editor.document().borrow());
+            let ranges = fold_ranges(&toc, &text);
             self.set.fold_all(&toc, &ranges);
         }
         self.apply(editor, false);
@@ -94,9 +102,8 @@ impl TabFolds {
     /// Unfolds the sections hiding `range` (a search match); true when one was folded.
     pub fn unfold_containing(&mut self, editor: &mut EditorView, range: TextRange) -> bool {
         let changed = {
-            let document = editor.document().borrow();
-            let toc = outline(&document);
-            let ranges = fold_ranges(&toc, &document.text());
+            let (toc, text) = outline(&editor.document().borrow());
+            let ranges = fold_ranges(&toc, &text);
             self.set.unfold_containing(&toc, &ranges, range.start)
                 | self.set.unfold_containing(&toc, &ranges, range.end)
         };
@@ -111,8 +118,13 @@ impl TabFolds {
     fn apply(&mut self, editor: &mut EditorView, edited: bool) {
         let (hidden, folded_headings) = {
             let document = editor.document().borrow();
-            let text = document.text();
-            let toc = outline(&document);
+            if self.set.is_empty() && self.folded.is_empty() {
+                // Nothing is folded and nothing was, so the editor has no folds to replace, and
+                // the outline is not worth building for every keystroke of a large document.
+                self.version = Some(document.version());
+                return;
+            }
+            let (toc, text) = outline(&document);
             if edited && self.version.is_some() && toc.entries().len() == self.headings {
                 // Same headings, possibly retitled: a fold stays with the heading at its index.
                 self.set = FoldSet::from_keys(
@@ -131,7 +143,8 @@ impl TabFolds {
             let folded_headings = ranges
                 .iter()
                 .filter(|r| self.folded.contains(&r.heading))
-                .map(|r| toc.entries()[r.heading].range.start)
+                .filter_map(|r| toc.entries().get(r.heading))
+                .map(|entry| entry.range.start)
                 .collect();
             (self.set.hidden_ranges(&toc, &ranges), folded_headings)
         };
@@ -139,8 +152,10 @@ impl TabFolds {
     }
 }
 
-fn outline(document: &Document) -> Toc {
-    Toc::build(document.ast(), &document.text())
+/// The outline of `document` and the text it was built from (copied once).
+fn outline(document: &Document) -> (Toc, String) {
+    let text = document.text();
+    (Toc::build(document.ast(), &text), text)
 }
 
 #[cfg(test)]
@@ -159,6 +174,12 @@ mod tests {
         let doc = Rc::new(RefCell::new(Document::new(text)));
         let clock: Rc<dyn Clock> = Rc::new(FakeClock::default());
         EditorView::new(doc, clock)
+    }
+
+    /// A second editor over the document of `editor`, like the one of a tab that moved.
+    fn another_view(editor: &EditorView) -> EditorView {
+        let clock: Rc<dyn Clock> = Rc::new(FakeClock::default());
+        EditorView::new(Rc::clone(editor.document()), clock)
     }
 
     fn hidden(editor: &EditorView, needle: &str) -> bool {
@@ -232,5 +253,60 @@ mod tests {
         folds.sync(&mut editor);
         assert!(!hidden(&editor, "body two"));
         assert!(folds.offsets(&editor.document().borrow()).is_empty());
+    }
+
+    #[test]
+    fn edits_without_folds_hide_nothing_and_a_later_fold_still_follows_a_retitle() {
+        let mut editor = editor(TEXT);
+        let mut folds = TabFolds::default();
+        folds.sync(&mut editor);
+
+        // Edits that add and remove headings while nothing is folded.
+        let more = format!("# Zero\n\nzero\n\n{TEXT}");
+        edit(&editor, &more);
+        folds.sync(&mut editor);
+        assert!(!hidden(&editor, "zero") && !hidden(&editor, "body two"));
+        let fewer = more.replace("# Two\n\nbody two\n\n", "");
+        edit(&editor, &fewer);
+        folds.sync(&mut editor);
+        assert!(!hidden(&editor, "body one") && !hidden(&editor, "body sub"));
+        assert!(folds.offsets(&editor.document().borrow()).is_empty());
+
+        // A fold made after those edits is recorded against the current headings: retitling
+        // the folded heading keeps it folded.
+        folds.toggle(&mut editor, fewer.find("# One").unwrap());
+        assert!(hidden(&editor, "body one") && !hidden(&editor, "zero"));
+        edit(&editor, &fewer.replace("# One", "# Uno"));
+        folds.sync(&mut editor);
+        assert!(hidden(&editor, "body one") && !hidden(&editor, "zero"));
+
+        // Unfolding the last fold returns to the free path: later edits hide nothing.
+        folds.unfold_all(&mut editor);
+        assert!(!hidden(&editor, "body one"));
+        edit(&editor, &fewer);
+        folds.sync(&mut editor);
+        assert!(!hidden(&editor, "body one"));
+    }
+
+    #[test]
+    fn folds_attach_to_another_view_of_the_document() {
+        let mut first = editor(TEXT);
+        let mut folds = TabFolds::default();
+        folds.sync(&mut first);
+        folds.toggle(&mut first, TEXT.find("# Two").unwrap());
+
+        let mut second = another_view(&first);
+        assert!(!hidden(&second, "body two"));
+        folds.attach(&mut second);
+        assert!(hidden(&second, "body two") && hidden(&second, "body sub"));
+        assert!(!hidden(&second, "body one"));
+
+        // A retitle the folds have not seen yet is followed, as `sync` would.
+        let two = TEXT.find("# Two").unwrap();
+        edit(&first, &TEXT.replace("# Two", "# Twice"));
+        let mut third = another_view(&first);
+        folds.attach(&mut third);
+        assert!(hidden(&third, "body two") && !hidden(&third, "body one"));
+        assert_eq!(folds.offsets(&third.document().borrow()), vec![two]);
     }
 }

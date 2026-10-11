@@ -1382,6 +1382,90 @@ fn the_session_remembers_caret_scroll_and_folds_of_open_tabs_and_tabs_restore_th
     });
 }
 
+/// What the active tab of `cell` shows of [`OUTLINE`]: whether the bodies of `# One` and
+/// `# Two` are folded away, and the scroll position.
+fn outline_view(cell: &WindowCell) -> ([bool; 2], f32) {
+    let view = cell.view.borrow();
+    let editor = &view.active_tab().expect("a tab is open").editor;
+    let hidden = |needle: &str| editor.is_offset_hidden(OUTLINE.find(needle).unwrap() + 1);
+    ([hidden("body one"), hidden("body two")], editor.scroll_y())
+}
+
+fn toggle_fold(rig: &Rig, cell: &WindowCell, heading: &str) {
+    let key = active_key(cell);
+    let heading_start = OUTLINE.find(heading).unwrap();
+    rig.controller.handle_action(
+        cell.id,
+        ShellAction::Editor(key, EditorEvent::ToggleFold { heading_start }),
+    );
+}
+
+fn scroll_to(cell: &WindowCell, y: f32) {
+    cell.view
+        .borrow_mut()
+        .active_editor_mut()
+        .expect("an editor")
+        .set_scroll_y(y);
+}
+
+#[test]
+fn a_dragged_out_tab_keeps_the_folds_and_scroll_it_has_now() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let first = rig.window();
+        std::fs::write(rig.work.join("a.md"), OUTLINE).unwrap();
+        rig.open("a.md");
+        // Closing the tab remembers both folds and the scroll position for the next opening.
+        assert!(handled(&rig.cmd(CommandId::ViewFoldAll)));
+        scroll_to(&first, 120.0);
+        assert!(handled(&rig.cmd(CommandId::TabClose)));
+        rig.open("a.md");
+        assert_eq!(outline_view(&first), ([true, true], 120.0));
+
+        // Changed since the file was opened: `# One` unfolded, scrolled elsewhere.
+        toggle_fold(rig, &first, "# One");
+        scroll_to(&first, 40.0);
+        assert_eq!(outline_view(&first), ([false, true], 40.0));
+
+        let key = active_key(&first);
+        rig.act(ShellAction::Title(TitleEvent::Tabs(TabsEvent::TornOut {
+            key,
+            at: Point::new(0.0, 0.0),
+        })));
+        let windows = rig.controller.windows();
+        assert_eq!(windows.len(), 2);
+        let fresh = &windows[1];
+        assert_eq!(names(fresh), [file("a.md")]);
+        assert_eq!(outline_view(fresh), ([false, true], 40.0));
+
+        // The moved tab owns its folds: the chevron works there.
+        toggle_fold(rig, fresh, "# Two");
+        assert_eq!(outline_view(fresh), ([false, false], 40.0));
+        toggle_fold(rig, fresh, "# One");
+        assert_eq!(outline_view(fresh), ([true, false], 40.0));
+    });
+}
+
+#[test]
+fn merged_tabs_keep_the_folds_and_scroll_they_have_now() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let first = rig.window();
+        std::fs::write(rig.work.join("a.md"), OUTLINE).unwrap();
+        rig.controller.open_launch(&Launch {
+            items: vec![LaunchItem::File(rig.work.join("a.md"))],
+            new_window: true,
+        });
+        let second = Rc::clone(&rig.controller.windows()[1]);
+        toggle_fold(rig, &second, "# Two");
+        scroll_to(&second, 120.0);
+        assert_eq!(outline_view(&second), ([false, true], 120.0));
+
+        assert!(handled(&rig.cmd_in(&first, CommandId::WindowMergeAll)));
+        assert_eq!(rig.controller.windows().len(), 1);
+        assert_eq!(names(&first), [file("notes.md"), file("a.md")]);
+        assert_eq!(outline_view(&first), ([false, true], 120.0));
+    });
+}
+
 #[test]
 fn insert_date_puts_todays_long_date_at_the_caret() {
     with_rig(NO_AUTOSAVE, |rig| {

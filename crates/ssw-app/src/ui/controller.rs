@@ -890,10 +890,7 @@ impl Controller {
         let size = cell.view.borrow().layout().size();
         let scale = cell.view.borrow().layout().scale();
         let fresh = self.create_window(None, size, scale);
-        fresh
-            .view
-            .borrow_mut()
-            .add_tab(Rc::clone(&tab.entry), tab.workspace.clone());
+        fresh.view.borrow_mut().add_moved_tab(tab);
         self.active_window.set(Some(fresh.id));
         self.refresh(&fresh);
     }
@@ -905,9 +902,7 @@ impl Controller {
                 continue;
             }
             while let Some(tab) = close_first_tab(&other) {
-                cell.view
-                    .borrow_mut()
-                    .add_tab(Rc::clone(&tab.entry), tab.workspace.clone());
+                cell.view.borrow_mut().add_moved_tab(tab);
             }
             self.windows
                 .borrow_mut()

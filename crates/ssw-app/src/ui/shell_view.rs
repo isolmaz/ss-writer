@@ -694,6 +694,25 @@ impl ShellView {
 
     /// Appends a tab showing `entry` and makes it the active one. Returns its key.
     pub fn add_tab(&mut self, entry: Rc<DocEntry>, workspace: Option<PathBuf>) -> u64 {
+        self.push_tab(entry, workspace, None)
+    }
+
+    /// Appends `moved`, a tab taken out of another window ([`ShellView::close_tab`]), and makes
+    /// it the active one. Unlike [`ShellView::add_tab`] the tab keeps the folds and the scroll
+    /// position it has now, not the ones the file was opened with. Returns its key.
+    pub fn add_moved_tab(&mut self, moved: TabView) -> u64 {
+        let scroll = moved.editor.scroll_y();
+        self.push_tab(moved.entry, moved.workspace, Some((moved.folds, scroll)))
+    }
+
+    /// Appends a tab showing `entry` with the folds and scroll position `carried` from the
+    /// tab it replaces, or else the ones the file was left with (spec §6).
+    fn push_tab(
+        &mut self,
+        entry: Rc<DocEntry>,
+        workspace: Option<PathBuf>,
+        carried: Option<(TabFolds, f32)>,
+    ) -> u64 {
         let key = self.next_key;
         self.next_key += 1;
         match entry.path() {
@@ -716,15 +735,20 @@ impl ShellView {
             .editor_setup
             .as_ref()
             .and_then(|setup| setup(&mut editor));
-        // The scroll position and the folds the file was left with (spec §6).
-        let remembered = entry.remembered_view();
-        let mut folds = remembered.as_ref().map_or_else(TabFolds::default, |view| {
-            TabFolds::from_offsets(&entry.document().borrow(), &view.folds)
-        });
-        if let Some(view) = &remembered {
-            editor.set_scroll_y(view.scroll_delta);
+        let (mut folds, scroll) = match carried {
+            Some((folds, scroll)) => (folds, Some(scroll)),
+            None => {
+                let remembered = entry.remembered_view();
+                let folds = remembered.as_ref().map_or_else(TabFolds::default, |view| {
+                    TabFolds::from_offsets(&entry.document().borrow(), &view.folds)
+                });
+                (folds, remembered.map(|view| view.scroll_delta))
+            }
+        };
+        if let Some(scroll) = scroll {
+            editor.set_scroll_y(scroll);
         }
-        folds.sync(&mut editor);
+        folds.attach(&mut editor);
         self.tabs.push(TabView {
             key,
             entry,

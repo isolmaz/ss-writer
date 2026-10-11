@@ -1413,23 +1413,38 @@ fn text_dragged_onto_another_tab_moves_or_copies_there() {
         drop(a, (0, 4), true, centre(notes));
         assert_eq!(text_of(a), "# B\n# A\nfind the needle\n");
         assert_eq!(text_of(notes), "# B\n# Notes\n");
-        // Released on its own tab, beside the row, or on a tab of the same document: nothing.
+        // Released on its own tab (also on its close button), beside the row, or on a second
+        // tab of the same document: nothing.
         drop(a, (0, 4), false, centre(a));
+        let own_close = {
+            let view = window.view.borrow();
+            let index = keys.iter().position(|&k| k == a).unwrap();
+            view.titlebar().tabs().strip().close_rect(index).center()
+        };
+        drop(a, (0, 4), false, own_close);
         drop(a, (0, 4), false, Point::new(-10.0, -10.0));
-        assert!(handled(&rig.cmd(CommandId::TabNew)));
-        rig.open("a.md");
-        let twin = active_key(&window);
+        let entry = {
+            let view = window.view.borrow();
+            Rc::clone(&view.tab(a).unwrap().entry)
+        };
+        let twin = window.view.borrow_mut().add_tab(entry, None);
+        assert_ne!(twin, a);
         window.view.borrow_mut().paint(
             &mut RecordingCanvas::new(),
             &MonoTextEngine::default(),
             false,
         );
-        let twin_centre = {
+        let (twin_centre, twin_close) = {
             let view = window.view.borrow();
             let index = view.tabs().iter().position(|tab| tab.key == twin).unwrap();
-            view.titlebar().tabs().strip().tab_rect(index).center()
+            let strip = view.titlebar().tabs().strip();
+            (
+                strip.tab_rect(index).center(),
+                strip.close_rect(index).center(),
+            )
         };
         drop(a, (0, 4), false, twin_centre);
+        drop(a, (0, 4), false, twin_close);
         assert_eq!(text_of(a), "# B\n# A\nfind the needle\n");
         // A tab that no longer exists is no source.
         rig.act(ShellAction::Editor(

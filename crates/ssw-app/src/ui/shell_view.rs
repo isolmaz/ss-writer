@@ -43,6 +43,7 @@ use ssw_ui::widget::{
 use ssw_ui::widgets::{Control, SharedClipboard};
 
 use super::clipboard::key_command;
+use super::folds::TabFolds;
 use super::history::HistoryHost;
 use super::overlays::{NoShortcuts, OverlayAction, OverlayEnv, OverlayRects, Overlays};
 use crate::documents::{DocEntry, DocMode, Documents};
@@ -101,6 +102,8 @@ pub struct TabView {
     pub table: Option<TableControl>,
     /// The workspace root of the tab.
     pub workspace: Option<PathBuf>,
+    /// The folded headings (spec §2.8).
+    pub folds: TabFolds,
 }
 
 /// What the view is built from.
@@ -571,6 +574,42 @@ impl ShellView {
         true
     }
 
+    /// The gutter chevron of tab `key`: folds or unfolds the heading block starting at
+    /// `heading_start` (spec §2.8).
+    pub fn toggle_fold(&mut self, key: u64, heading_start: usize) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.key == key) {
+            tab.folds.toggle(&mut tab.editor, heading_start);
+            self.requests.invalidate_all();
+        }
+    }
+
+    /// Unfolds the sections of tab `key` that hide `range` (a search match, spec §7).
+    pub fn unfold_containing(&mut self, key: u64, range: TextRange) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.key == key)
+            && tab.folds.unfold_containing(&mut tab.editor, range)
+        {
+            self.requests.invalidate_all();
+        }
+    }
+
+    /// View → Fold all / Unfold all on the active tab (spec §2.8). False without a Markdown
+    /// tab.
+    pub fn fold_all(&mut self, fold: bool) -> bool {
+        let Some(tab) = self
+            .active_tab_mut()
+            .filter(|tab| tab.editor.config().document_kind == DocumentKind::Markdown)
+        else {
+            return false;
+        };
+        if fold {
+            tab.folds.fold_all(&mut tab.editor);
+        } else {
+            tab.folds.unfold_all(&mut tab.editor);
+        }
+        self.requests.invalidate_all();
+        true
+    }
+
     /// A click on `[^label]` in tab `key` (spec §3): the caret goes to the text of the
     /// footnote definition. A reference without a definition stays where it is.
     pub fn jump_to_footnote(&mut self, key: u64, label: &str) {
@@ -655,6 +694,25 @@ impl ShellView {
 
     /// Appends a tab showing `entry` and makes it the active one. Returns its key.
     pub fn add_tab(&mut self, entry: Rc<DocEntry>, workspace: Option<PathBuf>) -> u64 {
+        self.push_tab(entry, workspace, None)
+    }
+
+    /// Appends `moved`, a tab taken out of another window ([`ShellView::close_tab`]), and makes
+    /// it the active one. Unlike [`ShellView::add_tab`] the tab keeps the folds and the scroll
+    /// position it has now, not the ones the file was opened with. Returns its key.
+    pub fn add_moved_tab(&mut self, moved: TabView) -> u64 {
+        let scroll = moved.editor.scroll_y();
+        self.push_tab(moved.entry, moved.workspace, Some((moved.folds, scroll)))
+    }
+
+    /// Appends a tab showing `entry` with the folds and scroll position `carried` from the
+    /// tab it replaces, or else the ones the file was left with (spec §6).
+    fn push_tab(
+        &mut self,
+        entry: Rc<DocEntry>,
+        workspace: Option<PathBuf>,
+        carried: Option<(TabFolds, f32)>,
+    ) -> u64 {
         let key = self.next_key;
         self.next_key += 1;
         match entry.path() {
@@ -677,12 +735,27 @@ impl ShellView {
             .editor_setup
             .as_ref()
             .and_then(|setup| setup(&mut editor));
+        let (mut folds, scroll) = match carried {
+            Some((folds, scroll)) => (folds, Some(scroll)),
+            None => {
+                let remembered = entry.remembered_view();
+                let folds = remembered.as_ref().map_or_else(TabFolds::default, |view| {
+                    TabFolds::from_offsets(&entry.document().borrow(), &view.folds)
+                });
+                (folds, remembered.map(|view| view.scroll_delta))
+            }
+        };
+        if let Some(scroll) = scroll {
+            editor.set_scroll_y(scroll);
+        }
+        folds.attach(&mut editor);
         self.tabs.push(TabView {
             key,
             entry,
             editor,
             table,
             workspace,
+            folds,
         });
         self.activate_tab(key);
         key
@@ -804,11 +877,13 @@ impl ShellView {
             .is_some_and(|table| table.execute(&mut tab.editor, &clipboard, command))
     }
 
-    /// Refreshes the tab titles and dirty dots (`show_dirty`: autosave is off) and the way each
-    /// editor presents its document (a Save as can change the file type).
+    /// Refreshes the tab titles and dirty dots (`show_dirty`: autosave is off), the way each
+    /// editor presents its document (a Save as can change the file type) and the folds of
+    /// documents that changed.
     pub fn sync_tabs(&mut self, show_dirty: bool) {
         for tab in &mut self.tabs {
             present_as(&mut tab.editor, tab.entry.mode());
+            tab.folds.sync(&mut tab.editor);
             let tabs = self.titlebar.tabs_mut();
             if let Some(path) = tab.entry.path() {
                 let path = path.to_string_lossy();
@@ -1421,6 +1496,8 @@ impl ShellView {
                 };
                 actions.extend(event.map(|event| ShellAction::Editor(key, event)));
             }
+            // Another tab (or an undo) may have changed the document under the folds.
+            tab.folds.sync(&mut tab.editor);
         }
         actions.extend(self.pump_overlays().into_iter().map(ShellAction::Overlay));
         actions.extend(

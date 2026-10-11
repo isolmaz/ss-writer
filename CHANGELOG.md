@@ -18,6 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The Copy button of a code block put nothing on the clipboard, clicking a footnote reference did not jump to its definition (also when the two spell the label in different case), and text dragged onto another tab of the window was dropped on the floor instead of moving (Ctrl: copying) to that tab; a read-only tab such as a Help page takes nothing, so the dragged text stays where it is.
 - The sidebar commands (open, rename, duplicate, delete, reveal, copy path, new file and folder, collapse and expand all) were listed in the command palette and assignable to shortcuts but ran only from the sidebar's context menu; from the palette or a shortcut they now act on the selected entry (or the workspace). They are disabled without a workspace; the entry commands also without a selected entry or while the sidebar is hidden, and the open commands for a selected folder.
 - Deleting, cutting or joining items of a numbered list (and typing a marker into one) renumbers the list, as Enter already did.
+- Heading folding did nothing: the gutter chevron, View → Fold all / Unfold all, unfolding of search hits and the per-file fold state were not connected to the editor.
+- The caret position, scroll position and folds of the tabs that were open when SS Writer closed were not remembered; restored tabs and reopened files started at the top. The scroll position was never restored at all.
 
 ## [0.1.0] - 2026-10-10
 

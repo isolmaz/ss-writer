@@ -22,6 +22,7 @@ pub mod context_menus;
 pub mod controller;
 pub mod export;
 pub mod files;
+pub mod folds;
 pub mod help;
 pub mod history;
 pub mod host;

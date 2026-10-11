@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use ssw_core::document::Document;
 use ssw_core::edit::{Edit, Selection, Transaction};
+use ssw_core::ops::{Ctx, typing};
 use ssw_core::text::TextRange;
 
 use crate::access::{
@@ -559,12 +560,17 @@ impl EditorView {
         if range.is_empty() || range.end > self.doc.borrow().buffer().len() {
             return false;
         }
-        let before = self.selection();
-        let after = Selection::caret(range.start);
-        self.apply(
-            Transaction::single(Edit::delete(range), before, after),
-            false,
-        )
+        let tx = {
+            let doc = self.doc.borrow();
+            let ctx = doc.ctx();
+            // The deletion of a selection: ordered lists it touches are renumbered.
+            typing::delete_forward(Ctx::new(
+                ctx.buffer,
+                ctx.ast,
+                Selection::new(range.start, range.end),
+            ))
+        };
+        tx.is_some_and(|tx| self.apply(tx, false))
     }
 
     /// The source range currently visible in the viewport.

@@ -1372,6 +1372,93 @@ fn clicking_a_footnote_reference_jumps_to_its_definition() {
 }
 
 #[test]
+fn a_footnote_reference_finds_its_definition_whatever_the_case_of_the_label() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let text = "Hello[^Note].\n\n[^note]:  the note\n";
+        rig.set_text(text);
+        let window = rig.window();
+        let key = active_key(&window);
+        let footnote = |label: &str| {
+            rig.act(ShellAction::Editor(
+                key,
+                EditorEvent::LinkActivated(LinkTarget::Footnote(label.to_owned())),
+            ));
+            rig.entry().document().borrow().primary_selection()
+        };
+        assert_eq!(
+            footnote("Note"),
+            Selection::caret(text.find("the note").unwrap())
+        );
+    });
+}
+
+#[test]
+fn text_dropped_on_a_read_only_tab_stays_in_its_source() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let window = rig.window();
+        rig.open("a.md");
+        rig.open("b.md");
+        window.view.borrow_mut().paint(
+            &mut RecordingCanvas::new(),
+            &MonoTextEngine::default(),
+            false,
+        );
+        let keys = keys(&window);
+        let (a, b) = (keys[1], keys[2]);
+        let centre = |key: u64| {
+            let view = window.view.borrow();
+            let strip = view.titlebar().tabs().strip();
+            let index = keys.iter().position(|&k| k == key).unwrap();
+            strip.tab_rect(index).center()
+        };
+        let text_of = |key: u64| {
+            let view = window.view.borrow();
+            view.tab(key).unwrap().entry.document().borrow().text()
+        };
+        let source = ssw_core::text::TextRange::new(0, 4);
+        let (a_before, b_before) = (text_of(a), text_of(b));
+        assert_eq!(b_before, "# B\n");
+        window
+            .view
+            .borrow_mut()
+            .tabs_mut()
+            .iter_mut()
+            .find(|tab| tab.key == a)
+            .unwrap()
+            .editor
+            .set_read_only(true);
+        let on_a = centre(a);
+        for copy in [false, true] {
+            let taken = window
+                .view
+                .borrow_mut()
+                .drop_text_on_tab(b, "# B\n", source, copy, on_a);
+            assert!(!taken, "a read-only tab takes nothing (copy: {copy})");
+            assert_eq!(text_of(b), b_before, "the source keeps its text");
+            assert_eq!(text_of(a), a_before, "the target is unchanged");
+        }
+        // Writable again: the same drop is taken and moves the text.
+        window
+            .view
+            .borrow_mut()
+            .tabs_mut()
+            .iter_mut()
+            .find(|tab| tab.key == a)
+            .unwrap()
+            .editor
+            .set_read_only(false);
+        assert!(
+            window
+                .view
+                .borrow_mut()
+                .drop_text_on_tab(b, "# B\n", source, false, on_a)
+        );
+        assert_eq!(text_of(b), "");
+        assert_eq!(text_of(a), format!("# B\n{a_before}"));
+    });
+}
+
+#[test]
 fn text_dragged_onto_another_tab_moves_or_copies_there() {
     with_rig(NO_AUTOSAVE, |rig| {
         let window = rig.window();

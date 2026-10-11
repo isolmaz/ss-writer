@@ -14,6 +14,7 @@ use ssw_core::command::CommandId;
 use ssw_core::edit::Selection;
 use ssw_core::i18n::{Arg, Localizer};
 use ssw_core::markdown::ast::BlockKind;
+use ssw_core::markdown::definitions::normalize_label;
 use ssw_core::ops::format::InlineStyle;
 use ssw_core::settings::{Settings, SortBy};
 use ssw_core::stats;
@@ -536,8 +537,8 @@ impl ShellView {
 
     /// Text dragged out of the editor of tab `source_key` and released at `position` (window
     /// DIPs): dropped on another tab of the row it goes to that tab's caret and, unless `copy`,
-    /// leaves `source` (spec §2.4). Returns whether a tab took it; a release anywhere else (or
-    /// on a tab that shows the same document) changes nothing.
+    /// leaves `source` (spec §2.4). Returns whether a tab took it; a release anywhere else, on
+    /// a tab that shows the same document or on a read-only tab changes nothing.
     pub fn drop_text_on_tab(
         &mut self,
         source_key: u64,
@@ -558,7 +559,11 @@ impl ShellView {
         if Rc::ptr_eq(&self.tabs[from].entry, &self.tabs[to].entry) {
             return false;
         }
-        self.tabs[to].editor.insert_text(text);
+        // A target that refuses the text (a read-only Help page) must not cost the source
+        // its text.
+        if !self.tabs[to].editor.insert_text(text) {
+            return false;
+        }
         if !copy {
             self.tabs[from].editor.remove_range(source);
         }
@@ -572,13 +577,15 @@ impl ShellView {
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.key == key) else {
             return;
         };
+        // Labels match the way the parser matches them: case-folded, whitespace collapsed.
+        let wanted = normalize_label(label);
         let target = {
             let document = tab.entry.document().borrow();
             document
                 .ast()
                 .iter_blocks()
                 .find(|block| {
-                    matches!(&block.kind, BlockKind::FootnoteDefinition { label: own } if own == label)
+                    matches!(&block.kind, BlockKind::FootnoteDefinition { label: own } if normalize_label(own) == wanted)
                 })
                 .map(|block| {
                     let after_prefix = block.markers.first().map_or(block.range.start, |m| m.end);

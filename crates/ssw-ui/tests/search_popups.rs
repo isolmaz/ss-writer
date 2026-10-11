@@ -1051,6 +1051,29 @@ fn the_completion_measures_paints_and_takes_no_actions_of_its_own() {
 }
 
 #[test]
+fn sources_fed_after_the_keystroke_fill_the_open_list_and_leave_a_closed_one_alone() {
+    let mut list = WikilinkCompletion::new(localizer());
+    // `[[#` typed before the host handed over the headings: the list is empty ...
+    list.open(Rect::new(100.0, 100.0, 2.0, 20.0), "#");
+    assert!(!list.is_visible());
+    // ... until they arrive.
+    let doc = Document::new("# Intro\n\n## Usage\n");
+    list.set_outline(&Toc::build(doc.ast(), &doc.text()));
+    assert!(list.is_visible());
+    assert_eq!(labels(&list), ["Intro", "Usage"]);
+    // The query is kept: the files complete the same text.
+    list.set_query("");
+    assert!(!list.is_visible());
+    let files = vec![RelPath::parse("notes.md").expect("path")];
+    list.set_files(files.clone(), Vec::new());
+    assert_eq!(labels(&list), ["notes.md"]);
+    // A closed list stays closed.
+    list.close();
+    list.set_files(files, Vec::new());
+    assert!(!list.is_visible());
+}
+
+#[test]
 fn the_wheel_scrolls_a_long_list_of_suggestions() {
     let mut host = Host::new();
     let mut list = WikilinkCompletion::new(localizer());

@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Shift+Tab on a bullet nested in a numbered list (or a numbered item nested in a bullet list) left a marker of the wrong kind that split the list in three; the item now takes the marker of the list it joins. Tab in a list item that cannot be indented inserted a tab character into its text.
 - Format → Quote with the caret in a callout removed the `>` of that line alone and left a broken callout; it now removes the whole callout (a title stays as a line of text).
 - Typing in a large document no longer parses the whole text on every keystroke: the editor now uses the incremental parser, so a keystroke in a 60 000-line document costs milliseconds instead of a quarter of a second.
+- The `[[` completion list shows the headings (`[[#`) and the workspace files as soon as they arrive instead of staying empty until the next keystroke.
 
 ## [0.1.0] - 2026-10-10
 

@@ -524,15 +524,32 @@ mod tests {
     #[test]
     fn keystroke_transactions_classify_as_typing() {
         use crate::undo::{TypingKind, typing_kind};
-        let kind = |before: &str, op: fn(Ctx<'_>) -> Option<Transaction>| {
+        let keystroke = |before: &str, op: fn(Ctx<'_>) -> Option<Transaction>| {
             let (text, selection) = parse_marked(before);
             let buffer = crate::text::Buffer::from_text(&text);
             let ast = crate::markdown::parse_document(&text);
-            let tx = op(Ctx::new(&buffer, &ast, selection)).expect("applies");
-            typing_kind(&tx)
+            op(Ctx::new(&buffer, &ast, selection)).expect("applies")
+        };
+        let kind = |before: &str, op: fn(Ctx<'_>) -> Option<Transaction>| {
+            typing_kind(&keystroke(before, op))
         };
         assert_eq!(kind("ab‸", backspace), Some(TypingKind::DeleteBackward));
         assert_eq!(kind("a‸b", delete_forward), Some(TypingKind::DeleteForward));
         assert_eq!(kind("«ab»", backspace), None);
+
+        // In an ordered list item the edit stays the one the key made, at the caret, also
+        // between repeated letters: undo only groups keystrokes it classifies as typing.
+        let tx = keystroke("1. h‸llo", |c| Some(insert_text(c, "l")));
+        assert_eq!(tx.edits, [Edit::insert(4, "l")]);
+        assert_eq!(tx.selection_after, Selection::caret(5));
+        assert_eq!(typing_kind(&tx), Some(TypingKind::Insert));
+        let tx = keystroke("1. hel‸lo", backspace);
+        assert_eq!(tx.edits, [Edit::delete(TextRange::new(5, 6))]);
+        assert_eq!(tx.selection_after, Selection::caret(5));
+        assert_eq!(typing_kind(&tx), Some(TypingKind::DeleteBackward));
+        let tx = keystroke("1. he‸llo", delete_forward);
+        assert_eq!(tx.edits, [Edit::delete(TextRange::new(5, 6))]);
+        assert_eq!(tx.selection_after, Selection::caret(5));
+        assert_eq!(typing_kind(&tx), Some(TypingKind::DeleteForward));
     }
 }

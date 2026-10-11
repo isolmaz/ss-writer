@@ -239,8 +239,13 @@ fn common_affixes(a: &str, b: &str) -> (usize, usize) {
     (prefix, suffix)
 }
 
-/// Builds the transaction for `edits`, renumbering the ordered lists they touch so the result
-/// is one edit. `after` is the selection in the coordinates of the text after `edits`.
+/// Builds the transaction for `edits`, renumbering the ordered lists they touch. `after` is the
+/// selection in the coordinates of the text after `edits`.
+///
+/// When `edits` leave the numbers consistent they are the transaction as given (a keystroke
+/// stays one edit at the caret, which the undo grouping relies on), or none when they cancel
+/// out. Only when numbers have to change is the result one edit that covers `edits` and the
+/// renumbering together.
 pub(crate) fn finish(ctx: Ctx<'_>, edits: Vec<Edit>, after: Selection) -> Transaction {
     let Some(window) = renumber_window(ctx, &edits) else {
         return ctx.transaction(edits, after);
@@ -254,7 +259,13 @@ pub(crate) fn finish(ctx: Ctx<'_>, edits: Vec<Edit>, after: Selection) -> Transa
         );
     }
     let renumber = renumber_edits(&parse_document(&text), &text);
-    let mut renumbered = text.clone();
+    if renumber.is_empty() {
+        // The common affixes of old and new text place an edit at the end of a run of equal
+        // characters (typing `l` into `h‸llo` would land behind the `ll`), not at the caret.
+        let edits = if text == old { Vec::new() } else { edits };
+        return ctx.transaction(edits, after);
+    }
+    let mut renumbered = text;
     for edit in renumber.iter().rev() {
         renumbered.replace_range(edit.range.as_range(), &edit.text);
     }
@@ -1005,6 +1016,10 @@ mod tests {
         check("1. a\n2. b‸", "1. a\n2. b‸", |c| {
             let end = Selection::caret(c.buffer.len());
             Some(finish(c, vec![Edit::insert(0, "")], end))
+        });
+        // A digit typed into the number of a later item is renumbered away again.
+        check("1. a\n2‸. b", "1. a\n2‸. b", |c| {
+            Some(finish(c, vec![Edit::insert(6, "5")], Selection::caret(7)))
         });
     }
 }

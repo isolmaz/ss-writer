@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::{Args, PerfScenario};
-use ssw_app::perf::{DOC_OPEN_RETURNED, SCROLL_BEGIN, SCROLL_END, TYPE_BEGIN};
+use ssw_app::perf::{
+    DOC_OPEN_RETURNED, FOLDER_OPEN_RETURNED, SCROLL_BEGIN, SCROLL_END, TREE_PAINTED, TYPE_BEGIN,
+};
 use ssw_app::startup::ProcessEnv;
 use ssw_app::ui::controller::WindowCell;
 use ssw_app::ui::host::{UiApp, UiOptions, UiServices};
@@ -517,6 +519,31 @@ fn a_folder_scenario_fails_without_a_target_or_without_rows() {
         );
         assert_eq!(finish(app, &mut driver, recorder, true), EXIT_PERF_FAILED);
         assert_eq!(report_error(tmp.path()), "the sidebar shows no rows");
+    });
+}
+
+#[test]
+fn a_shown_workspace_is_marked_painted_by_the_frame_after_the_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("folder");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("a.md"), "# a\n").unwrap();
+    with_app(tmp.path(), |app, args, recorder| {
+        recorder.reset();
+        let mut driver = new_driver(
+            args,
+            Some(PerfScenario::Folder10k),
+            Some(folder.as_path()),
+            None,
+            Limits::default(),
+        );
+        until_mark(app, &mut driver, recorder, FOLDER_OPEN_RETURNED);
+        // No frame since the open: the tree is not painted yet.
+        assert_eq!(driver.tick(app), Tick::Running);
+        assert!(!recorder.has_mark(TREE_PAINTED));
+        present(recorder);
+        assert_eq!(driver.tick(app), Tick::Running);
+        assert!(recorder.has_mark(TREE_PAINTED));
     });
 }
 

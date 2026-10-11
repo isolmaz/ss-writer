@@ -1548,6 +1548,116 @@ fn text_dragged_onto_another_tab_moves_or_copies_there() {
 }
 
 #[test]
+fn sidebar_commands_from_the_palette_act_on_the_selected_entry() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let window = rig.window();
+        // No workspace: nothing to act on.
+        assert!(matches!(
+            rig.cmd(CommandId::SidebarCollapseAll),
+            Dispatch::Unhandled
+        ));
+        let state = rig.controller.menu_state(&window);
+        assert!(!state.workspace && !state.sidebar_entry && !state.sidebar_file);
+        rig.controller.show_workspace(&window, &rig.work);
+        window.view.borrow_mut().paint(
+            &mut RecordingCanvas::new(),
+            &MonoTextEngine::default(),
+            false,
+        );
+        // Root commands work without a selection, entry commands do not.
+        assert!(handled(&rig.cmd(CommandId::SidebarCollapseAll)));
+        assert!(handled(&rig.cmd(CommandId::SidebarExpandAll)));
+        assert!(matches!(
+            rig.cmd(CommandId::SidebarCopyPath),
+            Dispatch::Unhandled
+        ));
+        let key = {
+            let view = window.view.borrow();
+            let sidebar = view.sidebar().expect("a sidebar");
+            let index = sidebar
+                .row_names()
+                .iter()
+                .position(|row| row == "b")
+                .unwrap();
+            sidebar.row_key(index).unwrap()
+        };
+        window
+            .view
+            .borrow_mut()
+            .sidebar_mut()
+            .unwrap()
+            .select_key(key);
+        assert!(rig.controller.menu_state(&window).sidebar_entry);
+        assert!(handled(&rig.cmd(CommandId::SidebarCopyPath)));
+        assert_eq!(
+            rig.clipboard.borrow().text(),
+            Ok(Some(rig.work.join("b.md").to_string_lossy().into_owned()))
+        );
+        assert!(handled(&rig.cmd(CommandId::SidebarOpenInNewTab)));
+        assert_eq!(names(&window).last().unwrap().as_deref(), Some("b.md"));
+
+        // A selected folder is not opened: the open commands are disabled and do nothing (no
+        // error dialog, no empty window, no tab); the other entry commands still apply.
+        let folder = {
+            let view = window.view.borrow();
+            let sidebar = view.sidebar().expect("a sidebar");
+            let index = sidebar
+                .row_names()
+                .iter()
+                .position(|row| row == "sub")
+                .unwrap();
+            sidebar.row_key(index).unwrap()
+        };
+        window
+            .view
+            .borrow_mut()
+            .sidebar_mut()
+            .unwrap()
+            .select_key(folder);
+        let state = rig.controller.menu_state(&window);
+        assert!(state.sidebar_entry && !state.sidebar_file);
+        let tabs = names(&window);
+        let windows = rig.controller.windows().len();
+        for command in [
+            CommandId::SidebarOpen,
+            CommandId::SidebarOpenInNewTab,
+            CommandId::SidebarOpenInNewWindow,
+        ] {
+            assert!(!state.enabled(command), "{command}");
+            assert!(matches!(rig.cmd(command), Dispatch::Unhandled), "{command}");
+            assert_eq!(names(&window), tabs, "{command}");
+            assert_eq!(rig.controller.windows().len(), windows, "{command}");
+        }
+        assert!(rig.services.dialog_log().is_empty());
+        assert!(state.enabled(CommandId::SidebarRename));
+        assert!(handled(&rig.cmd(CommandId::SidebarCopyPath)));
+        assert_eq!(
+            rig.clipboard.borrow().text(),
+            Ok(Some(rig.work.join("sub").to_string_lossy().into_owned()))
+        );
+
+        // A hidden sidebar has no entry to act on: the entry commands wait until it is shown.
+        window
+            .view
+            .borrow_mut()
+            .layout_mut()
+            .set_sidebar_visible(false);
+        let state = rig.controller.menu_state(&window);
+        assert!(!state.sidebar_entry && !state.sidebar_file);
+        assert!(state.workspace);
+        assert!(matches!(
+            rig.cmd(CommandId::SidebarRename),
+            Dispatch::Unhandled
+        ));
+        assert!(matches!(
+            rig.cmd(CommandId::SidebarDelete),
+            Dispatch::Unhandled
+        ));
+        assert!(handled(&rig.cmd(CommandId::SidebarCollapseAll)));
+    });
+}
+
+#[test]
 fn search_commands_open_the_find_bar_go_to_line_and_the_folder_search() {
     with_rig(NO_AUTOSAVE, |rig| {
         let window = rig.window();

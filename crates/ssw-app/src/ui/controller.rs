@@ -38,6 +38,7 @@ use ssw_ui::shortcuts::{CharProbe, ShortcutOutcome, ShortcutRouter};
 use ssw_ui::theme::{DEFAULT_ACCENT, Theme};
 use ssw_ui::widgets::SharedClipboard;
 
+use super::context_menus::{SidebarCommand, selected_sidebar_entry};
 use super::menus::MenuState;
 use super::overlays::{OverlayAction, list_workspace_files, panel_files};
 use super::shell_view::{ShellAction, ShellView, TabView, ViewConfig, sidebar_options};
@@ -1151,6 +1152,7 @@ impl Controller {
             let config = tab.editor.config();
             config.document_kind == DocumentKind::PlainText && config.wrap
         });
+        let selected = selected_sidebar_entry(&view);
         MenuState {
             has_document: active.is_some(),
             save_back: active.is_some_and(|tab| tab.entry.can_save_back()),
@@ -1166,6 +1168,9 @@ impl Controller {
             full_screen: layout.mode() == ShellMode::FullScreen,
             zen: layout.mode() == ShellMode::Zen,
             other_windows: self.windows.borrow().len() > 1,
+            workspace: cell.tree.borrow().is_some(),
+            sidebar_entry: selected.is_some(),
+            sidebar_file: selected.is_some_and(|(_, folder)| !folder),
         }
     }
 
@@ -1545,8 +1550,9 @@ impl AppActions for WindowActions<'_> {
                     controller.export_document(&cell, format);
                     true
                 }
-                // Settings, help and the sidebar context commands are handled elsewhere.
-                None => false,
+                // Settings and help are handled above; what is left are the sidebar commands.
+                None => SidebarCommand::from_id(other)
+                    .is_some_and(|item| controller.run_sidebar_command(&cell, item)),
             },
         }
     }

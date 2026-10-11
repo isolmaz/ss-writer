@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Typing in a large document no longer parses the whole text on every keystroke: the editor now uses the incremental parser, so a keystroke in a 60 000-line document costs milliseconds instead of a quarter of a second.
 - The `[[` completion list shows the headings (`[[#`) and the workspace files as soon as they arrive instead of staying empty until the next keystroke.
 - Edit → Insert date (F5), Format → Image and Format → Table did nothing. F5 inserts the long date of the Windows locale (escaped when it would start a numbered list; plain text files take it as it is), Image asks for picture files and inserts them like pasted files, Table inserts an empty two-column table with the caret in its first cell.
+- The Copy button of a code block put nothing on the clipboard, clicking a footnote reference did not jump to its definition, and text dragged onto another tab of the window was dropped on the floor instead of moving (Ctrl: copying) to that tab.
 
 ## [0.1.0] - 2026-10-10
 

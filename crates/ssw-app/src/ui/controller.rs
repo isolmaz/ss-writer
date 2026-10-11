@@ -25,8 +25,9 @@ use ssw_ui::editor::{
 use ssw_ui::geometry::Size;
 use ssw_ui::input::Cursor;
 use ssw_ui::services::{
-    Clock, Dialogs, FileFilter, MessageBoxButtons, MessageBoxIcon, MessageBoxOptions,
-    MessageBoxResult, OpenFileOptions, PickFolderOptions, SaveFileOptions, Shell,
+    ClipboardContent, Clock, Dialogs, FileFilter, MessageBoxButtons, MessageBoxIcon,
+    MessageBoxOptions, MessageBoxResult, OpenFileOptions, PickFolderOptions, SaveFileOptions,
+    Shell,
 };
 use ssw_ui::shell::banners::{BannerKind, HostEvent};
 use ssw_ui::shell::layout::ShellMode;
@@ -505,7 +506,7 @@ impl Controller {
             // The status bar's encoding and line-ending clicks are popups the loop owner shows
             // (`popup_for`); a click with no document open asks for nothing.
             ShellAction::Banner(HostEvent::Resized) | ShellAction::Status(_) => {}
-            ShellAction::Editor(_, event) => self.editor_event(&cell, event),
+            ShellAction::Editor(key, event) => self.editor_event(&cell, key, event),
             ShellAction::Inspector(event) => self.inspector_event(&cell, event),
             ShellAction::History(event) => self.history_event(&cell, event),
             ShellAction::Overlay(action) => self.overlay_action(&cell, action),
@@ -562,11 +563,31 @@ impl Controller {
         }
     }
 
-    fn editor_event(&self, cell: &Rc<WindowCell>, event: EditorEvent) {
+    fn editor_event(&self, cell: &Rc<WindowCell>, key: u64, event: EditorEvent) {
         match event {
             EditorEvent::ZoomChanged(percent) => self.set_zoom(percent),
             EditorEvent::Media(MediaEvent::LoadImage { dest, .. }) => {
                 self.allow_remote_image(cell, &dest);
+            }
+            EditorEvent::Media(MediaEvent::CopyCode { text, .. }) => {
+                // A clipboard that refuses leaves the block as it is; the button has no state.
+                let _ = self
+                    .clipboard
+                    .borrow_mut()
+                    .set(ClipboardContent::from_text(text));
+            }
+            EditorEvent::LinkActivated(LinkTarget::Footnote(label)) => {
+                cell.view.borrow_mut().jump_to_footnote(key, &label);
+            }
+            EditorEvent::TextDroppedOutside {
+                text,
+                source,
+                copy,
+                position,
+            } => {
+                cell.view
+                    .borrow_mut()
+                    .drop_text_on_tab(key, &text, source, copy, position);
             }
             EditorEvent::LinkActivated(LinkTarget::Wiki { target, heading }) => {
                 self.activate_wikilink(cell, &target, heading.as_deref());

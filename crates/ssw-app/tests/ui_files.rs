@@ -1392,6 +1392,40 @@ fn the_completion_list_offers_the_workspace_files_and_the_headings_of_the_docume
 }
 
 #[test]
+fn headings_fed_after_the_keystroke_fill_the_open_list_and_repaint() {
+    let note = "# One\n## Two\n\nSee [[#";
+    let files = vec![text_file("note.md", note)];
+    with_rig(files, "note.md", nothing, |rig| {
+        let window = rig.window();
+        window
+            .view
+            .borrow_mut()
+            .active_tab_mut()
+            .unwrap()
+            .editor
+            .go_to(Selection::caret(note.len()));
+        // `[[#` opened the list before the housekeeping turn handed over the headings.
+        assert!(rig.completion("#").is_empty());
+        window.view.borrow_mut().requests_mut().take_invalidation();
+        rig.pump();
+        let mut view = window.view.borrow_mut();
+        let rows: Vec<String> = view
+            .overlays()
+            .wikilink()
+            .list()
+            .rows()
+            .iter()
+            .map(|row| row.label.clone())
+            .collect();
+        assert_eq!(rows, ["One", "Two"]);
+        assert!(
+            !view.requests_mut().take_invalidation().is_clean(),
+            "the window repaints to show the list"
+        );
+    });
+}
+
+#[test]
 fn a_tab_outside_any_workspace_completes_nothing() {
     let files = vec![
         text_file("note.md", "See [[ta"),

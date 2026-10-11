@@ -1457,6 +1457,8 @@ pub struct WikilinkCompletion {
     files: Vec<RelPath>,
     recent: Vec<usize>,
     toc: Toc,
+    /// The text between `[[` and the caret the rows were computed for.
+    query: String,
     picks: Vec<WikilinkAccept>,
     open: bool,
     anchor: Rect,
@@ -1477,6 +1479,7 @@ impl WikilinkCompletion {
             files: Vec::new(),
             recent: Vec::new(),
             toc: Toc::default(),
+            query: String::new(),
             picks: Vec::new(),
             open: false,
             anchor: Rect::ZERO,
@@ -1486,14 +1489,28 @@ impl WikilinkCompletion {
     }
 
     /// The workspace files and the indices of the most recently used ones (most recent first).
+    /// An open list completes its query again from them.
     pub fn set_files(&mut self, files: Vec<RelPath>, recent: Vec<usize>) {
         self.files = files;
         self.recent = recent;
+        self.refresh();
     }
 
-    /// The headings of the current document (for `[[#`).
+    /// The headings of the current document (for `[[#`). An open list completes its query
+    /// again from them.
     pub fn set_outline(&mut self, toc: &Toc) {
         self.toc = toc.clone();
+        self.refresh();
+    }
+
+    /// The sources arrive from the host after the keystroke that opened or narrowed the list
+    /// (the workspace files and the headings are fed on the next housekeeping turn): the rows
+    /// of an open list follow them without waiting for the next keystroke.
+    fn refresh(&mut self) {
+        if self.open {
+            let query = std::mem::take(&mut self.query);
+            self.set_query(&query);
+        }
     }
 
     /// Opens the list below the caret rectangle `anchor` and completes `query` (the text between
@@ -1506,6 +1523,7 @@ impl WikilinkCompletion {
 
     /// Completes `query` again (the user typed or deleted a character).
     pub fn set_query(&mut self, query: &str) {
+        self.query = query.to_owned();
         let mut rows = Vec::new();
         let mut picks = Vec::new();
         if query.contains('|') || (query.contains('#') && !query.starts_with('#')) {

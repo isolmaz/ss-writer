@@ -945,6 +945,10 @@ impl Controller {
             completion.set_outline(&toc_of(&entry));
             key.outline = Some((tab_key, version));
         }
+        // The sources came after the keystroke that opened the list: show what they offer.
+        if completion.is_visible() {
+            view.requests_mut().invalidate_all();
+        }
     }
 
     // ----- placeholders -------------------------------------------------------------------

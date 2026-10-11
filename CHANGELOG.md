@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Starting SS Writer no longer opens an empty console window next to the editor.
+- Underline on struck text (and strikethrough on underlined text) produced three tildes, which Markdown shows as plain tildes; the second command then kept adding tildes. The two styles now replace each other, as `~x~` and `~~x~~` cannot nest.
 
 ## [0.1.0] - 2026-10-10
 

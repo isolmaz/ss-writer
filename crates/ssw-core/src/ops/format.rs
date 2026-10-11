@@ -39,6 +39,21 @@ impl InlineStyle {
         )
     }
 
+    /// The other tilde style. `~x~` and `~~x~~` cannot nest (a run of three tildes is plain
+    /// text), so applying one replaces the other.
+    fn tilde_sibling(self) -> Option<InlineStyle> {
+        match self {
+            InlineStyle::Underline => Some(InlineStyle::Strikethrough),
+            InlineStyle::Strikethrough => Some(InlineStyle::Underline),
+            _ => None,
+        }
+    }
+
+    /// True when `kind` is a node of this style or of a style it cannot nest with.
+    fn displaces(self, kind: &InlineKind) -> bool {
+        self.matches(kind) || self.tilde_sibling().is_some_and(|s| s.matches(kind))
+    }
+
     /// Opening and closing marker for wrapping `content`.
     fn markers(self, content: &str) -> (String, String) {
         let pair = |m: &str| (m.to_owned(), m.to_owned());
@@ -249,6 +264,19 @@ fn toggle_at_caret(ctx: Ctx<'_>, style: InlineStyle) -> Option<Transaction> {
     if let Some(node) = styled_node_at(ctx.ast, style, TextRange::at(caret)) {
         return Some(unwrap_or_recolor(ctx, style, &[node]));
     }
+    if let Some(node) = style
+        .tilde_sibling()
+        .and_then(|sibling| styled_node_at(ctx.ast, sibling, TextRange::at(caret)))
+    {
+        let (open, close) = style.markers("");
+        let edits = node
+            .markers
+            .iter()
+            .zip([open, close])
+            .map(|(marker, text)| Edit::replace(*marker, text))
+            .collect();
+        return Some(ctx.transaction_mapped(edits));
+    }
     if ctx.in_verbatim_block(caret) {
         return None;
     }
@@ -276,7 +304,16 @@ fn toggle_over_selection(ctx: Ctx<'_>, style: InlineStyle) -> Option<Transaction
         let trimmed = TextRange::new(part.start + lead, part.end - trail);
         let start = snap_endpoint(ctx.ast, trimmed.start, true, trimmed);
         let end = snap_endpoint(ctx.ast, trimmed.end, false, trimmed);
-        segments.push((TextRange::new(start, end), region));
+        let mut segment = TextRange::new(start, end);
+        // Inside the other tilde style the whole element changes style: its markers are
+        // removed by `wrap_segments` and the new ones go around it.
+        if let Some(node) = style
+            .tilde_sibling()
+            .and_then(|sibling| styled_node_at(ctx.ast, sibling, segment))
+        {
+            segment = node.range;
+        }
+        segments.push((segment, region));
     }
     if segments.is_empty() {
         return None;
@@ -315,8 +352,8 @@ fn unwrap_or_recolor(ctx: Ctx<'_>, style: InlineStyle, nodes: &[&Inline]) -> Tra
     ctx.transaction_mapped(edits)
 }
 
-/// Wraps every segment in the style markers, first removing markers of the same style that are
-/// now redundant inside a segment.
+/// Wraps every segment in the style markers, first removing markers of the same style (and of
+/// the tilde style it cannot nest with) inside a segment.
 fn wrap_segments(
     ctx: Ctx<'_>,
     style: InlineStyle,
@@ -331,7 +368,7 @@ fn wrap_segments(
         let mut last_removed: Option<TextRange> = None;
         for node in regions.iter().flat_map(|r| iter_inlines(r.inlines)) {
             let nested = last_removed.is_some_and(|r| r.contains_range(node.range));
-            if segment.contains_range(node.range) && style.matches(&node.kind) && !nested {
+            if segment.contains_range(node.range) && style.displaces(&node.kind) && !nested {
                 edits.extend(node.markers.iter().map(|m| Edit::delete(*m)));
                 last_removed = Some(node.range);
             }
@@ -593,6 +630,25 @@ mod tests {
     fn nested_same_style_unwraps_the_requested_one() {
         check("***a‸***", "**a‸**", style(InlineStyle::Italic));
         check("***a‸***", "*a‸*", style(InlineStyle::Bold));
+    }
+
+    #[test]
+    fn underline_and_strikethrough_replace_each_other() {
+        // `~~~x~~~` is plain text, so the two tilde styles never nest.
+        check("a ~~«b»~~ c", "a ~«b»~ c", style(InlineStyle::Underline));
+        check(
+            "a ~«b»~ c",
+            "a ~~«b»~~ c",
+            style(InlineStyle::Strikethrough),
+        );
+        check(
+            "a «~~b~~ d» c",
+            "a ~«b d»~ c",
+            style(InlineStyle::Underline),
+        );
+        check("a ~~b‸~~ c", "a ~b‸~ c", style(InlineStyle::Underline));
+        check("a ~b‸~ c", "a ~~b‸~~ c", style(InlineStyle::Strikethrough));
+        check("a ~~‸b~~ c", "a ~‸b~ c", style(InlineStyle::Underline));
     }
 
     #[test]

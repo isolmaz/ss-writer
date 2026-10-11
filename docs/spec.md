@@ -41,7 +41,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Tab / Shift+Tab in a list item indents/outdents (indent unit = setting: 2, 4 or tab; default "align to content").
 - Typing ```` ``` ```` + Enter closes the fence; `$$` + Enter closes the math block.
 - Pasting a URL over a selection creates `[selection](url)`. Pasting over a link label replaces the label text.
-- Toggle formatting commands wrap/unwrap selection; with empty selection they insert an empty pair with the caret inside, or unwrap the element at the caret.
+- Toggle formatting commands wrap/unwrap selection; with empty selection they insert an empty pair with the caret inside, or unwrap the element at the caret. Underline and strikethrough replace each other (`~x~` and `~~x~~` cannot nest: three tildes are plain text).
 - Ordered lists renumber after edits that change item order/count.
 - Tasks: click box or `Ctrl+.` toggles. Completed tasks move to the end of their list (setting "Sort completed tasks", default on); checked text turns `muted`, no strikethrough.
 - Insert date (`F5`): long date in the active locale; escaped if it would start an ordered list (`1\.`).

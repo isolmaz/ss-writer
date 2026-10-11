@@ -631,7 +631,12 @@ mod tests {
         );
         let inserted = run("‸", |c| Some(insert_table(c))).unwrap();
         let doc = crate::markdown::parse_document(&inserted.replace('‸', ""));
-        assert!(matches!(doc.blocks[0].kind, BlockKind::Table(_)));
+        assert_eq!(doc.blocks.len(), 1);
+        assert_eq!(
+            doc.blocks[0].inline_groups().len(),
+            4,
+            "one table block with two header and two body cells"
+        );
     }
 
     #[test]

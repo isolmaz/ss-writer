@@ -948,9 +948,12 @@ impl Controller {
     /// `F5`: inserts today's date as the long date of the user's locale (spec §2.2).
     pub(super) fn insert_date(&self, cell: &Rc<WindowCell>) -> bool {
         let (year, month, day) = ssw_win::locale::local_today();
+        // Today is always a valid date; the ISO form only stands in for a locale Windows
+        // cannot format.
+        let iso = format!("{year:04}-{month:02}-{day:02}");
         let formatted = ssw_win::locale::Locale::user_default()
             .format_date_long(year, month, day)
-            .unwrap_or_else(|| format!("{year:04}-{month:02}-{day:02}"));
+            .unwrap_or(iso);
         let mut view = cell.view.borrow_mut();
         let Some(editor) = view.active_editor_mut() else {
             return false;

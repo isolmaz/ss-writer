@@ -44,8 +44,11 @@ pub struct MenuState {
     pub other_windows: bool,
     /// The sidebar shows a workspace: new files and folders, Collapse all and Expand all apply.
     pub workspace: bool,
-    /// An entry of the sidebar is selected: the entry commands (open, rename, delete, …) apply.
+    /// An entry of the shown sidebar is selected: the entry commands (rename, delete, …) apply.
     pub sidebar_entry: bool,
+    /// The selected sidebar entry is a file: only then do the open commands (Open, Open in new
+    /// tab, Open in new window) apply.
+    pub sidebar_file: bool,
 }
 
 impl MenuState {
@@ -82,6 +85,9 @@ impl MenuState {
             | C::SidebarNewFolder
             | C::SidebarCollapseAll
             | C::SidebarExpandAll => self.workspace,
+            C::SidebarOpen | C::SidebarOpenInNewTab | C::SidebarOpenInNewWindow => {
+                self.sidebar_entry && self.sidebar_file
+            }
             _ if command.group() == ssw_core::command::CommandGroup::Sidebar => self.sidebar_entry,
             _ => self.has_document || !needs_document(command),
         }
@@ -478,6 +484,31 @@ mod tests {
         };
         assert!(selected.enabled(CommandId::SidebarDelete));
         assert!(selected.enabled(CommandId::SidebarCopyPath));
+        // The open commands are for a selected file: a selected folder is not opened.
+        let open = [
+            CommandId::SidebarOpen,
+            CommandId::SidebarOpenInNewTab,
+            CommandId::SidebarOpenInNewWindow,
+        ];
+        for command in open {
+            assert!(!selected.enabled(command), "{command}");
+        }
+        let file = MenuState {
+            sidebar_file: true,
+            ..selected
+        };
+        for command in open {
+            assert!(file.enabled(command), "{command}");
+        }
+        assert!(file.enabled(CommandId::SidebarRename));
+        // A file flag without a selected entry enables nothing.
+        let stale = MenuState {
+            sidebar_file: true,
+            ..workspace
+        };
+        for command in open {
+            assert!(!stale.enabled(command), "{command}");
+        }
     }
 
     #[test]

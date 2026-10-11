@@ -38,7 +38,7 @@ use CommandId as C;
 use super::controller::{Controller, WindowCell};
 use super::export::DiagramFormat;
 use super::menus::menu_id;
-use super::shell_view::ShellAction;
+use super::shell_view::{ShellAction, ShellView};
 use crate::documents::{DocEntry, DocError, Source, canonical_path};
 use crate::workers::WindowId;
 
@@ -329,6 +329,17 @@ pub fn tab_menu(key: u64, at: Point, menu: TabMenu, i18n: &Localizer, keymap: &K
         tab(C::TabRevealInExplorer),
     );
     builder.finish(at)
+}
+
+/// The selected entry of the sidebar of `view` and whether it is a folder; `None` without a
+/// selection and while the sidebar is not shown (hidden, or a mode without side panes).
+pub(super) fn selected_sidebar_entry(view: &ShellView) -> Option<(NodeKey, bool)> {
+    let sidebar = view
+        .sidebar()
+        .filter(|_| view.layout().rects().sidebar.is_some())?;
+    let key = sidebar.selected_key()?;
+    let folder = sidebar.entry(key).is_some_and(SidebarEntry::is_folder);
+    Some((key, folder))
 }
 
 /// The sidebar menu of the entry `target` (`None`: the root, or empty space): `folder` says
@@ -786,23 +797,23 @@ impl Controller {
     }
 
     /// A sidebar command from the palette or a shortcut: runs on the selected entry of the
-    /// sidebar (root commands on the workspace). False without a workspace and without a
-    /// selection for an entry command.
+    /// sidebar (root commands on the workspace). False without a workspace, for an entry
+    /// command without a selection or while the sidebar is hidden, and for the commands that
+    /// open a file when a folder is selected.
     pub(super) fn run_sidebar_command(&self, cell: &Rc<WindowCell>, item: SidebarCommand) -> bool {
+        use SidebarCommand as S;
         if cell.tree.borrow().is_none() {
             return false;
         }
         let target = if item.on_root() {
             None
         } else {
-            let Some(key) = cell
-                .view
-                .borrow()
-                .sidebar()
-                .and_then(|sidebar| sidebar.selected_key())
-            else {
+            let Some((key, folder)) = selected_sidebar_entry(&cell.view.borrow()) else {
                 return false;
             };
+            if folder && matches!(item, S::Open | S::OpenInNewTab | S::OpenInNewWindow) {
+                return false;
+            }
             Some(key)
         };
         self.sidebar_command(cell, item, target);

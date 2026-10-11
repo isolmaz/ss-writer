@@ -810,16 +810,18 @@ fn links_open_the_browser_or_a_markdown_file_next_to_the_document() {
         };
         rig.act(link("https://example.com/a"));
         rig.act(link("http://example.com/b"));
+        rig.act(link("mailto:someone@example.com"));
         assert_eq!(
             rig.services.shell_log(),
             [
                 ShellRecord::OpenUrl("https://example.com/a".to_owned()),
-                ShellRecord::OpenUrl("http://example.com/b".to_owned())
+                ShellRecord::OpenUrl("http://example.com/b".to_owned()),
+                ShellRecord::OpenUrl("mailto:someone@example.com".to_owned())
             ]
         );
         assert_eq!(names(&window), [file("notes.md")]);
 
-        rig.act(link("a.md"));
+        rig.act(link("a.md#needle"));
         assert_eq!(names(&window), [file("notes.md"), file("a.md")]);
         rig.act(link("c.markdown"));
         rig.act(link("Upper.MD"));
@@ -832,12 +834,16 @@ fn links_open_the_browser_or_a_markdown_file_next_to_the_document() {
                 file("Upper.MD")
             ]
         );
-        // Other files and names without an extension are no documents to follow.
-        for other in ["pic.png", "readme", "notes.txt"] {
+        // A picture next to the document goes to its default app; a name without an
+        // extension and unknown schemes are nothing to follow.
+        for other in ["pic.png", "readme", "javascript:alert(1)", "file:///C:/x"] {
             rig.act(link(other));
         }
         assert_eq!(names(&window).len(), 4);
-        assert_eq!(rig.services.shell_log().len(), 2);
+        assert_eq!(
+            rig.services.shell_log()[3..],
+            [ShellRecord::OpenPath(rig.work.join("pic.png"))]
+        );
 
         // An untitled document has no folder to resolve the link in.
         assert!(handled(&rig.cmd(CommandId::TabNew)));

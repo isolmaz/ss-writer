@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Deleting, cutting or joining items of a numbered list (and typing a marker into one) renumbers the list, as Enter already did.
 - Heading folding did nothing: the gutter chevron, View → Fold all / Unfold all, unfolding of search hits and the per-file fold state were not connected to the editor.
 - The caret position, scroll position and folds of the tabs that were open when SS Writer closed were not remembered; restored tabs and reopened files started at the top. The scroll position was never restored at all.
+- Ctrl+click follows links to text files, images and other files next to the document (default app for non-text files) and `mailto:` links; a `#heading` suffix no longer stops a `.md` link from opening.
 
 ## [0.1.0] - 2026-10-10
 

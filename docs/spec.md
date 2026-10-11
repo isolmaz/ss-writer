@@ -114,7 +114,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Tables the cell model cannot represent (escaped `|`, `|` inside inline code spanning cells) open in raw mode automatically.
 
 ### 3.2 Links & wikilinks
-- Relative `.md` links open inside the app (same tab; Ctrl+click new tab). Web links open in the default browser. Executables (per `AssocIsDangerous`) require confirmation.
+- Relative links to Markdown and text files open inside the app (same tab; Ctrl+click new tab); other files (images, PDFs, …) open with their default app, executable content (per `AssocIsDangerous`) is refused. Web and `mailto:` links open in the default browser or mail client.
 - `[[` completion: fuzzy match over workspace documents; `[[#` lists headings of the current file; `|` alias.
 - Clicking a wikilink to a missing file offers to create it (only inside the workspace root; paths are canonicalized and rejected if they escape the root).
 - Renaming/moving a file inside the workspace offers to update links pointing to it (wikilinks and relative Markdown links).

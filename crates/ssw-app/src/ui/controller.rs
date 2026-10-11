@@ -605,24 +605,22 @@ impl Controller {
                 self.activate_wikilink(cell, &target, heading.as_deref());
             }
             EditorEvent::LinkActivated(LinkTarget::Url(url)) => {
-                let target = Path::new(&url);
-                if url.starts_with("http://") || url.starts_with("https://") {
+                if ssw_win::services::shell::allowed_scheme(&url).is_some() {
                     let _ = self.shell.borrow_mut().open_url(&url);
-                } else {
-                    // The folder is read before the file opens: opening borrows the view
-                    // mutably, and the guard of an `if let` scrutinee lives through its body.
+                } else if ssw_win::assoc::link_extension(&url).is_some() {
+                    // A file next to the document: text opens in the app, everything else with
+                    // its default app (the shell refuses executable content). The folder is
+                    // read before the file opens: opening borrows the view mutably, and the
+                    // guard of an `if let` scrutinee lives through its body.
                     let base = cell
                         .view
                         .borrow()
                         .active_tab()
                         .and_then(|tab| tab.entry.path())
                         .and_then(|path| path.parent().map(Path::to_path_buf));
-                    if let Some(base) = base
-                        && target.extension().is_some_and(|ext| {
-                            ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
-                        })
-                    {
-                        self.open_path(cell, &base.join(target), false);
+                    if let Some(base) = base {
+                        let file = url.split(['#', '?']).next().unwrap_or_default();
+                        self.open_path(cell, &base.join(file), false);
                     }
                 }
             }

@@ -2852,6 +2852,14 @@ mod tests {
         // procedure answers it (0) instead of a second, aliasing borrow of the state.
         assert_eq!(send_message(host.hwnd(), WM_APP + 8, 0, 0), 8);
         assert_eq!(nested.get(), Some(0));
+        // Like the other handlers of these tests, this one ignores events and painting; told
+        // some, it leaves the canvas untouched.
+        let info = host.info();
+        let mut handler = Reentrant(nested);
+        handler.on_event(&info, Event::Timer(ssw_ui::services::TimerId::new(1)));
+        let mut canvas = ssw_ui::canvas::RecordingCanvas::default();
+        handler.on_paint(&info, &mut canvas);
+        assert!(canvas.recorded().is_empty());
     }
 
     #[test]

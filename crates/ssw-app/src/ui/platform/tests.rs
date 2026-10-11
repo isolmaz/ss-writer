@@ -161,7 +161,9 @@ fn with_seams(text: &str, seams: Seams, body: impl FnOnce(&UiApp, &Rc<Platform>,
     assert_eq!(code, 0);
 }
 
-fn with_app(text: &str, body: impl FnOnce(&UiApp, &Rc<Platform>, &Path)) {
+/// [`with_seams`] with the real seams; also the harness of the unit tests of the window owner
+/// (`ui::host`).
+pub(crate) fn with_app(text: &str, body: impl FnOnce(&UiApp, &Rc<Platform>, &Path)) {
     with_seams(text, Seams::default(), body);
 }
 
@@ -1085,9 +1087,9 @@ impl DictionaryFiles {
             match content {
                 Some(bytes) => {
                     if std::fs::read(path).ok().as_ref() != Some(bytes) {
-                        if let Some(folder) = path.parent() {
-                            let _ = std::fs::create_dir_all(folder);
-                        }
+                        // Every snapshotted path is `root\<folder>\<name>`: it has a folder.
+                        let folder = path.parent().expect("a dictionary file lies in a folder");
+                        let _ = std::fs::create_dir_all(folder);
                         let _ = std::fs::write(path, bytes);
                     }
                 }

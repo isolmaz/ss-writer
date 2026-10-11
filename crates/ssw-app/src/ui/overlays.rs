@@ -1013,6 +1013,24 @@ mod tests {
     }
 
     #[test]
+    fn a_junction_is_neither_listed_nor_walked_into() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.md"), "x").unwrap();
+        std::fs::write(outside.path().join("secret.md"), "x").unwrap();
+        // A directory junction needs no privilege. It is a link, neither a folder nor a file
+        // of the workspace, so the walk stays inside the root.
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(tmp.path().join("link"))
+            .arg(outside.path())
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "mklink /J failed: {made:?}");
+        assert_eq!(list_files(tmp.path(), false, 100), ["a.md"]);
+    }
+
+    #[test]
     fn hidden_entries_are_listed_on_request_git_never_and_a_missing_root_lists_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();

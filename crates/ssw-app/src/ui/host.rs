@@ -1213,3 +1213,40 @@ impl ShellHost for UiShell {
         code
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::platform::tests::with_app;
+
+    #[test]
+    fn a_window_the_system_cannot_describe_keeps_the_placement_it_had() {
+        with_app("text\n", |app, _, _| {
+            let windows = app.windows.borrow();
+            let native = &windows[0];
+            let placement = &native.cell.placement;
+            placement.set(WindowPlacement {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+                maximized: true,
+            });
+
+            // A live window reports where it is, and that is what gets stored.
+            app.store_placement(native);
+            let stored = placement.get();
+            assert_eq!(
+                Some((stored.x, stored.y, stored.width, stored.height)),
+                native.host.normal_placement()
+            );
+            assert!(!stored.maximized);
+
+            // Once the window is gone it reports nothing: the last placement stays.
+            native.host.destroy();
+            assert_eq!(native.host.normal_placement(), None);
+            app.store_placement(native);
+            assert_eq!(placement.get(), stored);
+        });
+    }
+}

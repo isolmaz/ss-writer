@@ -350,9 +350,11 @@ mod tests {
             system.theme.mode == ThemeMode::HighContrast,
             system.high_contrast
         );
+        // Both flags are read on every machine: `&&` would leave the second one unevaluated
+        // (and its code region unrun) wherever apps use the light theme.
         assert_eq!(
             system.theme.mode == ThemeMode::Dark,
-            system.dark && !system.high_contrast
+            system.dark & !system.high_contrast
         );
         assert_eq!(Win32Settings.sys_color(COLOR_WINDOW.0) & 0xFF00_0000, 0);
         let _ = (

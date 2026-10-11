@@ -2,8 +2,9 @@
 //! chord is named, the queue assistive technology hands its actions over in, the stamp of
 //! `settings.json`, the hub's description) and the window procedure side over a real startup:
 //! the handler is driven with a hand-made [`WindowInfo`], the native window is a hidden,
-//! off-screen one that is never shown or activated. Input is made by calling the pieces (or
-//! posting to the window), never by `SendInput`.
+//! off-screen one that is never shown or activated (the one test that shows it does so on a
+//! private desktop). Input is made by calling the pieces (or posting to the window), never by
+//! `SendInput`.
 
 use ssw_core::keymap::KeyChord;
 use ssw_core::settings::SettingsSection;
@@ -22,7 +23,9 @@ use ssw_win::keyboard::ToUnicodeCharProbe;
 use ssw_win::taskbar::SystemTaskbars;
 use ssw_win::window::{OsVersion, WM_WAKE, send_message};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_PAINT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    IsWindowVisible, MSG, PM_NOREMOVE, PM_REMOVE, PeekMessageW, WM_PAINT,
+};
 
 use super::*;
 use crate::app::AppCore;
@@ -328,6 +331,20 @@ fn take_wake(hwnd: HWND) -> bool {
     let mut message = MSG::default();
     // SAFETY: a plain peek into the queue of a window of this thread, with a valid MSG.
     unsafe { PeekMessageW(&mut message, Some(hwnd), WM_WAKE, WM_WAKE, PM_REMOVE) }.as_bool()
+}
+
+/// Whether the shown window `hwnd` waits for a repaint (the system turns its update region into
+/// a `WM_PAINT`; nothing is taken out of the queue).
+fn repaint_pending(hwnd: HWND) -> bool {
+    let mut message = MSG::default();
+    // SAFETY: a plain peek into the queue of a window of this thread, with a valid MSG.
+    unsafe { PeekMessageW(&mut message, Some(hwnd), WM_PAINT, WM_PAINT, PM_NOREMOVE) }.as_bool()
+}
+
+/// Whether the window `hwnd` is visible.
+fn is_visible(hwnd: HWND) -> bool {
+    // SAFETY: a plain query of a window of this thread.
+    unsafe { IsWindowVisible(hwnd) }.as_bool()
 }
 
 // ----- the window procedure side --------------------------------------------------------------
@@ -685,6 +702,47 @@ fn the_window_follows_the_theme_the_controller_switched_to_with_one_repaint() {
         assert!(native.sync().is_empty());
         assert!(native.sync().is_empty());
         assert!(!cell.dirty.get(), "the repaint was asked for");
+    });
+}
+
+#[test]
+fn a_window_that_is_not_hidden_is_shown_and_repainted_only_when_a_turn_asks_for_it() {
+    // Shown on a desktop of its own: nothing of it reaches the user's screen or focus.
+    let desktop = ssw_win::testing::PrivateDesktop::create().unwrap();
+    desktop.run(|| {
+        with_rig(|rig| {
+            let cell = open_cell(rig);
+            let hidden = hidden_window(rig, &cell);
+            assert!(!is_visible(hidden.hwnd()), "a hidden window is never shown");
+            drop(hidden);
+
+            let native = SettingsNative::create(
+                &rig.env,
+                &rig.devices,
+                &rig.wic,
+                &rig.logger,
+                Rc::clone(&cell),
+                (100, 100, 900, 640),
+                false,
+            )
+            .expect("the shown Settings window");
+            let hwnd = native.hwnd();
+            assert!(is_visible(hwnd));
+
+            // A new window is painted for the first time, then the flag that said so settles.
+            for _ in 0..2 {
+                assert!(native.sync().is_empty());
+                let _ = send_message(hwnd, WM_PAINT, 0, 0);
+            }
+            assert!(!cell.dirty.get());
+            // A turn with nothing to do asks for no repaint.
+            assert!(native.sync().is_empty());
+            assert!(!repaint_pending(hwnd));
+            // A widget that wants to be drawn again gets its repaint.
+            cell.view.borrow_mut().requests_mut().invalidate_all();
+            assert!(native.sync().is_empty());
+            assert!(repaint_pending(hwnd));
+        });
     });
 }
 

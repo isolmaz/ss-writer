@@ -562,6 +562,44 @@ fn a_typing_run_fails_without_a_frame_a_window_handle_or_a_window() {
 }
 
 #[test]
+fn typing_begins_with_the_frame_that_shows_the_new_document_and_not_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_app(tmp.path(), |app, args, recorder| {
+        let cell = app.controller().active_window().unwrap();
+        recorder.reset();
+        let mut driver = new_driver(
+            args,
+            Some(PerfScenario::TypeLatency),
+            None,
+            None,
+            Limits::default(),
+        );
+        // A frame comes before every tick, until the driver has added the untitled document.
+        let tabs = cell.view.borrow().tabs().len();
+        let deadline = Instant::now() + DEADLINE;
+        while cell.view.borrow().tabs().len() == tabs {
+            present(recorder);
+            assert_eq!(driver.tick(app), Tick::Running);
+            assert!(
+                Instant::now() < deadline,
+                "the untitled document never came"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // No frame has shown the document yet: the driver keeps waiting for it.
+        assert_eq!(driver.tick(app), Tick::Running);
+        assert!(
+            !recorder.has_mark(TYPE_BEGIN),
+            "typing began without a frame"
+        );
+        // The frame comes, and the typing begins.
+        present(recorder);
+        assert_eq!(driver.tick(app), Tick::Running);
+        assert!(recorder.has_mark(TYPE_BEGIN), "typing waits for no more");
+    });
+}
+
+#[test]
 fn a_character_the_full_message_queue_refuses_fails_the_run() {
     let tmp = tempfile::tempdir().unwrap();
     with_app(tmp.path(), |app, args, recorder| {
@@ -597,29 +635,41 @@ fn a_character_the_full_message_queue_refuses_fails_the_run() {
 }
 
 #[test]
-fn a_flick_sweep_whose_tab_was_closed_on_the_way_back_to_the_top_fails() {
+fn a_flick_sweep_whose_tab_or_window_was_closed_on_the_way_back_to_the_top_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let file = long_document(tmp.path(), 40);
     with_app(tmp.path(), |app, args, recorder| {
         let cell = app.controller().active_window().unwrap();
-        recorder.reset();
-        let mut driver = new_driver(
-            args,
-            Some(PerfScenario::Open60k),
-            Some(file.as_path()),
-            None,
-            Limits::default(),
-        );
-        // The stress sweep reached the end and sent the editor back to the top ...
-        paint_until_mark(app, &mut driver, recorder, SCROLL_END);
-        // ... but the tab is gone when that frame has been drawn: the flick sweep starts with
-        // no editor to move, and its first frame finds that out.
+        // The stress sweep reached the end and sent the editor back to the top.
+        let at_the_top = |app: &UiApp| {
+            recorder.reset();
+            let mut driver = new_driver(
+                args,
+                Some(PerfScenario::Open60k),
+                Some(file.as_path()),
+                None,
+                Limits::default(),
+            );
+            paint_until_mark(app, &mut driver, recorder, SCROLL_END);
+            driver
+        };
+
+        // The tab is gone when that frame has been drawn: the flick sweep starts with no editor
+        // to move, and its first frame finds that out.
+        let mut driver = at_the_top(app);
         close_tabs(&cell);
         present(recorder);
         assert_eq!(driver.tick(app), Tick::Running);
         present(recorder);
         assert_eq!(driver.tick(app), Tick::Finished(EXIT_PERF_FAILED));
         assert_eq!(report_error(tmp.path()), "the window has no editor");
+
+        // The window is gone: the flick sweep cannot even start.
+        let mut driver = at_the_top(app);
+        app.controller().close_window(cell.id);
+        present(recorder);
+        assert_eq!(driver.tick(app), Tick::Finished(EXIT_PERF_FAILED));
+        assert_eq!(report_error(tmp.path()), "the application has no window");
     });
 }
 

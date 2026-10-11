@@ -26,13 +26,18 @@ use ssw_ui::services::MemoryClipboard;
 use ssw_win::com::ComGuard;
 use ssw_win::dragdrop::OleGuard;
 use ssw_win::gfx::Driver;
+use ssw_win::instance::InstanceConfig;
 use ssw_win::jumplist::JumpList;
 use ssw_win::menus::{PopupHost, PopupRequest};
 use ssw_win::window::{current_os_version, send_message};
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, GetWindowRect, HMENU, IsWindow, IsWindowVisible, IsZoomed, WM_MOUSEMOVE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, HMENU, HWND_MESSAGE, IsWindow,
+    IsWindowVisible, IsZoomed, RegisterClassExW, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_MOUSEMOVE, WNDCLASSEXW,
 };
+use windows::core::{HSTRING, PCWSTR};
 
 /// Menus are never shown in these tests.
 struct NoPopups;
@@ -173,6 +178,92 @@ fn a_later_launch_is_forwarded_to_the_first_instance_and_opened_there() {
         0
     });
     assert_eq!(code, 0);
+}
+
+/// A running instance of the application that cannot take a launch: it owns the single-instance
+/// mutex and a message window of the application's class, but the window procedure does not
+/// handle `WM_COPYDATA`.
+struct DeafInstance {
+    mutex: HANDLE,
+    window: HWND,
+    class: HSTRING,
+}
+
+/// The window procedure of [`DeafInstance`]: default processing, which answers `WM_COPYDATA`
+/// with "not handled".
+unsafe extern "system" fn deaf_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: default processing with the original arguments.
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+impl DeafInstance {
+    fn start(config: &InstanceConfig) -> Self {
+        let class = HSTRING::from(config.window_class());
+        let name = HSTRING::from(config.mutex_name());
+        // SAFETY: a valid NUL-terminated name; default security attributes.
+        let mutex = unsafe { CreateMutexW(None, false, &name) }.unwrap();
+        let description = WNDCLASSEXW {
+            cbSize: size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(deaf_proc),
+            lpszClassName: PCWSTR(class.as_ptr()),
+            ..Default::default()
+        };
+        // SAFETY: the class structure is fully initialized; the name outlives the call.
+        assert_ne!(unsafe { RegisterClassExW(&description) }, 0);
+        // SAFETY: creates a message-only window of the class registered above.
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                &class,
+                PCWSTR::null(),
+                WINDOW_STYLE::default(),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        Self {
+            mutex,
+            window,
+            class,
+        }
+    }
+}
+
+impl Drop for DeafInstance {
+    fn drop(&mut self) {
+        // SAFETY: destroys the window made by `start` on its own thread, removes its class and
+        // closes the mutex handle, each once.
+        unsafe {
+            let _ = DestroyWindow(self.window);
+            let _ = UnregisterClassW(&self.class, None);
+            let _ = CloseHandle(self.mutex);
+        }
+    }
+}
+
+#[test]
+fn a_launch_the_running_instance_does_not_take_is_reported_as_an_error() {
+    let id = unique_id("deaf");
+    let running = DeafInstance::start(&InstanceConfig::new(id.clone()));
+    let mut later = WinInstance::with_app_id(id);
+    let error = later.claim(&Launch::default()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "single-instance handshake failed: the running instance rejected the launch"
+    );
+    drop(running);
 }
 
 #[test]

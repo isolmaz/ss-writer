@@ -38,7 +38,7 @@ use ssw_io::fs::RealFs;
 use ssw_ui::access::{AccessNode, Role};
 use ssw_ui::canvas::RecordingCanvas;
 use ssw_ui::editor::EditorEvent;
-use ssw_ui::geometry::{Point, Rect};
+use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{
     Event, KeyEvent, Modifiers, PointerButton, PointerEvent, PointerEventKind, TextInput, vk,
 };
@@ -886,6 +886,35 @@ fn a_spelling_menu_replaces_the_word_with_the_chosen_suggestion() {
             .unwrap();
         rig.choose(&stale, "tea");
         assert_eq!(rig.active_text(), "x");
+    });
+}
+
+#[test]
+fn a_suggestion_chosen_in_a_window_without_a_document_replaces_nothing() {
+    with_rig(&[("notes.md", b"I like teh weather\n")], |rig| {
+        let popup = rig
+            .controller
+            .popup_for(
+                rig.id(),
+                &ShellAction::Editor(
+                    rig.tab_key(),
+                    EditorEvent::SpellMenu {
+                        range: TextRange::new(7, 10),
+                        word: "teh".to_owned(),
+                        suggestions: vec!["the".to_owned()],
+                        anchor: anchor(),
+                    },
+                ),
+            )
+            .unwrap();
+        // The window the answer arrives in has no tab, so there is no editor to change.
+        let bare = rig
+            .controller
+            .create_window(None, Size::new(800.0, 600.0), 1.0);
+        rig.controller
+            .run_popup_choice(bare.id, &popup, item(&popup, "the").id);
+        assert!(bare.view.borrow().tabs().is_empty());
+        assert_eq!(rig.active_text(), "I like teh weather\n");
     });
 }
 

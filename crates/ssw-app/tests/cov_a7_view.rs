@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::Args;
@@ -15,10 +16,11 @@ use ssw_core::command::CommandId;
 use ssw_core::settings::{Settings, SortBy};
 use ssw_ui::access::AccessAction;
 use ssw_ui::canvas::RecordingCanvas;
+use ssw_ui::editor::EditorEvent;
 use ssw_ui::geometry::{Point, Size};
 use ssw_ui::input::{Event, FocusEvent, PointerButton, PointerEvent, PointerEventKind, TextInput};
 use ssw_ui::services::{Clock, FakeClock, MemoryClipboard};
-use ssw_ui::shell::layout::{ChromeHit, Pane, ShellMode};
+use ssw_ui::shell::layout::{ChromeHit, Pane, SIDEBAR_MAX_WIDTH, ShellMode};
 use ssw_ui::shell::sidebar::SortKey;
 use ssw_ui::text::MonoTextEngine;
 use ssw_ui::widgets::{Control, SharedClipboard};
@@ -308,6 +310,60 @@ fn f6_moves_the_focus_through_the_visible_panes_in_order() {
 }
 
 #[test]
+fn f6_still_visits_the_sidebar_and_the_editor_when_there_is_no_workspace_and_no_document() {
+    with_rig(&[("a.md", "# A\n")], |rig| {
+        let fresh = rig
+            .controller
+            .create_window(None, Size::new(800.0, 600.0), 1.0);
+        let mut view = fresh.view.borrow_mut();
+        if !view.layout().sidebar_visible() {
+            view.toggle_sidebar();
+        }
+        rig.paint_view(&mut view);
+        assert!(view.sidebar().is_none() && view.active_tab().is_none());
+        assert!(view.layout().panes().contains(&Pane::Sidebar));
+        // The panes stay stops of the cycle although neither has a widget to take the focus.
+        let visited: Vec<Pane> = (0..4)
+            .map(|_| {
+                let pane = view.next_pane(true);
+                assert_eq!(view.focused_pane(), pane, "the focus is where F6 said");
+                pane
+            })
+            .collect();
+        assert_eq!(
+            visited,
+            [Pane::StatusBar, Pane::TitleRow, Pane::Sidebar, Pane::Editor]
+        );
+    });
+}
+
+#[test]
+fn a_rename_of_an_entry_the_sidebar_does_not_show_opens_no_rename_box_and_keeps_the_focus() {
+    with_rig(&[("a.md", "# A\n")], |rig| {
+        let window = rig.window();
+        rig.controller.show_workspace(&window, &rig.work);
+        rig.paint();
+        let mut view = window.view.borrow_mut();
+        assert_eq!(view.focused_pane(), Pane::Editor);
+
+        view.request_rename(u64::MAX);
+        rig.paint_view(&mut view);
+        assert_eq!(view.sidebar().expect("a sidebar").renaming(), None);
+        assert_eq!(view.focused_pane(), Pane::Editor);
+
+        // An entry that is shown gets its rename box, and the sidebar the focus.
+        let key = view
+            .sidebar()
+            .and_then(|sidebar| sidebar.row_key(0))
+            .expect("the sidebar shows a row");
+        view.request_rename(key);
+        rig.paint_view(&mut view);
+        assert_eq!(view.sidebar().expect("a sidebar").renaming(), Some(key));
+        assert_eq!(view.focused_pane(), Pane::Sidebar);
+    });
+}
+
+#[test]
 fn the_splitter_follows_the_pointer_while_it_is_dragged() {
     with_rig(&[("a.md", "# A\n")], |rig| {
         let window = rig.window();
@@ -348,6 +404,34 @@ fn the_splitter_follows_the_pointer_while_it_is_dragged() {
 }
 
 #[test]
+fn a_splitter_dragged_past_its_limit_stays_at_the_limit() {
+    with_rig(&[("a.md", "# A\n")], |rig| {
+        let window = rig.window();
+        rig.controller.show_workspace(&window, &rig.work);
+        rig.paint();
+        let sidebar = window
+            .view
+            .borrow()
+            .layout()
+            .rects()
+            .sidebar
+            .expect("a sidebar");
+        let width = || window.view.borrow().layout().sidebar_width();
+        rig.pointer(
+            PointerEventKind::Down,
+            Point::new(sidebar.x + sidebar.width, 300.0),
+        );
+        rig.pointer(PointerEventKind::Move, Point::new(900.0, 300.0));
+        assert_eq!(width(), SIDEBAR_MAX_WIDTH);
+        // Dragging on past the limit changes nothing: the pane stays as wide as it can be.
+        rig.pointer(PointerEventKind::Move, Point::new(1000.0, 300.0));
+        assert_eq!(width(), SIDEBAR_MAX_WIDTH);
+        rig.pointer(PointerEventKind::Up, Point::new(1000.0, 300.0));
+        assert!(window.view.borrow().layout().dragging().is_none());
+    });
+}
+
+#[test]
 fn pointers_crossing_panes_leave_the_old_one_and_outside_the_window_hits_nothing() {
     with_rig(&[("a.md", "# A\n")], |rig| {
         rig.paint();
@@ -383,6 +467,42 @@ fn the_link_command_opens_the_link_popup_over_the_active_editor() {
         assert!(!window.view.borrow().overlays().link_visible());
         let _ = rig.controller.run_command(window.id, CommandId::FormatLink);
         assert!(window.view.borrow().overlays().link_visible());
+    });
+}
+
+#[test]
+fn the_link_command_has_nothing_to_edit_in_a_window_without_a_document() {
+    with_rig(&[("a.md", "[text](target.md)\n")], |rig| {
+        let fresh = rig
+            .controller
+            .create_window(None, Size::new(800.0, 600.0), 1.0);
+        let _ = rig.controller.run_command(fresh.id, CommandId::FormatLink);
+        assert!(!fresh.view.borrow().overlays().link_visible());
+    });
+}
+
+#[test]
+fn what_the_editor_of_a_background_tab_reports_reaches_the_controller_under_its_own_key() {
+    with_rig(&[("a.md", "A\n"), ("b.md", "B\n")], |rig| {
+        let window = rig.window();
+        rig.controller
+            .open_file(&window, &rig.work.join("b.md"))
+            .unwrap();
+        let mut view = window.view.borrow_mut();
+        let background = view.tabs()[0].key;
+        assert_ne!(Some(background), view.active_tab().map(|tab| tab.key));
+
+        // The text of a tab that is not shown changes (a drop from another window, say).
+        view.tabs_mut()[0].editor.insert_date("1 January 2000");
+        let actions = view.event(&Event::AnimationFrame(Duration::ZERO), &rig.engine);
+        let reported: Vec<&ShellAction> = actions
+            .iter()
+            .filter(|action| matches!(action, ShellAction::Editor(..)))
+            .collect();
+        assert_eq!(
+            reported,
+            [&ShellAction::Editor(background, EditorEvent::Edited)]
+        );
     });
 }
 

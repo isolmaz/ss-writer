@@ -2542,6 +2542,8 @@ quit
             "open x.md",
             "assert-text-is ",
             "save-as x.md",
+            "select 0 0",
+            "select-text x",
         ] {
             let (_, message) = failure(runner.run(&Script::parse(&format!("{step}\n")).unwrap()));
             assert!(message.contains("has no window"), "{step}: {message}");
@@ -3043,16 +3045,30 @@ quit
             scale_percent: 100,
         };
         let geometry = Geometry::new(64, 64, 1.0).unwrap();
-        // The first system call of a render is the creation of the Direct2D factory.
-        ssw_win::fault::arm(0);
-        let outcome = write_shot(&visuals, &shot, geometry, Color::WHITE, &mut |_| {});
-        ssw_win::fault::disarm();
-        let message = outcome.unwrap_err();
+        // Every system call of a render fails in turn: the first is the creation of the Direct2D
+        // factory, the last ones come after the picture was painted. Whichever it is, the
+        // failure is the render's and no file is written (the run that gets through writes it).
+        let mut painted = 0_u32;
+        let outcomes = ssw_win::fault::sweep(|| {
+            let outcome = write_shot(&visuals, &shot, geometry, Color::WHITE, &mut |_| {
+                painted += 1;
+            });
+            (outcome, shot.path.exists())
+        });
+        assert!(outcomes.len() >= 8, "a render makes many system calls");
+        for (call, (outcome, written)) in outcomes.iter().enumerate() {
+            let message = outcome.as_ref().unwrap_err();
+            assert!(
+                message.starts_with("cannot render the screenshot: "),
+                "call {call}: {message}"
+            );
+            assert!(!written, "call {call} wrote the picture");
+        }
         assert!(
-            message.starts_with("cannot render the screenshot: "),
-            "{message}"
+            painted > 0,
+            "the later calls are reached after the painting"
         );
-        assert!(!shot.path.exists());
+        assert!(shot.path.exists(), "the render that got through wrote it");
     }
 
     #[test]

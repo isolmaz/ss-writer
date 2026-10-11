@@ -604,6 +604,26 @@ fn escape_closes_the_find_bar_even_when_the_editor_has_the_focus() {
 }
 
 #[test]
+fn the_find_bar_takes_typing_and_f3_before_the_editor_does() {
+    let mut rig = Rig::new("one two one\n");
+    rig.overlays.open_find(false);
+    // The layout grants the focus to the bar's search field.
+    rig.layout();
+    assert!(rig.deliver(typed("one")).handled);
+    assert_eq!(rig.overlays.find().find_box().text(), "one");
+    assert_eq!(
+        rig.overlays.find().matches(),
+        [TextRange::new(0, 3), TextRange::new(8, 11)]
+    );
+    assert!(rig.pump().is_empty());
+    assert_eq!(rig.editor.selection(), Selection::new(0, 3));
+    // F3 steps to the next match; the bar answers, so the editor never sees the key.
+    assert!(rig.press(vk::F3).handled);
+    assert!(rig.pump().is_empty());
+    assert_eq!(rig.editor.selection(), Selection::new(8, 11));
+}
+
+#[test]
 fn typing_hides_the_toolbar_and_the_editor_still_gets_the_text() {
     let mut rig = Rig::new("some words here\n");
     rig.show_toolbar();

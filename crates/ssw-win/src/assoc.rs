@@ -114,7 +114,12 @@ fn is_open_with_prompt(path: &Path) -> bool {
 /// (compared without regard to case), e.g. `is_default_app(".md", "SSWriter.exe")`.
 #[must_use]
 pub fn is_default_app(extension: &str, executable_name: &str) -> bool {
-    default_app_for(extension)
+    is_default_app_with(|kind| query(kind, extension), executable_name)
+}
+
+/// [`is_default_app`] with the association strings `query` answers.
+fn is_default_app_with(query: impl Fn(ASSOCSTR) -> Option<String>, executable_name: &str) -> bool {
+    default_app_with(query)
         .and_then(|app| app.executable)
         .is_some_and(|path| has_file_name(&path, executable_name))
 }
@@ -199,13 +204,21 @@ mod tests {
         assert!(!is_open_with_prompt(Path::new(r"C:\Windows\notepad.exe")));
     }
 
-    /// Answers like the shell: the length with the terminator first, then `text`.
-    fn shell_string(text: &str, second: HRESULT) -> impl FnMut(Option<PWSTR>, &mut u32) -> HRESULT {
+    /// Answers like the shell: `first` and `reported` (the length with the terminator) for the
+    /// call without a buffer, then `text` and `second` for the call with one. Every case of
+    /// the tests uses this one function, so that the coverage gate sees a single copy of
+    /// `read_string` run all of its branches.
+    fn shell_string(
+        first: HRESULT,
+        reported: u32,
+        text: &str,
+        second: HRESULT,
+    ) -> impl FnMut(Option<PWSTR>, &mut u32) -> HRESULT {
         let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
         move |out, length| match out {
             None => {
-                *length = wide.len() as u32;
-                S_FALSE
+                *length = reported;
+                first
             }
             Some(buffer) => {
                 assert_eq!(
@@ -222,30 +235,66 @@ mod tests {
 
     #[test]
     fn a_string_is_read_in_two_calls_and_any_other_answer_is_none() {
+        // "Notepad" and its terminator.
+        const LENGTH: u32 = 8;
         assert_eq!(
-            read_string(shell_string("Notepad", S_OK)).as_deref(),
+            read_string(shell_string(S_FALSE, LENGTH, "Notepad", S_OK)).as_deref(),
             Some("Notepad")
         );
         // The second call fails.
-        assert_eq!(read_string(shell_string("Notepad", E_FAIL)), None);
+        assert_eq!(
+            read_string(shell_string(S_FALSE, LENGTH, "Notepad", E_FAIL)),
+            None
+        );
         // The first call fails, succeeds without asking for a buffer, or reports no length.
-        assert_eq!(read_string(|_, _| E_FAIL), None);
-        assert_eq!(read_string(|_, _| S_OK), None);
-        assert_eq!(read_string(|_, _| S_FALSE), None);
+        assert_eq!(
+            read_string(shell_string(E_FAIL, LENGTH, "Notepad", S_OK)),
+            None
+        );
+        assert_eq!(
+            read_string(shell_string(S_OK, LENGTH, "Notepad", S_OK)),
+            None
+        );
+        assert_eq!(read_string(shell_string(S_FALSE, 0, "Notepad", S_OK)), None);
+    }
+
+    /// The association strings of an app: its friendly name and its program file. Every test
+    /// that needs them uses this one function, so that the coverage gate sees a single copy of
+    /// the generic functions it feeds run all of their branches.
+    fn answers(name: Option<&str>, exe: Option<&str>) -> impl Fn(ASSOCSTR) -> Option<String> {
+        let (name, exe) = (name.map(str::to_owned), exe.map(str::to_owned));
+        move |kind| {
+            if kind == ASSOCSTR_FRIENDLYAPPNAME {
+                name.clone()
+            } else {
+                exe.clone()
+            }
+        }
+    }
+
+    #[test]
+    fn a_program_is_the_default_app_when_its_file_name_matches_without_case() {
+        let notepad = || answers(Some("Notepad"), Some(r"C:\Windows\NOTEPAD.EXE"));
+        assert!(is_default_app_with(notepad(), "notepad.exe"));
+        assert!(!is_default_app_with(notepad(), "wordpad.exe"));
+        // An app without a program file, the "Choose an app" prompt and a program file with no
+        // app name behind it are no default app, whatever file name is asked for.
+        assert!(!is_default_app_with(
+            answers(Some("Photos"), None),
+            "notepad.exe"
+        ));
+        assert!(!is_default_app_with(
+            answers(Some("Open With"), Some(r"C:\Windows\System32\OpenWith.exe")),
+            "openwith.exe"
+        ));
+        assert!(!is_default_app_with(
+            answers(None, Some(r"C:\Windows\notepad.exe")),
+            "notepad.exe"
+        ));
     }
 
     #[test]
     fn the_default_app_needs_a_name_and_the_choose_an_app_prompt_is_none() {
-        let answers = |name: Option<&str>, exe: Option<&str>| {
-            let (name, exe) = (name.map(str::to_owned), exe.map(str::to_owned));
-            move |kind: ASSOCSTR| {
-                if kind == ASSOCSTR_FRIENDLYAPPNAME {
-                    name.clone()
-                } else {
-                    exe.clone()
-                }
-            }
-        };
         assert_eq!(
             default_app_with(answers(Some("Notepad"), Some(r"C:\Windows\notepad.exe"))),
             Some(DefaultApp {

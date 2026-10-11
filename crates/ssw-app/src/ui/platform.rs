@@ -1352,4 +1352,4 @@ fn diff<'a>(old: &'a str, new: &'a str) -> (usize, &'a str, &'a str) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

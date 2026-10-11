@@ -1008,6 +1008,26 @@ fn a_missing_note_is_created_inside_the_workspace_when_the_user_agrees() {
 }
 
 #[test]
+fn a_new_note_shows_in_the_sidebar_while_another_window_shows_no_folder() {
+    let files = vec![text_file("note.md", "# Note\n")];
+    with_rig(files, "note.md", nothing, |rig| {
+        rig.show();
+        // A second window without a tab: it shows no workspace and has no sidebar.
+        let bare = rig
+            .controller
+            .create_window(None, Size::new(800.0, 600.0), 1.0);
+
+        rig.answer(MessageBoxResult::Yes);
+        rig.wiki("fresh note", None);
+        assert_eq!(read(&rig.work.join("fresh note.md")), "");
+        assert!(rig.has_row("fresh note"));
+        assert!(bare.tree.borrow().is_none());
+        assert!(bare.view.borrow_mut().sidebar_mut().is_none());
+        assert!(bare.view.borrow().tabs().is_empty());
+    });
+}
+
+#[test]
 fn a_wikilink_that_would_leave_the_workspace_is_never_offered() {
     let files = vec![text_file("note.md", "# Note\n")];
     with_rig(files, "note.md", nothing, |rig| {
@@ -1292,6 +1312,32 @@ fn the_tree_applies_the_changes_it_is_told_about_and_re_reads_on_request() {
     assert_eq!(names(&mut tree), ["c.md"]);
     paths.request_rescan();
     assert_eq!(names(&mut tree), ["c.md", "d.md"]);
+}
+
+#[test]
+fn a_folder_the_tree_never_handed_out_or_can_no_longer_read_lists_as_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonical_path(tmp.path());
+    std::fs::create_dir(root.join("gone")).unwrap();
+    std::fs::write(root.join("a.md"), "a").unwrap();
+    let mut tree = WorkspaceTree::open(Arc::new(RealFs), &root).unwrap();
+    let paths = tree.paths();
+    let options = SidebarOptions::default();
+    let top = tree.children(0, &options);
+    assert_eq!(
+        top.iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["gone", "a.md"]
+    );
+
+    // A key nobody was given has no folder behind it.
+    assert_eq!(paths.path(9999), None);
+    assert!(tree.children(9999, &options).is_empty());
+
+    // The folder vanished before the sidebar expanded it: the listing fails and shows nothing.
+    std::fs::remove_dir(root.join("gone")).unwrap();
+    assert!(tree.children(top[0].key, &options).is_empty());
 }
 
 // ----- `[[` completion -------------------------------------------------------------------------

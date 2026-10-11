@@ -477,6 +477,21 @@ mod tests {
 
     #[test]
     fn a_library_that_does_not_load_or_lacks_an_export_applies_nothing() {
+        // The real exports apply every theme. The integration tests do that through
+        // `apply_menu_theme`, but the coverage gate judges this function by its best copy and
+        // this unit-test copy must run the success path too, or the library copy (which never
+        // sees a failure) would win and leave the failure branches below uncovered.
+        for theme in [MenuTheme::System, MenuTheme::Light, MenuTheme::Dark] {
+            assert!(
+                apply_theme_exports(
+                    w!("uxtheme.dll"),
+                    SET_PREFERRED_APP_MODE,
+                    FLUSH_MENU_THEMES,
+                    theme
+                ),
+                "{theme:?}"
+            );
+        }
         // No such library.
         assert!(!apply_theme_exports(
             w!("ssw-no-such-library.dll"),

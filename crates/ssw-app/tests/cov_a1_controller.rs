@@ -1251,6 +1251,137 @@ fn the_link_command_opens_the_link_popup_and_unhandled_commands_are_reported() {
     });
 }
 
+const OUTLINE: &str = "# One\n\nbody one\n\n# Two\n\nbody two\n";
+
+#[test]
+fn folding_commands_chevrons_and_search_hits_fold_and_unfold_sections() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        rig.set_text(OUTLINE);
+        let window = rig.window();
+        let key = active_key(&window);
+        let hidden = |needle: &str| {
+            let at = OUTLINE.find(needle).unwrap() + 1;
+            window
+                .view
+                .borrow()
+                .tab(key)
+                .unwrap()
+                .editor
+                .is_offset_hidden(at)
+        };
+        assert!(handled(&rig.cmd(CommandId::ViewFoldAll)));
+        assert!(hidden("body one") && hidden("body two"));
+        assert!(handled(&rig.cmd(CommandId::ViewUnfoldAll)));
+        assert!(!hidden("body one") && !hidden("body two"));
+
+        let two = OUTLINE.find("# Two").unwrap();
+        let toggle = |key| {
+            rig.act(ShellAction::Editor(
+                key,
+                EditorEvent::ToggleFold { heading_start: two },
+            ));
+        };
+        toggle(key);
+        assert!(hidden("body two") && !hidden("body one"));
+        // A find hit inside the fold opens it; one outside changes nothing.
+        let body = OUTLINE.find("body two").unwrap();
+        rig.act(ShellAction::Editor(
+            key,
+            EditorEvent::UnfoldRequested {
+                range: ssw_core::text::TextRange::new(body, body + 4),
+            },
+        ));
+        assert!(!hidden("body two"));
+        toggle(key);
+        rig.act(ShellAction::Editor(
+            key,
+            EditorEvent::UnfoldRequested {
+                range: ssw_core::text::TextRange::new(0, 2),
+            },
+        ));
+        assert!(hidden("body two"));
+        // Events of a tab that is gone are ignored.
+        toggle(key + 100);
+        rig.act(ShellAction::Editor(
+            key + 100,
+            EditorEvent::UnfoldRequested {
+                range: ssw_core::text::TextRange::new(body, body + 4),
+            },
+        ));
+        assert!(hidden("body two"));
+
+        // The folds follow edits made through the document (another tab, a reload).
+        let longer = OUTLINE.replace("# One", "# One and only");
+        rig.set_text(&longer);
+        let at = longer.find("body two").unwrap() + 1;
+        assert!(
+            window
+                .view
+                .borrow()
+                .tab(key)
+                .unwrap()
+                .editor
+                .is_offset_hidden(at)
+        );
+
+        // Plain text has no headings to fold; a window without a tab has nothing.
+        std::fs::write(rig.work.join("plain.txt"), "# not a heading\n\nx\n").unwrap();
+        rig.open("plain.txt");
+        assert!(matches!(
+            rig.cmd(CommandId::ViewFoldAll),
+            Dispatch::Unhandled
+        ));
+        let empty = rig.empty_window();
+        assert!(matches!(
+            rig.cmd_in(&empty, CommandId::ViewUnfoldAll),
+            Dispatch::Unhandled
+        ));
+    });
+}
+
+#[test]
+fn the_session_remembers_caret_scroll_and_folds_of_open_tabs_and_tabs_restore_them() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        std::fs::write(rig.work.join("a.md"), OUTLINE).unwrap();
+        rig.open("a.md");
+        let window = rig.window();
+        let key = active_key(&window);
+        let path = rig.entry().path().unwrap();
+        rig.select(Selection::caret(3));
+        window
+            .view
+            .borrow_mut()
+            .active_editor_mut()
+            .unwrap()
+            .set_scroll_y(120.0);
+        assert!(handled(&rig.cmd(CommandId::ViewFoldAll)));
+        let session = rig.controller.session();
+        assert_eq!(session.windows[0].tabs.len(), 2);
+        let stored = rig.controller.docs().view_state(&path).unwrap();
+        assert_eq!(stored.caret, 3);
+        assert_eq!(stored.scroll_delta, 120.0);
+        assert_eq!(
+            stored.folds,
+            vec![
+                OUTLINE.find("# One").unwrap(),
+                OUTLINE.find("# Two").unwrap()
+            ]
+        );
+
+        // Closing the tab stores the same; reopening the file restores scroll and folds.
+        assert!(handled(&rig.cmd(CommandId::TabClose)));
+        assert_eq!(rig.controller.docs().view_state(&path).unwrap(), stored);
+        rig.open("a.md");
+        let restored = active_key(&window);
+        assert_ne!(restored, key);
+        let view = window.view.borrow();
+        let editor = &view.tab(restored).unwrap().editor;
+        assert_eq!(editor.scroll_y(), 120.0);
+        assert!(editor.is_offset_hidden(OUTLINE.find("body two").unwrap() + 1));
+        assert_eq!(editor.document().borrow().primary_selection().head, 3);
+    });
+}
+
 #[test]
 fn insert_date_puts_todays_long_date_at_the_caret() {
     with_rig(NO_AUTOSAVE, |rig| {

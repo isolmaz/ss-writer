@@ -148,6 +148,9 @@ struct DocState {
     /// "Render as Markdown" (spec §4.1) is on: a plain-text file is shown and edited as
     /// Markdown. Only the presentation changes; the file is written as it was.
     render_markdown: bool,
+    /// The scroll position and folds remembered for the file (spec §6); a tab opening the
+    /// document starts from them.
+    remembered: Option<ssw_io::session::ViewState>,
 }
 
 /// One open document and everything the app tracks about it.
@@ -235,6 +238,12 @@ impl DocEntry {
         };
         name.map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
+    }
+
+    /// The scroll position and folds remembered for the file when it was opened (spec §6).
+    #[must_use]
+    pub fn remembered_view(&self) -> Option<ssw_io::session::ViewState> {
+        self.state.borrow().remembered.clone()
     }
 
     /// Encoding, BOM and line endings restored on save.
@@ -489,16 +498,15 @@ impl Documents {
         }
         let mut document = Document::new(&loaded.text);
         ssw_win::perf::mark_latest(crate::perf::DOC_PARSED);
-        let caret = self
+        let remembered = self
             .env
             .store
             .borrow()
             .view_state(&canonical)
             .ok()
-            .flatten()
-            .map(|view| view.caret);
-        if let Some(caret) = caret {
-            let caret = document.buffer().floor_char_boundary(caret);
+            .flatten();
+        if let Some(view) = &remembered {
+            let caret = document.buffer().floor_char_boundary(view.caret);
             document.set_selections(Selection::caret(caret), &[]);
         }
         let tracked = !matches!(loaded.source, Source::TextBundle { .. });
@@ -515,6 +523,7 @@ impl Documents {
             lossy: loaded.lossy,
             mixed_endings_notice: loaded.format.had_mixed_endings,
             render_markdown: false,
+            remembered,
         };
         if tracked {
             self.tracker.borrow_mut().track(&canonical, loaded.stamp);
@@ -554,6 +563,7 @@ impl Documents {
             lossy: false,
             mixed_endings_notice: false,
             render_markdown: false,
+            remembered: None,
         }
     }
 

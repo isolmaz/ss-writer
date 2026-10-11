@@ -414,7 +414,8 @@ impl Controller {
         self.offer_recovery();
     }
 
-    /// The windows as the session stores them.
+    /// The windows as the session stores them. The caret, scroll position and folds of every
+    /// open file are remembered on the way (spec §6: the restored tabs start where they were).
     #[must_use]
     pub fn session(&self) -> Session {
         let windows = self.windows.borrow();
@@ -422,6 +423,10 @@ impl Controller {
             .iter()
             .map(|cell| {
                 let view = cell.view.borrow();
+                for tab in view.tabs() {
+                    // A store that cannot be written costs the positions, nothing else.
+                    let _ = self.docs.remember_view(&tab.entry, &tab_view_state(tab));
+                }
                 let active_key = view.active_tab().map(|tab| tab.key);
                 WindowState {
                     placement: cell.placement.get(),
@@ -567,6 +572,12 @@ impl Controller {
     fn editor_event(&self, cell: &Rc<WindowCell>, key: u64, event: EditorEvent) {
         match event {
             EditorEvent::ZoomChanged(percent) => self.set_zoom(percent),
+            EditorEvent::ToggleFold { heading_start } => {
+                cell.view.borrow_mut().toggle_fold(key, heading_start);
+            }
+            EditorEvent::UnfoldRequested { range } => {
+                cell.view.borrow_mut().unfold_containing(key, range);
+            }
             EditorEvent::Media(MediaEvent::LoadImage { dest, .. }) => {
                 self.allow_remote_image(cell, &dest);
             }
@@ -775,15 +786,7 @@ impl Controller {
         let Some(tab) = cell.view.borrow_mut().close_tab(key) else {
             return CloseOutcome::Closed;
         };
-        let view_state = {
-            let document = entry.document().borrow();
-            ViewState {
-                caret: document.primary_selection().head,
-                scroll_anchor: 0,
-                scroll_delta: tab.editor.scroll_y(),
-                folds: Vec::new(),
-            }
-        };
+        let view_state = tab_view_state(&tab);
         let _ = self
             .core
             .borrow()
@@ -1287,6 +1290,17 @@ impl Controller {
     }
 }
 
+/// Caret, scroll position and folds of `tab`, as the store remembers them per file (spec §6).
+fn tab_view_state(tab: &TabView) -> ViewState {
+    let document = tab.entry.document().borrow();
+    ViewState {
+        caret: document.primary_selection().head,
+        scroll_anchor: 0,
+        scroll_delta: tab.editor.scroll_y(),
+        folds: tab.folds.offsets(&document),
+    }
+}
+
 /// Whether two paths name the same file (case-insensitive on Windows, canonical when possible).
 fn same_file(a: &Path, b: &Path) -> bool {
     let canonical =
@@ -1391,6 +1405,8 @@ impl AppActions for WindowActions<'_> {
                 self.cell.view.borrow_mut().next_pane(true);
                 true
             }
+            CommandId::ViewFoldAll => self.cell.view.borrow_mut().fold_all(true),
+            CommandId::ViewUnfoldAll => self.cell.view.borrow_mut().fold_all(false),
             // Spec §4.1: the plain-text file's own switches; they decline other documents.
             CommandId::ViewWordWrap => self.cell.view.borrow_mut().toggle_word_wrap(),
             CommandId::ViewRenderAsMarkdown => {

@@ -1548,6 +1548,55 @@ fn text_dragged_onto_another_tab_moves_or_copies_there() {
 }
 
 #[test]
+fn sidebar_commands_from_the_palette_act_on_the_selected_entry() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let window = rig.window();
+        // No workspace: nothing to act on.
+        assert!(matches!(
+            rig.cmd(CommandId::SidebarCollapseAll),
+            Dispatch::Unhandled
+        ));
+        rig.controller.show_workspace(&window, &rig.work);
+        window.view.borrow_mut().paint(
+            &mut RecordingCanvas::new(),
+            &MonoTextEngine::default(),
+            false,
+        );
+        // Root commands work without a selection, entry commands do not.
+        assert!(handled(&rig.cmd(CommandId::SidebarCollapseAll)));
+        assert!(handled(&rig.cmd(CommandId::SidebarExpandAll)));
+        assert!(matches!(
+            rig.cmd(CommandId::SidebarCopyPath),
+            Dispatch::Unhandled
+        ));
+        let key = {
+            let view = window.view.borrow();
+            let sidebar = view.sidebar().expect("a sidebar");
+            let index = sidebar
+                .row_names()
+                .iter()
+                .position(|row| row == "b")
+                .unwrap();
+            sidebar.row_key(index).unwrap()
+        };
+        window
+            .view
+            .borrow_mut()
+            .sidebar_mut()
+            .unwrap()
+            .select_key(key);
+        assert!(rig.controller.menu_state(&window).sidebar_entry);
+        assert!(handled(&rig.cmd(CommandId::SidebarCopyPath)));
+        assert_eq!(
+            rig.clipboard.borrow().text(),
+            Ok(Some(rig.work.join("b.md").to_string_lossy().into_owned()))
+        );
+        assert!(handled(&rig.cmd(CommandId::SidebarOpenInNewTab)));
+        assert_eq!(names(&window).last().unwrap().as_deref(), Some("b.md"));
+    });
+}
+
+#[test]
 fn search_commands_open_the_find_bar_go_to_line_and_the_folder_search() {
     with_rig(NO_AUTOSAVE, |rig| {
         let window = rig.window();

@@ -149,6 +149,38 @@ impl SidebarCommand {
             Self::ExpandAll => C::SidebarExpandAll,
         }
     }
+
+    /// The item behind a sidebar command id (the palette, a shortcut); `None` for other
+    /// commands.
+    #[must_use]
+    pub fn from_id(command: CommandId) -> Option<Self> {
+        Self::ALL.into_iter().find(|item| item.id() == command)
+    }
+
+    /// Whether the item works on the workspace root rather than on a selected entry.
+    #[must_use]
+    pub fn on_root(self) -> bool {
+        matches!(
+            self,
+            Self::NewFile | Self::NewFolder | Self::CollapseAll | Self::ExpandAll
+        )
+    }
+
+    const ALL: [Self; 13] = [
+        Self::Open,
+        Self::OpenInNewTab,
+        Self::OpenInNewWindow,
+        Self::Rename,
+        Self::Duplicate,
+        Self::Delete,
+        Self::RevealInExplorer,
+        Self::CopyPath,
+        Self::CopyRelativePath,
+        Self::NewFile,
+        Self::NewFolder,
+        Self::CollapseAll,
+        Self::ExpandAll,
+    ];
 }
 
 /// A popup menu to show: the model, where, and what each item does.
@@ -751,6 +783,30 @@ impl Controller {
             .borrow()
             .as_ref()
             .and_then(|paths| paths.path(key))
+    }
+
+    /// A sidebar command from the palette or a shortcut: runs on the selected entry of the
+    /// sidebar (root commands on the workspace). False without a workspace and without a
+    /// selection for an entry command.
+    pub(super) fn run_sidebar_command(&self, cell: &Rc<WindowCell>, item: SidebarCommand) -> bool {
+        if cell.tree.borrow().is_none() {
+            return false;
+        }
+        let target = if item.on_root() {
+            None
+        } else {
+            let Some(key) = cell
+                .view
+                .borrow()
+                .sidebar()
+                .and_then(|sidebar| sidebar.selected_key())
+            else {
+                return false;
+            };
+            Some(key)
+        };
+        self.sidebar_command(cell, item, target);
+        true
     }
 
     /// Runs the sidebar command `command` on the entry `target` (`None`: the root).

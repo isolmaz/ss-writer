@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The `[[` completion list shows the headings (`[[#`) and the workspace files as soon as they arrive instead of staying empty until the next keystroke.
 - Edit → Insert date (F5), Format → Image and Format → Table did nothing. F5 inserts the long date of the Windows locale (escaped when it would start a numbered list; plain text files take it as it is), Image asks for picture files and inserts them like pasted files, Table inserts an empty two-column table with the caret in its first cell.
 - The Copy button of a code block put nothing on the clipboard, clicking a footnote reference did not jump to its definition (also when the two spell the label in different case), and text dragged onto another tab of the window was dropped on the floor instead of moving (Ctrl: copying) to that tab; a read-only tab such as a Help page takes nothing, so the dragged text stays where it is.
+- The sidebar commands (open, rename, duplicate, delete, reveal, copy path, new file and folder, collapse and expand all) were listed in the command palette and assignable to shortcuts but ran only from the sidebar's context menu; from the palette or a shortcut they now act on the selected entry (or the workspace) and are disabled without one.
 
 ## [0.1.0] - 2026-10-10
 

@@ -144,14 +144,20 @@ pub fn toggle_quote(ctx: Ctx<'_>) -> Option<Transaction> {
     }
     // A callout is one unit: its tag line without the body (or the body without the tag line)
     // is no callout any more.
-    let callout = ctx.selection.is_caret().then(|| {
-        enclosing_blocks(ctx)
-            .find(|b| matches!(b.kind, BlockKind::BlockQuote | BlockKind::Callout { .. }))
-            .filter(|b| matches!(b.kind, BlockKind::Callout { .. }))
-    });
-    let callout = callout.flatten();
+    let callout = ctx
+        .selection
+        .is_caret()
+        .then(|| {
+            enclosing_blocks(ctx)
+                .find(|b| matches!(b.kind, BlockKind::BlockQuote | BlockKind::Callout { .. }))
+                .and_then(|block| match &block.kind {
+                    BlockKind::Callout { tag, title, .. } => Some((block, *tag, *title)),
+                    _ => None,
+                })
+        })
+        .flatten();
     let (first, last) = match callout {
-        Some(block) => (ctx.line_of(block.range.start), ctx.line_of(block.range.end)),
+        Some((block, ..)) => (ctx.line_of(block.range.start), ctx.line_of(block.range.end)),
         None => target_lines(ctx),
     };
     let non_blank: Vec<usize> = (first..=last).filter(|&l| !ctx.is_blank_line(l)).collect();
@@ -161,10 +167,7 @@ pub fn toggle_quote(ctx: Ctx<'_>) -> Option<Transaction> {
     if remove {
         // The tag goes with the quote: a line holding only the tag disappears, a title stays
         // as a line of its own.
-        let tag_line = callout.and_then(|block| match &block.kind {
-            BlockKind::Callout { tag, title, .. } => Some((ctx.line_of(tag.start), *tag, *title)),
-            _ => None,
-        });
+        let tag_line = callout.map(|(_, tag, title)| (ctx.line_of(tag.start), tag, title));
         for line in non_blank {
             if let Some((tag_at, tag, title)) = tag_line
                 && line == tag_at

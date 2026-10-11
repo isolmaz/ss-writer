@@ -1,8 +1,6 @@
 * text=auto eol=lf
 *.rs text eol=lf
 *.ftl text eol=lf
-# Branches append changelog entries at the same place; keep both sides when they meet.
-CHANGELOG.md merge=union
 tests/fixtures/** -text
 *.ttf binary
 *.png binary

@@ -142,19 +142,48 @@ pub fn toggle_quote(ctx: Ctx<'_>) -> Option<Transaction> {
     if ctx.selection.is_caret() && ctx.in_verbatim_block(ctx.selection.head) {
         return None;
     }
-    let (first, last) = target_lines(ctx);
+    // A callout is one unit: its tag line without the body (or the body without the tag line)
+    // is no callout any more.
+    let callout = ctx.selection.is_caret().then(|| {
+        enclosing_blocks(ctx)
+            .find(|b| matches!(b.kind, BlockKind::BlockQuote | BlockKind::Callout { .. }))
+            .filter(|b| matches!(b.kind, BlockKind::Callout { .. }))
+    });
+    let callout = callout.flatten();
+    let (first, last) = match callout {
+        Some(block) => (ctx.line_of(block.range.start), ctx.line_of(block.range.end)),
+        None => target_lines(ctx),
+    };
     let non_blank: Vec<usize> = (first..=last).filter(|&l| !ctx.is_blank_line(l)).collect();
     let is_quoted = |l: usize| ctx.line_text(l).trim_start().starts_with('>');
     let remove = !non_blank.is_empty() && non_blank.iter().all(|&l| is_quoted(l));
     let mut edits = Vec::new();
     if remove {
+        // The tag goes with the quote: a line holding only the tag disappears, a title stays
+        // as a line of its own.
+        let tag_line = callout.and_then(|block| match &block.kind {
+            BlockKind::Callout { tag, title, .. } => Some((ctx.line_of(tag.start), *tag, *title)),
+            _ => None,
+        });
         for line in non_blank {
+            if let Some((tag_at, tag, title)) = tag_line
+                && line == tag_at
+            {
+                match title {
+                    None => {
+                        edits.push(delete_line(ctx, tag.start));
+                        continue;
+                    }
+                    Some(title) => edits.push(Edit::delete(TextRange::new(tag.start, title.start))),
+                }
+            }
             let text = ctx.line_text(line);
             let indent = text.len() - text.trim_start().len();
             let extra = usize::from(text[indent + 1..].starts_with(' '));
             let at = ctx.line_range(line).start + indent;
             edits.push(Edit::delete(TextRange::new(at, at + 1 + extra)));
         }
+        edits.sort_by_key(|e| e.range.start);
     } else {
         for line in first..=last {
             edits.push(Edit::insert(
@@ -463,6 +492,18 @@ mod tests {
         check("> > a‸", "> a‸", toggle_quote);
         check("- a‸", "> - a‸", toggle_quote);
         check_none("```\nco‸de\n```", toggle_quote);
+    }
+
+    #[test]
+    fn quote_toggle_in_a_callout_removes_the_whole_callout() {
+        // Removing the quote of one line would leave a tag without a body (or a lazy
+        // continuation of the tag line).
+        check("> [!NOTE]\n> no‸te", "no‸te", toggle_quote);
+        check("> [!TIP] Title\n> a\n> b‸", "Title\na\nb‸", toggle_quote);
+        check("> [!NOTE]\n> ‸a\n>\n> b", "‸a\n\nb", toggle_quote);
+        check("x\n> [!NOTE]‸", "x‸", toggle_quote);
+        // A plain quote keeps working paragraph by paragraph.
+        check("> a\n>\n> b‸", "> a\n>\nb‸", toggle_quote);
     }
 
     #[test]

@@ -6,3 +6,4 @@
 /.briefs
 /.tmp*
 /third_party/*/target
+/AGENTS.MD

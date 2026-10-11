@@ -7,6 +7,7 @@ use windows::Win32::Globalization::{
     LOCALE_ILZERO, LOCALE_INEGNUMBER, LOCALE_SDECIMAL, LOCALE_SGROUPING, LOCALE_STHOUSAND,
     NUMBERFMTW,
 };
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::SystemServices::LOCALE_NAME_MAX_LENGTH;
 use windows::core::{PCWSTR, PWSTR};
 
@@ -39,6 +40,14 @@ pub fn ui_language() -> String {
     // SAFETY: pure query.
     let langid = unsafe { GetUserDefaultUILanguage() };
     tag_or_fallback(langid)
+}
+
+/// Today's date in the local time zone as `(year, month, day)`.
+#[must_use]
+pub fn local_today() -> (u16, u16, u16) {
+    // SAFETY: pure query that fills the returned struct.
+    let now = unsafe { GetLocalTime() };
+    (now.wYear, now.wMonth, now.wDay)
 }
 
 /// [`tag_from_langid`], or [`FALLBACK_TAG`] for an id without a locale name.
@@ -310,6 +319,21 @@ mod tests {
         );
         assert_eq!(en.format_date_long(2026, 13, 40), None);
         assert_eq!(en.format_date_short(2026, 2, 31), None);
+    }
+
+    #[test]
+    fn today_is_a_valid_date_the_locale_can_format() {
+        let (year, month, day) = local_today();
+        assert!(
+            (2026..2200).contains(&year) && (1..=12).contains(&month),
+            "{year}-{month}"
+        );
+        assert!((1..=31).contains(&day), "{day}");
+        assert!(
+            Locale::new("en-US")
+                .format_date_long(year, month, day)
+                .is_some()
+        );
     }
 
     #[test]

@@ -386,6 +386,12 @@ pub fn insert_page_break(ctx: Ctx<'_>) -> Transaction {
     insert_block(ctx, "<!-- pagebreak -->", None)
 }
 
+/// Inserts an empty two-column table (header, alignment row, one row) as its own block, the
+/// caret in the first header cell.
+pub fn insert_table(ctx: Ctx<'_>) -> Transaction {
+    insert_block(ctx, "|     |     |\n| --- | --- |\n|     |     |", Some(2))
+}
+
 /// The smallest positive number not used as a footnote label.
 fn next_footnote_label(ctx: Ctx<'_>) -> u64 {
     let mut used: HashSet<u64> = HashSet::new();
@@ -614,6 +620,18 @@ mod tests {
         });
         // A divider after selected text goes after the last selected line.
         check("«a»\nb", "a\n\n---\n‸\nb", |c| Some(insert_divider(c)));
+    }
+
+    #[test]
+    fn table_is_inserted_as_a_block_with_the_caret_in_the_first_cell() {
+        check(
+            "text‸",
+            "text\n\n| ‸    |     |\n| --- | --- |\n|     |     |\n",
+            |c| Some(insert_table(c)),
+        );
+        let inserted = run("‸", |c| Some(insert_table(c))).unwrap();
+        let doc = crate::markdown::parse_document(&inserted.replace('‸', ""));
+        assert!(matches!(doc.blocks[0].kind, BlockKind::Table(_)));
     }
 
     #[test]

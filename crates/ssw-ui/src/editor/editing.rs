@@ -1205,8 +1205,8 @@ impl EditorView {
 
     /// Runs `command` if it is an editing, formatting, table or view command of the editor.
     /// Returns whether the editor owns the command (the host should not route it elsewhere);
-    /// commands that need the app (links, images, tables insertion, find, files, copy as plain
-    /// text / HTML / RTF) return `false`.
+    /// commands that need the app (links, images, the date, find, files, copy as plain text /
+    /// HTML / RTF) return `false`.
     pub fn execute(&mut self, command: C) -> bool {
         if !self.is_markdown()
             && !matches!(
@@ -1275,6 +1275,7 @@ impl EditorView {
             C::FormatDivider => self.op(|ctx| Some(blocks::insert_divider(ctx))),
             C::FormatFootnote => self.op(|ctx| Some(blocks::insert_footnote(ctx))),
             C::FormatPageBreak => self.op(|ctx| Some(blocks::insert_page_break(ctx))),
+            C::FormatTable => self.op(|ctx| Some(blocks::insert_table(ctx))),
             C::FormatParagraph => self.op(blocks::clear_heading),
             C::FormatBulletList => self.op(|ctx| lists::toggle_list(ctx, ListKind::Bullet)),
             C::FormatNumberedList => self.op(|ctx| lists::toggle_list(ctx, ListKind::Numbered)),
@@ -1394,10 +1395,14 @@ impl EditorView {
 
     // ----- commands that need text from the app ---------------------------------------------
 
-    /// Inserts `formatted` (the localized long date, `F5`) at the caret; escapes a date that
-    /// would start an ordered list.
+    /// Inserts `formatted` (the localized long date, `F5`) at the caret; in a Markdown document
+    /// a date that would start an ordered list is escaped.
     pub fn insert_date(&mut self, formatted: &str) {
-        self.run(|ctx| Some(format::insert_date(ctx, formatted)));
+        if self.is_markdown() {
+            self.run(|ctx| Some(format::insert_date(ctx, formatted)));
+        } else {
+            self.run(|ctx| Some(typing::insert_text(ctx, formatted)));
+        }
     }
 
     /// Creates or updates the link at the caret/selection (`Ctrl+K` popup result).

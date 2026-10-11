@@ -945,6 +945,20 @@ impl Controller {
         self.dialogs.borrow_mut().save_file(&options).ok().flatten()
     }
 
+    /// `F5`: inserts today's date as the long date of the user's locale (spec §2.2).
+    pub(super) fn insert_date(&self, cell: &Rc<WindowCell>) -> bool {
+        let (year, month, day) = ssw_win::locale::local_today();
+        let formatted = ssw_win::locale::Locale::user_default()
+            .format_date_long(year, month, day)
+            .unwrap_or_else(|| format!("{year:04}-{month:02}-{day:02}"));
+        let mut view = cell.view.borrow_mut();
+        let Some(editor) = view.active_editor_mut() else {
+            return false;
+        };
+        editor.insert_date(&formatted);
+        true
+    }
+
     fn open_dialog(&self) -> Vec<PathBuf> {
         let options = OpenFileOptions {
             title: self.i18n.text("window-open-title"),
@@ -1279,6 +1293,11 @@ impl AppActions for WindowActions<'_> {
     fn run_in_editor(&mut self, command: CommandId) -> bool {
         if let Some(handled) = self.controller.clipboard_command(&self.cell, command) {
             return handled;
+        }
+        match command {
+            CommandId::EditInsertDate => return self.controller.insert_date(&self.cell),
+            CommandId::FormatImage => return self.controller.insert_image_file(&self.cell),
+            _ => {}
         }
         let mut view = self.cell.view.borrow_mut();
         if command == CommandId::FormatLink {

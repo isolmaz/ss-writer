@@ -1,7 +1,8 @@
 //! The editable document: text, tree, selections and undo history.
 
 use crate::edit::{Edit, EditError, Selection, Transaction};
-use crate::markdown::{ast, parse_document};
+use crate::markdown::ast;
+use crate::markdown::incremental::IncrementalParser;
 use crate::ops::Ctx;
 use crate::text::Buffer;
 use crate::undo::{Timestamp, UndoStack};
@@ -12,7 +13,7 @@ use crate::undo::{Timestamp, UndoStack};
 #[derive(Clone, Debug)]
 pub struct Document {
     buffer: Buffer,
-    ast: ast::Document,
+    parser: IncrementalParser,
     selections: Vec<Selection>,
     version: u64,
     undo: UndoStack,
@@ -22,10 +23,9 @@ impl Document {
     /// A document holding `text` with the caret at the start.
     pub fn new(text: &str) -> Self {
         let buffer = Buffer::from_text(text);
-        let ast = parse_document(text);
         Self {
             buffer,
-            ast,
+            parser: IncrementalParser::new(text),
             selections: vec![Selection::caret(0)],
             version: 0,
             undo: UndoStack::new(),
@@ -42,7 +42,7 @@ impl Document {
     }
 
     pub fn ast(&self) -> &ast::Document {
-        &self.ast
+        self.parser.document()
     }
 
     /// All selections; the primary selection is first. Never empty.
@@ -70,7 +70,11 @@ impl Document {
 
     /// Context for the editing operations of [`crate::ops`], over the primary selection.
     pub fn ctx(&self) -> Ctx<'_> {
-        Ctx::new(&self.buffer, &self.ast, self.primary_selection())
+        Ctx::new(
+            &self.buffer,
+            self.parser.document(),
+            self.primary_selection(),
+        )
     }
 
     pub fn can_undo(&self) -> bool {
@@ -150,12 +154,10 @@ impl Document {
         Ok(inverse)
     }
 
-    /// Brings the tree in line with the text after `edits` (old-document coordinates).
-    ///
-    /// This is the only place that parses; it re-parses everything until the incremental
-    /// parser replaces the call.
-    fn refresh_ast(&mut self, _edits: &[Edit]) {
-        self.ast = parse_document(&self.buffer.to_string());
+    /// Brings the tree in line with the text after `edits` (old-document coordinates): only
+    /// the blocks around the edits are parsed again.
+    fn refresh_ast(&mut self, edits: &[Edit]) {
+        self.parser.apply(&self.buffer.to_string(), edits);
     }
 }
 
@@ -357,6 +359,26 @@ mod tests {
         assert_eq!(doc.ast().blocks[0].heading_level(), Some(1));
         assert!(doc.can_undo());
         assert!(!doc.can_redo());
+    }
+
+    #[test]
+    fn the_tree_after_several_edits_in_one_step_and_their_undo_equals_a_full_parse() {
+        let mut doc = Document::new("one\n\n```\ntwo\n```\n\n[ref]: /u\n\nsee [x][ref]\n");
+        // A fence opened at the top and a definition renamed far below change blocks on both
+        // sides of each edit.
+        let tx = Transaction::new(
+            vec![
+                Edit::insert(0, "```\n"),
+                Edit::replace(TextRange::new(16, 19), "r"),
+            ],
+            Selection::caret(0),
+            Selection::caret(4),
+        );
+        doc.apply(tx).expect("apply");
+        assert_eq!(doc.ast(), &crate::markdown::parse_document(&doc.text()));
+        assert!(doc.undo().expect("undo"));
+        assert_eq!(doc.ast(), &crate::markdown::parse_document(&doc.text()));
+        assert_eq!(doc.ast().blocks.len(), 4);
     }
 
     #[test]

@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use ssw_core::command::CommandId;
+use ssw_core::edit::Selection;
 use ssw_core::i18n::{Arg, Localizer};
+use ssw_core::markdown::ast::BlockKind;
+use ssw_core::markdown::definitions::normalize_label;
 use ssw_core::ops::format::InlineStyle;
 use ssw_core::settings::{Settings, SortBy};
 use ssw_core::stats;
@@ -29,6 +32,7 @@ use ssw_ui::shell::sidebar::{
     SidebarEvent, SidebarOptions, SidebarStrings, SidebarView, SortKey, TreeSource,
 };
 use ssw_ui::shell::statusbar::{Eol, StatusBar, StatusEvent, StatusInfo, StatusStrings};
+use ssw_ui::shell::tabs::TabHit;
 use ssw_ui::shell::titlebar::{FormatState, TitleBar, TitleEvent, TitleStrings};
 use ssw_ui::text::TextLayoutEngine;
 use ssw_ui::theme::Theme;
@@ -529,6 +533,70 @@ impl ShellView {
         let visible = self.titlebar.pill_visible();
         self.titlebar.set_pill_visible(!visible);
         self.requests.invalidate_all();
+    }
+
+    /// Text dragged out of the editor of tab `source_key` and released at `position` (window
+    /// DIPs): dropped on another tab of the row it goes to that tab's caret and, unless `copy`,
+    /// leaves `source` (spec §2.4). Returns whether a tab took it; a release anywhere else, on
+    /// a tab that shows the same document or on a read-only tab changes nothing.
+    pub fn drop_text_on_tab(
+        &mut self,
+        source_key: u64,
+        text: &str,
+        source: TextRange,
+        copy: bool,
+        position: Point,
+    ) -> bool {
+        let target_key = match self.titlebar.tabs().hit_test(position) {
+            Some(TabHit::Tab(key) | TabHit::Close(key)) if key != source_key => key,
+            _ => return false,
+        };
+        let from = self.tabs.iter().position(|tab| tab.key == source_key);
+        let to = self.tabs.iter().position(|tab| tab.key == target_key);
+        let (Some(from), Some(to)) = (from, to) else {
+            return false;
+        };
+        if Rc::ptr_eq(&self.tabs[from].entry, &self.tabs[to].entry) {
+            return false;
+        }
+        // A target that refuses the text (a read-only Help page) must not cost the source
+        // its text.
+        if !self.tabs[to].editor.insert_text(text) {
+            return false;
+        }
+        if !copy {
+            self.tabs[from].editor.remove_range(source);
+        }
+        self.requests.invalidate_all();
+        true
+    }
+
+    /// A click on `[^label]` in tab `key` (spec §3): the caret goes to the text of the
+    /// footnote definition. A reference without a definition stays where it is.
+    pub fn jump_to_footnote(&mut self, key: u64, label: &str) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.key == key) else {
+            return;
+        };
+        // Labels match the way the parser matches them: case-folded, whitespace collapsed.
+        let wanted = normalize_label(label);
+        let target = {
+            let document = tab.entry.document().borrow();
+            document
+                .ast()
+                .iter_blocks()
+                .find(|block| {
+                    matches!(&block.kind, BlockKind::FootnoteDefinition { label: own } if normalize_label(own) == wanted)
+                })
+                .map(|block| {
+                    let after_prefix = block.markers.first().map_or(block.range.start, |m| m.end);
+                    let text = document.buffer().slice(TextRange::new(after_prefix, block.range.end));
+                    after_prefix + (text.len() - text.trim_start().len())
+                })
+        };
+        if let Some(at) = target {
+            tab.editor.go_to(Selection::caret(at));
+            self.requests.invalidate_all();
+        }
     }
 
     /// View → Word wrap (spec §4.1): wraps long lines at the window edge or lets them run on

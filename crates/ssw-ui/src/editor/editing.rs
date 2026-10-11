@@ -1420,6 +1420,13 @@ impl EditorView {
         self.run(|ctx| Some(paste::paste_markdown(ctx, markdown)));
     }
 
+    /// Replaces the selection with `text` as it is (text dropped from another tab). Returns
+    /// whether the document took it (`false` when the view is read-only or the edit fails).
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        let tx = typing::insert_text(self.doc.borrow().ctx(), text);
+        self.apply(tx, false)
+    }
+
     /// Pastes code as a fenced block (VS Code / monospace HTML) unless the caret is already
     /// inside one.
     pub fn paste_code(&mut self, code: &str) {

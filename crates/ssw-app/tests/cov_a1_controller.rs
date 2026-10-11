@@ -27,6 +27,7 @@ use ssw_core::i18n::Arg;
 use ssw_io::folder_search::SearchOptions;
 use ssw_io::session::WindowPlacement;
 use ssw_ui::canvas::RecordingCanvas;
+use ssw_ui::editor::blocks_media::MediaEvent;
 use ssw_ui::editor::{EditorEvent, LinkTarget};
 use ssw_ui::geometry::{Point, Size};
 use ssw_ui::services::{
@@ -1278,6 +1279,24 @@ fn insert_date_puts_todays_long_date_at_the_caret() {
 }
 
 #[test]
+fn the_copy_button_of_a_code_block_fills_the_clipboard() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let key = active_key(&rig.window());
+        rig.act(ShellAction::Editor(
+            key,
+            EditorEvent::Media(MediaEvent::CopyCode {
+                range: ssw_core::text::TextRange::new(0, 0),
+                text: "let a = 1;\n".to_owned(),
+            }),
+        ));
+        assert_eq!(
+            rig.clipboard.borrow().text(),
+            Ok(Some("let a = 1;\n".to_owned()))
+        );
+    });
+}
+
+#[test]
 fn format_image_asks_for_pictures_and_inserts_them_like_pasted_files() {
     with_rig(NO_AUTOSAVE, |rig| {
         let window = rig.window();
@@ -1319,6 +1338,212 @@ fn format_image_asks_for_pictures_and_inserts_them_like_pasted_files() {
             rig.cmd_in(&empty, CommandId::FormatImage),
             Dispatch::Unhandled
         ));
+    });
+}
+
+#[test]
+fn clicking_a_footnote_reference_jumps_to_its_definition() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let text = "Hello[^1] and[^x].\n\n[^1]:   the note\n";
+        rig.set_text(text);
+        let window = rig.window();
+        let key = active_key(&window);
+        let footnote = |key, label: &str| {
+            rig.act(ShellAction::Editor(
+                key,
+                EditorEvent::LinkActivated(LinkTarget::Footnote(label.to_owned())),
+            ));
+            rig.entry().document().borrow().primary_selection()
+        };
+        assert_eq!(
+            footnote(key, "1"),
+            Selection::caret(text.find("the note").unwrap())
+        );
+        // No definition, no tab: the caret stays.
+        assert_eq!(
+            footnote(key, "x"),
+            Selection::caret(text.find("the note").unwrap())
+        );
+        assert_eq!(
+            footnote(key + 100, "1"),
+            Selection::caret(text.find("the note").unwrap())
+        );
+    });
+}
+
+#[test]
+fn a_footnote_reference_finds_its_definition_whatever_the_case_of_the_label() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let text = "Hello[^Note].\n\n[^note]:  the note\n";
+        rig.set_text(text);
+        let window = rig.window();
+        let key = active_key(&window);
+        let footnote = |label: &str| {
+            rig.act(ShellAction::Editor(
+                key,
+                EditorEvent::LinkActivated(LinkTarget::Footnote(label.to_owned())),
+            ));
+            rig.entry().document().borrow().primary_selection()
+        };
+        assert_eq!(
+            footnote("Note"),
+            Selection::caret(text.find("the note").unwrap())
+        );
+    });
+}
+
+#[test]
+fn text_dropped_on_a_read_only_tab_stays_in_its_source() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let window = rig.window();
+        rig.open("a.md");
+        rig.open("b.md");
+        window.view.borrow_mut().paint(
+            &mut RecordingCanvas::new(),
+            &MonoTextEngine::default(),
+            false,
+        );
+        let keys = keys(&window);
+        let (a, b) = (keys[1], keys[2]);
+        let centre = |key: u64| {
+            let view = window.view.borrow();
+            let strip = view.titlebar().tabs().strip();
+            let index = keys.iter().position(|&k| k == key).unwrap();
+            strip.tab_rect(index).center()
+        };
+        let text_of = |key: u64| {
+            let view = window.view.borrow();
+            view.tab(key).unwrap().entry.document().borrow().text()
+        };
+        let source = ssw_core::text::TextRange::new(0, 4);
+        let (a_before, b_before) = (text_of(a), text_of(b));
+        assert_eq!(b_before, "# B\n");
+        window
+            .view
+            .borrow_mut()
+            .tabs_mut()
+            .iter_mut()
+            .find(|tab| tab.key == a)
+            .unwrap()
+            .editor
+            .set_read_only(true);
+        let on_a = centre(a);
+        for copy in [false, true] {
+            let taken = window
+                .view
+                .borrow_mut()
+                .drop_text_on_tab(b, "# B\n", source, copy, on_a);
+            assert!(!taken, "a read-only tab takes nothing (copy: {copy})");
+            assert_eq!(text_of(b), b_before, "the source keeps its text");
+            assert_eq!(text_of(a), a_before, "the target is unchanged");
+        }
+        // Writable again: the same drop is taken and moves the text.
+        window
+            .view
+            .borrow_mut()
+            .tabs_mut()
+            .iter_mut()
+            .find(|tab| tab.key == a)
+            .unwrap()
+            .editor
+            .set_read_only(false);
+        assert!(
+            window
+                .view
+                .borrow_mut()
+                .drop_text_on_tab(b, "# B\n", source, false, on_a)
+        );
+        assert_eq!(text_of(b), "");
+        assert_eq!(text_of(a), format!("# B\n{a_before}"));
+    });
+}
+
+#[test]
+fn text_dragged_onto_another_tab_moves_or_copies_there() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let window = rig.window();
+        rig.open("a.md");
+        rig.open("b.md");
+        window.view.borrow_mut().paint(
+            &mut RecordingCanvas::new(),
+            &MonoTextEngine::default(),
+            false,
+        );
+        let keys = keys(&window);
+        let (notes, a, b) = (keys[0], keys[1], keys[2]);
+        let centre = |key: u64| {
+            let view = window.view.borrow();
+            let strip = view.titlebar().tabs().strip();
+            let index = keys.iter().position(|&k| k == key).unwrap();
+            strip.tab_rect(index).center()
+        };
+        let text_of = |key: u64| {
+            let view = window.view.borrow();
+            view.tab(key).unwrap().entry.document().borrow().text()
+        };
+        let drop = |from: u64, source: (usize, usize), copy: bool, at: Point| {
+            rig.act(ShellAction::Editor(
+                from,
+                EditorEvent::TextDroppedOutside {
+                    text: text_of(from)[source.0..source.1].to_owned(),
+                    source: ssw_core::text::TextRange::new(source.0, source.1),
+                    copy,
+                    position: at,
+                },
+            ));
+        };
+        // "# B\n" dragged from b.md onto a.md moves it (a.md's caret is at 0).
+        drop(b, (0, 4), false, centre(a));
+        assert_eq!(text_of(b), "");
+        assert_eq!(text_of(a), "# B\n# A\nfind the needle\n");
+        // With Ctrl the source keeps its text.
+        drop(a, (0, 4), true, centre(notes));
+        assert_eq!(text_of(a), "# B\n# A\nfind the needle\n");
+        assert_eq!(text_of(notes), "# B\n# Notes\n");
+        // Released on its own tab (also on its close button), beside the row, or on a second
+        // tab of the same document: nothing.
+        drop(a, (0, 4), false, centre(a));
+        let own_close = {
+            let view = window.view.borrow();
+            let index = keys.iter().position(|&k| k == a).unwrap();
+            view.titlebar().tabs().strip().close_rect(index).center()
+        };
+        drop(a, (0, 4), false, own_close);
+        drop(a, (0, 4), false, Point::new(-10.0, -10.0));
+        let entry = {
+            let view = window.view.borrow();
+            Rc::clone(&view.tab(a).unwrap().entry)
+        };
+        let twin = window.view.borrow_mut().add_tab(entry, None);
+        assert_ne!(twin, a);
+        window.view.borrow_mut().paint(
+            &mut RecordingCanvas::new(),
+            &MonoTextEngine::default(),
+            false,
+        );
+        let (twin_centre, twin_close) = {
+            let view = window.view.borrow();
+            let index = view.tabs().iter().position(|tab| tab.key == twin).unwrap();
+            let strip = view.titlebar().tabs().strip();
+            (
+                strip.tab_rect(index).center(),
+                strip.close_rect(index).center(),
+            )
+        };
+        drop(a, (0, 4), false, twin_centre);
+        drop(a, (0, 4), false, twin_close);
+        assert_eq!(text_of(a), "# B\n# A\nfind the needle\n");
+        // A tab that no longer exists is no source.
+        rig.act(ShellAction::Editor(
+            a + 100,
+            EditorEvent::TextDroppedOutside {
+                text: "gone".to_owned(),
+                source: ssw_core::text::TextRange::new(0, 4),
+                copy: false,
+                position: centre(notes),
+            },
+        ));
+        assert_eq!(text_of(notes), "# B\n# Notes\n");
     });
 }
 

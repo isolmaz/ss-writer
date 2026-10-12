@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-12
+
 ### Fixed
 
 - A test of the animation-frame idle sleep compared it against the refresh interval read a second time from DWM. DWM measures the rate, so the second reading differed by a fraction of a microsecond under load and the test failed at random. It now compares against the interval the application itself sleeps for (`UiApp::frame_interval`).
@@ -113,6 +115,7 @@ First release.
 
 - Scrolling very large documents (60 000 lines) at high speed does not yet keep up with a 144 Hz display: in the stress test a frame takes about 16 ms instead of 7 ms. See [docs/performance.md](docs/performance.md#known-issues).
 
-[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/isolmaz/ss-writer/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/isolmaz/ss-writer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/isolmaz/ss-writer/releases/tag/v0.1.0

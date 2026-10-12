@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-12
+
 ### Fixed
 
 - Starting SS Writer no longer opens an empty console window next to the editor.
@@ -103,4 +105,6 @@ First release.
 
 - Scrolling very large documents (60 000 lines) at high speed does not yet keep up with a 144 Hz display: in the stress test a frame takes about 16 ms instead of 7 ms. See [docs/performance.md](docs/performance.md#known-issues).
 
+[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/isolmaz/ss-writer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/isolmaz/ss-writer/releases/tag/v0.1.0

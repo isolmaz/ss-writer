@@ -9,7 +9,7 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::VecDeque;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -605,24 +605,25 @@ impl Controller {
                 self.activate_wikilink(cell, &target, heading.as_deref());
             }
             EditorEvent::LinkActivated(LinkTarget::Url(url)) => {
-                let target = Path::new(&url);
-                if url.starts_with("http://") || url.starts_with("https://") {
+                if ssw_win::services::shell::allowed_scheme(&url).is_some() {
                     let _ = self.shell.borrow_mut().open_url(&url);
-                } else {
-                    // The folder is read before the file opens: opening borrows the view
-                    // mutably, and the guard of an `if let` scrutinee lives through its body.
+                } else if !has_uri_scheme(&url) && ssw_win::assoc::link_extension(&url).is_some() {
+                    // A file link. Documents the app opens itself may live anywhere; everything
+                    // else goes to its default app only from the document's folder or below,
+                    // and never when the shell considers its type dangerous. The folder is
+                    // read before the file opens: opening borrows the view mutably, and the
+                    // guard of an `if let` scrutinee lives through its body.
                     let base = cell
                         .view
                         .borrow()
                         .active_tab()
                         .and_then(|tab| tab.entry.path())
                         .and_then(|path| path.parent().map(Path::to_path_buf));
-                    if let Some(base) = base
-                        && target.extension().is_some_and(|ext| {
-                            ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
-                        })
-                    {
-                        self.open_path(cell, &base.join(target), false);
+                    if let Some(base) = base {
+                        let path = base.join(link_path(&url));
+                        if opens_in_app(&path) || may_open_with_default_app(&url) {
+                            self.open_path(cell, &path, false);
+                        }
                     }
                 }
             }
@@ -711,23 +712,10 @@ impl Controller {
     }
 
     pub(super) fn open_path(&self, cell: &Rc<WindowCell>, path: &Path, _new_tab: bool) {
-        use ssw_io::workspace::{FileClass, classify_extension};
-        if super::import::is_import(path) {
+        if opens_in_app(path) {
             self.open_document(cell, path);
-            return;
-        }
-        let class = path.extension().map_or(FileClass::Text, |ext| {
-            classify_extension(&ext.to_string_lossy())
-        });
-        match class {
-            FileClass::Markdown | FileClass::Text => {
-                if let Err(error) = self.open_file(cell, path) {
-                    self.report(&error);
-                }
-            }
-            FileClass::Image | FileClass::Other => {
-                let _ = self.shell.borrow_mut().open_path(path);
-            }
+        } else {
+            let _ = self.shell.borrow_mut().open_path(path);
         }
     }
 
@@ -1294,6 +1282,46 @@ fn tab_view_state(tab: &TabView) -> ViewState {
         scroll_delta: tab.editor.scroll_y(),
         folds: tab.folds.offsets(&document),
     }
+}
+
+/// Whether `Controller::open_path` opens `path` in the app (word-processor files are imported,
+/// Markdown and text are edited) instead of handing it to the default app.
+fn opens_in_app(path: &Path) -> bool {
+    use ssw_io::workspace::{FileClass, classify_extension};
+    let class = path.extension().map_or(FileClass::Text, |ext| {
+        classify_extension(&ext.to_string_lossy())
+    });
+    super::import::is_import(path) || matches!(class, FileClass::Markdown | FileClass::Text)
+}
+
+/// The file a link target names: the target without its `#fragment` and `?query`.
+fn link_path(target: &str) -> &str {
+    target.split(['#', '?']).next().unwrap_or_default()
+}
+
+/// Whether `target` starts with a URI scheme (RFC 3986: a letter, then letters, digits, `+`,
+/// `-` or `.`, then `:`), as `file:` or `javascript:` do. A single letter is a drive (`C:`).
+fn has_uri_scheme(target: &str) -> bool {
+    let Some((scheme, _)) = target.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    scheme.len() >= 2
+        && chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+}
+
+/// Whether a link may hand the file `target` names to its default app: the file lies in the
+/// document's folder or below (no root, drive, UNC prefix or `..`), so a link cannot reach an
+/// arbitrary local or network file, and the shell does not consider its type dangerous. The
+/// danger check reads the extension as Windows does, ignoring trailing dots and spaces.
+fn may_open_with_default_app(target: &str) -> bool {
+    Path::new(link_path(target))
+        .components()
+        .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+        && !ssw_win::assoc::is_dangerous_link(target)
 }
 
 /// Whether two paths name the same file (case-insensitive on Windows, canonical when possible).

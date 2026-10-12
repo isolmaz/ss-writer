@@ -114,7 +114,9 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Tables the cell model cannot represent (escaped `|`, `|` inside inline code spanning cells) open in raw mode automatically.
 
 ### 3.2 Links & wikilinks
-- Relative `.md` links open inside the app (same tab; Ctrl+click new tab). Web links open in the default browser. Executables (per `AssocIsDangerous`) require confirmation.
+- Ctrl+click follows a link. `http`, `https` and `mailto:` links open in the default browser or mail client; links with any other URI scheme (`file:`, `javascript:`, …) are ignored. Anything else is a path relative to the folder of the active document (an unsaved document has none: nothing happens). A `#heading` or `?query` suffix is dropped, so the file opens without scrolling to the heading; targets without a file extension, such as a bare `#heading`, are ignored.
+- Markdown, text and word-processor files (`.docx`, `.odt`, `.rtf`, `.doc`: imported, §4.1) open inside the app, an absolute path included: in a new tab, or the existing tab of the window when the file is open already. A file that cannot be opened, a missing one included, shows an error message.
+- Every other file (images, PDFs, …) opens with its default app, but only when it lies in the document's folder or a subfolder (no absolute or drive path, network share or `..`) and its type is not dangerous per `AssocIsDangerous`, checked on the name without the trailing dots and spaces Windows ignores (`setup.exe.` is `setup.exe`). Anything else, a missing file included, is ignored without a message.
 - `[[` completion: fuzzy match over workspace documents; `[[#` lists headings of the current file; `|` alias.
 - Clicking a wikilink to a missing file offers to create it (only inside the workspace root; paths are canonicalized and rejected if they escape the root).
 - Renaming/moving a file inside the workspace offers to update links pointing to it (wikilinks and relative Markdown links).

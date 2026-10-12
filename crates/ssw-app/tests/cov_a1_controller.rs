@@ -798,7 +798,7 @@ fn the_zoom_is_clamped_and_follows_every_window_and_the_zoom_commands() {
 // ----- links in the editor ---------------------------------------------------------------------
 
 #[test]
-fn links_open_the_browser_or_a_markdown_file_next_to_the_document() {
+fn links_open_the_browser_documents_and_files_in_the_documents_folder() {
     with_rig(NO_AUTOSAVE, |rig| {
         let window = rig.window();
         let key = active_key(&window);
@@ -810,16 +810,18 @@ fn links_open_the_browser_or_a_markdown_file_next_to_the_document() {
         };
         rig.act(link("https://example.com/a"));
         rig.act(link("http://example.com/b"));
+        rig.act(link("mailto:someone@example.com"));
         assert_eq!(
             rig.services.shell_log(),
             [
                 ShellRecord::OpenUrl("https://example.com/a".to_owned()),
-                ShellRecord::OpenUrl("http://example.com/b".to_owned())
+                ShellRecord::OpenUrl("http://example.com/b".to_owned()),
+                ShellRecord::OpenUrl("mailto:someone@example.com".to_owned())
             ]
         );
         assert_eq!(names(&window), [file("notes.md")]);
 
-        rig.act(link("a.md"));
+        rig.act(link("a.md#needle"));
         assert_eq!(names(&window), [file("notes.md"), file("a.md")]);
         rig.act(link("c.markdown"));
         rig.act(link("Upper.MD"));
@@ -832,17 +834,84 @@ fn links_open_the_browser_or_a_markdown_file_next_to_the_document() {
                 file("Upper.MD")
             ]
         );
-        // Other files and names without an extension are no documents to follow.
-        for other in ["pic.png", "readme", "notes.txt"] {
-            rig.act(link(other));
-        }
+        // A document that is open already is activated, not opened a second time.
+        let a_key = keys(&window)[1];
+        assert_ne!(active_key(&window), a_key);
+        rig.act(link("a.md"));
         assert_eq!(names(&window).len(), 4);
-        assert_eq!(rig.services.shell_log().len(), 2);
+        assert_eq!(active_key(&window), a_key);
+
+        // Text opens in the app next to the document, and so does a document at an absolute
+        // path.
+        std::fs::write(rig.work.join("notes.txt"), "text\n").unwrap();
+        let absolute_markdown = rig.work.join("d.md").to_string_lossy().into_owned();
+        rig.act(link("notes.txt"));
+        rig.act(link(&absolute_markdown));
+        assert_eq!(names(&window)[4..], [file("notes.txt"), file("d.md")]);
+        // A missing document is reported.
+        rig.ok();
+        rig.act(link("missing.md"));
+        assert_eq!(rig.messages(), [text_of("app-error-not-found")]);
+        assert_eq!(names(&window).len(), 6);
+        assert_eq!(
+            rig.services.shell_log().len(),
+            3,
+            "only the web links so far"
+        );
+
+        // Other files go to their default app from the document's folder and below.
+        std::fs::write(rig.work.join("sub").join("pic.png"), "png").unwrap();
+        rig.act(link("pic.png"));
+        rig.act(link("sub/pic.png"));
+        assert_eq!(
+            rig.services.shell_log()[3..],
+            [
+                ShellRecord::OpenPath(rig.work.join("pic.png")),
+                ShellRecord::OpenPath(rig.work.join("sub").join("pic.png"))
+            ]
+        );
+        assert_eq!(names(&window).len(), 6);
+
+        // Everything else is ignored: no tab, no error, nothing for the shell. The fake shell
+        // does not apply the real one's refusals, so each of these must stop in the controller.
+        let outside = rig.work.parent().unwrap().join("outside.png");
+        std::fs::write(&outside, "png").unwrap();
+        std::fs::write(rig.work.join("tool.exe"), "MZ").unwrap();
+        let absolute_picture = rig.work.join("pic.png").to_string_lossy().into_owned();
+        let ignored = [
+            // Executable content, also behind the dots Windows strips from the name.
+            "tool.exe",
+            "tool.exe.",
+            // A picture outside the document's folder, by `..`, absolute path and share.
+            "../outside.png",
+            absolute_picture.as_str(),
+            "//host/share/r.pdf",
+            r"\\host\share\r.pdf",
+            // Other schemes, and names that are no file.
+            "file:///C:/x.md",
+            "foo:bar.pdf",
+            "ms-settings:display.pdf",
+            "javascript:alert(1)",
+            "readme",
+        ];
+        let log = rig.services.shell_log();
+        let tabs = names(&window);
+        let messages = rig.messages();
+        for target in ignored {
+            rig.act(link(target));
+            assert_eq!(
+                rig.services.shell_log(),
+                log,
+                "{target:?} reaches the shell"
+            );
+            assert_eq!(names(&window), tabs, "{target:?} opens a tab");
+            assert_eq!(rig.messages(), messages, "{target:?} shows an error");
+        }
 
         // An untitled document has no folder to resolve the link in.
         assert!(handled(&rig.cmd(CommandId::TabNew)));
         rig.act(link("b.md"));
-        assert_eq!(names(&window).len(), 5);
+        assert_eq!(names(&window).len(), tabs.len() + 1);
     });
 }
 

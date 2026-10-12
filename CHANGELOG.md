@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- A test of the animation-frame idle sleep compared it against the refresh interval read a second time from DWM. DWM measures the rate, so the second reading differed by a fraction of a microsecond under load and the test failed at random. It now compares against the interval the application itself sleeps for (`UiApp::frame_interval`).
+
+### Removed
+
+- The test that opened exported DOCX and ODT files in a headless LibreOffice (`crates/ssw-convert/tests/office_libreoffice.rs`): it blocked the whole test run for minutes on machines where LibreOffice was installed. Nothing in the repository starts an office suite any more. What the exporters write stays covered by the package, schema-order and write → read round-trip tests, and opening the result in Word is a manual checklist item.
+
 ## [0.1.1] - 2026-10-12
 
 ### Fixed

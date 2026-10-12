@@ -491,6 +491,13 @@ impl UiApp {
         &self.controller
     }
 
+    /// How long the loop sleeps between animation frames: the refresh interval read once at
+    /// start-up (DWM measures the rate, so a later call can report a slightly different one).
+    #[must_use]
+    pub fn frame_interval(&self) -> Duration {
+        self.frame_interval
+    }
+
     /// The exit code once the application decided to leave the loop.
     #[must_use]
     pub fn exit_code(&self) -> Option<i32> {

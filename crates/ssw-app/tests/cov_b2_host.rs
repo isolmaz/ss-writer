@@ -328,7 +328,7 @@ fn a_turn_that_delivers_animation_frames_sleeps_for_one_refresh() {
             .borrow_mut()
             .requests_mut()
             .request_animation_frame();
-        let frame = ssw_win::services::timers::refresh_interval();
+        let frame = app.frame_interval();
         let waits: Vec<Option<std::time::Duration>> = (0..10).map(|_| app.idle()).collect();
         assert!(waits.contains(&Some(frame)), "{waits:?} against {frame:?}");
         0

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-13
+
+### Fixed
+
+- The mouse pointer kept the shape of the surface it came from until it moved again. Windows asks a window which cursor to show before it delivers the move that decides it, so the shape chosen while handling that move only reached the screen with the next move: a pointer that jumps (a shortcut that opens a window below it, a window that opens under a resting pointer, remote control) showed the wrong shape until it was moved.
+
 ## [0.1.3] - 2026-10-13
 
 ### Added
@@ -134,7 +140,8 @@ First release.
 
 - Scrolling very large documents (60 000 lines) at high speed does not yet keep up with a 144 Hz display: in the stress test a frame takes about 16 ms instead of 7 ms. See [docs/performance.md](docs/performance.md#known-issues).
 
-[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/isolmaz/ss-writer/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/isolmaz/ss-writer/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/isolmaz/ss-writer/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/isolmaz/ss-writer/compare/v0.1.0...v0.1.1

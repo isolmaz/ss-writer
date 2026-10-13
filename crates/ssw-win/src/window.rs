@@ -782,6 +782,16 @@ impl WindowState {
         }
     }
 
+    /// Shows the cursor the widgets asked for over the client area.
+    fn apply_cursor(&self) {
+        // SAFETY: loads and sets a stock cursor; one that cannot be loaded (the stock
+        // resources always load) leaves the cursor as it is.
+        unsafe {
+            let _ = LoadCursorW(None, cursor_resource(self.cursor))
+                .map(|cursor| SetCursor(Some(cursor)));
+        }
+    }
+
     fn track(&mut self, nonclient: bool) {
         let flag = if nonclient {
             &mut self.tracking_nonclient
@@ -1063,12 +1073,7 @@ impl WindowState {
             }
             WM_SETCURSOR => {
                 if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
-                    // SAFETY: loads and sets a stock cursor; one that cannot be loaded (the
-                    // stock resources always load) leaves the cursor as it is.
-                    unsafe {
-                        let _ = LoadCursorW(None, cursor_resource(self.cursor))
-                            .map(|cursor| SetCursor(Some(cursor)));
-                    }
+                    self.apply_cursor();
                     (Some(LRESULT(1)), After::None)
                 } else {
                     (None, After::None)
@@ -1585,8 +1590,21 @@ impl WindowHost {
     }
 
     /// Sets the cursor shown over the client area.
+    ///
+    /// Windows asks for the cursor (`WM_SETCURSOR`) *before* it delivers the move that decides
+    /// it, so a shape chosen while handling that move has to be set here as well; waiting for
+    /// the next `WM_SETCURSOR` leaves the previous surface's shape on screen until the pointer
+    /// moves again (a pointer that jumps, or a window that opens below a resting pointer,
+    /// never moves).
     pub fn set_cursor(&self, cursor: Cursor) {
-        self.state.borrow_mut().cursor = cursor;
+        let mut state = self.state.borrow_mut();
+        if state.cursor == cursor {
+            return;
+        }
+        state.cursor = cursor;
+        if state.tracking_client {
+            state.apply_cursor();
+        }
     }
 
     /// Schedules a repaint.
@@ -1783,7 +1801,7 @@ mod tests {
     use ssw_ui::theme::DEFAULT_ACCENT;
     use std::cell::RefCell as Cell;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SendMessageW};
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursor, GetWindowRect, SendMessageW};
 
     #[derive(Default)]
     struct Log {
@@ -2163,6 +2181,45 @@ mod tests {
             .downcast_ref::<String>()
             .map(String::as_str)
             .or_else(|| payload.downcast_ref::<&str>().copied())
+    }
+
+    #[test]
+    fn a_new_cursor_is_shown_at_once_while_the_pointer_is_over_the_client_area() {
+        // SAFETY: reads the cursor of this thread; the stock cursors always load.
+        let shown = || unsafe { GetCursor() };
+        let stock = |resource| {
+            // SAFETY: loads a stock cursor.
+            unsafe { LoadCursorW(None, resource) }.unwrap()
+        };
+        let (host, _log) = host(true, false);
+
+        // Without the pointer over the window the shape is only remembered: Windows asks for
+        // it when the pointer arrives.
+        host.set_cursor(Cursor::Hand);
+        assert_eq!(host.state.borrow().cursor, Cursor::Hand);
+        send(&host, WM_SETCURSOR, 0, HTCLIENT as isize);
+        assert_eq!(shown(), stock(IDC_HAND));
+
+        // A move brings the pointer in; `WM_SETCURSOR` has already been answered for it, so a
+        // shape decided while handling the move has to reach the screen without another move.
+        send(&host, WM_MOUSEMOVE, 0, (8 << 16) | 4);
+        assert!(host.state.borrow().tracking_client);
+        host.set_cursor(Cursor::IBeam);
+        assert_eq!(shown(), stock(IDC_IBEAM), "the new shape is shown at once");
+
+        // The same shape again is not set again, and after the pointer left the window only
+        // remembers.
+        host.set_cursor(Cursor::IBeam);
+        assert_eq!(shown(), stock(IDC_IBEAM));
+        send(&host, WM_MOUSELEAVE, 0, 0);
+        assert!(!host.state.borrow().tracking_client);
+        host.set_cursor(Cursor::Arrow);
+        assert_eq!(
+            shown(),
+            stock(IDC_IBEAM),
+            "the shape of another window stays"
+        );
+        assert_eq!(host.state.borrow().cursor, Cursor::Arrow);
     }
 
     #[test]

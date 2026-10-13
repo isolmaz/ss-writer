@@ -34,7 +34,7 @@ use ssw_ui::canvas::Canvas;
 use ssw_ui::editor::spell::SpellCheck;
 use ssw_ui::editor::{EditorConfig, MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT};
 use ssw_ui::geometry::{Color, Point, Rect, Size};
-use ssw_ui::input::{Cursor, Event, vk};
+use ssw_ui::input::{Cursor, Event, PointerEventKind, vk};
 use ssw_ui::services::{MessageBoxButtons, MessageBoxOptions, MessageBoxResult, PickFolderOptions};
 use ssw_ui::shell::settings::{
     FieldId, KeyNames, LanguageChoice, SettingsEnv, SettingsEvent, SettingsWindow,
@@ -438,6 +438,13 @@ impl SettingsView {
     /// when no control wants the key (and no shortcut is being captured).
     pub fn event(&mut self, event: &Event, text: &dyn TextLayoutEngine) -> Vec<SettingsEvent> {
         self.arrange(text);
+        // The control under the pointer asks for its own shape; without this reset the shape of
+        // the control the pointer left would stay.
+        if let Event::Pointer(pointer) = event
+            && pointer.kind != PointerEventKind::Leave
+        {
+            self.requests.set_cursor(Cursor::Arrow);
+        }
         let theme = self.theme;
         let id = self.window.id();
         let result = {

@@ -223,10 +223,19 @@ fn text_size(cx: &LayoutCx, text: &str, size: f32, width: f32) -> Size {
         .size()
 }
 
-/// Delivers `e` to `control` with a context for its id.
+/// Delivers `e` to `control` with a context for its id and gives it the keyboard when it asks
+/// for it (a click on a text box or a drop-down). The host only knows the window, not which of
+/// its controls was clicked, so the focus has to be granted here.
 pub(crate) fn forward(control: &mut dyn Control, cx: &mut EventCx, e: &Event) -> EventResult {
     let id = control.id();
-    control.event(&mut cx.for_widget(id), e)
+    let result = control.event(&mut cx.for_widget(id), e);
+    if result.request_focus {
+        cx.focus.focus(id);
+    }
+    EventResult {
+        request_focus: false,
+        ..result
+    }
 }
 
 impl<K: Copy + PartialEq> Form<K> {
@@ -396,10 +405,20 @@ impl<K: Copy + PartialEq> Form<K> {
                     canvas.draw_text_layout(layout.as_ref(), origin, tokens.text_muted);
                 }
             }
-            let control = row.input.control();
-            control.paint(&cx.for_widget(control.id()), canvas);
+            if let Input::Choice(combo) = &row.input {
+                combo.paint_box(&cx.for_widget(combo.id()), canvas);
+            } else {
+                let control = row.input.control();
+                control.paint(&cx.for_widget(control.id()), canvas);
+            }
             if let Some(button) = &row.accessory {
                 button.paint(&cx.for_widget(button.id()), canvas);
+            }
+        }
+        // An open drop-down hangs over the rows below its box: it is drawn after all of them.
+        for row in &self.rows {
+            if let Input::Choice(combo) = &row.input {
+                combo.paint_popup(&cx.for_widget(combo.id()), canvas);
             }
         }
     }

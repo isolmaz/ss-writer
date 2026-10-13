@@ -1,16 +1,20 @@
 //! The weekly update check (spec §13): ask GitHub for the latest release, compare it with the
-//! running version and report it; notification only, never a download, and switched off by the
-//! `check_for_updates` setting. The time of the last successful check is kept in the state
-//! database so the check runs at most once a week however often the app starts.
+//! running version and report it; switched off by the `check_for_updates` setting. The time of
+//! the last successful check is kept in the state database so the check runs at most once a
+//! week however often the app starts. The check itself only notifies; the installer of a
+//! reported release is downloaded, and verified against the release's `SHA256SUMS.txt`, by
+//! [`download_installer`] when the user asks for it.
 
 use std::cmp::Ordering;
 use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::net::{Accept, FetchOptions, Http, NetError, Scheme, Url, fetch};
+use crate::net::{Accept, FetchOptions, Http, NetError, Scheme, Url, download, fetch};
 use crate::store::{Store, StoreError, UnixSeconds};
 
 /// The release feed of the project.
@@ -21,8 +25,18 @@ pub const CHECK_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
 pub const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 /// Deadline of one check.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+/// Largest installer accepted.
+pub const MAX_INSTALLER_BYTES: u64 = 200 * 1024 * 1024;
+/// Largest `SHA256SUMS.txt` accepted: a few lines of 64 digits and file names.
+pub const MAX_CHECKSUMS_BYTES: u64 = 64 * 1024;
+/// Deadline of an installer download, redirects included. The 15 seconds of a check are too
+/// short for a 35 MB file on a slow line; the checksum list is still fetched within
+/// [`CHECK_TIMEOUT`].
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 const LAST_CHECK_KEY: &str = "update.last_check";
+/// The checksum list every release carries: `<64 hex digits>  <file name>` per line.
+const CHECKSUMS_NAME: &str = "SHA256SUMS.txt";
 
 /// A text that is not a semantic version (`1.2.3`, optionally `-pre.release` and `+build`,
 /// optionally with a leading `v`).
@@ -146,6 +160,17 @@ impl fmt::Display for Version {
     }
 }
 
+/// A file attached to a release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Asset {
+    /// The file name (`SSWriter-1.2.0-x64.msi`).
+    pub name: String,
+    /// The `https` URL the file is downloaded from.
+    pub url: String,
+    /// The size in bytes as published.
+    pub size: u64,
+}
+
 /// A published release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
@@ -154,6 +179,8 @@ pub struct Release {
     pub tag: String,
     /// The `https` page describing the release.
     pub page_url: String,
+    /// The files attached to the release, in the order the feed lists them.
+    pub assets: Vec<Asset>,
 }
 
 /// Outcome of [`check_for_updates`].
@@ -169,7 +196,7 @@ pub enum UpdateStatus {
     Available(Release),
 }
 
-/// Why the check failed (it is retried at the next start).
+/// Why the check or the download of an installer failed (a check is retried at the next start).
 #[derive(Debug, Error)]
 pub enum UpdateError {
     #[error(transparent)]
@@ -182,6 +209,28 @@ pub enum UpdateError {
     Version(#[from] VersionError),
     #[error("the release page URL is not an https URL")]
     InsecurePage,
+    #[error("the download URL of `{0}` is not an https URL")]
+    InsecureAsset(String),
+    #[error("the release has no `{0}` to download")]
+    MissingAsset(String),
+    #[error("{CHECKSUMS_NAME} does not list `{0}`")]
+    MissingChecksum(String),
+    #[error(
+        "the downloaded `{name}` does not match its checksum (expected {expected}, got {actual})"
+    )]
+    ChecksumMismatch {
+        name: String,
+        /// The digest `SHA256SUMS.txt` lists, lower-case hex.
+        expected: String,
+        /// The digest of the downloaded file, lower-case hex.
+        actual: String,
+    },
+    #[error("i/o error at {}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Whether a check is due: none was made, or the last one is a week or more old (a clock
@@ -192,26 +241,91 @@ pub fn is_due(last_check: Option<UnixSeconds>, now: UnixSeconds) -> bool {
 }
 
 #[derive(Deserialize)]
+struct AssetJson {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
 struct ReleaseJson {
     tag_name: String,
     html_url: String,
+    #[serde(default)]
+    assets: Vec<AssetJson>,
+}
+
+fn is_https(url: &str) -> bool {
+    Url::parse(url).map(|url| url.scheme()) == Ok(Scheme::Https)
 }
 
 /// The release described by the feed's JSON answer.
 ///
 /// # Errors
-/// [`UpdateError::Json`], [`UpdateError::Version`] for an unparsable tag and
-/// [`UpdateError::InsecurePage`] when the page URL is not `https`.
+/// [`UpdateError::Json`], [`UpdateError::Version`] for an unparsable tag,
+/// [`UpdateError::InsecurePage`] when the page URL is not `https` and
+/// [`UpdateError::InsecureAsset`] when the download URL of an asset is not.
 pub fn parse_release(body: &[u8]) -> Result<Release, UpdateError> {
     let json: ReleaseJson = serde_json::from_slice(body)?;
     let version = Version::parse(&json.tag_name)?;
-    if Url::parse(&json.html_url).map(|url| url.scheme()) != Ok(Scheme::Https) {
+    if !is_https(&json.html_url) {
         return Err(UpdateError::InsecurePage);
     }
+    let assets = json
+        .assets
+        .into_iter()
+        .map(|asset| {
+            if is_https(&asset.browser_download_url) {
+                Ok(Asset {
+                    name: asset.name,
+                    url: asset.browser_download_url,
+                    size: asset.size,
+                })
+            } else {
+                Err(UpdateError::InsecureAsset(asset.name))
+            }
+        })
+        .collect::<Result<_, _>>()?;
     Ok(Release {
         version,
         tag: json.tag_name,
         page_url: json.html_url,
+        assets,
+    })
+}
+
+/// The per-user MSI of `release` (`SSWriter-<version>-x64.msi`).
+#[must_use]
+pub fn installer_asset(release: &Release) -> Option<&Asset> {
+    let name = installer_name(&release.version);
+    release.assets.iter().find(|asset| asset.name == name)
+}
+
+/// The checksum list of `release` (`SHA256SUMS.txt`).
+#[must_use]
+pub fn checksums_asset(release: &Release) -> Option<&Asset> {
+    release
+        .assets
+        .iter()
+        .find(|asset| asset.name == CHECKSUMS_NAME)
+}
+
+fn installer_name(version: &Version) -> String {
+    format!("SSWriter-{version}-x64.msi")
+}
+
+/// The digest `sums` (the text of `SHA256SUMS.txt`: `<64 hex>  <name>` per line, a `*` before
+/// the name marking binary mode as `sha256sum` writes it) records for the file `name`,
+/// lower-cased. Lines that are not of that shape and other names are ignored; when a name is
+/// listed twice the first line counts.
+#[must_use]
+pub fn expected_sha256(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let (digest, listed) = line.trim().split_once(char::is_whitespace)?;
+        let listed = listed.trim_start();
+        let listed = listed.strip_prefix('*').unwrap_or(listed);
+        let valid = digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit());
+        (valid && listed == name).then(|| digest.to_ascii_lowercase())
     })
 }
 
@@ -232,6 +346,73 @@ pub fn latest_release(http: &dyn Http, endpoint: &str) -> Result<Release, Update
         },
     )?;
     parse_release(&fetched.body)
+}
+
+/// Download the installer of `release` ([`installer_asset`]) into `dir` (created when missing)
+/// as a file of the asset's name, reporting `(downloaded, total)` to `progress` after every
+/// chunk, and verify it against the release's `SHA256SUMS.txt` ([`checksums_asset`]). The list
+/// is fetched first, so a release that does not cover its installer fails before the big
+/// download starts. Returns the path of the verified file; a file that does not match its
+/// checksum is deleted.
+///
+/// # Errors
+/// [`UpdateError::MissingAsset`] when the release has no installer or no checksum list,
+/// [`UpdateError::MissingChecksum`] when the list does not name the installer,
+/// [`UpdateError::ChecksumMismatch`] when the download does not match, [`UpdateError::Io`]
+/// when `dir` cannot be created and [`UpdateError::Net`] for network, protocol and file
+/// failures of either download, including a body over [`MAX_INSTALLER_BYTES`] (installer) or
+/// [`MAX_CHECKSUMS_BYTES`] (list) and a deadline of [`DOWNLOAD_TIMEOUT`] (installer) or
+/// [`CHECK_TIMEOUT`] (list).
+pub fn download_installer(
+    http: &dyn Http,
+    release: &Release,
+    dir: &Path,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<PathBuf, UpdateError> {
+    let installer = installer_asset(release)
+        .ok_or_else(|| UpdateError::MissingAsset(installer_name(&release.version)))?;
+    let checksums = checksums_asset(release)
+        .ok_or_else(|| UpdateError::MissingAsset(CHECKSUMS_NAME.to_owned()))?;
+    let list = fetch(
+        http,
+        &checksums.url,
+        &FetchOptions {
+            accept: Accept::Any,
+            max_body: MAX_CHECKSUMS_BYTES,
+            timeout: CHECK_TIMEOUT,
+            allow_http: false,
+        },
+    )?;
+    let expected = expected_sha256(&String::from_utf8_lossy(&list.body), &installer.name)
+        .ok_or_else(|| UpdateError::MissingChecksum(installer.name.clone()))?;
+    std::fs::create_dir_all(dir).map_err(|source| UpdateError::Io {
+        path: dir.to_owned(),
+        source,
+    })?;
+    // The asset name is `SSWriter-<version>-x64.msi` with a parsed version: no separators.
+    let path = dir.join(&installer.name);
+    let downloaded = download(
+        http,
+        &installer.url,
+        &FetchOptions {
+            accept: Accept::Any,
+            max_body: MAX_INSTALLER_BYTES,
+            timeout: DOWNLOAD_TIMEOUT,
+            allow_http: false,
+        },
+        &path,
+        progress,
+    )?;
+    if downloaded.sha256 != expected {
+        // Best effort: the mismatch is the error worth reporting.
+        let _ = std::fs::remove_file(&path);
+        return Err(UpdateError::ChecksumMismatch {
+            name: installer.name.clone(),
+            expected,
+            actual: downloaded.sha256,
+        });
+    }
+    Ok(path)
 }
 
 /// The time of the last successful check, if any.

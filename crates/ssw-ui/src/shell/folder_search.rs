@@ -652,6 +652,7 @@ impl Widget for FolderSearchPanel {
             let in_list = self.list.bounds().contains(pointer.position);
             match pointer.kind {
                 PointerEventKind::Move => {
+                    self.list.request_cursor(cx, pointer.position);
                     let changed = if in_list {
                         self.list.hover_at(pointer.position)
                     } else {

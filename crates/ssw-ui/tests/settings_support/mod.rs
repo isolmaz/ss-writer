@@ -13,7 +13,7 @@ use ssw_ui::access::{AccessAction, AccessNode, AccessTree, Role};
 use ssw_ui::canvas::RecordingCanvas;
 use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{
-    Event, KeyEvent, Modifiers, PointerButton, PointerEvent, PointerEventKind, WheelEvent,
+    Cursor, Event, KeyEvent, Modifiers, PointerButton, PointerEvent, PointerEventKind, WheelEvent,
 };
 use ssw_ui::services::MemoryClipboard;
 use ssw_ui::shell::settings::{DisplayKeyNames, LanguageChoice, SettingsEnv, SettingsWindow};
@@ -202,6 +202,14 @@ impl Host {
 
     pub fn key(&mut self, root: &mut dyn Control, vk: u16, mods: Modifiers) -> EventResult {
         self.event(root, Event::Key(KeyEvent::press(vk, mods)))
+    }
+
+    /// Moves the pointer to `at` and returns the cursor the controls asked for.
+    pub fn cursor_at(&mut self, root: &mut dyn Control, at: Point) -> Option<Cursor> {
+        self.requests.take_cursor();
+        let event = PointerEvent::mouse(PointerEventKind::Move, None, at);
+        self.event(root, Event::Pointer(event));
+        self.requests.take_cursor()
     }
 
     pub fn click(&mut self, root: &mut dyn Control, at: Point) {

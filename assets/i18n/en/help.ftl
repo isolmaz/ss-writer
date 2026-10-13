@@ -34,6 +34,17 @@ help-update-title = A new version of SS Writer is available
 help-update-message = SS Writer { $version } is available. You are using { $current }.
 help-update-download = Download
 
+# Downloading and installing the new version.
+help-update-downloading-title = Downloading SS Writer { $version }
+help-update-downloading-message = { $done } of { $total } MB downloaded.
+help-update-downloading-unknown = { $done } MB downloaded.
+help-update-ready-title = SS Writer { $version } is ready to install
+help-update-ready-message = SS Writer closes, installs the update and opens again.
+help-update-restart = Restart and install
+help-update-download-failed-title = Download failed
+help-update-download-failed-message = SS Writer could not download the update. { $detail }
+help-update-install-failed-message = SS Writer could not start the installer. { $detail }
+
 # "Check for updates" results.
 help-update-current-title = Check for updates
 help-update-current-message = SS Writer { $version } is the latest version.

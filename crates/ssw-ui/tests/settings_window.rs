@@ -7,11 +7,11 @@ mod settings_support;
 use settings_support::{
     Host, SETTINGS_FTL, localizer, localizer_with, settings_env, settings_window,
 };
-use ssw_core::settings::{Settings, SettingsSection};
+use ssw_core::settings::{ListIndent, Settings, SettingsSection};
 use ssw_ui::access::{AccessAction, Role, ToggleState};
 use ssw_ui::canvas::DrawOp;
 use ssw_ui::geometry::{Point, Rect, Size};
-use ssw_ui::input::{Event, Modifiers, WheelEvent, vk};
+use ssw_ui::input::{Cursor, Event, Modifiers, TextInput, WheelEvent, vk};
 use ssw_ui::shell::settings::{
     FieldId, SettingsChange, SettingsEnv, SettingsEvent, SettingsWindow,
 };
@@ -894,4 +894,179 @@ fn animation_frames_ease_the_page_after_a_notched_wheel() {
     }
     let after = host.control(&window, &last).bounds.y;
     assert!(after < before, "{before} -> {after}");
+}
+
+#[test]
+fn navigation_rows_and_switches_ask_for_the_hand_and_the_blank_page_for_nothing() {
+    let (mut window, mut host) = open(Settings::default(), SettingsSection::General);
+    let editor = host.node(&window, Role::ListItem, "Editor");
+    let switch = host.control(&window, &label(FieldId::CheckForUpdates));
+    let blank = Point::new(2.0, WINDOW.height - 2.0);
+    assert_eq!(
+        host.cursor_at(&mut window, editor.bounds.center()),
+        Some(Cursor::Hand)
+    );
+    assert_eq!(
+        host.cursor_at(&mut window, switch.bounds.center()),
+        Some(Cursor::Hand)
+    );
+    assert_eq!(host.cursor_at(&mut window, blank), None);
+}
+
+fn text_event(text: &str) -> Event {
+    Event::Text(TextInput(text.to_owned()))
+}
+
+#[test]
+fn an_open_drop_down_is_painted_above_everything_below_it() {
+    let (mut window, mut host) = open(Settings::default(), SettingsSection::Editor);
+    let name = label(FieldId::ListIndent);
+    let combo = host.control(&window, &name);
+    host.click(&mut window, combo.bounds.center());
+    assert_eq!(host.control(&window, &name).state.expanded, Some(true));
+
+    let canvas = host.paint(&window);
+    let ops: Vec<&DrawOp> = canvas.ops().collect();
+    let menu = host.theme.tokens.menu_bg;
+    let surface = ops
+        .iter()
+        .position(|op| matches!(op, DrawOp::FillRoundedRect { color, .. } if *color == menu))
+        .expect("the surface of the pop-up is drawn");
+    let DrawOp::FillRoundedRect { rect: popup, .. } = ops[surface] else {
+        unreachable!("found as a rounded fill");
+    };
+    assert_eq!(popup.x, combo.bounds.x, "the pop-up hangs under its box");
+    // Everything drawn from the pop-up's surface on belongs to the pop-up: the labels, hairlines
+    // and controls of the rows it covers were drawn before it.
+    let mut options = 0;
+    for op in &ops[surface..] {
+        match op {
+            DrawOp::Text { text, origin, .. } => {
+                assert!(
+                    popup.contains(*origin),
+                    "{text:?} is drawn over the drop-down"
+                );
+                options += 1;
+            }
+            DrawOp::StrokeLine { from, to, .. } => {
+                let across = from.y >= popup.y
+                    && from.y <= popup.bottom()
+                    && from.x.min(to.x) < popup.right()
+                    && from.x.max(to.x) > popup.x;
+                assert!(!across, "a row separator is drawn over the drop-down");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(options, 4, "the four options of the list indent");
+}
+
+#[test]
+fn a_click_on_a_drop_down_row_over_other_controls_chooses_the_row_and_nothing_else() {
+    let (mut window, mut host) = open(Settings::default(), SettingsSection::Editor);
+    let before = window.settings().clone();
+    let name = label(FieldId::ListIndent);
+    let combo = host.control(&window, &name);
+    host.click(&mut window, combo.bounds.center());
+    let tree = host.tree(&window);
+    let option = tree
+        .nodes()
+        .iter()
+        .find(|node| node.role == Role::ListItem && node.name == "4 spaces")
+        .cloned()
+        .expect("the third option");
+    let at = option.bounds.center();
+    // The row of the pop-up is over another control of the page.
+    let covered: Vec<&str> = tree
+        .nodes()
+        .iter()
+        .filter(|node| {
+            node.bounds.contains(at)
+                && !matches!(
+                    node.role,
+                    Role::ListItem | Role::List | Role::ComboBox | Role::Group | Role::Window
+                )
+        })
+        .map(|node| node.name.as_str())
+        .collect();
+    assert!(!covered.is_empty(), "nothing lies under {at:?}");
+
+    host.click(&mut window, at);
+    let mut expected = before;
+    expected.editor.list_indent = ListIndent::Four;
+    assert_eq!(window.settings(), &expected, "covered: {covered:?}");
+    assert_eq!(window.take_events(), changed(FieldId::ListIndent));
+}
+
+#[test]
+fn clicking_a_text_box_gives_it_the_keyboard_so_typing_reaches_the_setting() {
+    let field = FieldId::FontSize;
+    let (mut window, mut host) = open(Settings::default(), field.section());
+    let node = host.control(&window, &label(field));
+    host.click(&mut window, node.bounds.center());
+    assert!(host.control(&window, &label(field)).state.focused);
+
+    // Select all and type a size: "2" alone is below the smallest size and refused, "20" is kept.
+    host.key(&mut window, 0x41, Modifiers::CTRL);
+    host.event(&mut window, text_event("2"));
+    assert_eq!(window.settings().editor.font_size, 16.0);
+    host.event(&mut window, text_event("0"));
+    assert_eq!(window.settings().editor.font_size, 20.0);
+    assert_eq!(window.take_events(), changed(field));
+}
+
+#[test]
+fn a_drop_down_opened_with_the_mouse_is_driven_with_the_keyboard() {
+    let (mut window, mut host) = open(Settings::default(), SettingsSection::Editor);
+    let name = label(FieldId::ListIndent);
+    let combo = host.control(&window, &name);
+    host.click(&mut window, combo.bounds.center());
+    assert!(host.control(&window, &name).state.focused);
+    host.key(&mut window, vk::DOWN, Modifiers::NONE);
+    host.key(&mut window, vk::RETURN, Modifiers::NONE);
+    assert_eq!(window.settings().editor.list_indent, ListIndent::Two);
+    assert_eq!(host.control(&window, &name).state.expanded, Some(false));
+    assert_eq!(window.take_events(), changed(FieldId::ListIndent));
+}
+
+#[test]
+fn a_clicked_page_of_the_list_keeps_the_keyboard_for_the_arrow_keys() {
+    let (mut window, mut host) = open(Settings::default(), SettingsSection::General);
+    let editor = host.node(&window, Role::ListItem, "Editor");
+    host.click(&mut window, editor.bounds.center());
+    assert_eq!(window.section(), SettingsSection::Editor);
+    host.key(&mut window, vk::DOWN, Modifiers::NONE);
+    assert_eq!(window.section(), SettingsSection::Sidebar);
+}
+
+#[test]
+fn typing_in_the_shortcut_filter_after_a_click_narrows_the_list() {
+    let (mut window, mut host) = open(Settings::default(), SettingsSection::Shortcuts);
+    let rows = |host: &Host, window: &SettingsWindow| -> Vec<String> {
+        host.tree(window)
+            .nodes()
+            .iter()
+            .filter(|node| node.role == Role::ListItem && node.name.contains(" — "))
+            .map(|node| node.name.clone())
+            .collect()
+    };
+    let all = rows(&host, &window);
+    assert!(all.iter().any(|row| row.starts_with("Save —")), "{all:?}");
+
+    let name = localizer().text("settings-shortcut-filter");
+    let filter = host.control(&window, &name);
+    host.click(&mut window, filter.bounds.center());
+    for letter in ["b", "o", "l", "d"] {
+        host.event(&mut window, text_event(letter));
+    }
+    let shown = rows(&host, &window);
+    assert!(shown.len() < all.len(), "{} of {}", shown.len(), all.len());
+    assert!(
+        shown.iter().any(|row| row.starts_with("Bold —")),
+        "{shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|row| row.starts_with("Save —")),
+        "{shown:?}"
+    );
 }

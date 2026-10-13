@@ -22,7 +22,7 @@ use ssw_ui::editor::object::{
 };
 use ssw_ui::editor::{Composition, EditorConfig, EditorEvent, EditorStrings, LinkTarget};
 use ssw_ui::geometry::{Point, Rect, Size};
-use ssw_ui::input::{Event, Modifiers, PointerButton, PointerEvent, PointerEventKind, vk};
+use ssw_ui::input::{Cursor, Event, Modifiers, PointerButton, PointerEvent, PointerEventKind, vk};
 use ssw_ui::services::MemoryClipboard;
 use ssw_ui::text::{FontWeight, MonoTextEngine, TextLayout, TextLayoutEngine, TextStyle};
 use ssw_ui::theme::{DEFAULT_ACCENT, Theme};
@@ -640,6 +640,26 @@ fn table_harness(text: &str) -> Harness {
     blocks_table::register(h.view.registry_mut());
     h.paint();
     h
+}
+
+#[test]
+fn the_pointer_is_a_text_cursor_in_a_cell_and_an_arrow_beside_a_narrow_grid() {
+    let mut h = table_harness(SAMPLE);
+    let y = TOP + ROW / 2.0;
+    h.pointer(
+        PointerEventKind::Move,
+        Point::new(COLUMN_LEFT + 10.0, y),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+    h.pointer(
+        PointerEventKind::Move,
+        Point::new(COLUMN_LEFT + 200.0, y),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Arrow));
 }
 
 #[test]

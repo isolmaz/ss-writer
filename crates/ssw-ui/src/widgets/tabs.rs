@@ -5,7 +5,7 @@ use crate::access::{AccessAction, AccessNode, AccessTree, Role};
 use crate::canvas::{Canvas, Dash, IconFont};
 use crate::geometry::{CornerRadii, Insets, Point, Rect, Size};
 use crate::input::{
-    Event, FocusEvent, PointerButton, PointerEvent, PointerEventKind, WheelEvent, vk,
+    Cursor, Event, FocusEvent, PointerButton, PointerEvent, PointerEventKind, WheelEvent, vk,
 };
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
 
@@ -332,13 +332,16 @@ impl TabStrip {
         if forwarded.handled {
             return forwarded;
         }
+        let tab = self.tab_at(event.position);
+        if event.kind == PointerEventKind::Move && (tab.is_some() || self.drag.is_some()) {
+            cx.set_cursor(Cursor::Hand);
+        }
         if event.kind == PointerEventKind::Move
             && let Some(drag) = self.drag
         {
             self.drag_to(cx, drag, event.position);
             return EventResult::handled();
         }
-        let tab = self.tab_at(event.position);
         match (event.kind, event.button) {
             (PointerEventKind::Down, Some(PointerButton::Left)) => {
                 let Some(index) = tab else {
@@ -831,6 +834,39 @@ mod tests {
         let plus = strip.new_tab_rect().center();
         assert!(harness.click(&mut strip, plus).handled);
         assert_eq!(strip.take_events(), vec![TabEvent::NewTab]);
+    }
+
+    #[test]
+    fn kit_tabs_request_the_hand_over_tabs_close_and_new_tab_only() {
+        let (mut harness, mut strip) = strip(3, 700.0);
+        let cursor_at = |harness: &mut Harness, strip: &mut TabStrip, at: Point| {
+            harness.hover(strip, at);
+            harness.requests.take_cursor()
+        };
+        let tab = strip.tab_rect(1).center();
+        assert_eq!(cursor_at(&mut harness, &mut strip, tab), Some(Cursor::Hand));
+        let close = strip.close_rect(1).center();
+        assert_eq!(
+            cursor_at(&mut harness, &mut strip, close),
+            Some(Cursor::Hand)
+        );
+        let plus = strip.new_tab_rect().center();
+        assert_eq!(
+            cursor_at(&mut harness, &mut strip, plus),
+            Some(Cursor::Hand)
+        );
+        let empty = Point::new(strip.bounds.right() - 4.0, tab.y);
+        assert_eq!(cursor_at(&mut harness, &mut strip, empty), None);
+        let away = Point::new(tab.x, strip.bounds.bottom() + 50.0);
+        assert_eq!(cursor_at(&mut harness, &mut strip, away), None);
+        press(&mut harness, &mut strip, PointerButton::Left, tab);
+        harness.requests.take_cursor();
+        assert_eq!(
+            cursor_at(&mut harness, &mut strip, away),
+            Some(Cursor::Hand)
+        );
+        strip.set_enabled(false);
+        assert_eq!(cursor_at(&mut harness, &mut strip, tab), None);
     }
 
     #[test]

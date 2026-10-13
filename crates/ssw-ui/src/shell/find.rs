@@ -32,7 +32,7 @@ use ssw_core::text::TextRange;
 
 use crate::access::{AccessAction, AccessNode, AccessTree, Role, ToggleState};
 use crate::canvas::{Canvas, IconFont};
-use crate::geometry::{CornerRadii, Insets, Rect, Size};
+use crate::geometry::{CornerRadii, Insets, Point, Rect, Size};
 use crate::input::{Event, KeyEvent, vk};
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
 use crate::widgets::anim::Motion;
@@ -128,6 +128,11 @@ impl ToggleChip {
     #[must_use]
     pub fn bounds(&self) -> Rect {
         self.bounds
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// The new state, once after the user (or assistive technology) flipped the chip.
@@ -396,6 +401,23 @@ impl FindBar {
     #[must_use]
     pub fn is_replace_open(&self) -> bool {
         self.replace_open
+    }
+
+    /// The icon-only control under `point` and its name, the text of its tooltip: the replace
+    /// expander, the three search toggles, previous, next and close.
+    #[must_use]
+    pub fn tooltip_at(&self, point: Point) -> Option<(Rect, &str)> {
+        if !self.visible {
+            return None;
+        }
+        let chips = [&self.expand, &self.case, &self.word, &self.regex]
+            .map(|chip| (chip.bounds(), chip.name()));
+        let buttons = [&self.previous, &self.next, &self.close]
+            .map(|button| (button.bounds(), button.label()));
+        chips
+            .into_iter()
+            .chain(buttons)
+            .find(|(bounds, _)| bounds.contains(point))
     }
 
     /// The bar's bounds within the window (empty while hidden or before layout).

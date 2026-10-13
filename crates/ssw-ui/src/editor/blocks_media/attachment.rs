@@ -11,6 +11,7 @@ use crate::canvas::{Canvas, ImageId};
 use crate::editor::block::{BlockCx, BlockLayout, BlockPaintCx, SpecialRenderer, composition_in};
 use crate::editor::config::{EditorStrings, LinkTarget};
 use crate::geometry::{CornerRadii, Point, Rect};
+use crate::input::Cursor;
 use crate::text::{FontWeight, StyledRange, TextLayout, TextStyle};
 
 use super::verbatim::{Row, SourceText, display_of};
@@ -230,6 +231,10 @@ impl BlockLayout for AttachmentLayout {
         self.chip
             .contains(point)
             .then(|| LinkTarget::Url(self.dest.clone()))
+    }
+
+    fn cursor_at(&self, point: Point) -> Option<Cursor> {
+        (point.y < self.source_top).then_some(Cursor::Arrow)
     }
 
     fn access_label(&self, _strings: &EditorStrings) -> String {

@@ -1,8 +1,8 @@
-//! Editor popups (spec §2.9 and §3.2): the B I U pill, the selection toolbar, the heading level
-//! menu, the link edit popup and the wikilink completion list.
+//! Editor popups (spec §2.9 and §3.2): the selection toolbar, the heading level menu, the link
+//! edit popup and the wikilink completion list. The B I U pill is part of the title bar.
 //!
 //! None of them touches the document: each reports what the user chose as an event
-//! ([`FormatPillEvent`], [`ToolbarEvent`], [`CommandMenuEvent`], [`LinkEditEvent`],
+//! ([`ToolbarEvent`], [`CommandMenuEvent`], [`LinkEditEvent`],
 //! [`WikilinkEvent`]) and the editor / app applies it through `ssw_core::ops`. Commands are
 //! reported as [`CommandId`]s, so the host runs them like a shortcut. Labels come from Fluent
 //! (the command labels of `main.ftl` and `search.ftl`), accelerators from [`ShortcutLabels`].
@@ -17,12 +17,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use ssw_core::command::CommandId;
-use ssw_core::document::Document;
 use ssw_core::fuzzy::FuzzyMatcher;
 use ssw_core::i18n::{Arg, Localizer};
 use ssw_core::links::{RelPath, complete_heading, complete_wikilink};
-use ssw_core::markdown::ast::{Block, Inline, InlineKind};
-use ssw_core::text::TextRange;
 use ssw_core::toc::Toc;
 
 use crate::access::{AccessAction, AccessNode, AccessTree, Role};
@@ -36,7 +33,6 @@ use crate::widgets::menu::{Menu, MenuEntry, MenuEvent, MenuItem};
 use crate::widgets::textbox::TextBox;
 use crate::widgets::{CONTROL_HEIGHT, Control, ICON_SIZE, SharedClipboard, glyph, paint_overlay};
 
-use super::find::{CHIP_SIZE, ToggleChip};
 use super::palette::ShortcutLabels;
 use super::picker::{Row, RowClick, RowList, RowOutcome, highlight_ranges};
 
@@ -46,8 +42,6 @@ const PAD: f32 = 4.0;
 const ANCHOR_GAP: f32 = 6.0;
 /// Distance kept from the window edges.
 const EDGE: f32 = 8.0;
-/// Gap between neighbouring chips.
-const CHIP_GAP: f32 = 2.0;
 
 // ---------------------------------------------------------------------------- shared helpers
 
@@ -121,13 +115,19 @@ fn heading_entries(
         .collect()
 }
 
-/// Sends `e` to every child; a child that asks for focus gets it right away.
-fn route(cx: &mut EventCx, children: Vec<&mut dyn Control>, e: &Event) -> EventResult {
+/// Sends `e` to every child; with `grant_focus` a child that asks for focus gets it right away
+/// (a popup that does not take the keyboard from the editor passes `false`).
+fn route(
+    cx: &mut EventCx,
+    children: Vec<&mut dyn Control>,
+    e: &Event,
+    grant_focus: bool,
+) -> EventResult {
     let mut result = EventResult::ignored();
     for child in children {
         let id = child.id();
         let handled = child.event(&mut cx.for_widget(id), e);
-        if handled.request_focus {
+        if grant_focus && handled.request_focus {
             cx.focus.focus(id);
         }
         result = result.or(EventResult {
@@ -376,276 +376,6 @@ impl Widget for HeadingLevelMenu {
     }
 }
 
-// ---------------------------------------------------------------------------- B I U pill
-
-/// Whether the text at the caret or selection is bold, italic or underlined.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FormatState {
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-}
-
-fn scan_block(block: &Block, range: TextRange, state: &mut FormatState) {
-    if !block.range.contains_range(range) {
-        return;
-    }
-    for inline in &block.inlines {
-        scan_inline(inline, range, state);
-    }
-    for child in &block.children {
-        scan_block(child, range, state);
-    }
-}
-
-fn scan_inline(inline: &Inline, range: TextRange, state: &mut FormatState) {
-    if !inline.range.contains_range(range) {
-        return;
-    }
-    if inline.content.contains_range(range) {
-        match inline.kind {
-            InlineKind::Strong => state.bold = true,
-            InlineKind::Emphasis => state.italic = true,
-            InlineKind::Underline => state.underline = true,
-            _ => {}
-        }
-    }
-    for child in &inline.children {
-        scan_inline(child, range, state);
-    }
-}
-
-/// The formatting at the primary selection of `doc`: a state is on when the whole selection (or
-/// the caret) lies inside the content of such an element (`**bo|ld**`, a caret at the edge of the
-/// markers does not count).
-#[must_use]
-pub fn format_state_at(doc: &Document) -> FormatState {
-    let range = doc.primary_selection().range();
-    let mut state = FormatState::default();
-    for block in &doc.ast().blocks {
-        scan_block(block, range, &mut state);
-    }
-    state
-}
-
-/// What the pill asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FormatPillEvent {
-    /// Toggle bold, italic or underline (`FormatBold`, `FormatItalic`, `FormatUnderline`): the
-    /// command applies to the selection or inserts a marker pair.
-    Toggle(CommandId),
-}
-
-/// The B I U pill: three toggles that reflect [`FormatState`]. A click does not flip a toggle
-/// by itself: it reports [`FormatPillEvent::Toggle`], the host runs the command and calls
-/// [`FormatPill::set_state`] with the new state at the caret.
-#[derive(Debug)]
-pub struct FormatPill {
-    id: WidgetId,
-    name: String,
-    bold: ToggleChip,
-    italic: ToggleChip,
-    underline: ToggleChip,
-    state: FormatState,
-    visible: bool,
-    bounds: Rect,
-    events: Vec<FormatPillEvent>,
-}
-
-impl FormatPill {
-    /// A visible pill with every toggle off.
-    #[must_use]
-    pub fn new(localizer: &Localizer) -> Self {
-        let chip = |glyph_id: &str, command: CommandId| {
-            ToggleChip::text(
-                localizer.text(glyph_id),
-                localizer.text(command.label_id()),
-                false,
-            )
-        };
-        Self {
-            id: WidgetId::allocate(),
-            name: localizer.text("search-pill-label"),
-            bold: chip("search-pill-bold-glyph", CommandId::FormatBold),
-            italic: chip("search-pill-italic-glyph", CommandId::FormatItalic),
-            underline: chip("search-pill-underline-glyph", CommandId::FormatUnderline),
-            state: FormatState::default(),
-            visible: true,
-            bounds: Rect::ZERO,
-            events: Vec::new(),
-        }
-    }
-
-    /// Applies the motion preference to the toggles.
-    #[must_use]
-    pub fn with_motion(mut self, motion: Motion) -> Self {
-        self.bold = self.bold.with_motion(motion);
-        self.italic = self.italic.with_motion(motion);
-        self.underline = self.underline.with_motion(motion);
-        self
-    }
-
-    /// Shows the formatting at the caret.
-    pub fn set_state(&mut self, state: FormatState) {
-        self.state = state;
-        self.sync();
-    }
-
-    #[must_use]
-    pub fn state(&self) -> FormatState {
-        self.state
-    }
-
-    /// Shows or hides the pill (Zen mode, the "show B I U pill" setting).
-    pub fn set_visible(&mut self, visible: bool) {
-        self.visible = visible;
-    }
-
-    #[must_use]
-    pub fn is_visible(&self) -> bool {
-        self.visible
-    }
-
-    /// The pill's bounds (empty while hidden or before layout).
-    #[must_use]
-    pub fn bounds(&self) -> Rect {
-        self.bounds
-    }
-
-    /// The events since the last call, oldest first.
-    pub fn take_events(&mut self) -> Vec<FormatPillEvent> {
-        std::mem::take(&mut self.events)
-    }
-
-    fn sync(&mut self) {
-        self.bold.set_on(self.state.bold);
-        self.italic.set_on(self.state.italic);
-        self.underline.set_on(self.state.underline);
-    }
-
-    fn size() -> Size {
-        Size::new(
-            3.0 * CHIP_SIZE + 2.0 * CHIP_GAP + 2.0 * PAD,
-            CHIP_SIZE + 2.0 * PAD,
-        )
-    }
-
-    fn chips(&self) -> [&ToggleChip; 3] {
-        [&self.bold, &self.italic, &self.underline]
-    }
-
-    /// Turns what the chips recorded into events and puts them back to the caret state.
-    fn collect(&mut self) {
-        let commands = [
-            (CommandId::FormatBold, &mut self.bold),
-            (CommandId::FormatItalic, &mut self.italic),
-            (CommandId::FormatUnderline, &mut self.underline),
-        ];
-        for (command, chip) in commands {
-            if chip.take_changed().is_some() {
-                self.events.push(FormatPillEvent::Toggle(command));
-            }
-        }
-        self.sync();
-    }
-}
-
-impl Control for FormatPill {
-    fn id(&self) -> WidgetId {
-        self.id
-    }
-}
-
-impl Widget for FormatPill {
-    fn measure(&mut self, _cx: &mut LayoutCx, _available: Size) -> Size {
-        if self.visible {
-            Self::size()
-        } else {
-            Size::ZERO
-        }
-    }
-
-    /// `bounds` is the slot the shell reserved for the pill; the pill sits at its right edge,
-    /// vertically centred.
-    fn arrange(&mut self, cx: &mut LayoutCx, bounds: Rect) {
-        self.bounds = Rect::ZERO;
-        if !self.visible {
-            return;
-        }
-        let size = Self::size();
-        let pill = Rect::new(
-            bounds.right() - size.width,
-            bounds.y + (bounds.height - size.height) / 2.0,
-            size.width,
-            size.height,
-        );
-        self.bounds = pill;
-        let mut x = pill.x + PAD;
-        for chip in [&mut self.bold, &mut self.italic, &mut self.underline] {
-            let id = chip.id();
-            chip.arrange(
-                &mut cx.for_widget(id),
-                Rect::new(x, pill.y + PAD, CHIP_SIZE, CHIP_SIZE),
-            );
-            x += CHIP_SIZE + CHIP_GAP;
-        }
-    }
-
-    fn paint(&self, cx: &PaintCx, canvas: &mut dyn Canvas) {
-        if !self.visible || !cx.needs_paint(self.bounds) {
-            return;
-        }
-        paint_overlay(canvas, self.bounds, cx.theme.tokens.surface, cx.theme);
-        for chip in self.chips() {
-            chip.paint(&cx.for_widget(chip.id()), canvas);
-        }
-    }
-
-    fn event(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
-        if !self.visible {
-            return EventResult::ignored();
-        }
-        let children: Vec<&mut dyn Control> = vec![
-            &mut self.bold as &mut dyn Control,
-            &mut self.italic,
-            &mut self.underline,
-        ];
-        let mut result = route(cx, children, e);
-        self.collect();
-        if let Event::Pointer(pointer) = e
-            && self.bounds.contains(pointer.position)
-        {
-            result = result.or(EventResult::handled());
-        }
-        if result.handled {
-            cx.invalidate(self.bounds);
-        }
-        result
-    }
-
-    fn access(&self, cx: &AccessCx, out: &mut AccessTree) {
-        if !self.visible {
-            let mut node = AccessNode::new(self.id, Role::ToolBar, self.name.clone(), Rect::ZERO);
-            node.state.offscreen = true;
-            out.insert(node);
-            return;
-        }
-        let mut children = Vec::new();
-        for chip in self.chips() {
-            chip.access(&cx.for_widget(chip.id()), out);
-            children.push(chip.id());
-        }
-        out.insert(
-            AccessNode::new(self.id, Role::ToolBar, self.name.clone(), self.bounds)
-                .with_children(children),
-        );
-    }
-
-    fn perform(&mut self, _cx: &mut EventCx, _a: &AccessAction) -> bool {
-        false
-    }
-}
-
 // ---------------------------------------------------------------------------- selection toolbar
 
 /// What the toolbar reports.
@@ -798,6 +528,20 @@ impl SelectionToolbar {
     #[must_use]
     pub fn is_menu_open(&self) -> bool {
         self.menu.is_open()
+    }
+
+    /// The button under `point` and its name, the text of its tooltip. Nothing while the toolbar
+    /// is hidden or a dropdown is open.
+    #[must_use]
+    pub fn tooltip_at(&self, point: Point) -> Option<(Rect, &str)> {
+        if !self.visible || self.menu.is_open() {
+            return None;
+        }
+        self.tools
+            .iter()
+            .map(|tool| &tool.button)
+            .find(|button| button.bounds().contains(point))
+            .map(|button| (button.bounds(), button.label()))
     }
 
     /// The events since the last call, oldest first.
@@ -1041,8 +785,9 @@ impl Widget for SelectionToolbar {
             }
             _ => {}
         }
+        // A click runs a command on the selection: the editor keeps the keyboard.
         let children = self.children_mut();
-        let mut result = route(cx, children, e);
+        let mut result = route(cx, children, e, false);
         self.collect(cx);
         if let Event::Pointer(pointer) = e
             && self.bounds.contains(pointer.position)
@@ -1377,7 +1122,7 @@ impl Widget for LinkEditPopup {
             return EventResult::ignored();
         }
         let children = self.children_mut();
-        let mut result = route(cx, children, e);
+        let mut result = route(cx, children, e, true);
         self.collect();
         if let Event::Pointer(pointer) = e
             && self.bounds.contains(pointer.position)
@@ -1714,6 +1459,7 @@ impl Widget for WikilinkCompletion {
                         EventResult::handled()
                     }
                     PointerEventKind::Move => {
+                        self.list.request_cursor(cx, pointer.position);
                         let changed = if inside {
                             self.list.hover_at(pointer.position)
                         } else {

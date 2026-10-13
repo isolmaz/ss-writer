@@ -7,6 +7,7 @@ use crate::canvas::{Canvas, Dash};
 use crate::editor::block::{BlockLayout, BlockPaintCx};
 use crate::editor::config::EditorStrings;
 use crate::geometry::{Point, Rect};
+use crate::input::Cursor;
 use crate::text::TextLayout;
 
 use super::text::TextBlock;
@@ -93,6 +94,10 @@ impl BlockLayout for RuleLayout {
 
     fn line_range(&self, _offset: usize) -> TextRange {
         self.range
+    }
+
+    fn cursor_at(&self, _point: Point) -> Option<Cursor> {
+        Some(Cursor::Arrow)
     }
 
     fn access_label(&self, _strings: &EditorStrings) -> String {

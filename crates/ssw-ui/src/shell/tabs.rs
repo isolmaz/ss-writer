@@ -718,6 +718,25 @@ mod tests {
     }
 
     #[test]
+    fn tabs_close_buttons_and_new_tab_ask_for_the_hand_and_the_empty_caption_for_nothing() {
+        use crate::input::Cursor;
+        let (mut harness, mut tabs) = setup();
+        let close = tabs.strip().close_rect(0).center();
+        let new_tab = tabs.strip().new_tab_rect().center();
+        let targets = [
+            (Point::new(300.0, 20.0), Some(Cursor::Hand)),
+            (close, Some(Cursor::Hand)),
+            (new_tab, Some(Cursor::Hand)),
+            (Point::new(660.0, 20.0), None),
+        ];
+        for (at, cursor) in targets {
+            harness.requests.take_cursor();
+            harness.pointer(&mut tabs, PointerEventKind::Move, None, at);
+            assert_eq!(harness.requests.take_cursor(), cursor, "{at:?}");
+        }
+    }
+
+    #[test]
     fn drop_index_is_the_nearest_tab_boundary() {
         let (_, tabs) = setup();
         assert_eq!(tabs.drop_index_at(Point::new(10.0, 20.0)), Some(0));

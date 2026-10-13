@@ -8,7 +8,7 @@
 use crate::access::{AccessAction, AccessNode, AccessTree, Role, ToggleState};
 use crate::canvas::{Canvas, Dash, IconFont};
 use crate::geometry::{CornerRadii, Insets, Point, Rect, Size};
-use crate::input::{Event, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk};
+use crate::input::{Cursor, Event, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk};
 use crate::text::TextLayoutEngine;
 use crate::theme::Theme;
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
@@ -419,6 +419,9 @@ impl Menu {
             (PointerEventKind::Move | PointerEventKind::Enter, _) => {
                 if let Some((depth, Some(row))) = hit {
                     let enabled = self.item(depth, row).is_some_and(|item| item.enabled);
+                    if enabled && event.kind == PointerEventKind::Move {
+                        cx.set_cursor(Cursor::Hand);
+                    }
                     if enabled
                         && self.levels.get(depth) == Some(&Some(row))
                         && self.levels.len() == depth + 1
@@ -1085,6 +1088,23 @@ mod tests {
             entries_at(&menu.entries, &[Some(3), None, Some(0)]).len(),
             3
         );
+    }
+
+    #[test]
+    fn kit_menu_requests_the_hand_over_enabled_items_only() {
+        let (mut harness, mut menu) = open_menu();
+        let levels = menu.layout(&harness.engine, &harness.theme);
+        let row = |r: usize| levels[0].rows[r].center();
+        harness.hover(&mut menu, row(1));
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        harness.hover(&mut menu, row(4));
+        assert_eq!(harness.requests.take_cursor(), None, "disabled item");
+        harness.hover(&mut menu, row(2));
+        assert_eq!(harness.requests.take_cursor(), None, "separator");
+        harness.hover(&mut menu, Point::new(row(1).x, levels[0].rect.y + 1.0));
+        assert_eq!(harness.requests.take_cursor(), None, "padding");
+        harness.hover(&mut menu, row(3));
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
     }
 
     #[test]

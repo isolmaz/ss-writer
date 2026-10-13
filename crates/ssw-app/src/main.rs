@@ -2,7 +2,9 @@
 //!
 //! Runs startup, then the visible shell ([`UiShell`]): windows, tabs, editor and panels.
 //! `--test-exit-after-start` waits for the graphics device and exits 0; `--test-script` runs the
-//! scripted harness instead of the windows.
+//! scripted harness instead of the windows. The internal updater flags (`--apply-update` and its
+//! companions) turn the process into the updater of an installed update, which never opens a
+//! window.
 
 // A desktop application: started from Explorer or the Start menu it opens no console window.
 // Standard handles a parent redirects (pipes of tests and tools) are still inherited.
@@ -17,6 +19,7 @@ use ssw_app::startup::{InstanceHook, ProcessEnv};
 use ssw_app::ui::host::{UiShell, WinInstance};
 use ssw_app::ui::scripted_services::ScriptedServices;
 use ssw_app::ui::test_script::ScriptHost;
+use ssw_app::update_apply::{SystemProcesses, run_updater};
 use ssw_win::gfx::Driver;
 use ssw_win::locale::ui_language;
 use ssw_win::services::dialogs::{DialogStrings, WindowsDialogs};
@@ -24,6 +27,13 @@ use ssw_win::window::current_os_version;
 
 fn main() -> ExitCode {
     let args = Args::parse(std::env::args_os().skip(1));
+    // The updater role (a copy of this executable started by `update_apply::start`) does its
+    // work and leaves before anything else exists: no window, no single-instance handshake, no
+    // settings, no session.
+    if let Some(updater) = &args.updater {
+        let code = run_updater(updater, &SystemProcesses, &SystemProcesses);
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
     // Refused before anything is created: flags that cannot work together, and a process whose
     // data locations cannot be determined.
     let env = match args.startup_environment(args.environment()) {

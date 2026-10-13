@@ -1,12 +1,11 @@
-//! Editor popups: the B I U pill and the formatting state at the caret, the heading level menu,
-//! the selection toolbar, the link edit popup and the wikilink completion.
+//! Editor popups: the heading level menu, the selection toolbar, the link edit popup and the
+//! wikilink completion.
 
 mod search_common;
 
 use search_common::{Host, Shortcuts, child_names, clipboard, covered, localizer, node_named};
 use ssw_core::command::CommandId;
 use ssw_core::document::Document;
-use ssw_core::edit::Selection;
 use ssw_core::links::RelPath;
 use ssw_core::toc::Toc;
 use ssw_ui::access::{AccessAction, Role, ToggleState};
@@ -14,9 +13,8 @@ use ssw_ui::canvas::DrawOp;
 use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{Event, Modifiers, PointerEventKind, WheelEvent, vk};
 use ssw_ui::shell::popups::{
-    CommandMenu, CommandMenuEvent, FormatPill, FormatPillEvent, FormatState, HeadingLevelMenu,
-    LinkEditEvent, LinkEditPopup, SelectionToolbar, ToolbarEvent, WikilinkAccept,
-    WikilinkCompletion, WikilinkEvent, format_state_at,
+    CommandMenu, CommandMenuEvent, HeadingLevelMenu, LinkEditEvent, LinkEditPopup,
+    SelectionToolbar, ToolbarEvent, WikilinkAccept, WikilinkCompletion, WikilinkEvent,
 };
 use ssw_ui::widget::{Widget, WidgetId};
 use ssw_ui::widgets::Control;
@@ -26,172 +24,6 @@ use ssw_ui::widgets::menu::{MenuEntry, MenuItem};
 const WINDOW: Rect = Rect::new(0.0, 0.0, 800.0, 600.0);
 /// Virtual-key code of the letter A (`ssw_ui::input::vk` only names the non-letter keys).
 const KEY_A: u16 = 0x41;
-
-// ------------------------------------------------------------------------ format state
-
-fn state_of(text: &str, from: usize, to: usize) -> FormatState {
-    let mut doc = Document::new(text);
-    doc.set_selections(Selection::new(from, to), &[]);
-    format_state_at(&doc)
-}
-
-#[test]
-fn the_format_state_follows_the_elements_around_the_caret() {
-    let text = "x *it* y ~un~ z **bold _both_ w**";
-    let inside = |needle: &str, shift: usize| text.find(needle).expect("needle") + shift;
-    let it = inside("it", 1);
-    assert_eq!(
-        state_of(text, it, it),
-        FormatState {
-            italic: true,
-            ..FormatState::default()
-        }
-    );
-    let un = inside("un", 1);
-    assert_eq!(
-        state_of(text, un, un),
-        FormatState {
-            underline: true,
-            ..FormatState::default()
-        }
-    );
-    let both = inside("both", 2);
-    assert_eq!(
-        state_of(text, both, both),
-        FormatState {
-            bold: true,
-            italic: true,
-            underline: false
-        }
-    );
-    let w = inside(" w**", 1);
-    assert_eq!(
-        state_of(text, w, w),
-        FormatState {
-            bold: true,
-            ..FormatState::default()
-        }
-    );
-    assert_eq!(state_of(text, 0, 0), FormatState::default());
-    // A selection counts when it lies inside the content; one reaching into the markers does not.
-    let bold = "a **bold** b";
-    assert!(state_of(bold, 4, 8).bold);
-    assert!(state_of(bold, 5, 7).bold);
-    assert!(!state_of(bold, 2, 8).bold);
-    // The edges of the content count, the markers do not.
-    assert!(state_of(bold, 4, 4).bold && state_of(bold, 8, 8).bold);
-    assert!(!state_of(bold, 2, 2).bold && !state_of(bold, 10, 10).bold);
-    // Elements inside list items.
-    let list = "- **item**";
-    assert!(state_of(list, 5, 5).bold);
-    assert_eq!(state_of("", 0, 0), FormatState::default());
-}
-
-// ------------------------------------------------------------------------ pill
-
-fn pill() -> (Host, FormatPill) {
-    let mut host = Host::new();
-    let mut pill = FormatPill::new(&localizer()).with_motion(Motion::reduced());
-    host.layout(&mut pill, Rect::new(0.0, 0.0, 800.0, 40.0));
-    (host, pill)
-}
-
-#[test]
-fn the_pill_sits_at_the_right_of_its_slot_and_reflects_the_caret_state() {
-    let (host, mut pill) = pill();
-    assert_eq!(pill.bounds(), Rect::new(704.0, 2.0, 96.0, 36.0));
-    let tree = host.tree(&pill);
-    let root = tree.root().expect("root").clone();
-    assert_eq!(root.role, Role::ToolBar);
-    assert_eq!(root.name, "Text style");
-    assert_eq!(child_names(&tree, root.id), ["Bold", "Italic", "Underline"]);
-    assert_eq!(
-        node_named(&tree, "Bold").state.toggle,
-        Some(ToggleState::Off)
-    );
-    pill.set_state(FormatState {
-        bold: true,
-        italic: true,
-        underline: false,
-    });
-    assert!(pill.state().bold);
-    let tree = host.tree(&pill);
-    assert_eq!(
-        node_named(&tree, "Bold").state.toggle,
-        Some(ToggleState::On)
-    );
-    assert_eq!(
-        node_named(&tree, "Italic").state.toggle,
-        Some(ToggleState::On)
-    );
-    assert_eq!(
-        node_named(&tree, "Underline").state.toggle,
-        Some(ToggleState::Off)
-    );
-    assert_eq!(host.paint(&pill).texts(), ["B", "I", "U"]);
-}
-
-#[test]
-fn a_click_asks_for_the_command_and_waits_for_the_new_state() {
-    let (mut host, mut pill) = pill();
-    pill.set_state(FormatState {
-        bold: true,
-        ..FormatState::default()
-    });
-    let tree = host.tree(&pill);
-    let bold = node_named(&tree, "Bold").bounds.center();
-    let underline = node_named(&tree, "Underline").bounds.center();
-    host.click(&mut pill, bold);
-    host.click(&mut pill, underline);
-    assert_eq!(
-        pill.take_events(),
-        vec![
-            FormatPillEvent::Toggle(CommandId::FormatBold),
-            FormatPillEvent::Toggle(CommandId::FormatUnderline)
-        ]
-    );
-    // The chips still show the caret state until the host reports the new one.
-    let tree = host.tree(&pill);
-    assert_eq!(
-        node_named(&tree, "Bold").state.toggle,
-        Some(ToggleState::On)
-    );
-    assert_eq!(
-        node_named(&tree, "Underline").state.toggle,
-        Some(ToggleState::Off)
-    );
-    // Keyboard: the first tab stop is Bold.
-    host.focus.focus_next();
-    host.key(&mut pill, vk::SPACE);
-    assert_eq!(
-        pill.take_events(),
-        vec![FormatPillEvent::Toggle(CommandId::FormatBold)]
-    );
-    // Clicks on the pill itself do not fall through to the editor.
-    let bounds = pill.bounds();
-    assert!(
-        host.click(&mut pill, Point::new(bounds.x + 1.0, bounds.y + 1.0))
-            .handled
-    );
-    assert!(!host.click(&mut pill, Point::new(10.0, 10.0)).handled);
-}
-
-#[test]
-fn a_hidden_pill_draws_nothing_and_takes_no_input() {
-    let (mut host, mut pill) = pill();
-    assert!(pill.is_visible());
-    pill.set_visible(false);
-    assert!(!pill.is_visible());
-    host.layout(&mut pill, Rect::new(0.0, 0.0, 800.0, 40.0));
-    assert_eq!(pill.bounds(), Rect::ZERO);
-    assert!(host.paint(&pill).recorded().is_empty());
-    assert!(host.tree(&pill).root().expect("root").state.offscreen);
-    assert!(!host.click(&mut pill, Point::new(750.0, 20.0)).handled);
-    assert!(pill.take_events().is_empty());
-    pill.set_visible(true);
-    host.layout(&mut pill, Rect::new(0.0, 0.0, 800.0, 40.0));
-    assert!(!host.paint(&pill).recorded().is_empty());
-}
 
 // ------------------------------------------------------------------------ heading menu
 
@@ -352,6 +184,28 @@ fn command_buttons_report_their_command() {
     click_named(&mut host, &mut toolbar, "Image");
     click_named(&mut host, &mut toolbar, "Italic");
     assert_eq!(toolbar.take_events().len(), 3);
+}
+
+#[test]
+fn a_click_runs_the_command_without_taking_the_keyboard_and_buttons_name_themselves() {
+    let (mut host, mut toolbar) = toolbar();
+    let tree = host.tree(&toolbar);
+    let bold = node_named(&tree, "Bold").bounds;
+    assert_eq!(toolbar.tooltip_at(bold.center()), Some((bold, "Bold")));
+    assert_eq!(toolbar.tooltip_at(Point::new(5.0, 5.0)), None);
+    click_named(&mut host, &mut toolbar, "Bold");
+    assert_eq!(
+        toolbar.take_events(),
+        vec![ToolbarEvent::Command(CommandId::FormatBold)]
+    );
+    assert_eq!(host.focus.focused(), None);
+    // No tooltip over an open dropdown or a hidden toolbar.
+    click_named(&mut host, &mut toolbar, "List");
+    assert!(toolbar.is_menu_open());
+    assert_eq!(host.focus.focused(), None);
+    assert_eq!(toolbar.tooltip_at(bold.center()), None);
+    toolbar.hide();
+    assert_eq!(toolbar.tooltip_at(bold.center()), None);
 }
 
 fn menu_items(host: &Host, toolbar: &SelectionToolbar) -> Vec<String> {
@@ -915,15 +769,6 @@ fn the_access_tree_lists_the_suggestions_and_rows_can_be_invoked() {
 // ------------------------------------------------------------------------ measuring, painting, actions
 
 #[test]
-fn only_the_block_around_the_caret_decides_the_format_state() {
-    let text = "**bold** text\n\nplain words";
-    assert!(state_of(text, 4, 4).bold);
-    let second = text.find("plain").expect("second paragraph") + 2;
-    assert_eq!(state_of(text, second, second), FormatState::default());
-    assert_eq!(state_of(text, 4, second), FormatState::default());
-}
-
-#[test]
 fn the_command_menu_is_a_modal_flyout_that_reports_commands() {
     let mut host = Host::new();
     let mut menu = CommandMenu::new("Insert");
@@ -968,20 +813,6 @@ fn the_heading_menu_takes_no_layout_space_and_no_actions_of_its_own() {
     let mut cx = host.cx(id);
     assert!(!Widget::perform(&mut menu, &mut cx, &AccessAction::Invoke));
     assert!(menu.is_open());
-}
-
-#[test]
-fn the_pill_measures_its_size_while_shown_and_nothing_while_hidden() {
-    let (mut host, mut pill) = pill();
-    assert_eq!(
-        host.measure(&mut pill, Size::new(800.0, 40.0)),
-        pill.bounds().size()
-    );
-    let id = pill.id();
-    let mut cx = host.cx(id);
-    assert!(!Widget::perform(&mut pill, &mut cx, &AccessAction::Toggle));
-    pill.set_visible(false);
-    assert_eq!(host.measure(&mut pill, Size::new(800.0, 40.0)), Size::ZERO);
 }
 
 #[test]

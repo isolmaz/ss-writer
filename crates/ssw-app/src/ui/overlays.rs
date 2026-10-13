@@ -24,7 +24,7 @@ use ssw_core::text::TextRange;
 use ssw_core::toc::Toc;
 use ssw_ui::access::AccessTree;
 use ssw_ui::canvas::Canvas;
-use ssw_ui::editor::{EditorEvent, EditorView};
+use ssw_ui::editor::{DocumentKind, EditorEvent, EditorView};
 use ssw_ui::geometry::{Point, Rect};
 use ssw_ui::input::{Event, vk};
 use ssw_ui::shell::export_dialog::ExportRequest;
@@ -500,6 +500,25 @@ impl Overlays {
             || self.folder_visible
     }
 
+    /// The overlay button under `point` and its name, the text of its tooltip (the selection
+    /// toolbar, the icon controls of the find bar).
+    #[must_use]
+    pub fn tooltip_at(&self, point: Point) -> Option<(Rect, &str)> {
+        self.toolbar
+            .tooltip_at(point)
+            .or_else(|| self.find.tooltip_at(point))
+    }
+
+    /// Whether an open overlay takes the pointer from everything behind it, so none of the
+    /// window's controls may show a tooltip.
+    #[must_use]
+    pub fn covers_tooltips(&self) -> bool {
+        self.export.is_open()
+            || self.heading.is_open()
+            || self.toolbar.is_menu_open()
+            || self.quick.is_visible()
+    }
+
     // ----- layout, paint, accessibility ----------------------------------------------------
 
     /// Places the visible overlays.
@@ -692,7 +711,11 @@ impl Overlays {
     pub fn editor_event(&mut self, event: EditorEvent, editor: &EditorView) -> Option<EditorEvent> {
         match event {
             EditorEvent::SelectionToolbar { anchor } => {
-                self.toolbar.show(anchor);
+                // Every button of the toolbar writes Markdown, which a plain-text or diagram
+                // document refuses (spec §4.1): there the toolbar is not offered.
+                if editor.config().document_kind == DocumentKind::Markdown {
+                    self.toolbar.show(anchor);
+                }
                 None
             }
             EditorEvent::HeadingMenu { level, anchor, .. } => {

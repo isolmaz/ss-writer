@@ -319,7 +319,10 @@ fn requests_run_commands_close_windows_and_quit() {
 #[test]
 fn a_pointer_over_the_editor_asks_for_the_text_cursor() {
     let tmp = tempfile::tempdir().unwrap();
-    let file = note(tmp.path(), "a.md", "some text to point at\n");
+    // Many lines: the pointer lands on text, not on the empty space below the last block
+    // (which asks for the arrow).
+    let text = "some text to point at\n".repeat(200);
+    let file = note(tmp.path(), "a.md", &text);
     let code = start(&[file], tmp.path(), |core, _| {
         let _ole = OleGuard::initialize().unwrap();
         let app = UiApp::new(core, options(true, None, false)).unwrap();

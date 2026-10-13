@@ -1206,7 +1206,9 @@ mod tests {
 
     #[test]
     fn hovering_the_text_shows_the_i_beam_and_only_the_client_area_is_the_panes() {
-        let rig = rig("Some text to hover over.\n");
+        // A document that fills the pane: the point below is text, not the empty space after
+        // the last block (which asks for the arrow).
+        let rig = rig(&long_document());
         let hwnd = rig.window.hwnd();
         assert_eq!(rig.window.state.borrow().cursor, Cursor::Arrow);
         assert_eq!(send(hwnd, WM_MOUSEMOVE, 0, pack(300, 100)), 0);

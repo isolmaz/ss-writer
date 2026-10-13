@@ -40,6 +40,7 @@ use ssw_ui::widget::{
     EventCx, EventResult, FocusManager, LayoutCx, PaintCx, PointerCapture, Requests, Widget,
     WidgetId,
 };
+use ssw_ui::widgets::tooltip::Tooltip;
 use ssw_ui::widgets::{Control, SharedClipboard};
 
 use super::clipboard::key_command;
@@ -194,6 +195,8 @@ pub struct ShellView {
     hover: Option<Target>,
     capture_target: Option<Target>,
     refocus_editor: bool,
+    /// The one tooltip of the window: its target and text follow the control under the pointer.
+    tooltip: Tooltip,
     status_key: Option<StatusKey>,
     words: Option<(u64, u64, usize)>,
 }
@@ -263,6 +266,7 @@ impl ShellView {
         let mut titlebar = TitleBar::new(TitleStrings::from_localizer(&localizer));
         titlebar.set_pill_visible(settings.appearance.show_format_pill);
         titlebar.set_panes_open(false, false);
+        titlebar.set_format_enabled(false);
         Self {
             theme,
             layout,
@@ -292,6 +296,7 @@ impl ShellView {
             hover: None,
             capture_target: None,
             refocus_editor: false,
+            tooltip: Tooltip::new("", Rect::ZERO),
             status_key: None,
             words: None,
             localizer,
@@ -1150,6 +1155,8 @@ impl ShellView {
                 .paint(&cx.for_widget(self.statusbar.id()), canvas);
         }
         self.overlays.paint(&cx, canvas, rects.sidebar);
+        self.tooltip
+            .paint(&cx.for_widget(self.tooltip.id()), canvas);
     }
 
     // ----- input ---------------------------------------------------------------------------
@@ -1274,7 +1281,9 @@ impl ShellView {
         let Some(target) = target else {
             return;
         };
-        if pointer.kind == PointerEventKind::Down {
+        // The pill formats the editor's selection: a click on it leaves the keyboard where it is.
+        let on_pill = target == Target::Title && self.titlebar.pill_rect().contains(position);
+        if pointer.kind == PointerEventKind::Down && !on_pill {
             self.focus_target = target;
         }
         let result = self.deliver(target, event, text);
@@ -1292,6 +1301,15 @@ impl ShellView {
     /// Delivers `event` and returns what the user asked for.
     pub fn event(&mut self, event: &Event, text: &dyn TextLayoutEngine) -> Vec<ShellAction> {
         self.arrange(text);
+        // The surface under the pointer asks for its own shape below; without this reset the
+        // last request (the editor's I-beam) would stay over the title bar, tabs, the sidebar,
+        // buttons and dialogs.
+        if let Event::Pointer(pointer) = event
+            && pointer.kind != PointerEventKind::Leave
+        {
+            self.requests.set_cursor(Cursor::Arrow);
+        }
+        self.track_tooltip(event, text);
         if self.deliver_overlays(event, text) {
             self.dispatch_focus(text);
             let actions = self.collect();
@@ -1340,6 +1358,85 @@ impl ShellView {
         self.flush_overlays(text);
         self.refresh_status();
         actions
+    }
+
+    /// The icon-only control under `point` and its name: what the tooltip shows. Controls in a
+    /// hidden pane are not asked, and nothing shows through an overlay that covers the window.
+    fn tooltip_at(&self, point: Point) -> Option<(Rect, &str)> {
+        if self.overlays.covers_tooltips() {
+            return None;
+        }
+        let rects = self.layout.rects();
+        self.overlays
+            .tooltip_at(point)
+            .or_else(|| {
+                rects
+                    .title_row
+                    .and_then(|_| self.titlebar.tooltip_at(point))
+            })
+            .or_else(|| {
+                let sidebar = self.sidebar.as_ref()?;
+                rects.sidebar?;
+                sidebar.tooltip_at(point)
+            })
+            .or_else(|| {
+                rects
+                    .status_bar
+                    .and_then(|_| self.statusbar.tooltip_at(point))
+            })
+    }
+
+    /// Points the window's tooltip at the control under the pointer and lets it watch `event`:
+    /// the tooltip itself times the delay and hides on a press, a key, the wheel or when the
+    /// pointer leaves.
+    fn track_tooltip(&mut self, event: &Event, text: &dyn TextLayoutEngine) {
+        if let Event::Pointer(pointer) = event {
+            let (rect, label) = self
+                .tooltip_at(pointer.position)
+                .unwrap_or((Rect::ZERO, ""));
+            if rect != self.tooltip.target() || label != self.tooltip.text() {
+                let label = label.to_owned();
+                let leave = Event::Pointer(PointerEvent::mouse(
+                    PointerEventKind::Leave,
+                    None,
+                    pointer.position,
+                ));
+                self.deliver_tooltip(&leave, text);
+                let size = self.layout.size();
+                self.tooltip.set_target(rect);
+                self.tooltip.set_text(label);
+                self.tooltip
+                    .set_area(Rect::new(0.0, 0.0, size.width, size.height));
+            }
+        }
+        self.deliver_tooltip(event, text);
+    }
+
+    fn deliver_tooltip(&mut self, event: &Event, text: &dyn TextLayoutEngine) {
+        let theme = self.theme;
+        let scale = self.layout.scale();
+        let Self {
+            tooltip,
+            focus,
+            capture,
+            requests,
+            ..
+        } = self;
+        let mut shared = Shared {
+            theme: &theme,
+            scale,
+            text,
+            focus,
+            capture,
+            requests,
+        };
+        run(tooltip, event, &mut shared);
+    }
+
+    /// The window's tooltip.
+    #[must_use]
+    pub fn tooltip(&self) -> &Tooltip {
+        &self.tooltip
     }
 
     /// Offers `event` to the overlays. True when one took it (timer and animation ticks are
@@ -1518,6 +1615,7 @@ impl ShellView {
     /// changed.
     pub fn refresh_status(&mut self) {
         let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) else {
+            self.titlebar.set_format_enabled(false);
             return;
         };
         let bold = tab.editor.style_active(InlineStyle::Bold);
@@ -1540,6 +1638,9 @@ impl ShellView {
             italic,
             underline,
         });
+        // Formatting writes Markdown: a plain-text or diagram document refuses it (spec §4.1).
+        self.titlebar
+            .set_format_enabled(tab.editor.config().document_kind == DocumentKind::Markdown);
         if self.status_key == Some(key) {
             return;
         }

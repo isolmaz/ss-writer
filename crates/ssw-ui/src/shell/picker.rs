@@ -14,9 +14,9 @@ use std::ops::Range;
 use crate::access::{AccessAction, AccessNode, AccessState, AccessTree, Role};
 use crate::canvas::{Canvas, IconFont};
 use crate::geometry::{CornerRadii, Insets, Point, Rect};
-use crate::input::{KeyEvent, WheelEvent, vk};
+use crate::input::{Cursor, KeyEvent, WheelEvent, vk};
 use crate::text::FontWeight;
-use crate::widget::{AccessCx, PaintCx, WidgetId};
+use crate::widget::{AccessCx, EventCx, PaintCx, WidgetId};
 use crate::widgets::{FONT_SIZE, ICON_SIZE, draw_left_centered, focus_ring, glyph, ui_style};
 
 /// Height of one row.
@@ -390,6 +390,16 @@ impl RowList {
     pub fn hover_at(&mut self, point: Point) -> bool {
         let hover = self.hit(point);
         std::mem::replace(&mut self.hover, hover) != hover
+    }
+
+    /// Asks for the hand while `point` is over a row a click acts on.
+    pub fn request_cursor(&self, cx: &mut EventCx, point: Point) {
+        if self
+            .hit(point)
+            .is_some_and(|index| self.rows[index].selectable() && !self.rows[index].disabled)
+        {
+            cx.set_cursor(Cursor::Hand);
+        }
     }
 
     /// Clears the hover (the pointer left).
@@ -773,6 +783,23 @@ mod tests {
         let mut grouped = list_of(vec![header("One"), Row::new("a")], 64.0);
         assert!(grouped.hover_at(Point::new(20.0, 30.0)));
         assert_eq!(count_fills(&paint(&harness, &grouped, None), hover), 0);
+    }
+
+    #[test]
+    fn the_hand_is_requested_over_clickable_rows_only() {
+        let mut harness = Harness::new();
+        let mut disabled = Row::new("off");
+        disabled.disabled = true;
+        let list = list_of(vec![header("One"), Row::new("a"), disabled], 96.0);
+        let mut cursor_at = |y: f32| {
+            let mut cx = harness.event_cx(list.id());
+            list.request_cursor(&mut cx, Point::new(20.0, y));
+            harness.requests.take_cursor()
+        };
+        assert_eq!(cursor_at(20.0 + 1.5 * ROW_HEIGHT), Some(Cursor::Hand));
+        assert_eq!(cursor_at(20.0 + 0.5 * ROW_HEIGHT), None);
+        assert_eq!(cursor_at(20.0 + 2.5 * ROW_HEIGHT), None);
+        assert_eq!(cursor_at(500.0), None);
     }
 
     #[test]

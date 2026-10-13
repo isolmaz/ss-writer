@@ -696,3 +696,31 @@ fn the_bar_itself_takes_no_accessibility_actions() {
         assert!(!Widget::perform(&mut bar, &mut cx, &action));
     }
 }
+
+#[test]
+fn toggles_and_buttons_ask_for_the_hand_the_boxes_for_the_beam_and_the_padding_for_nothing() {
+    use ssw_ui::input::Cursor;
+    let (mut host, mut bar, _) = setup("one two");
+    let tree = host.tree(&bar);
+    let panel = tree.root().expect("root").bounds;
+    let targets = [
+        (
+            node_named(&tree, "Match case").bounds.center(),
+            Some(Cursor::Hand),
+        ),
+        (
+            node_named(&tree, "Next match").bounds.center(),
+            Some(Cursor::Hand),
+        ),
+        (
+            node_named(&tree, "Find").bounds.center(),
+            Some(Cursor::IBeam),
+        ),
+        (Point::new(panel.x + 1.0, panel.y + 1.0), None),
+    ];
+    for (at, cursor) in targets {
+        host.requests.take_cursor();
+        host.pointer(&mut bar, PointerEventKind::Move, at);
+        assert_eq!(host.requests.take_cursor(), cursor, "{at:?}");
+    }
+}

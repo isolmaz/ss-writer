@@ -31,6 +31,8 @@
 //! - [`share`]: the Windows share sheet (`DataTransferManager`) for a file.
 //! - [`perf`]: the performance recorder behind `--perf-report` (marks, frame timings, input
 //!   latency; inert until enabled).
+//! - [`process`]: the bounded wait for another process to end (the updater waits for the
+//!   application).
 //! - `testing` (feature `test-support`): the private desktop tests show and raise real windows
 //!   on, so nothing of them reaches the user's screen or focus.
 
@@ -52,6 +54,7 @@ pub mod locale;
 pub mod menus;
 pub mod perf;
 pub mod print;
+pub mod process;
 pub mod scene_render;
 pub mod services;
 pub mod share;

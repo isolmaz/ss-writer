@@ -1,5 +1,6 @@
-//! The command line (spec §5, §6): files and folders to open, `--new-window`, and the test flags
-//! the integration tests launch `SSWriter.exe` with.
+//! The command line (spec §5, §6): files and folders to open, `--new-window`, the test flags
+//! the integration tests launch `SSWriter.exe` with, and the internal flags of the updater
+//! (`--apply-update`, `--updater-parent`, `--updater-target`; never typed by users).
 //!
 //! Locations of settings and data (portable mode included) are decided by
 //! [`ssw_io::paths::AppPaths`]; nothing here duplicates that.
@@ -40,6 +41,16 @@ pub const PERF_SCROLL_STEP_FLAG: &str = "--perf-scroll-step";
 /// Test flag: place the first window at (-20000, -20000) and show it without activating it, so
 /// frames are really presented while nothing appears on the user's screen.
 pub const PERF_OFFSCREEN_FLAG: &str = "--perf-offscreen";
+/// Internal flag with a value, never shown to users: the updater role (see
+/// [`crate::update_apply`]) installs this MSI package. Only meaningful together with
+/// [`UPDATER_PARENT_FLAG`] and [`UPDATER_TARGET_FLAG`].
+pub const APPLY_UPDATE_FLAG: &str = "--apply-update";
+/// Internal flag with a value, never shown to users: the decimal id of the application process
+/// the updater waits for before it installs.
+pub const UPDATER_PARENT_FLAG: &str = "--updater-parent";
+/// Internal flag with a value, never shown to users: the installed executable the updater
+/// starts once the package is installed.
+pub const UPDATER_TARGET_FLAG: &str = "--updater-target";
 
 /// A scripted performance run (`--perf-scenario`, see `ui::perf_driver`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +160,86 @@ impl TestFlags {
     }
 }
 
+/// The internal flags that turn a launch into the updater (`--apply-update`,
+/// `--updater-parent`, `--updater-target`). They are not test flags: [`TestFlags::any`] ignores
+/// them, and a launch carries them only when all three are given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdaterFlags {
+    /// `--apply-update <msi>`: the package to install.
+    pub installer: PathBuf,
+    /// `--updater-parent <pid>`: the application process to wait for (never 0).
+    pub parent: u32,
+    /// `--updater-target <exe>`: the installed executable to start after the installation.
+    pub target: PathBuf,
+}
+
+impl UpdaterFlags {
+    /// The command-line arguments that [`Args::parse`] reads back as these flags.
+    #[must_use]
+    pub fn arguments(&self) -> Vec<OsString> {
+        vec![
+            APPLY_UPDATE_FLAG.into(),
+            self.installer.clone().into_os_string(),
+            UPDATER_PARENT_FLAG.into(),
+            self.parent.to_string().into(),
+            UPDATER_TARGET_FLAG.into(),
+            self.target.clone().into_os_string(),
+        ]
+    }
+}
+
+/// The values of the updater flags as parsed so far; they become [`UpdaterFlags`] only when all
+/// three are there.
+#[derive(Default)]
+struct UpdaterParts {
+    installer: Option<PathBuf>,
+    parent: Option<u32>,
+    target: Option<PathBuf>,
+}
+
+impl UpdaterParts {
+    /// Stores `value` of the flag `flag`. Returns false when the value is not usable (a process
+    /// id that is not a positive decimal number).
+    fn set(&mut self, flag: &str, value: &OsStr) -> bool {
+        match flag {
+            APPLY_UPDATE_FLAG => self.installer = Some(absolute(value)),
+            UPDATER_TARGET_FLAG => self.target = Some(absolute(value)),
+            _ => match value.to_string_lossy().parse::<u32>() {
+                Ok(pid) if pid > 0 => self.parent = Some(pid),
+                _ => return false,
+            },
+        }
+        true
+    }
+
+    /// The complete flags, or the names of the flags that were given without the others.
+    fn finish(self) -> Result<UpdaterFlags, Vec<&'static str>> {
+        match self {
+            Self {
+                installer: Some(installer),
+                parent: Some(parent),
+                target: Some(target),
+            } => Ok(UpdaterFlags {
+                installer,
+                parent,
+                target,
+            }),
+            Self {
+                installer,
+                parent,
+                target,
+            } => Err([
+                (APPLY_UPDATE_FLAG, installer.is_some()),
+                (UPDATER_PARENT_FLAG, parent.is_some()),
+                (UPDATER_TARGET_FLAG, target.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(flag, given)| given.then_some(flag))
+            .collect()),
+        }
+    }
+}
+
 /// What a launch asks to open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchItem {
@@ -210,8 +301,12 @@ pub struct Args {
     pub new_window: bool,
     /// Test flags.
     pub test: TestFlags,
+    /// The internal updater flags; `Some` only when `--apply-update`, `--updater-parent` and
+    /// `--updater-target` were all given with usable values. Every other launch is a normal one.
+    pub updater: Option<UpdaterFlags>,
     /// Options starting with `--` that this version does not know; they are ignored (a shell
-    /// verb or a newer installer may pass more than this version understands).
+    /// verb or a newer installer may pass more than this version understands). Updater flags
+    /// that are not complete or have an unusable value are kept here too.
     pub ignored: Vec<String>,
 }
 
@@ -224,6 +319,7 @@ impl Args {
         I: IntoIterator<Item = OsString>,
     {
         let mut parsed = Self::default();
+        let mut updater = UpdaterParts::default();
         let mut options_ended = false;
         let mut args = args.into_iter();
         while let Some(argument) = args.next() {
@@ -244,10 +340,21 @@ impl Args {
                     | PERF_REPORT_FLAG
                     | PERF_SCENARIO_FLAG
                     | PERF_TARGET_FLAG
-                    | PERF_SCROLL_STEP_FLAG => {
+                    | PERF_SCROLL_STEP_FLAG
+                    | APPLY_UPDATE_FLAG
+                    | UPDATER_PARENT_FLAG
+                    | UPDATER_TARGET_FLAG => {
                         match args.next() {
                             Some(value) => {
-                                if !parsed.test.set_valued(&text, &value) {
+                                let usable = if matches!(
+                                    &*text,
+                                    APPLY_UPDATE_FLAG | UPDATER_PARENT_FLAG | UPDATER_TARGET_FLAG
+                                ) {
+                                    updater.set(&text, &value)
+                                } else {
+                                    parsed.test.set_valued(&text, &value)
+                                };
+                                if !usable {
                                     // An unusable value: kept visible as `--flag=value`.
                                     parsed
                                         .ignored
@@ -263,6 +370,12 @@ impl Args {
             } else {
                 parsed.paths.push(absolute(&argument));
             }
+        }
+        match updater.finish() {
+            Ok(flags) => parsed.updater = Some(flags),
+            Err(incomplete) => parsed
+                .ignored
+                .extend(incomplete.into_iter().map(str::to_owned)),
         }
         parsed
     }
@@ -616,5 +729,133 @@ mod tests {
             ]),
             None
         );
+    }
+
+    const MSI: &str = r"C:\Users\me\AppData\Local\Temp\SSWriter-1.2.3-x64.msi";
+    const EXE: &str = r"C:\Users\me\AppData\Local\Programs\SS Writer\SSWriter.exe";
+
+    #[test]
+    fn the_updater_flags_are_read_only_when_all_three_are_given() {
+        let args = parse(&[
+            "--apply-update",
+            MSI,
+            "--updater-parent",
+            "4242",
+            "--updater-target",
+            EXE,
+        ]);
+        let expected = UpdaterFlags {
+            installer: MSI.into(),
+            parent: 4242,
+            target: EXE.into(),
+        };
+        assert_eq!(args.updater, Some(expected));
+        assert!(args.ignored.is_empty());
+        assert!(args.paths.is_empty());
+        // They are no test flags: the launch is not exempt from the single-instance handshake.
+        assert!(!args.test.any());
+
+        let reordered = parse(&[
+            "--updater-target",
+            EXE,
+            "--updater-parent",
+            "4242",
+            "--apply-update",
+            MSI,
+        ]);
+        assert_eq!(reordered.updater, args.updater);
+
+        // Anything less is a normal launch; the flags that were given stay visible.
+        for given in [
+            vec!["--apply-update", MSI, "--updater-parent", "4242"],
+            vec!["--apply-update", MSI, "--updater-target", EXE],
+            vec!["--updater-parent", "4242", "--updater-target", EXE],
+            vec!["--apply-update", MSI],
+            vec!["--updater-parent", "4242"],
+            vec!["--updater-target", EXE],
+        ] {
+            let args = parse(&given);
+            assert_eq!(args.updater, None, "{given:?}");
+            let flags: Vec<&str> = given
+                .iter()
+                .copied()
+                .filter(|part| part.starts_with("--"))
+                .collect();
+            assert_eq!(args.ignored, flags, "{given:?}");
+            assert!(args.paths.is_empty(), "{given:?}");
+        }
+        assert_eq!(
+            parse(&[
+                "--apply-update",
+                MSI,
+                "--updater-parent",
+                "4242",
+                "--updater-target"
+            ]),
+            Args {
+                ignored: vec![
+                    "--updater-target".to_owned(),
+                    "--apply-update".to_owned(),
+                    "--updater-parent".to_owned()
+                ],
+                ..Args::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_parent_that_is_not_a_positive_process_id_is_refused() {
+        for bad in ["abc", "", "-1", "0", "12x", "1.5", "4294967296"] {
+            let args = parse(&[
+                "--apply-update",
+                MSI,
+                "--updater-parent",
+                bad,
+                "--updater-target",
+                EXE,
+            ]);
+            assert_eq!(args.updater, None, "{bad:?}");
+            assert_eq!(
+                args.ignored,
+                [
+                    format!("--updater-parent={bad}"),
+                    "--apply-update".to_owned(),
+                    "--updater-target".to_owned()
+                ],
+                "{bad:?}"
+            );
+        }
+        let largest = parse(&[
+            "--apply-update",
+            MSI,
+            "--updater-parent",
+            "4294967295",
+            "--updater-target",
+            EXE,
+        ]);
+        assert_eq!(largest.updater.map(|flags| flags.parent), Some(u32::MAX));
+    }
+
+    #[test]
+    fn updater_flags_are_parsed_back_from_their_arguments() {
+        let flags = UpdaterFlags {
+            installer: MSI.into(),
+            parent: 7,
+            target: EXE.into(),
+        };
+        let arguments = flags.arguments();
+        assert_eq!(
+            arguments,
+            [
+                "--apply-update",
+                MSI,
+                "--updater-parent",
+                "7",
+                "--updater-target",
+                EXE
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(Args::parse(arguments).updater, Some(flags));
     }
 }

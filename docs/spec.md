@@ -257,7 +257,9 @@ Stored in `settings.json` (human-editable; unknown keys preserved).
 
 ## 13. Distribution & updates
 - Per-user MSI (WiX), portable zip (a `portable` file next to the exe stores settings/data beside it), winget manifest. Releases on GitHub.
-- Update check: weekly, `https://api.github.com/repos/<owner>/ss-writer/releases/latest`; notification only; can be turned off.
+- Update check: weekly, `https://api.github.com/repos/<owner>/ss-writer/releases/latest`; a banner names the new version; can be turned off. Nothing is fetched or installed until the user asks.
+- Download: the banner's Download button fetches the release's MSI while a bar in the banner shows the progress, and verifies it against the release's `SHA256SUMS.txt`; a package that does not match is deleted and the failure is reported. A portable copy has no package to install and gets the release page instead.
+- Install: the downloaded package offers "Restart and install". SS Writer saves the session, leaves, and a copy of the executable in the temp folder waits for the process to end, runs `msiexec /i … /qb /norestart` and starts the new build. Closing the banner postpones the install; the package stays.
 
 ## 14. Performance targets (measured, not assumed)
 - Window frame with Mica backdrop visible < 150 ms from process start; first content frame bounded by Direct3D device creation (205–370 ms measured on the reference machine; created in parallel with startup work) — measured with ETW.

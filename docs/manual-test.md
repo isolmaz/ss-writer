@@ -104,7 +104,8 @@ Item format: `- [ ] **ID** Steps → Expected`. Steps assume the installed build
 - [ ] **ED-32** Drag text from SS Writer to Notepad/Word and from Notepad/Word into SS Writer → drop effect cursors correct (move/copy), content arrives intact (HTML from Word converts to Markdown).
 - [ ] **ED-33** Ctrl+click on a link opens it; hovering a link shows hand cursor; plain click places the caret and shows the ✎ edit popup.
 - [ ] **ED-34** Mouse wheel scrolling: smooth animated scroll with a standard wheel, with a high-resolution wheel (Logitech/Razer free-spin), with "Scroll inactive windows when I hover over them" on/off, and with Settings → Mouse → "Lines to scroll" at 1 and 100 → each follows the setting; Shift+wheel = horizontal where applicable; Ctrl+wheel = zoom.
-- [ ] **ED-35** Cursor shapes: I-beam over text, arrow over gutter/scrollbar, hand over links/checkboxes/chevrons, resize cursors on image handles, `⇔` on sidebar/inspector splitters.
+- [ ] **ED-35** Cursor shapes in the editor: I-beam over text, arrow over the gutter, scrollbar, image and diagram bodies, dividers and the empty area below the last block, hand over links (with Ctrl), task boxes, fold chevrons, the code block's Copy button and a footnote with a definition, resize cursor on image handles, `⇔` on sidebar/inspector splitters.
+- [ ] **ED-36** Cursor shapes outside the editor: move the pointer from the text to the title bar, the tab row and its close buttons, the B/I/U pill, the sidebar rows, the status bar segments, a banner's buttons, the find bar and the Settings window → the I-beam never stays behind; every clickable thing shows the hand, text boxes the I-beam, inert chrome the arrow.
 
 ### 2.4 Touch, pen, touchpad
 
@@ -376,11 +377,16 @@ Item format: `- [ ] **ID** Steps → Expected`. Steps assume the installed build
 
 ### 13.6 Update check
 
-- [ ] **UPD-01** Update check (weekly when Settings → General → "Check for updates" is on; manually via Help → Check for updates): with a build older than the latest GitHub release → a banner "A new version of SS Writer is available — SS Writer <new> is available. You are using <current>." with a Download button that opens the release page in the default browser; the app never downloads or installs anything itself; closing the banner dismisses it.
+- [ ] **UPD-01** Update check (weekly when Settings → General → "Check for updates" is on; manually via Help → Check for updates): with a build older than the latest GitHub release → a banner "A new version of SS Writer is available — SS Writer <new> is available. You are using <current>." with a Download button; nothing is fetched before it is pressed; closing the banner dismisses it.
 - [ ] **UPD-02** Same version or newer than latest → Help → Check for updates shows "SS Writer <version> is the latest version."; the weekly check shows nothing.
 - [ ] **UPD-03** Offline/blocked network/GitHub rate limit (403)/invalid JSON → the weekly check is silent; the manual check shows "SS Writer could not check for updates." with the reason; no hang on exit or startup (check with the network disabled and with a proxy requiring authentication).
 - [ ] **UPD-04** Setting off → no request is made (verify with Resource Monitor/Fiddler/Wireshark that nothing connects to `api.github.com`); with it on, only a single request to `api.github.com/repos/<owner>/ss-writer/releases/latest` per week and no other telemetry traffic during a full session.
-- [ ] **UPD-05** Link in the notification opens the default browser at the release page.
+- [ ] **UPD-05** Download: press Download in the banner of an installed (MSI) build → the banner shows a bar and "x of y MB downloaded" that both grow, the editor stays usable while it downloads, and the package appears in `%LOCALAPPDATA%\SS Writer\updates\SSWriter-<new>-x64.msi` with the SHA-256 of the release's `SHA256SUMS.txt` (`Get-FileHash`). When it is there the banner reads "SS Writer <new> is ready to install" with a "Restart and install" button.
+- [ ] **UPD-06** Restart and install: with unsaved work in an open tab, press "Restart and install" → the editor saves its session and closes, the msiexec basic UI runs, SS Writer opens again with the new version (Help → About) and the previous tabs and caret positions; `%LOCALAPPDATA%\SS Writer\updates\` is empty afterwards and no `SSWriter-updater.exe` process is left in Task Manager.
+- [ ] **UPD-07** Postponing: download the update, close the banner, keep working → nothing is installed, the package stays; the offer (with Restart and install) comes back on the next check.
+- [ ] **UPD-08** Failures: break the download (disable the network while the bar is moving) → "SS Writer could not download the update." with the reason, no file left in `updates\`, and the banner offers Download again. Then cancel the msiexec UI during an install → the editor is already closed; starting SS Writer again shows the old version and the package is still there.
+- [ ] **UPD-09** Portable zip build: press Download → the release page opens in the browser and nothing is downloaded or installed by the app.
+- [ ] **UPD-10** Link in the notification opens the default browser at the release page.
 
 ## 14. Performance (spec §14)
 

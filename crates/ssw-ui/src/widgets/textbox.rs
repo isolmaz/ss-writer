@@ -476,7 +476,7 @@ impl TextBox {
             return EventResult::ignored();
         }
         let inside = self.bounds.contains(event.position);
-        if inside {
+        if inside || self.dragging {
             cx.set_cursor(Cursor::IBeam);
         }
         match event.kind {
@@ -1068,6 +1068,35 @@ mod tests {
                 .send(&mut textbox, Event::Ime(ImeEvent::Start))
                 .handled
         );
+    }
+
+    #[test]
+    fn kit_textbox_requests_the_ibeam_over_the_box_and_while_dragging() {
+        let (mut harness, mut textbox, _) = setup("hello");
+        let y = 26.0;
+        harness.hover(&mut textbox, Point::new(40.0, y));
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::IBeam));
+        harness.hover(&mut textbox, Point::new(500.0, y));
+        assert_eq!(harness.requests.take_cursor(), None);
+        harness.pointer(
+            &mut textbox,
+            PointerEventKind::Down,
+            Some(PointerButton::Left),
+            Point::new(40.0, y),
+        );
+        harness.requests.take_cursor();
+        harness.hover(&mut textbox, Point::new(500.0, y));
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::IBeam));
+        harness.pointer(
+            &mut textbox,
+            PointerEventKind::Up,
+            Some(PointerButton::Left),
+            Point::new(500.0, y),
+        );
+        harness.requests.take_cursor();
+        textbox.set_enabled(false);
+        harness.hover(&mut textbox, Point::new(40.0, y));
+        assert_eq!(harness.requests.take_cursor(), None);
     }
 
     #[test]

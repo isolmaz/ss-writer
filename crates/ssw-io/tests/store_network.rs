@@ -14,9 +14,11 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use ssw_io::net::{
-    Accept, FetchOptions, Fetched, Http, HttpRequest, MAX_REDIRECTS, NetError, ResponseHead,
-    Scheme, ScriptedHttp, USER_AGENT, Url, WinHttp, fetch,
+    Accept, BodySink, Downloaded, FetchOptions, Fetched, Http, HttpRequest, HttpResponse,
+    MAX_REDIRECTS, NetError, ResponseHead, Scheme, ScriptedHttp, USER_AGENT, Url, WinHttp,
+    download, fetch,
 };
 use ssw_io::remote_images::{
     CACHE_LIMIT_BYTES, IMAGE_TIMEOUT, ImageError, ImageLoad, MAX_IMAGE_BYTES, RemoteImage,
@@ -24,8 +26,10 @@ use ssw_io::remote_images::{
 };
 use ssw_io::store::{Store, StoreError};
 use ssw_io::update::{
-    CHECK_INTERVAL_SECS, RELEASES_URL, Release, UpdateError, UpdateStatus, Version,
-    check_for_updates, is_due, last_check, latest_release, parse_release,
+    Asset, CHECK_INTERVAL_SECS, CHECK_TIMEOUT, DOWNLOAD_TIMEOUT, MAX_CHECKSUMS_BYTES,
+    MAX_INSTALLER_BYTES, RELEASES_URL, Release, UpdateError, UpdateStatus, Version,
+    check_for_updates, checksums_asset, download_installer, expected_sha256, installer_asset,
+    is_due, last_check, latest_release, parse_release,
 };
 use tempfile::{TempDir, tempdir};
 
@@ -1296,6 +1300,7 @@ fn v020() -> Release {
         version: version("0.2.0"),
         tag: "v0.2.0".to_owned(),
         page_url: PAGE.to_owned(),
+        assets: Vec::new(),
     }
 }
 
@@ -1632,18 +1637,33 @@ struct Loopback {
     port: u16,
 }
 
+impl Loopback {
+    /// The address on the loopback server of the same path and query as `url`.
+    fn rewrite(&self, url: &Url) -> Url {
+        Url::parse(&format!("http://127.0.0.1:{}{}", self.port, url.target())).unwrap()
+    }
+}
+
 impl Http for Loopback {
-    fn get(&self, request: &HttpRequest<'_>) -> Result<ssw_io::net::HttpResponse, NetError> {
-        let rewritten = Url::parse(&format!(
-            "http://127.0.0.1:{}{}",
-            self.port,
-            request.url.target()
-        ))
-        .unwrap();
+    fn get(&self, request: &HttpRequest<'_>) -> Result<HttpResponse, NetError> {
         WinHttp.get(&HttpRequest {
-            url: &rewritten,
+            url: &self.rewrite(request.url),
             ..*request
         })
+    }
+
+    fn get_streaming(
+        &self,
+        request: &HttpRequest<'_>,
+        sink: &mut BodySink<'_>,
+    ) -> Result<ResponseHead, NetError> {
+        WinHttp.get_streaming(
+            &HttpRequest {
+                url: &self.rewrite(request.url),
+                ..*request
+            },
+            sink,
+        )
     }
 }
 
@@ -1691,6 +1711,33 @@ fn update_errors_describe_themselves() {
             "nightly",
         ),
         (UpdateError::InsecurePage, "not an https URL"),
+        (
+            UpdateError::InsecureAsset("a.msi".to_owned()),
+            "`a.msi` is not an https URL",
+        ),
+        (
+            UpdateError::MissingAsset("a.msi".to_owned()),
+            "no `a.msi` to download",
+        ),
+        (
+            UpdateError::MissingChecksum("a.msi".to_owned()),
+            "SHA256SUMS.txt does not list `a.msi`",
+        ),
+        (
+            UpdateError::ChecksumMismatch {
+                name: "a.msi".to_owned(),
+                expected: "aa".to_owned(),
+                actual: "bb".to_owned(),
+            },
+            "`a.msi` does not match its checksum (expected aa, got bb)",
+        ),
+        (
+            UpdateError::Io {
+                path: PathBuf::from("updates"),
+                source: std::io::Error::other("disk full"),
+            },
+            "updates: disk full",
+        ),
     ];
     for (error, expected) in cases {
         assert!(
@@ -1698,6 +1745,885 @@ fn update_errors_describe_themselves() {
             "{error} vs {expected}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Streaming and installer downloads
+// ---------------------------------------------------------------------------------------------
+
+const PORTABLE: &str = "SSWriter-0.2.0-x64-portable.zip";
+const MSI: &str = "SSWriter-0.2.0-x64.msi";
+const SUMS: &str = "SHA256SUMS.txt";
+const DOWNLOADS: &str = "https://github.com/isolmaz/ss-writer/releases/download/v0.2.0";
+const ASSET: &str =
+    "https://github.com/isolmaz/ss-writer/releases/download/v0.2.0/SSWriter-0.2.0-x64.msi";
+const CDN: &str =
+    "https://release-assets.githubusercontent.com/github-production-release-asset/42/installer";
+const SUMS_TARGET: &str = "/isolmaz/ss-writer/releases/download/v0.2.0/SHA256SUMS.txt";
+const MSI_TARGET: &str = "/isolmaz/ss-writer/releases/download/v0.2.0/SSWriter-0.2.0-x64.msi";
+const CDN_TARGET: &str = "/github-production-release-asset/42/installer";
+
+/// The SHA-256 of `abc` (FIPS 180-2, appendix B) and of nothing.
+const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// What a release `v0.2.0` of the project carries, in the order the API lists it.
+const ASSETS: [(&str, u64); 6] = [
+    (PORTABLE, 41_943_040),
+    ("isolmaz.SSWriter.installer.yaml", 1_024),
+    (MSI, 36_700_160),
+    ("isolmaz.SSWriter.locale.en-US.yaml", 812),
+    (SUMS, 245),
+    ("isolmaz.SSWriter.yaml", 407),
+];
+
+/// `len` bytes that differ from place to place, so a lost, repeated or misplaced chunk changes
+/// the file and its digest.
+fn payload(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| u8::try_from(index * 31 % 251).unwrap())
+        .collect()
+}
+
+/// The SHA-256 of `bytes` as `sha256sum` prints it.
+fn sha256_of(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn octet_head(length: usize) -> String {
+    head(
+        "200 OK",
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", &length.to_string()),
+        ],
+    )
+}
+
+fn octet_response(body: &[u8]) -> Vec<u8> {
+    response(
+        "200 OK",
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Length", &body.len().to_string()),
+        ],
+        body,
+    )
+}
+
+fn text_head() -> String {
+    head("200 OK", &[("Content-Type", "text/plain; charset=utf-8")])
+}
+
+/// The release feed's answer for `tag` with `assets` attached.
+fn release_with(tag: &str, assets: &[(&str, u64)]) -> Release {
+    let listed: Vec<String> = assets
+        .iter()
+        .map(|(name, size)| {
+            format!(
+                r#"{{"name":"{name}","browser_download_url":"{DOWNLOADS}/{name}","size":{size},"content_type":"application/octet-stream","state":"uploaded"}}"#
+            )
+        })
+        .collect();
+    let json = format!(
+        r#"{{"tag_name":"{tag}","html_url":"{PAGE}","assets":[{}]}}"#,
+        listed.join(",")
+    );
+    parse_release(json.as_bytes()).unwrap()
+}
+
+/// Whether `seen`, the progress reports of one download, grows with every report, carries
+/// `total` and ends at `end`; a body of the sizes used here arrives in several chunks.
+fn assert_progress(seen: &[(u64, Option<u64>)], total: Option<u64>, end: u64) {
+    assert!(seen.len() > 1, "expected several chunks: {seen:?}");
+    assert!(
+        seen.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "progress must grow: {seen:?}"
+    );
+    assert!(
+        seen.iter().all(|&(_, announced)| announced == total),
+        "{seen:?}"
+    );
+    assert_eq!(seen.last().map(|&(downloaded, _)| downloaded), Some(end));
+}
+
+#[test]
+fn a_streamed_download_writes_the_exact_bytes_and_reports_monotonic_progress() {
+    let body = payload(300_000);
+    let served = body.clone();
+    let server = Server::start(move |_| Reply::Bytes(octet_response(&served)));
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("installer.msi");
+    let url = server.url("/installer.msi");
+    let mut seen = Vec::new();
+
+    let done = download(
+        &WinHttp,
+        &url,
+        &loopback_options(Accept::Any),
+        &target,
+        &mut |downloaded, total| seen.push((downloaded, total)),
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), body);
+    assert_eq!(
+        done,
+        Downloaded {
+            url: Url::parse(&url).unwrap(),
+            bytes: 300_000,
+            sha256: sha256_of(&body),
+        }
+    );
+    assert_progress(&seen, Some(300_000), 300_000);
+    assert_eq!(cached_names(dir.path()), ["installer.msi"]);
+}
+
+#[test]
+fn the_digest_is_the_sha256_of_what_was_written_and_an_unannounced_total_stays_unknown() {
+    let http = ScriptedHttp::new();
+    let no_length = head("200 OK", &[("Content-Type", "application/octet-stream")]);
+    let big = payload(100_000);
+    http.respond(ASSET, &no_length, b"abc");
+    http.respond(ASSET, &no_length, &big);
+    http.respond(ASSET, &octet_head(0), b"");
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("a.bin");
+    let mut seen = Vec::new();
+    let run = |seen: &mut Vec<(u64, Option<u64>)>| {
+        seen.clear();
+        download(
+            &http,
+            ASSET,
+            &options(Accept::Any),
+            &target,
+            &mut |downloaded, total| seen.push((downloaded, total)),
+        )
+        .unwrap()
+    };
+
+    let done = run(&mut seen);
+    assert_eq!((done.bytes, done.sha256.as_str()), (3, ABC_SHA256));
+    assert_eq!(seen, [(3, None)]);
+
+    // A longer body replaces the first file.
+    let done = run(&mut seen);
+    assert_eq!((done.bytes, done.sha256), (100_000, sha256_of(&big)));
+    assert_progress(&seen, None, 100_000);
+    assert_eq!(std::fs::read(&target).unwrap(), big);
+
+    // An empty body is a complete download too; nothing is reported for it.
+    let done = run(&mut seen);
+    assert_eq!((done.bytes, done.sha256.as_str()), (0, EMPTY_SHA256));
+    assert!(seen.is_empty());
+    assert!(std::fs::read(&target).unwrap().is_empty());
+    assert_eq!(cached_names(dir.path()), ["a.bin"]);
+}
+
+#[test]
+fn a_download_follows_the_redirect_to_the_asset_host() {
+    let http = ScriptedHttp::new();
+    http.respond(ASSET, &redirect_head("302 Found", CDN), b"");
+    http.respond(CDN, &octet_head(3), b"abc");
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("SSWriter-0.2.0-x64.msi");
+
+    let done = download(&http, ASSET, &options(Accept::Any), &target, &mut |_, _| {}).unwrap();
+
+    assert_eq!(done.url, Url::parse(CDN).unwrap());
+    assert_eq!(done.sha256, ABC_SHA256);
+    assert_eq!(std::fs::read(&target).unwrap(), b"abc");
+    assert_eq!(http.requests(), [ASSET, CDN]);
+    assert_eq!(cached_names(dir.path()), ["SSWriter-0.2.0-x64.msi"]);
+}
+
+#[test]
+fn a_download_follows_the_fetch_policy_and_creates_nothing_when_it_is_refused() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("a.bin");
+    let run = |http: &ScriptedHttp, url: &str, rules: &FetchOptions| {
+        download(http, url, rules, &target, &mut |_, _| {}).unwrap_err()
+    };
+
+    let http = ScriptedHttp::new();
+    assert_eq!(
+        run(&http, "http://example.com/a.bin", &options(Accept::Any)),
+        NetError::InsecureScheme
+    );
+    assert!(http.requests().is_empty());
+
+    http.respond(ASSET, &head("404 Not Found", &[]), b"");
+    assert_eq!(
+        run(&http, ASSET, &options(Accept::Any)),
+        NetError::HttpStatus(404)
+    );
+
+    http.respond(
+        ASSET,
+        &head("200 OK", &[("Content-Type", "text/html")]),
+        b"<html>",
+    );
+    assert_eq!(
+        run(&http, ASSET, &options(Accept::Image)),
+        NetError::WrongContentType(Some("text/html".to_owned()))
+    );
+
+    http.respond(
+        ASSET,
+        &redirect_head("302 Found", "http://example.com/a.bin"),
+        b"",
+    );
+    assert_eq!(
+        run(&http, ASSET, &options(Accept::Any)),
+        NetError::InsecureScheme
+    );
+
+    http.respond_after(ASSET, Duration::from_millis(200), &octet_head(3), b"abc");
+    let quick = FetchOptions {
+        timeout: Duration::from_millis(40),
+        ..options(Accept::Any)
+    };
+    assert_eq!(run(&http, ASSET, &quick), NetError::Timeout);
+
+    assert!(cached_names(dir.path()).is_empty());
+}
+
+#[test]
+fn a_failed_download_leaves_an_earlier_file_alone_and_no_partial_one_behind() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("installer.msi");
+    std::fs::write(&target, b"old installer").unwrap();
+    let http = ScriptedHttp::new();
+    let broken = NetError::Os {
+        call: "WinHttpReadData",
+        code: 12030,
+    };
+    http.respond_broken(
+        ASSET,
+        &octet_head(100_000),
+        &payload(40_000),
+        broken.clone(),
+    );
+    http.respond(ASSET, &octet_head(100), &[1u8; 10]);
+    let mut seen = Vec::new();
+    let run = |seen: &mut Vec<(u64, Option<u64>)>| {
+        download(
+            &http,
+            ASSET,
+            &options(Accept::Any),
+            &target,
+            &mut |downloaded, total| seen.push((downloaded, total)),
+        )
+    };
+
+    // The connection breaks after some chunks were written.
+    assert_eq!(run(&mut seen).unwrap_err(), broken);
+    assert_eq!(seen.last().map(|&(downloaded, _)| downloaded), Some(40_000));
+    // The connection ends early without an error: the short body is caught.
+    assert_eq!(
+        run(&mut seen).unwrap_err(),
+        NetError::MalformedResponse("body does not match Content-Length")
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"old installer");
+    assert_eq!(cached_names(dir.path()), ["installer.msi"]);
+
+    // A complete download replaces it.
+    http.respond(ASSET, &octet_head(1000), &payload(1000));
+    run(&mut seen).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), payload(1000));
+    assert_eq!(cached_names(dir.path()), ["installer.msi"]);
+}
+
+#[test]
+fn a_target_that_cannot_be_created_fails_with_the_os_error() {
+    let dir = tempdir().unwrap();
+    let http = ScriptedHttp::new();
+    http.respond(ASSET, &octet_head(3), b"abc");
+    let error = download(
+        &http,
+        ASSET,
+        &options(Accept::Any),
+        &dir.path().join("missing").join("a.bin"),
+        &mut |_, _| {},
+    )
+    .unwrap_err();
+    // ERROR_PATH_NOT_FOUND
+    assert_eq!(
+        error,
+        NetError::Os {
+            call: "CreateFileW",
+            code: 3
+        }
+    );
+}
+
+#[test]
+fn a_body_over_the_limit_fails_with_too_large_and_leaves_no_file_behind() {
+    let server = Server::start(|seen| match seen.target.as_str() {
+        // Announced size over the limit.
+        "/announced" => Reply::Bytes(octet_response(&payload(100_000))),
+        // No Content-Length: the size is only known by reading.
+        "/streamed" => Reply::Bytes(response(
+            "200 OK",
+            &[("Content-Type", "application/octet-stream")],
+            &payload(100_000),
+        )),
+        _ => Reply::Bytes(octet_response(&payload(50_000))),
+    });
+    let dir = tempdir().unwrap();
+    let tight = FetchOptions {
+        max_body: 50_000,
+        ..loopback_options(Accept::Any)
+    };
+    for target in ["/announced", "/streamed"] {
+        let mut seen = Vec::new();
+        let error = download(
+            &WinHttp,
+            &server.url(target),
+            &tight,
+            &dir.path().join("a.bin"),
+            &mut |downloaded, total| seen.push((downloaded, total)),
+        )
+        .unwrap_err();
+        assert_eq!(error, NetError::TooLarge { limit: 50_000 }, "{target}");
+        // No chunk beyond the limit reached the file.
+        assert!(seen.iter().all(|&(downloaded, _)| downloaded <= 50_000));
+        assert!(cached_names(dir.path()).is_empty(), "{target}");
+    }
+
+    // Exactly at the limit is fine.
+    let exact = dir.path().join("exact.bin");
+    let done = download(
+        &WinHttp,
+        &server.url("/exact"),
+        &tight,
+        &exact,
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(done.bytes, 50_000);
+    assert_eq!(std::fs::read(&exact).unwrap(), payload(50_000));
+}
+
+#[test]
+fn winhttp_hands_the_body_to_the_sink_in_chunks_and_returns_the_head() {
+    let body = payload(200_000);
+    let served = body.clone();
+    let server = Server::start(move |_| Reply::Bytes(octet_response(&served)));
+    let url = Url::parse(&server.url("/big")).unwrap();
+    let mut received = Vec::new();
+    let mut totals = Vec::new();
+
+    let head = WinHttp
+        .get_streaming(
+            &request(&url, Accept::Any, LIMIT, FIVE_SECONDS),
+            &mut |chunk, total| {
+                received.extend_from_slice(chunk);
+                totals.push(total);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(head.status, 200);
+    assert_eq!(head.mime().as_deref(), Some("application/octet-stream"));
+    assert_eq!(received, body);
+    assert!(totals.len() > 1, "{} chunks", totals.len());
+    assert!(totals.iter().all(|&total| total == Some(200_000)));
+}
+
+#[test]
+fn a_sink_that_fails_stops_the_stream_with_its_error() {
+    let served = payload(200_000);
+    let server = Server::start(move |_| Reply::Bytes(octet_response(&served)));
+    let scripted = ScriptedHttp::new();
+    scripted.respond(ASSET, &octet_head(100_000), &payload(100_000));
+    let failure = NetError::Os {
+        call: "WriteFile",
+        code: 112,
+    };
+    let networks: [(&dyn Http, String); 2] = [
+        (&WinHttp, server.url("/big")),
+        (&scripted, ASSET.to_owned()),
+    ];
+    for (http, url) in networks {
+        let url = Url::parse(&url).unwrap();
+        let mut calls = 0;
+        let result = http.get_streaming(
+            &request(&url, Accept::Any, LIMIT, FIVE_SECONDS),
+            &mut |_, _| {
+                calls += 1;
+                if calls == 2 {
+                    Err(failure.clone())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.unwrap_err(), failure, "{url}");
+        assert_eq!(
+            calls, 2,
+            "no chunk is delivered after the sink failed: {url}"
+        );
+    }
+}
+
+#[test]
+fn winhttp_streaming_gives_up_on_a_body_that_stops_arriving() {
+    let server = Server::start(|_| {
+        let head = response(
+            "200 OK",
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Length", "100000"),
+            ],
+            &payload(40_000),
+        );
+        Reply::BytesThenStall(head, Duration::from_millis(2500))
+    });
+    let url = Url::parse(&server.url("/half")).unwrap();
+    let mut received = 0;
+    let started = Instant::now();
+
+    let error = WinHttp
+        .get_streaming(
+            &request(&url, Accept::Any, LIMIT, Duration::from_millis(400)),
+            &mut |chunk, _| {
+                received += chunk.len();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(error, NetError::Timeout);
+    // The chunks that arrived before the stall were handed over, the rest never came.
+    assert!(
+        (1..=40_000).contains(&received),
+        "{received} bytes reached the sink"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(2000),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// A network that implements only `get`.
+#[derive(Debug)]
+struct GetOnly {
+    raw_head: String,
+    body: Vec<u8>,
+}
+
+impl Http for GetOnly {
+    fn get(&self, _request: &HttpRequest<'_>) -> Result<HttpResponse, NetError> {
+        Ok(HttpResponse {
+            head: ResponseHead::parse(&self.raw_head)?,
+            body: self.body.clone(),
+        })
+    }
+}
+
+#[test]
+fn a_network_that_only_implements_get_still_streams_to_a_file() {
+    let body = payload(70_000);
+    let http = GetOnly {
+        raw_head: octet_head(body.len()),
+        body: body.clone(),
+    };
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("a.bin");
+    let mut seen = Vec::new();
+
+    let done = download(
+        &http,
+        ASSET,
+        &options(Accept::Any),
+        &target,
+        &mut |downloaded, total| seen.push((downloaded, total)),
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(&target).unwrap(), body);
+    assert_eq!(done.sha256, sha256_of(&body));
+    assert_progress(&seen, Some(70_000), 70_000);
+
+    // A response whose body is not wanted hands nothing to the sink.
+    let refused = GetOnly {
+        raw_head: head("404 Not Found", &[]),
+        body: Vec::new(),
+    };
+    let url = Url::parse(ASSET).unwrap();
+    let mut calls = 0;
+    let answered = refused
+        .get_streaming(
+            &request(&url, Accept::Any, LIMIT, FIVE_SECONDS),
+            &mut |_, _| {
+                calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!((answered.status, calls), (404, 0));
+}
+
+#[test]
+fn expected_sha256_picks_the_line_of_the_named_file() {
+    let (zip, msi, yaml) = (sha256_of(b"zip"), sha256_of(b"msi"), sha256_of(b"yaml"));
+    let sums = format!("{zip}  {PORTABLE}\n{msi}  {MSI}\n{yaml}  isolmaz.SSWriter.yaml\n");
+
+    assert_eq!(expected_sha256(&sums, MSI), Some(msi.clone()));
+    assert_eq!(expected_sha256(&sums, PORTABLE), Some(zip.clone()));
+    assert_eq!(expected_sha256(&sums, "isolmaz.SSWriter.yaml"), Some(yaml));
+    // Other names, including parts of listed ones, are not found.
+    for name in [
+        "SSWriter-0.2.0-x64",
+        "x64.msi",
+        "sswriter-0.2.0-x64.msi",
+        "",
+    ] {
+        assert_eq!(expected_sha256(&sums, name), None, "{name:?}");
+    }
+    assert_eq!(expected_sha256("", MSI), None);
+
+    // The digest comes back lower-case whatever case the list uses; CRLF line ends and the
+    // binary-mode marker of `sha256sum` do not matter.
+    let shouted = format!("{}  {MSI}\r\n", msi.to_uppercase());
+    assert_eq!(expected_sha256(&shouted, MSI), Some(msi.clone()));
+    let binary = format!("{zip}  {PORTABLE}\r\n{msi} *{MSI}\r\n");
+    assert_eq!(expected_sha256(&binary, MSI), Some(msi.clone()));
+}
+
+#[test]
+fn expected_sha256_ignores_lines_that_are_not_checksums() {
+    let (first, second) = (sha256_of(b"first"), sha256_of(b"second"));
+    let sums = format!(
+        "# release 0.2.0\n\nabc123  {MSI}\n{bad}  {MSI}\n{MSI}\n{first}  {MSI}\n{second}  {MSI}\n",
+        bad = "g".repeat(64)
+    );
+    // Short digests, digests that are not hex and lines without a digest are skipped; of two
+    // valid lines for one name the first counts.
+    assert_eq!(expected_sha256(&sums, MSI), Some(first));
+    assert_eq!(expected_sha256(&sums, "release 0.2.0"), None);
+}
+
+#[test]
+fn the_installer_and_the_checksum_list_are_picked_out_of_the_release_assets() {
+    let release = release_with("v0.2.0", &ASSETS);
+
+    assert_eq!(
+        release
+            .assets
+            .iter()
+            .map(|asset| asset.name.as_str())
+            .collect::<Vec<_>>(),
+        ASSETS.map(|(name, _)| name),
+        "every asset, in feed order"
+    );
+    assert_eq!(
+        installer_asset(&release),
+        Some(&Asset {
+            name: MSI.to_owned(),
+            url: format!("{DOWNLOADS}/{MSI}"),
+            size: 36_700_160,
+        })
+    );
+    assert_eq!(
+        checksums_asset(&release),
+        Some(&Asset {
+            name: SUMS.to_owned(),
+            url: format!("{DOWNLOADS}/{SUMS}"),
+            size: 245,
+        })
+    );
+}
+
+#[test]
+fn assets_that_are_not_the_installer_or_the_checksum_list_are_not_picked() {
+    // Neither the zip nor the winget manifests are the installer, and none is the list.
+    let others = release_with(
+        "v0.2.0",
+        &[
+            (PORTABLE, 1),
+            ("isolmaz.SSWriter.yaml", 1),
+            ("SSWriter-0.2.0-x64.msi.sig", 1),
+            ("sswriter-0.2.0-x64.msi", 1),
+            ("SHA256SUMS.txt.sig", 1),
+        ],
+    );
+    assert_eq!(installer_asset(&others), None);
+    assert_eq!(checksums_asset(&others), None);
+
+    // The installer of another version is not the installer of this release.
+    let stale = release_with("v0.3.0", &ASSETS);
+    assert_eq!(installer_asset(&stale), None);
+    assert!(checksums_asset(&stale).is_some());
+
+    // A release without assets.
+    let bare = parse_release(release_json("v0.2.0", PAGE).as_bytes()).unwrap();
+    assert_eq!(installer_asset(&bare), None);
+    assert_eq!(checksums_asset(&bare), None);
+}
+
+#[test]
+fn asset_entries_are_validated() {
+    let with = |asset: &str| {
+        parse_release(
+            format!(r#"{{"tag_name":"v0.2.0","html_url":"{PAGE}","assets":[{asset}]}}"#).as_bytes(),
+        )
+    };
+    assert!(matches!(
+        with(r#"{"name":"a.msi","browser_download_url":"http://example.com/a.msi","size":1}"#),
+        Err(UpdateError::InsecureAsset(name)) if name == "a.msi"
+    ));
+    assert!(matches!(
+        with(r#"{"name":"a.msi","browser_download_url":"not a url","size":1}"#),
+        Err(UpdateError::InsecureAsset(_))
+    ));
+    for incomplete in [
+        r#"{"name":"a.msi","browser_download_url":"https://example.com/a.msi"}"#,
+        r#"{"browser_download_url":"https://example.com/a.msi","size":1}"#,
+        r#"{"name":"a.msi","size":1}"#,
+    ] {
+        assert!(
+            matches!(with(incomplete), Err(UpdateError::Json(_))),
+            "{incomplete}"
+        );
+    }
+}
+
+/// A server standing in for GitHub: the checksum list `sums`, and the installer `msi` behind a
+/// redirect to the asset host, as GitHub serves it.
+fn release_server(sums: String, msi: Vec<u8>) -> Server {
+    Server::start(move |seen| match seen.target.as_str() {
+        SUMS_TARGET => Reply::Bytes(response(
+            "200 OK",
+            &[
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", &sums.len().to_string()),
+            ],
+            sums.as_bytes(),
+        )),
+        MSI_TARGET => Reply::Bytes(redirect(
+            "302 Found",
+            &format!("https://release-assets.githubusercontent.com{CDN_TARGET}"),
+        )),
+        CDN_TARGET => Reply::Bytes(octet_response(&msi)),
+        _ => Reply::Bytes(response("404 Not Found", &[("Content-Length", "0")], b"")),
+    })
+}
+
+#[test]
+fn the_installer_is_downloaded_and_verified_over_real_http() {
+    let msi = payload(250_000);
+    let sums = format!(
+        "{}  {PORTABLE}\n{}  {MSI}\n",
+        sha256_of(b"zip"),
+        sha256_of(&msi)
+    );
+    let server = release_server(sums, msi.clone());
+    let release = release_with("v0.2.0", &ASSETS);
+    let tmp = tempdir().unwrap();
+    // The folder does not exist yet.
+    let dir = tmp.path().join("updates");
+    let mut seen = Vec::new();
+
+    let path = download_installer(
+        &Loopback { port: server.port },
+        &release,
+        &dir,
+        &mut |downloaded, total| seen.push((downloaded, total)),
+    )
+    .unwrap();
+
+    assert_eq!(path, dir.join(MSI));
+    assert_eq!(std::fs::read(&path).unwrap(), msi);
+    assert_eq!(cached_names(&dir), [MSI]);
+    assert_progress(&seen, Some(250_000), 250_000);
+    // The list comes first, so a release that does not cover its installer fails early; the
+    // installer follows the redirect to the asset host.
+    let targets: Vec<String> = server
+        .requests()
+        .into_iter()
+        .map(|entry| entry.target)
+        .collect();
+    assert_eq!(targets, [SUMS_TARGET, MSI_TARGET, CDN_TARGET]);
+}
+
+#[test]
+fn a_download_that_does_not_match_the_checksum_list_fails_and_leaves_no_file() {
+    let msi = payload(100_000);
+    let listed = sha256_of(b"not the installer");
+    let server = release_server(format!("{listed}  {MSI}\n"), msi.clone());
+    let release = release_with("v0.2.0", &ASSETS);
+    let tmp = tempdir().unwrap();
+
+    let error = download_installer(
+        &Loopback { port: server.port },
+        &release,
+        tmp.path(),
+        &mut |_, _| {},
+    )
+    .unwrap_err();
+
+    match error {
+        UpdateError::ChecksumMismatch {
+            name,
+            expected,
+            actual,
+        } => {
+            assert_eq!(name, MSI);
+            assert_eq!(expected, listed);
+            assert_eq!(actual, sha256_of(&msi));
+        }
+        other => panic!("not a checksum mismatch: {other:?}"),
+    }
+    assert!(cached_names(tmp.path()).is_empty());
+}
+
+#[test]
+fn a_release_that_cannot_be_verified_or_fetched_is_refused() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let release = release_with("v0.2.0", &ASSETS);
+    let sums_url = format!("{DOWNLOADS}/{SUMS}");
+    let msi_url = format!("{DOWNLOADS}/{MSI}");
+    let run = |http: &ScriptedHttp, release: &Release| {
+        download_installer(http, release, dir, &mut |_, _| {}).unwrap_err()
+    };
+
+    // Nothing is requested for a release without an installer or without a list.
+    let idle = ScriptedHttp::new();
+    let error = run(&idle, &release_with("v0.2.0", &[(SUMS, 10)]));
+    assert!(
+        matches!(&error, UpdateError::MissingAsset(name) if name == MSI),
+        "{error:?}"
+    );
+    let error = run(&idle, &release_with("v0.2.0", &[(MSI, 10)]));
+    assert!(
+        matches!(&error, UpdateError::MissingAsset(name) if name == SUMS),
+        "{error:?}"
+    );
+    assert!(idle.requests().is_empty());
+
+    // A list that does not name the installer: the big download never starts.
+    let http = ScriptedHttp::new();
+    let others = format!("{}  {PORTABLE}\n", sha256_of(b"zip"));
+    http.respond(&sums_url, &text_head(), others.as_bytes());
+    let error = run(&http, &release);
+    assert!(
+        matches!(&error, UpdateError::MissingChecksum(name) if name == MSI),
+        "{error:?}"
+    );
+    assert_eq!(http.requests(), [sums_url.as_str()]);
+
+    // A list that cannot be fetched, or is too big.
+    let http = ScriptedHttp::new();
+    http.respond(&sums_url, &head("404 Not Found", &[]), b"");
+    assert!(matches!(
+        run(&http, &release),
+        UpdateError::Net(NetError::HttpStatus(404))
+    ));
+    let http = ScriptedHttp::new();
+    let oversized = usize::try_from(MAX_CHECKSUMS_BYTES).unwrap() + 1;
+    http.respond(&sums_url, &octet_head(oversized), b"");
+    assert!(matches!(
+        run(&http, &release),
+        UpdateError::Net(NetError::TooLarge { limit }) if limit == MAX_CHECKSUMS_BYTES
+    ));
+
+    // An installer that cannot be fetched, or announces more than the limit.
+    let listed = format!("{ABC_SHA256}  {MSI}\n");
+    let http = ScriptedHttp::new();
+    http.respond(&sums_url, &text_head(), listed.as_bytes());
+    http.respond(&msi_url, &head("404 Not Found", &[]), b"");
+    assert!(matches!(
+        run(&http, &release),
+        UpdateError::Net(NetError::HttpStatus(404))
+    ));
+    let http = ScriptedHttp::new();
+    http.respond(&sums_url, &text_head(), listed.as_bytes());
+    let oversized = usize::try_from(MAX_INSTALLER_BYTES).unwrap() + 1;
+    http.respond(&msi_url, &octet_head(oversized), b"");
+    assert!(matches!(
+        run(&http, &release),
+        UpdateError::Net(NetError::TooLarge { limit }) if limit == MAX_INSTALLER_BYTES
+    ));
+
+    assert!(cached_names(dir).is_empty());
+}
+
+/// A network that notes the limits of every request and answers like the scripted one.
+#[derive(Debug, Default)]
+struct Limits {
+    inner: ScriptedHttp,
+    asked: Mutex<Vec<(String, Duration, u64)>>,
+}
+
+impl Limits {
+    fn note(&self, request: &HttpRequest<'_>) {
+        self.asked
+            .lock()
+            .push((request.url.to_string(), request.timeout, request.max_body));
+    }
+}
+
+impl Http for Limits {
+    fn get(&self, request: &HttpRequest<'_>) -> Result<HttpResponse, NetError> {
+        self.note(request);
+        self.inner.get(request)
+    }
+
+    fn get_streaming(
+        &self,
+        request: &HttpRequest<'_>,
+        sink: &mut BodySink<'_>,
+    ) -> Result<ResponseHead, NetError> {
+        self.note(request);
+        self.inner.get_streaming(request, sink)
+    }
+}
+
+#[test]
+fn the_checksum_list_and_the_installer_are_fetched_under_their_own_limits() {
+    assert_eq!(CHECK_TIMEOUT, Duration::from_secs(15));
+    assert_eq!(DOWNLOAD_TIMEOUT, Duration::from_secs(10 * 60));
+    assert_eq!(MAX_INSTALLER_BYTES, 200 * 1024 * 1024);
+    let (sums_url, msi_url) = (format!("{DOWNLOADS}/{SUMS}"), format!("{DOWNLOADS}/{MSI}"));
+    let net = Limits::default();
+    net.inner.respond(
+        &sums_url,
+        &text_head(),
+        format!("{ABC_SHA256}  {MSI}\n").as_bytes(),
+    );
+    net.inner.respond(&msi_url, &octet_head(3), b"abc");
+    let tmp = tempdir().unwrap();
+
+    let path = download_installer(
+        &net,
+        &release_with("v0.2.0", &ASSETS),
+        tmp.path(),
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(path).unwrap(), b"abc");
+    let asked = net.asked.lock().clone();
+    let urls: Vec<&str> = asked.iter().map(|(url, ..)| url.as_str()).collect();
+    assert_eq!(urls, [sums_url.as_str(), msi_url.as_str()]);
+    // What is left of a deadline is what remains after the instants that already passed.
+    let (_, list_timeout, list_cap) = &asked[0];
+    assert_eq!(*list_cap, MAX_CHECKSUMS_BYTES);
+    assert!(*list_timeout <= CHECK_TIMEOUT, "{list_timeout:?}");
+    let (_, installer_timeout, installer_cap) = &asked[1];
+    assert_eq!(*installer_cap, MAX_INSTALLER_BYTES);
+    assert!(
+        *installer_timeout > Duration::from_secs(9 * 60) && *installer_timeout <= DOWNLOAD_TIMEOUT,
+        "{installer_timeout:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

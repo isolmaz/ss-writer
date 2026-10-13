@@ -125,6 +125,11 @@ impl Banner {
         &self.message
     }
 
+    /// Replaces the message (a running count, for example) without rebuilding the banner.
+    pub fn set_message(&mut self, message: impl Into<String>) {
+        self.message = message.into();
+    }
+
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.open

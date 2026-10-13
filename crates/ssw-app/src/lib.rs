@@ -12,6 +12,8 @@
 //! - [`app`]: [`app::AppCore`], the composition of the above, and [`app::run`].
 //! - [`perf`]: the marks and the JSON report of `--perf-report` runs (driven by
 //!   [`ui::perf_driver`]).
+//! - [`update_apply`]: "restart and install": the detached updater that waits for the
+//!   application, installs the downloaded MSI and starts the new build.
 //!
 //! The visible shell (windows, tabs, editor view, panels) is a later wave: it implements
 //! [`app::ShellHost`], [`commands::AppActions`], [`startup::InstanceHook`] and
@@ -29,4 +31,5 @@ pub mod perf;
 pub mod session;
 pub mod startup;
 pub mod ui;
+pub mod update_apply;
 pub mod workers;

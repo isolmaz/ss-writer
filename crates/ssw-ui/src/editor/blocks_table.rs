@@ -31,6 +31,7 @@ use ssw_core::text::{Buffer, TextRange};
 
 use crate::canvas::{Canvas, Dash};
 use crate::geometry::{CornerRadii, Point, Rect};
+use crate::input::Cursor;
 use crate::services::ClipboardContent;
 use crate::text::{FontWeight, LineHeight, TextLayout, TextStyle};
 use crate::widgets::SharedClipboard;
@@ -548,6 +549,10 @@ impl BlockLayout for GridLayout {
         cell.display
             .link_at(hit.offset)
             .map(|link| link.target.clone())
+    }
+
+    fn cursor_at(&self, point: Point) -> Option<Cursor> {
+        (point.x >= self.width).then_some(Cursor::Arrow)
     }
 
     fn context_menu(&self, point: Point, origin: Point) -> Option<EditorEvent> {

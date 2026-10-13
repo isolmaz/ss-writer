@@ -213,4 +213,4 @@ description = "Settings > General > Default apps… opens the Windows page where
 id = "distribution-updates"
 title = "Installer, portable zip and updates"
 spec = "13"
-description = "A per-user MSI that needs no administrator rights, a portable zip, a winget package and a weekly update notification that can be turned off."
+description = "A per-user MSI that needs no administrator rights, a portable zip, a winget package, and a weekly update check that can be turned off: the banner downloads the new version with a progress bar, checks it against the release checksums and installs it when you choose to restart."

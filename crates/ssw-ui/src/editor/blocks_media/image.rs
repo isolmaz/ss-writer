@@ -321,8 +321,11 @@ impl BlockLayout for ImageLayout {
     fn cursor_at(&self, point: Point) -> Option<Cursor> {
         if self.on_handle(point) {
             Some(Cursor::SizeWE)
+        } else if self.on_blocked(point) {
+            Some(Cursor::Hand)
         } else {
-            self.on_blocked(point).then_some(Cursor::Hand)
+            let text_height = self.source.as_ref().map_or(0.0, SourceText::height);
+            (point.y >= text_height).then_some(Cursor::Arrow)
         }
     }
 

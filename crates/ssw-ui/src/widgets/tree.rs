@@ -5,7 +5,7 @@ use crate::access::{AccessAction, AccessNode, AccessTree, Role};
 use crate::canvas::{Canvas, IconFont};
 use crate::geometry::{CornerRadii, Insets, Point, Rect, Size};
 use crate::input::{
-    Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
+    Cursor, Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
 };
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
 
@@ -580,6 +580,13 @@ impl TreeView {
             return bar;
         }
         let left = event.button == Some(PointerButton::Left);
+        if event.kind == PointerEventKind::Move {
+            let on_bar =
+                self.bar.model().is_scrollable() && self.bar.bounds().contains(event.position);
+            if self.press.is_some() || (self.row_at(event.position).is_some() && !on_bar) {
+                cx.set_cursor(Cursor::Hand);
+            }
+        }
         match event.kind {
             PointerEventKind::Down if left => {
                 let Some(index) = self.row_at(event.position) else {
@@ -1636,6 +1643,27 @@ mod tests {
             position: Point::new(100.0, 50.0),
             mods: Modifiers::NONE,
         })
+    }
+
+    #[test]
+    fn kit_tree_requests_the_hand_over_rows_and_while_pressed() {
+        let (mut harness, mut tree) = long_tree(Motion::reduced());
+        let row = tree.row_rect(1).center();
+        harness.hover(&mut tree, row);
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        harness.hover(&mut tree, Point::new(237.0, 50.0));
+        assert_eq!(harness.requests.take_cursor(), None, "scroll bar");
+        harness.hover(&mut tree, Point::new(500.0, 50.0));
+        assert_eq!(harness.requests.take_cursor(), None, "outside");
+        let left = Some(PointerButton::Left);
+        harness.pointer(&mut tree, PointerEventKind::Down, left, row);
+        harness.requests.take_cursor();
+        harness.hover(&mut tree, Point::new(500.0, 50.0));
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        harness.pointer(&mut tree, PointerEventKind::Up, left, row);
+        tree.set_enabled(false);
+        harness.hover(&mut tree, row);
+        assert_eq!(harness.requests.take_cursor(), None);
     }
 
     #[test]

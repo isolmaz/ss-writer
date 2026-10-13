@@ -263,6 +263,21 @@ impl StatusBar {
         std::mem::take(&mut self.events)
     }
 
+    /// The clickable segment under `point` and what a click does, the text of its tooltip.
+    #[must_use]
+    pub fn tooltip_at(&self, point: Point) -> Option<(Rect, &str)> {
+        let segment = self
+            .segments
+            .iter()
+            .filter(|segment| segment.is_active())
+            .find(|segment| segment.bounds.contains(point))?;
+        let hint = match segment.kind {
+            StatusSegment::Encoding => &self.strings.encoding_hint,
+            _ => &self.strings.eol_hint,
+        };
+        Some((segment.bounds, hint))
+    }
+
     fn collect(&mut self) {
         for segment in &mut self.segments {
             if std::mem::take(&mut segment.activated) == 0 {
@@ -623,6 +638,21 @@ mod tests {
             assert!(!result.handled);
         }
         assert!(bar.take_events().is_empty());
+    }
+
+    #[test]
+    fn clickable_segments_ask_for_the_hand_and_text_segments_for_nothing() {
+        use crate::input::{Cursor, PointerEventKind};
+        let (mut harness, mut bar) = setup(&info());
+        let mut cursor_at = |bar: &mut StatusBar, at: Point| {
+            harness.requests.take_cursor();
+            harness.pointer(bar, PointerEventKind::Move, None, at);
+            harness.requests.take_cursor()
+        };
+        let encoding = bar.segment_rect(StatusSegment::Encoding).center();
+        let position = bar.segment_rect(StatusSegment::Position).center();
+        assert_eq!(cursor_at(&mut bar, encoding), Some(Cursor::Hand));
+        assert_eq!(cursor_at(&mut bar, position), None);
     }
 
     #[test]

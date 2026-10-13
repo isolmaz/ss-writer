@@ -1505,6 +1505,14 @@ fn the_pointer_is_a_hand_over_a_task_checkbox_and_a_text_cursor_beside_it() {
 }
 
 #[test]
+fn the_pointer_is_an_arrow_over_a_hidden_divider() {
+    let mut h = editor("a\n\n---\n\nb\n", Size::new(400.0, 200.0));
+    let rule = h.view.rect_at(3).expect("on the divider");
+    h.pointer(PointerEventKind::Move, rule.center(), 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Arrow));
+}
+
+#[test]
 fn the_pointer_over_a_heading_shows_its_open_fold_chevron() {
     let mut h = editor("# Title\n\nbody\n", Size::new(400.0, 200.0));
     h.set_caret(12);

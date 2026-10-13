@@ -6,7 +6,7 @@ use crate::access::{AccessAction, AccessNode, AccessTree, Role};
 use crate::canvas::Canvas;
 use crate::geometry::{CornerRadii, Insets, Point, Rect, Size};
 use crate::input::{
-    Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
+    Cursor, Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
 };
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
 
@@ -365,6 +365,12 @@ impl ListView {
                 EventResult::handled_with_focus()
             }
             PointerEventKind::Move | PointerEventKind::Enter | PointerEventKind::Leave => {
+                if event.kind == PointerEventKind::Move
+                    && row.is_some()
+                    && !self.scrollbar_contains(event.position)
+                {
+                    cx.set_cursor(Cursor::Hand);
+                }
                 let hover = if event.kind == PointerEventKind::Leave {
                     None
                 } else {
@@ -864,6 +870,21 @@ mod tests {
                 .iter()
                 .all(|color| *color == tokens.text_disabled)
         );
+    }
+
+    #[test]
+    fn kit_list_requests_the_hand_over_rows_only() {
+        let (mut harness, mut list) = setup(SelectionMode::Single);
+        let row = list.row_rect(1).center();
+        harness.hover(&mut list, row);
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        harness.hover(&mut list, Point::new(195.0, 50.0));
+        assert_eq!(harness.requests.take_cursor(), None);
+        harness.hover(&mut list, Point::new(500.0, 50.0));
+        assert_eq!(harness.requests.take_cursor(), None);
+        list.set_enabled(false);
+        harness.hover(&mut list, row);
+        assert_eq!(harness.requests.take_cursor(), None);
     }
 
     #[test]

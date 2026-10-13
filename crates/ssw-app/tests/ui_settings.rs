@@ -27,11 +27,13 @@ use ssw_core::keymap::KeyChord;
 use ssw_core::settings::{AccentMode, Settings, SettingsSection, Theme as ThemeSetting};
 use ssw_io::paths::Environment;
 use ssw_io::settings_file::load_settings;
-use ssw_ui::access::{AccessAction, Role};
-use ssw_ui::canvas::RecordingCanvas;
+use ssw_ui::access::{AccessAction, AccessNode, Role};
+use ssw_ui::canvas::{DrawOp, RecordingCanvas};
 use ssw_ui::editor::spell::{SpellCheck, SpellProvider};
-use ssw_ui::geometry::Color;
-use ssw_ui::input::{KeyEvent, Modifiers};
+use ssw_ui::geometry::{Color, Point};
+use ssw_ui::input::{
+    Event, KeyEvent, Modifiers, PointerButton, PointerEvent, PointerEventKind, TextInput,
+};
 use ssw_ui::services::{Clock, FakeClock, MemoryClipboard, MessageBoxResult};
 use ssw_ui::shell::settings::{DisplayKeyNames, FieldId, SettingsEvent};
 use ssw_ui::shortcuts::{CharProbe, ShortcutOutcome};
@@ -123,40 +125,84 @@ fn editor_config(controller: &Controller) -> ssw_ui::editor::EditorConfig {
     view.tabs()[0].editor.config().clone()
 }
 
+/// The control labelled `field` on the page of `section` of the open Settings window.
+fn control_node(fx: &Fixture, section: SettingsSection, field: FieldId) -> AccessNode {
+    let cell = fx.controller.settings_cell().expect("settings are open");
+    let engine = MonoTextEngine::default();
+    let label = localizer_for("en").text(field.label_id());
+    let mut view = cell.view.borrow_mut();
+    view.window_mut().select_section(section);
+    // One pass so the page of the section exists in the tree.
+    let _ = view.event(&Event::AnimationFrame(Duration::ZERO), &engine);
+    view.access_tree(&engine)
+        .nodes()
+        .iter()
+        .find(|node| {
+            node.name == label
+                && !matches!(
+                    node.role,
+                    Role::Group
+                        | Role::Window
+                        | Role::Pane
+                        | Role::List
+                        | Role::ListItem
+                        | Role::Text
+                )
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no control named {label:?}"))
+}
+
+/// Delivers `event` to the open Settings window like its window procedure does and hands what
+/// the window reports to the controller.
+fn settings_input(fx: &Fixture, event: Event) {
+    let cell = fx.controller.settings_cell().expect("settings are open");
+    let events = cell
+        .view
+        .borrow_mut()
+        .event(&event, &MonoTextEngine::default());
+    for event in events {
+        fx.controller.settings_event(event);
+    }
+}
+
+fn click_settings(fx: &Fixture, at: Point) {
+    for kind in [
+        PointerEventKind::Move,
+        PointerEventKind::Down,
+        PointerEventKind::Up,
+    ] {
+        let button = (kind != PointerEventKind::Move).then_some(PointerButton::Left);
+        settings_input(
+            fx,
+            Event::Pointer(PointerEvent {
+                click_count: 1,
+                ..PointerEvent::mouse(kind, button, at)
+            }),
+        );
+    }
+}
+
+/// Selects the text of the box under `at` (a click, Ctrl+A) and types `text` character by
+/// character.
+fn type_into(fx: &Fixture, at: Point, text: &str) {
+    click_settings(fx, at);
+    settings_input(fx, Event::Key(KeyEvent::press(0x41, Modifiers::CTRL)));
+    for character in text.chars() {
+        settings_input(fx, Event::Text(TextInput(character.to_string())));
+    }
+}
+
 /// Changes the control labelled `field` of the open Settings window like a user would (through
 /// its accessibility action) and hands the resulting events to the controller.
 fn change(fx: &Fixture, section: SettingsSection, field: FieldId, action: AccessAction) {
     let cell = fx.controller.settings_cell().expect("settings are open");
     let engine = MonoTextEngine::default();
-    let label = localizer_for("en").text(field.label_id());
-    let events = {
-        let mut view = cell.view.borrow_mut();
-        view.window_mut().select_section(section);
-        // One pass so the page of the section exists in the tree.
-        let _ = view.event(
-            &ssw_ui::input::Event::AnimationFrame(Duration::ZERO),
-            &engine,
-        );
-        let tree = view.access_tree(&engine);
-        let node = tree
-            .nodes()
-            .iter()
-            .find(|node| {
-                node.name == label
-                    && !matches!(
-                        node.role,
-                        Role::Group
-                            | Role::Window
-                            | Role::Pane
-                            | Role::List
-                            | Role::ListItem
-                            | Role::Text
-                    )
-            })
-            .cloned()
-            .unwrap_or_else(|| panic!("no control named {label:?}"));
-        view.perform_access(node.id, &action, &engine)
-    };
+    let node = control_node(fx, section, field);
+    let events = cell
+        .view
+        .borrow_mut()
+        .perform_access(node.id, &action, &engine);
     assert!(!events.is_empty(), "{field:?} reported nothing");
     for event in events {
         fx.controller.settings_event(event);
@@ -598,4 +644,134 @@ fn settings_open_in_one_native_window_that_closes_with_its_close_button() {
         },
     );
     assert_eq!(code, 0);
+}
+
+// ----- through the pointer and the keyboard -----------------------------------------------------
+
+/// Opens `name` (a document with one line of text) in `cell` and returns the controller's view
+/// of every open editor's configuration: `(window, tab)` in order.
+fn open_document(fx: &Fixture, cell: &Rc<ssw_app::ui::controller::WindowCell>, name: &str) {
+    let path = fx._tmp.path().join(name);
+    std::fs::write(&path, "hello world\n").unwrap();
+    fx.controller.open_file(cell, &path).unwrap();
+}
+
+fn all_configs(fx: &Fixture) -> Vec<ssw_ui::editor::EditorConfig> {
+    fx.controller
+        .windows()
+        .iter()
+        .flat_map(|cell| {
+            let view = cell.view.borrow();
+            view.tabs()
+                .iter()
+                .map(|tab| tab.editor.config().clone())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The size and origin of the line "hello world" the first window draws for its active tab.
+fn drawn_line(fx: &Fixture) -> (ssw_ui::geometry::Size, Point) {
+    let mut canvas = RecordingCanvas::new();
+    let cell = fx.controller.windows()[0].clone();
+    cell.view
+        .borrow_mut()
+        .paint(&mut canvas, &MonoTextEngine::default(), false);
+    canvas
+        .ops()
+        .find_map(|op| match op {
+            DrawOp::Text {
+                text, size, origin, ..
+            } if text.starts_with("hello world") => Some((*size, *origin)),
+            _ => None,
+        })
+        .expect("the document's line is drawn")
+}
+
+#[test]
+fn typing_editor_settings_with_the_mouse_and_keyboard_changes_every_open_editor_and_the_canvas() {
+    let fx = fixture(Some(r#"{"general":{"autosave":false}}"#));
+    let first = fx.controller.windows()[0].clone();
+    open_document(&fx, &first, "one.md");
+    open_document(&fx, &first, "two.md");
+    let second = fx
+        .controller
+        .create_window(None, ssw_ui::geometry::Size::new(1000.0, 700.0), 1.0);
+    open_document(&fx, &second, "three.md");
+    let _cell = fx.controller.create_settings(setup());
+    assert!(all_configs(&fx).len() >= 3);
+    let before = drawn_line(&fx).0;
+    assert_eq!(before.height, 16.0 * 1.75);
+
+    let at = |field| {
+        control_node(&fx, SettingsSection::Editor, field)
+            .bounds
+            .center()
+    };
+    type_into(&fx, at(FieldId::FontSize), "20");
+    type_into(&fx, at(FieldId::LineHeight), "2");
+    type_into(&fx, at(FieldId::TextFont), "Georgia");
+
+    let stored = fx.controller.settings().editor.clone();
+    assert_eq!(
+        (
+            stored.font_size,
+            stored.line_height,
+            stored.text_font.as_str()
+        ),
+        (20.0, 2.0, "Georgia")
+    );
+    for config in all_configs(&fx) {
+        assert_eq!(config.font_size, 20.0);
+        assert_eq!(config.line_height, 2.0);
+        assert_eq!(&*config.text_font, "Georgia");
+    }
+    // What the window draws follows: the line is as tall as size × line height.
+    assert_eq!(drawn_line(&fx).0.height, 20.0 * 2.0);
+
+    // Closing the window writes what was typed.
+    fx.controller.close_settings();
+    let loaded = load_settings(&fx.file).unwrap().settings;
+    assert_eq!(loaded.editor.font_size, 20.0);
+    assert_eq!(loaded.editor.text_font, "Georgia");
+}
+
+#[test]
+fn an_open_drop_down_of_the_settings_window_is_painted_last_and_takes_the_click() {
+    let fx = fixture(None);
+    let cell = fx.controller.create_settings(setup());
+    let combo = control_node(&fx, SettingsSection::Editor, FieldId::ListIndent);
+    click_settings(&fx, combo.bounds.center());
+
+    let paint = |cell: &Rc<ssw_app::ui::settings_window::SettingsCell>| {
+        let mut canvas = RecordingCanvas::new();
+        cell.view
+            .borrow_mut()
+            .paint(&mut canvas, &MonoTextEngine::default(), false);
+        canvas
+    };
+    // The last texts drawn are the options of the open list, not labels of the rows below it.
+    let canvas = paint(&cell);
+    let texts = canvas.texts();
+    let last = &texts[texts.len() - 4..];
+    assert_eq!(
+        last,
+        ["Align with the item text", "2 spaces", "4 spaces", "Tab"]
+    );
+
+    // The click on an option reaches the list, not the control under it.
+    let tree = cell.view.borrow().access_tree(&MonoTextEngine::default());
+    let option = tree
+        .nodes()
+        .iter()
+        .find(|node| node.role == Role::ListItem && node.name == "4 spaces")
+        .cloned()
+        .unwrap();
+    click_settings(&fx, option.bounds.center());
+    let stored = fx.controller.settings().editor.clone();
+    assert_eq!(format!("{:?}", stored.list_indent), "Four");
+    assert_eq!(
+        stored.typewriter_position,
+        Settings::default().editor.typewriter_position
+    );
 }

@@ -38,7 +38,7 @@ use std::time::Duration;
 use crate::access::AccessState;
 use crate::canvas::Canvas;
 use crate::geometry::{Color, CornerRadii, Insets, Point, Rect};
-use crate::input::{PointerButton, PointerEvent, PointerEventKind};
+use crate::input::{Cursor, PointerButton, PointerEvent, PointerEventKind};
 use crate::services::{Clipboard, TimerId};
 use crate::text::{TextLayout, TextLayoutEngine, TextStyle};
 use crate::theme::Theme;
@@ -487,6 +487,9 @@ impl Interaction {
                 }
             }
             PointerEventKind::Move | PointerEventKind::Enter => {
+                if inside || self.pressed {
+                    cx.set_cursor(Cursor::Hand);
+                }
                 if self.set_hovered(cx, inside) {
                     cx.invalidate(bounds);
                     PointerOutcome::Handled
@@ -872,6 +875,38 @@ mod tests {
         assert_eq!(
             interaction.pointer(&mut cx, BOUNDS, &right_up, true),
             PointerOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn kit_interaction_requests_the_hand_over_enabled_bounds_and_while_pressed() {
+        let mut harness = Harness::new();
+        let mut interaction = Interaction::new(Motion::reduced());
+        let id = crate::widget::WidgetId::allocate();
+        let move_to = |harness: &mut Harness, interaction: &mut Interaction, x: f32, on: bool| {
+            let mut cx = harness.event_cx(id);
+            interaction.pointer(
+                &mut cx,
+                BOUNDS,
+                &event(PointerEventKind::Move, None, x, 5.0),
+                on,
+            );
+            harness.requests.take_cursor()
+        };
+        assert_eq!(
+            move_to(&mut harness, &mut interaction, 5.0, true),
+            Some(Cursor::Hand)
+        );
+        assert_eq!(move_to(&mut harness, &mut interaction, 500.0, true), None);
+        assert_eq!(move_to(&mut harness, &mut interaction, 5.0, false), None);
+        {
+            let mut cx = harness.event_cx(id);
+            let down = event(PointerEventKind::Down, Some(PointerButton::Left), 5.0, 5.0);
+            interaction.pointer(&mut cx, BOUNDS, &down, true);
+        }
+        assert_eq!(
+            move_to(&mut harness, &mut interaction, 500.0, true),
+            Some(Cursor::Hand)
         );
     }
 

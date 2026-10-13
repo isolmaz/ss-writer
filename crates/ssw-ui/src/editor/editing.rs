@@ -810,24 +810,45 @@ impl EditorView {
             self.hovered_item = hovered;
             cx.invalidate(self.bounds);
         }
-        let (left, _) = self.column();
-        let block_cursor = hit.as_ref().and_then(|hit| hit.layout.cursor_at(hit.local));
-        let cursor = block_cursor.unwrap_or_else(|| match &hit {
-            Some(hit) if pointer.position.x < left => {
-                if hit.layout.gutter_hit(hit.local).is_some() {
-                    Cursor::Hand
-                } else {
-                    Cursor::Arrow
-                }
-            }
-            Some(hit) if hit.layout.task_box_at(hit.local).is_some() => Cursor::Hand,
+        let (left, width) = self.column();
+        let cursor = match &hit {
+            None => Cursor::Arrow,
             Some(hit) if pointer.mods.ctrl() && hit.layout.link_at(hit.local).is_some() => {
                 Cursor::Hand
             }
-            _ => Cursor::IBeam,
-        });
+            Some(hit) => hit.layout.cursor_at(hit.local).unwrap_or_else(|| {
+                if pointer.position.x < left {
+                    if hit.layout.gutter_hit(hit.local).is_some() {
+                        Cursor::Hand
+                    } else {
+                        Cursor::Arrow
+                    }
+                } else if hit.layout.task_box_at(hit.local).is_some()
+                    || (!pointer.mods.shift() && self.footnote_defined_at(hit))
+                {
+                    Cursor::Hand
+                } else if hit.local.y < 0.0
+                    || hit.local.y >= hit.layout.height()
+                    || (!self.is_unwrapped() && pointer.position.x >= left + width)
+                {
+                    Cursor::Arrow
+                } else {
+                    Cursor::IBeam
+                }
+            }),
+        };
         cx.set_cursor(cursor);
         EventResult::handled()
+    }
+
+    /// Whether the link under `hit` is a footnote reference whose definition exists: a plain
+    /// click on it jumps there.
+    fn footnote_defined_at(&self, hit: &Hit) -> bool {
+        matches!(
+            hit.layout.link_at(hit.local),
+            Some(LinkTarget::Footnote(label))
+                if self.doc.borrow().ast().definitions.footnote(&label).is_some()
+        )
     }
 
     /// Extends the selection drag `drag` to the pointer at `position` (window DIPs). The probe

@@ -1144,6 +1144,48 @@ fn the_resize_handle_shows_its_cursor_previews_the_drag_and_ignores_a_zero_drag(
 }
 
 #[test]
+fn image_and_diagram_bodies_are_arrows_and_their_revealed_source_stays_text() {
+    let ready_image = ready(ObjectVisual::Image(ImageId(3)), 100.0, 40.0);
+    let mut h = harness("a\n\n![alt](p.png)\n", image_provider(ready_image));
+    h.set_caret(6);
+    let body = image_at(&h.paint());
+    let source = h.view.rect_at(8).expect("inside the source");
+    h.requests.take_cursor();
+    h.pointer(PointerEventKind::Move, body.center(), 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Arrow));
+    h.pointer(PointerEventKind::Move, source.center(), 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+
+    let scene = ready(ObjectVisual::Scene(SceneId(4)), 200.0, 100.0);
+    let mut h = mermaid_harness(scene, false);
+    h.set_caret(16);
+    let canvas = h.paint();
+    let code_box = fills(&canvas, h.theme.tokens.code_bg)[0];
+    let diagram = scene_rects(&canvas, SceneId(4))[0];
+    h.requests.take_cursor();
+    h.pointer(PointerEventKind::Move, diagram.center(), 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Arrow));
+    h.pointer(
+        PointerEventKind::Move,
+        code_box.center(),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+}
+
+#[test]
+fn an_attachment_chip_is_an_arrow_and_a_hand_with_ctrl() {
+    let mut h = chip_harness(CHIP, Rc::new(Files), false);
+    let chip = fills(&h.paint(), h.theme.tokens.code_bg)[0];
+    h.requests.take_cursor();
+    h.pointer(PointerEventKind::Move, chip.center(), 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Arrow));
+    h.pointer(PointerEventKind::Move, chip.center(), 0, Modifiers::CTRL);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Hand));
+}
+
+#[test]
 fn a_hovered_blocked_image_shows_the_hand_cursor() {
     let mut h = harness(
         "a\n\n![alt](https://x.test/p.png)\n",
@@ -1219,7 +1261,7 @@ fn a_code_block_without_a_language_hovers_with_only_the_copy_button() {
 }
 
 #[test]
-fn a_math_scene_has_the_text_cursor_and_no_context_menu() {
+fn a_math_scene_has_the_arrow_cursor_and_no_context_menu() {
     let mut h = harness(
         "a\n\n$$\nx^2\n$$\n",
         Provider {
@@ -1230,7 +1272,7 @@ fn a_math_scene_has_the_text_cursor_and_no_context_menu() {
     let scene = scene_rects(&h.paint(), SceneId(9))[0];
     h.requests.take_cursor();
     h.pointer(PointerEventKind::Move, scene.center(), 0, Modifiers::NONE);
-    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Arrow));
 
     h.events();
     let right = h.event(Event::Pointer(PointerEvent::mouse(

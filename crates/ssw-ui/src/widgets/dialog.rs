@@ -449,7 +449,7 @@ impl Widget for ContentDialog {
 mod tests {
     use super::*;
     use crate::canvas::DrawOp;
-    use crate::input::{FocusEvent, Modifiers, PointerButton, PointerEventKind};
+    use crate::input::{Cursor, FocusEvent, Modifiers, PointerButton, PointerEventKind};
     use crate::widgets::testkit::Harness;
 
     fn setup() -> (Harness, ContentDialog) {
@@ -468,6 +468,19 @@ mod tests {
             .nth(which)
             .map(|node| node.bounds.center())
             .expect("button")
+    }
+
+    #[test]
+    fn kit_dialog_requests_the_hand_over_its_buttons_only() {
+        let (mut harness, mut dialog) = setup();
+        let primary = center(&harness, &dialog, 0);
+        harness.hover(&mut dialog, primary);
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        harness.hover(&mut dialog, Point::new(5.0, 5.0));
+        assert_eq!(harness.requests.take_cursor(), None, "scrim");
+        let panel = dialog.panel_bounds(&harness.engine, &harness.theme);
+        harness.hover(&mut dialog, Point::new(panel.x + 4.0, panel.y + 4.0));
+        assert_eq!(harness.requests.take_cursor(), None, "panel padding");
     }
 
     #[test]

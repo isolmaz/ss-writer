@@ -365,7 +365,10 @@ impl BlockLayout for SceneLayout {
     }
 
     fn cursor_at(&self, point: Point) -> Option<Cursor> {
-        self.text.as_ref()?.cursor_at(point)
+        match &self.text {
+            Some(text) if point.y < text.height() => text.cursor_at(point),
+            _ => Some(Cursor::Arrow),
+        }
     }
 
     fn context_menu(&self, point: Point, origin: Point) -> Option<EditorEvent> {

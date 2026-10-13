@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- The update banner downloads the new version itself: Download fetches the release's installer while a bar in the banner shows how far it got, checks it against the release's `SHA256SUMS.txt`, and then offers "Restart and install", which closes SS Writer, installs the package and opens the new version. A package that does not match its checksum is deleted and the reason is shown. A portable copy still gets the release page.
+- Tooltips: the buttons that are only an icon name themselves after the pointer rests on them — the selection toolbar, the B/I/U pill, the sidebar and inspector toggles, the sidebar header buttons, the find bar and the Encoding and Line-ending segments of the status bar.
+
+### Fixed
+
+- The mouse pointer kept the text cursor everywhere outside the text: over the title bar, tabs, the sidebar, the status bar, banners, buttons and dialogs. Every surface now asks for its own shape: a hand over anything clickable, the text cursor over text and text boxes, the arrow over everything else. In the editor the image and diagram bodies, dividers, a narrow table's margin and the empty area below the last block are no longer text either.
+- B, I and U of the pill and the buttons of the selection toolbar did nothing: clicking them moved the keyboard focus out of the editor. The editor now keeps the focus and the selection, so the buttons do what their shortcuts do.
+- In a plain-text document (`.txt`) the formatting buttons wrote nothing because Markdown markers do not belong there, but the UI still offered them: the pill is now disabled and the selection toolbar does not appear. "Render as Markdown" turns both on again.
+- Clicking a control in the Settings window (and in the export dialog and the history panel) did not give it the keyboard, so the editor font, font size and line height could not be typed and the shortcut filter stayed empty unless the control was reached with Tab. A click now focuses the control, and the settings reach every open tab of every window at once.
+- An open drop-down in the Settings window and in the export dialog was painted behind the rows below it; open lists are now drawn above everything else.
+
+### Removed
+
+- A second, unused B/I/U pill implementation (`FormatPill` in the popups module) and the format-state scanning that only served it; the pill the window shows is the title bar's.
+
 ## [0.1.2] - 2026-10-12
 
 ### Fixed

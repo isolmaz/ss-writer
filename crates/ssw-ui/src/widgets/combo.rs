@@ -1,14 +1,15 @@
 //! The Fluent combo box: a closed box showing the selection and a drop-down popup list.
 //!
-//! The popup is part of the combo box: [`ComboBox::paint`] draws it above the box (the host
-//! paints open combo boxes last so nothing covers it) and [`ComboBox::popup_bounds`] tells the
-//! host where it hit-tests and invalidates.
+//! The popup is part of the combo box: [`ComboBox::paint`] draws it above the box. A host that
+//! paints other controls below the box draws every box with [`ComboBox::paint_box`] and the
+//! popups last with [`ComboBox::paint_popup`] so nothing covers them, and
+//! [`ComboBox::popup_bounds`] tells the host where it hit-tests and invalidates.
 
 use crate::access::{AccessAction, AccessNode, AccessTree, Role};
 use crate::canvas::{Canvas, IconFont};
 use crate::geometry::{CornerRadii, Insets, Point, Rect, Size};
 use crate::input::{
-    Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
+    Cursor, Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
 };
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
 
@@ -271,6 +272,9 @@ impl ComboBox {
         let popup_rect = self.popup_rect();
         let on_box = self.bounds.contains(event.position);
         let on_popup = popup_rect.contains(event.position);
+        if on_box && event.kind == PointerEventKind::Move {
+            cx.set_cursor(Cursor::Hand);
+        }
         let down =
             event.kind == PointerEventKind::Down && event.button == Some(PointerButton::Left);
         if down && !on_popup {
@@ -351,58 +355,8 @@ impl Widget for ComboBox {
     }
 
     fn paint(&self, cx: &PaintCx, canvas: &mut dyn Canvas) {
-        let tokens = &cx.theme.tokens;
-        if cx.needs_paint(self.bounds) {
-            let radii = CornerRadii::uniform(tokens.metrics.control_radius);
-            let fill = if self.enabled {
-                self.interaction.blend(
-                    tokens.surface,
-                    tokens.hover_bg.over(tokens.surface),
-                    tokens.pressed_bg.over(tokens.surface),
-                )
-            } else {
-                tokens.surface
-            };
-            canvas.fill_rounded_rect(self.bounds, radii, fill);
-            canvas.stroke_rounded_rect(
-                self.bounds.inset(Insets::uniform(0.5)),
-                radii,
-                tokens.hairline,
-                1.0,
-            );
-            let color = if self.enabled {
-                tokens.text
-            } else {
-                tokens.text_disabled
-            };
-            if let Some(text) = self.selected_text() {
-                let layout = layout_line(cx.text, cx.theme, text, FONT_SIZE);
-                draw_left_centered(
-                    canvas,
-                    layout.as_ref(),
-                    self.bounds.x + CONTROL_PADDING,
-                    self.bounds,
-                    color,
-                );
-            }
-            canvas.draw_icon(
-                glyph::CHEVRON_DOWN,
-                IconFont::SegoeFluent,
-                CHEVRON_SIZE,
-                color,
-                Point::new(
-                    self.bounds.right() - CONTROL_PADDING - CHEVRON_SIZE / 2.0,
-                    self.bounds.center().y,
-                ),
-            );
-            if cx.is_focused() {
-                focus_ring::paint(canvas, self.bounds, tokens.metrics.control_radius, cx.theme);
-            }
-        }
-        if let Some(list) = &self.popup {
-            paint_overlay(canvas, self.popup_rect(), tokens.menu_bg, cx.theme);
-            list.paint(&cx.for_widget(list.id()), canvas);
-        }
+        self.paint_box(cx, canvas);
+        self.paint_popup(cx, canvas);
     }
 
     fn event(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
@@ -485,6 +439,73 @@ impl Widget for ComboBox {
     }
 }
 
+impl ComboBox {
+    /// Draws the closed box (and its focus ring) without the popup. A host that paints several
+    /// controls calls this for each of them and [`ComboBox::paint_popup`] after the last one, so
+    /// the popup is above the controls under it ([`Widget::paint`] does both in a row).
+    pub fn paint_box(&self, cx: &PaintCx, canvas: &mut dyn Canvas) {
+        let tokens = &cx.theme.tokens;
+        if cx.needs_paint(self.bounds) {
+            let radii = CornerRadii::uniform(tokens.metrics.control_radius);
+            let fill = if self.enabled {
+                self.interaction.blend(
+                    tokens.surface,
+                    tokens.hover_bg.over(tokens.surface),
+                    tokens.pressed_bg.over(tokens.surface),
+                )
+            } else {
+                tokens.surface
+            };
+            canvas.fill_rounded_rect(self.bounds, radii, fill);
+            canvas.stroke_rounded_rect(
+                self.bounds.inset(Insets::uniform(0.5)),
+                radii,
+                tokens.hairline,
+                1.0,
+            );
+            let color = if self.enabled {
+                tokens.text
+            } else {
+                tokens.text_disabled
+            };
+            if let Some(text) = self.selected_text() {
+                let layout = layout_line(cx.text, cx.theme, text, FONT_SIZE);
+                draw_left_centered(
+                    canvas,
+                    layout.as_ref(),
+                    self.bounds.x + CONTROL_PADDING,
+                    self.bounds,
+                    color,
+                );
+            }
+            canvas.draw_icon(
+                glyph::CHEVRON_DOWN,
+                IconFont::SegoeFluent,
+                CHEVRON_SIZE,
+                color,
+                Point::new(
+                    self.bounds.right() - CONTROL_PADDING - CHEVRON_SIZE / 2.0,
+                    self.bounds.center().y,
+                ),
+            );
+            if cx.is_focused() {
+                focus_ring::paint(canvas, self.bounds, tokens.metrics.control_radius, cx.theme);
+            }
+        }
+    }
+
+    /// Draws the popup while it is open and the damage reaches it.
+    pub fn paint_popup(&self, cx: &PaintCx, canvas: &mut dyn Canvas) {
+        let rect = self.popup_rect();
+        if let Some(list) = &self.popup
+            && cx.needs_paint(rect)
+        {
+            paint_overlay(canvas, rect, cx.theme.tokens.menu_bg, cx.theme);
+            list.paint(&cx.for_widget(list.id()), canvas);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +524,28 @@ mod tests {
         let mut combo = ComboBox::new("Fruit", fruit(), selected).with_motion(Motion::reduced());
         let bounds = harness.place(&mut combo, Point::new(10.0, 10.0));
         (harness, combo, bounds)
+    }
+
+    #[test]
+    fn kit_combo_requests_the_hand_over_the_box_and_popup_rows() {
+        let (mut harness, mut combo, bounds) = setup(Some(0));
+        harness.hover(&mut combo, bounds.center());
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        harness.hover(&mut combo, Point::new(900.0, 900.0));
+        assert_eq!(harness.requests.take_cursor(), None);
+        harness.click(&mut combo, bounds.center());
+        harness.requests.take_cursor();
+        // Open: the box and the popup rows are clickable, the rest of the window is not.
+        harness.hover(&mut combo, bounds.center());
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        let popup = combo.popup_bounds().expect("popup");
+        harness.hover(&mut combo, Point::new(popup.x + 20.0, popup.y + 20.0));
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        harness.hover(&mut combo, Point::new(900.0, 900.0));
+        assert_eq!(harness.requests.take_cursor(), None);
+        combo.set_enabled(false);
+        harness.hover(&mut combo, bounds.center());
+        assert_eq!(harness.requests.take_cursor(), None);
     }
 
     #[test]

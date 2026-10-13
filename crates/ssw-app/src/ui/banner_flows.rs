@@ -250,8 +250,9 @@ impl Controller {
                 self.remote_images().set_disabled(entry.id(), true);
                 self.remote_images_changed(cell);
             }
-            // The update banner's Download needs no document.
-            (BannerAction::Download, _) => self.open_update_page(),
+            // The update banner's buttons need no document.
+            (BannerAction::Download, _) => self.start_update_download(),
+            (BannerAction::Restart, _) => self.install_update(),
             (_, None) => {}
         }
     }

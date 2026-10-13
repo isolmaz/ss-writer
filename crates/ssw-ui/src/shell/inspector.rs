@@ -22,7 +22,7 @@ use crate::access::{AccessAction, AccessNode, AccessTree, Role};
 use crate::canvas::{Canvas, Dash, IconFont};
 use crate::geometry::{CornerRadii, Insets, Point, Rect, Size};
 use crate::input::{
-    Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
+    Cursor, Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
 };
 use crate::text::FontWeight;
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
@@ -720,6 +720,11 @@ impl Inspector {
             return bar;
         }
         let hit = self.hit(event.position);
+        if matches!(event.kind, PointerEventKind::Move | PointerEventKind::Enter)
+            && hit.is_some_and(|hit| self.is_clickable(hit))
+        {
+            cx.set_cursor(Cursor::Hand);
+        }
         match (event.kind, event.button) {
             (PointerEventKind::Down, Some(PointerButton::Left)) => {
                 let Some(hit) = hit else {
@@ -742,6 +747,16 @@ impl Inspector {
             (PointerEventKind::Move | PointerEventKind::Enter, _) => self.hover_to(cx, hit),
             (PointerEventKind::Leave, _) => self.hover_to(cx, None),
             _ => EventResult::ignored(),
+        }
+    }
+
+    /// Whether a click on `hit` does something: the Info tab's plain rows are inert.
+    fn is_clickable(&self, hit: Hit) -> bool {
+        match hit {
+            Hit::Item(item) if self.tab == InspectorTab::Info => {
+                matches!(self.info_rows().nth(item), Some(InfoRow::Link { .. }))
+            }
+            _ => true,
         }
     }
 
@@ -2196,6 +2211,28 @@ mod tests {
         let fills = hover_fills(&mut harness, &inspector);
         assert_eq!(fills.len(), 1);
         assert!(second.contains_rect(fills[0]));
+    }
+
+    #[test]
+    fn tabs_and_backlinks_ask_for_the_hand_and_the_header_padding_for_nothing() {
+        let (mut harness, mut inspector) = setup();
+        fill_info(&mut inspector);
+        inspector.set_tab(InspectorTab::Info);
+        harness.arrange(&mut inspector, Rect::new(800.0, 80.0, 280.0, 400.0));
+        focus_list(&mut harness, &inspector);
+        harness.key(&mut inspector, vk::DOWN);
+        harness.key(&mut inspector, vk::DOWN);
+        let tab = inspector.tab_rect(InspectorTab::Contents).center();
+        let link = inspector.item_rect(16).center();
+        for (at, cursor) in [
+            (tab, Some(Cursor::Hand)),
+            (link, Some(Cursor::Hand)),
+            (Point::new(801.0, 100.0), None),
+        ] {
+            harness.requests.take_cursor();
+            harness.hover(&mut inspector, at);
+            assert_eq!(harness.requests.take_cursor(), cursor);
+        }
     }
 
     #[test]

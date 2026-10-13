@@ -511,3 +511,29 @@ fn the_panel_itself_takes_no_accessibility_actions() {
         assert!(!Widget::perform(&mut panel, &mut cx, &action));
     }
 }
+
+#[test]
+fn results_and_toggles_ask_for_the_hand_the_box_for_the_beam_and_the_header_for_nothing() {
+    use ssw_ui::input::Cursor;
+    let (mut host, mut panel) = setup();
+    show_results(&mut host, &mut panel);
+    let tree = host.tree(&panel);
+    let row = panel.list().row_rect(2).expect("row 2").center();
+    let targets = [
+        (row, Some(Cursor::Hand)),
+        (
+            node_named(&tree, "Match case").bounds.center(),
+            Some(Cursor::Hand),
+        ),
+        (
+            node_named(&tree, "Search in folder").bounds.center(),
+            Some(Cursor::IBeam),
+        ),
+        (Point::new(row.x, panel.list().bounds().y - 1.0), None),
+    ];
+    for (at, cursor) in targets {
+        host.requests.take_cursor();
+        host.pointer(&mut panel, PointerEventKind::Move, at);
+        assert_eq!(host.requests.take_cursor(), cursor, "{at:?}");
+    }
+}

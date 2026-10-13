@@ -31,6 +31,8 @@ grep-regex = "0.1"
 grep-matcher = "0.1"
 regex = "1"
 blake3 = "1"
+# SHA-256 of downloaded installers (the version `xtask` and the lockfile already use).
+sha2 = "0.10"
 windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",

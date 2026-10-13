@@ -27,6 +27,10 @@ const DETAIL_PADDING: f32 = 8.0;
 pub const MAX_DETAIL_ROWS: usize = 6;
 /// Inset of the details text from the panel's left edge.
 const DETAIL_INSET: f32 = 32.0;
+/// Thickness of the download bar along the lower edge of a banner.
+const PROGRESS_HEIGHT: f32 = 3.0;
+/// Distance of the download bar from the banner's edges.
+const PROGRESS_INSET: f32 = 12.0;
 
 /// The kinds of banner; the host holds at most one of each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,8 +66,10 @@ pub enum BannerAction {
     Restore,
     /// Delete the recovered text.
     Discard,
-    /// Open the page of the newer release.
+    /// Download the newer release.
     Download,
+    /// Install the downloaded release: leave and come back.
+    Restart,
 }
 
 /// What the user did to the stack.
@@ -176,6 +182,8 @@ struct Entry {
     slots: Vec<Slot>,
     details: Option<Details>,
     details_rect: Rect,
+    /// How far a running download got (0 to 1); drawn as a bar along the banner's lower edge.
+    progress: Option<f32>,
 }
 
 impl Entry {
@@ -248,6 +256,7 @@ impl BannerHost {
             slots: actions.iter().map(|(_, slot)| *slot).collect(),
             details: None,
             details_rect: Rect::ZERO,
+            progress: None,
         }
     }
 
@@ -357,6 +366,51 @@ impl BannerHost {
             title,
             message,
             &[(&download, Slot::Emit(BannerAction::Download))],
+            true,
+        );
+        self.insert(entry);
+    }
+
+    /// Shows the running download of the release: a bar along the lower edge instead of a
+    /// button. It cannot be closed; the banner is replaced when the download ends.
+    pub fn show_update_download(&mut self, title: &str, message: &str, fraction: f32) {
+        let mut entry = self.build(
+            BannerKind::Update,
+            Severity::Info,
+            title,
+            message,
+            &[],
+            false,
+        );
+        entry.progress = Some(fraction.clamp(0.0, 1.0));
+        self.insert(entry);
+    }
+
+    /// Moves the bar of the running download and replaces its message. False when no download
+    /// banner is up (the user never started one, or it already finished).
+    pub fn set_update_progress(&mut self, message: &str, fraction: f32) -> bool {
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.kind == BannerKind::Update && entry.progress.is_some())
+        else {
+            return false;
+        };
+        entry.progress = Some(fraction.clamp(0.0, 1.0));
+        entry.banner.set_message(message);
+        true
+    }
+
+    /// Shows the downloaded release with the button that installs it. Closing the banner leaves
+    /// the file where it is: the install waits for the next time.
+    pub fn show_update_ready(&mut self, title: &str, message: &str, restart: &str) {
+        let restart = restart.to_owned();
+        let entry = self.build(
+            BannerKind::Update,
+            Severity::Info,
+            title,
+            message,
+            &[(&restart, Slot::Emit(BannerAction::Restart))],
             true,
         );
         self.insert(entry);
@@ -503,6 +557,19 @@ impl Widget for BannerHost {
             entry
                 .banner
                 .paint(&cx.for_widget(entry.banner.id()), canvas);
+            if let Some(fraction) = entry.progress {
+                let banner = entry.banner.bounds();
+                let track = Rect::new(
+                    banner.x + PROGRESS_INSET,
+                    banner.bottom() - PROGRESS_HEIGHT - PROGRESS_INSET,
+                    (banner.width - 2.0 * PROGRESS_INSET).max(0.0),
+                    PROGRESS_HEIGHT,
+                );
+                let radii = CornerRadii::uniform(PROGRESS_HEIGHT / 2.0);
+                canvas.fill_rounded_rect(track, radii, tokens.hairline);
+                let done = Rect::new(track.x, track.y, track.width * fraction, track.height);
+                canvas.fill_rounded_rect(done, radii, tokens.accent);
+            }
             let Some(details) = entry.details.as_ref().filter(|d| d.expanded) else {
                 continue;
             };
@@ -1010,6 +1077,67 @@ mod tests {
     }
 
     #[test]
+    fn the_download_banner_draws_how_far_it_got_and_the_ready_banner_offers_a_restart() {
+        let (mut harness, mut host) = host();
+        let accent = harness.theme.tokens.accent;
+        let bar = |harness: &mut Harness, host: &BannerHost| {
+            harness
+                .paint(host)
+                .ops()
+                .find_map(|op| match op {
+                    DrawOp::FillRoundedRect { rect, color, .. } if *color == accent => {
+                        Some(rect.width)
+                    }
+                    _ => None,
+                })
+                .expect("the download bar")
+        };
+
+        host.show_update_download("Downloading SS Writer 1.2.0", "0 of 34 MB downloaded.", 0.0);
+        layout(&mut harness, &mut host);
+        // A running download has nothing to click: no action and no close button.
+        assert!(harness.focus.tab_order().is_empty());
+        assert_eq!(bar(&mut harness, &host), 0.0);
+
+        assert!(host.set_update_progress("17 of 34 MB downloaded.", 0.5));
+        layout(&mut harness, &mut host);
+        let half = bar(&mut harness, &host);
+        let track =
+            host.banner_rect(BannerKind::Update).expect("rect").width - 2.0 * PROGRESS_INSET;
+        assert!(
+            (half - track / 2.0).abs() < 0.5,
+            "half of {track} is not {half}"
+        );
+        assert!(
+            harness
+                .paint(&host)
+                .texts()
+                .contains(&"17 of 34 MB downloaded.")
+        );
+        // Out of range values stay inside the track.
+        assert!(host.set_update_progress("done", 4.0));
+        layout(&mut harness, &mut host);
+        assert!((bar(&mut harness, &host) - track).abs() < 0.01);
+
+        host.show_update_ready("Ready to install", "SS Writer restarts.", "Restart");
+        host.take_events();
+        layout(&mut harness, &mut host);
+        // The download is over: nothing moves the bar any more and the banner can be closed.
+        assert!(!host.set_update_progress("late", 0.2));
+        let order = harness.focus.tab_order().to_vec();
+        assert_eq!(order.len(), 2);
+        harness.focus.focus(order[0]);
+        assert!(harness.key(&mut host, vk::SPACE).handled);
+        assert_eq!(
+            host.take_events(),
+            vec![HostEvent::Action {
+                kind: BannerKind::Update,
+                action: BannerAction::Restart
+            }]
+        );
+    }
+
+    #[test]
     fn a_custom_id_names_the_host_in_the_access_tree() {
         let id = WidgetId::allocate();
         let host = BannerHost::new(BannerStrings::from_localizer(&localizer())).with_id(id);
@@ -1066,5 +1194,24 @@ mod tests {
             Point::new(100.0, 100.0),
         );
         assert!(host.take_events().is_empty());
+    }
+
+    #[test]
+    fn banner_buttons_ask_for_the_hand_and_the_message_for_nothing() {
+        use crate::input::Cursor;
+        let (mut harness, mut host) = host();
+        host.show_update("Update available", "Version 1.2.0 is out.", "Download");
+        layout(&mut harness, &mut host);
+        let rect = host.banner_rect(BannerKind::Update).expect("rect");
+        let close = Point::new(rect.right() - 8.0 - 16.0, rect.center().y);
+        harness.pointer(&mut host, PointerEventKind::Move, None, close);
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        harness.pointer(
+            &mut host,
+            PointerEventKind::Move,
+            None,
+            Point::new(rect.x + 2.0, rect.center().y),
+        );
+        assert_eq!(harness.requests.take_cursor(), None);
     }
 }

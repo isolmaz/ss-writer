@@ -878,6 +878,59 @@ fn the_cursor_follows_gutter_widgets_and_ctrl_over_links() {
 }
 
 #[test]
+fn the_cursor_is_an_arrow_where_there_is_no_text() {
+    let mut h = Harness::new("see\n");
+    let cursor_at = |h: &mut Harness, x: f32, y: f32| {
+        h.pointer(PointerEventKind::Move, Point::new(x, y), 0, Modifiers::NONE);
+        h.requests.take_cursor()
+    };
+    let (left, line) = (h.left, TOP + 14.0);
+    assert_eq!(cursor_at(&mut h, left + 100.0, line), Some(Cursor::IBeam));
+    assert_eq!(
+        cursor_at(&mut h, left + 100.0, TOP / 2.0),
+        Some(Cursor::Arrow)
+    );
+    assert_eq!(
+        cursor_at(&mut h, left + 100.0, TOP + 100.0),
+        Some(Cursor::Arrow)
+    );
+    assert_eq!(
+        cursor_at(&mut h, left + 352.0 + 4.0, line),
+        Some(Cursor::Arrow)
+    );
+}
+
+#[test]
+fn a_footnote_reference_with_a_definition_is_a_hand_and_one_without_is_text() {
+    let mut h = Harness::new("a[^1]\n\n[^1]: note\n");
+    h.set_caret(18);
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(1),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Hand));
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(1),
+        0,
+        Modifiers::SHIFT,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+
+    let mut h = Harness::new("a[^2]\n\nb\n");
+    h.set_caret(8);
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(1),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+}
+
+#[test]
 fn dragging_by_words_and_paragraphs_extends_by_whole_units() {
     let mut h = Harness::new("one two three\n\nfour five\n");
     h.pointer(

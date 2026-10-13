@@ -18,7 +18,7 @@ use crate::access::{AccessAction, AccessNode, AccessTree, Role};
 use crate::canvas::{Canvas, IconFont};
 use crate::geometry::{CornerRadii, Insets, Point, Rect, Size};
 use crate::input::{
-    Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
+    Cursor, Event, FocusEvent, KeyEvent, PointerButton, PointerEvent, PointerEventKind, vk,
 };
 use crate::text::FontWeight;
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
@@ -998,6 +998,9 @@ impl SidebarView {
         event: &PointerEvent,
         row: Option<usize>,
     ) -> EventResult {
+        if row.is_some() || self.press.is_some() {
+            cx.set_cursor(Cursor::Hand);
+        }
         if let Some(drag) = self.drag {
             let target = self
                 .drop_target_at(event.position)
@@ -1538,6 +1541,15 @@ impl Widget for SidebarView {
 }
 
 impl SidebarView {
+    /// The header button under `point` and its name, the text of its tooltip.
+    #[must_use]
+    pub fn tooltip_at(&self, point: Point) -> Option<(Rect, &str)> {
+        [&self.more, &self.new]
+            .into_iter()
+            .find(|button| button.bounds().contains(point))
+            .map(|button| (button.bounds(), button.label()))
+    }
+
     fn forward_to_buttons(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
         let more_id = self.more.id();
         let new_id = self.new.id();
@@ -2127,6 +2139,32 @@ mod tests {
             .send(&mut f.view, Event::Focus(FocusEvent::Gained));
         f.harness.frame(&mut f.view, 16);
         assert!(f.harness.paint(&f.view).is_balanced());
+    }
+
+    #[test]
+    fn rows_and_header_buttons_ask_for_the_hand_and_inert_areas_for_nothing() {
+        let mut f = fixture(SidebarOptions::default());
+        let cursor_at = |f: &mut Fixture, at: Point| {
+            f.harness.requests.take_cursor();
+            f.harness
+                .pointer(&mut f.view, PointerEventKind::Move, None, at);
+            f.harness.requests.take_cursor()
+        };
+        let row = f.row_center(1);
+        assert_eq!(cursor_at(&mut f, row), Some(Cursor::Hand));
+        let more = f.view.more.bounds().center();
+        assert_eq!(cursor_at(&mut f, more), Some(Cursor::Hand));
+        assert_eq!(cursor_at(&mut f, Point::new(20.0, 100.0)), None);
+        f.harness.pointer(
+            &mut f.view,
+            PointerEventKind::Down,
+            Some(PointerButton::Left),
+            row,
+        );
+        assert_eq!(
+            cursor_at(&mut f, Point::new(20.0, 100.0)),
+            Some(Cursor::Hand)
+        );
     }
 
     #[test]

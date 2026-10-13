@@ -3,7 +3,7 @@
 use crate::access::{AccessAction, AccessNode, AccessTree, RangeValue, Role};
 use crate::canvas::Canvas;
 use crate::geometry::{CornerRadii, Insets, Rect, Size};
-use crate::input::{Event, FocusEvent, PointerButton, PointerEvent, PointerEventKind, vk};
+use crate::input::{Cursor, Event, FocusEvent, PointerButton, PointerEvent, PointerEventKind, vk};
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
 
 use super::anim::Motion;
@@ -177,6 +177,9 @@ impl Slider {
         }
         let left = event.button == Some(PointerButton::Left);
         let inside = self.bounds.contains(event.position);
+        if event.kind == PointerEventKind::Move && (inside || self.dragging) {
+            cx.set_cursor(Cursor::Hand);
+        }
         match event.kind {
             PointerEventKind::Down if left && inside => {
                 self.dragging = true;
@@ -437,6 +440,34 @@ mod tests {
         // Moving by a key that changes nothing queues nothing.
         harness.key(&mut slider, vk::END);
         assert_eq!(slider.take_changed(), None);
+    }
+
+    #[test]
+    fn kit_slider_requests_the_hand_over_the_track_and_while_dragging() {
+        let (mut harness, mut slider, bounds) = placed(0.0);
+        let y = bounds.center().y;
+        harness.hover(&mut slider, Point::new(110.0, y));
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        harness.hover(&mut slider, Point::new(1000.0, y));
+        assert_eq!(harness.requests.take_cursor(), None);
+        harness.pointer(
+            &mut slider,
+            PointerEventKind::Down,
+            Some(PointerButton::Left),
+            Point::new(110.0, y),
+        );
+        harness.requests.take_cursor();
+        harness.hover(&mut slider, Point::new(1000.0, y));
+        assert_eq!(harness.requests.take_cursor(), Some(Cursor::Hand));
+        slider.set_enabled(false);
+        harness.pointer(
+            &mut slider,
+            PointerEventKind::Up,
+            Some(PointerButton::Left),
+            Point::new(1000.0, y),
+        );
+        harness.hover(&mut slider, Point::new(110.0, y));
+        assert_eq!(harness.requests.take_cursor(), None);
     }
 
     #[test]

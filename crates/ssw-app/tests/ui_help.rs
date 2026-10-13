@@ -5,20 +5,22 @@
 //! disk, the dialogs shown, the shell requests and the accessibility tree. Nothing is shown.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::Args;
 use ssw_app::documents::{DocError, canonical_path};
 use ssw_app::startup::ProcessEnv;
-use ssw_app::ui::controller::{Controller, WindowCell};
+use ssw_app::ui::controller::{Controller, Request, WindowCell};
 use ssw_app::ui::help::{
     ISSUES_URL, THIRD_PARTY_NOTICES, about_message, shortcuts_markdown, write_help_file,
 };
 use ssw_app::ui::scripted_services::{Answer, DialogKind, ScriptedServices, ShellRecord};
+use ssw_app::update_apply::Launcher;
 use ssw_core::command::CommandId;
 use ssw_io::fs::{FaultFs, FileSystem, FsFailure, FsOp, RealFs};
 use ssw_io::net::{Http, HttpRequest, HttpResponse, NetError, ScriptedHttp, Url};
@@ -93,6 +95,16 @@ impl<B: FnOnce(&Rig)> ShellHost for Host<B> {
 
 /// Runs `body` over a started application whose first window shows `notes.md`.
 fn with_rig(settings: &str, body: impl FnOnce(&Rig)) {
+    with_rig_of(settings, false, body);
+}
+
+/// The same application, started as a portable copy (the `portable` marker next to the
+/// executable), which has no package to install.
+fn with_portable_rig(body: impl FnOnce(&Rig)) {
+    with_rig_of(NO_AUTOSAVE, true, body);
+}
+
+fn with_rig_of(settings: &str, portable: bool, body: impl FnOnce(&Rig)) {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -100,6 +112,11 @@ fn with_rig(settings: &str, body: impl FnOnce(&Rig)) {
     let roaming = tmp.path().join("profile").join("roaming").join("SS Writer");
     std::fs::create_dir_all(&roaming).unwrap();
     std::fs::write(roaming.join("settings.json"), settings).unwrap();
+    let exe_dir = tmp.path().join("profile").join("exe");
+    std::fs::create_dir_all(&exe_dir).unwrap();
+    if portable {
+        std::fs::write(exe_dir.join("portable"), []).unwrap();
+    }
     let mut args = Args {
         paths: vec![work.join("notes.md")],
         ..Args::default()
@@ -226,6 +243,31 @@ impl Rig {
         self.click(node.bounds.center());
     }
 
+    /// Points the restart at `launcher` and at a small file of its own instead of the test
+    /// executable. Returns that file and the folder the updater copy goes into.
+    fn updater_seam(&self, launcher: Arc<dyn Launcher>) -> (PathBuf, PathBuf) {
+        let dir = self
+            .controller
+            .core()
+            .borrow()
+            .paths
+            .local_dir()
+            .join("exe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("SSWriter.exe");
+        std::fs::write(&exe, b"the application").unwrap();
+        let temp = dir.join("temp");
+        std::fs::create_dir_all(&temp).unwrap();
+        self.controller
+            .set_updater(launcher, exe.clone(), temp.clone());
+        (exe, temp)
+    }
+
+    /// What the controller asked the loop owner to do.
+    fn requests(&self) -> Vec<Request> {
+        std::iter::from_fn(|| self.controller.take_request()).collect()
+    }
+
     fn help_dir(&self) -> PathBuf {
         self.controller
             .core()
@@ -238,10 +280,23 @@ impl Rig {
 
 /// The release feed's answer for a release with `tag`.
 fn release_json(tag: &str) -> Vec<u8> {
+    let version = tag.trim_start_matches('v');
     format!(
-        r#"{{"tag_name":"{tag}","html_url":"https://github.com/isolmaz/ss-writer/releases/tag/{tag}"}}"#
+        r#"{{"tag_name":"{tag}","html_url":"https://github.com/isolmaz/ss-writer/releases/tag/{tag}","assets":[{{"name":"SSWriter-{version}-x64.msi","browser_download_url":"{}","size":9}},{{"name":"SHA256SUMS.txt","browser_download_url":"{}","size":78}}]}}"#,
+        installer_url(tag),
+        checksums_url(tag),
     )
     .into_bytes()
+}
+
+/// Where the fake release serves its package and its checksum list.
+fn installer_url(tag: &str) -> String {
+    let version = tag.trim_start_matches('v');
+    format!("https://downloads.invalid/{tag}/SSWriter-{version}-x64.msi")
+}
+
+fn checksums_url(tag: &str) -> String {
+    format!("https://downloads.invalid/{tag}/SHA256SUMS.txt")
 }
 
 fn feed_url() -> String {
@@ -468,14 +523,165 @@ fn checking_for_updates_now_offers_a_newer_release_in_a_banner() {
         assert_eq!(http.requests(), [feed_url()]);
         assert_eq!(rig.banners(), [BannerKind::Update]);
         assert!(rig.shows("99.0.0"), "the banner names the version");
+    });
+}
 
-        // Download opens the release page; nothing is downloaded.
+/// A package served as `installer` and the checksum list that covers it.
+const PACKAGE: &[u8] = b"installer";
+const PACKAGE_SHA256: &str = "9c0d294c05fc1d88d698034609bb81c0c69196327594e4c69d2915c80fd9850c";
+const TEXT_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/plain";
+const PACKAGE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream";
+
+/// Records what the application asked to start instead of starting a process.
+#[derive(Debug, Default)]
+struct RecordingLauncher(Mutex<Vec<(PathBuf, Vec<OsString>)>>);
+
+impl RecordingLauncher {
+    fn launches(&self) -> Vec<(PathBuf, Vec<OsString>)> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Launcher for RecordingLauncher {
+    fn launch(&self, program: &Path, args: &[OsString]) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((program.to_path_buf(), args.to_vec()));
+        Ok(())
+    }
+}
+
+/// Serves the release, its checksum list and its package.
+fn update_network(tag: &str, sums: &str) -> Arc<ScriptedHttp> {
+    let http = network_with(&[tag]);
+    http.respond(&checksums_url(tag), TEXT_HEAD, sums.as_bytes());
+    http.respond(&installer_url(tag), PACKAGE_HEAD, PACKAGE);
+    http
+}
+
+#[test]
+fn downloading_the_update_fills_the_banner_and_the_restart_starts_the_updater() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let sums = format!("{PACKAGE_SHA256}  SSWriter-99.0.0-x64.msi\n");
+        let http = update_network("v99.0.0", &sums);
+        rig.controller
+            .set_update_http(Arc::clone(&http) as Arc<dyn Http>);
+        let launcher = Arc::new(RecordingLauncher::default());
+        let (exe, temp) = rig.updater_seam(Arc::clone(&launcher) as Arc<dyn Launcher>);
+        rig.command(CommandId::HelpCheckForUpdates);
+        rig.settle();
+
         rig.press_in(BannerKind::Update, "Download");
+        rig.settle();
+        // The package was fetched after its checksum list, and verified.
+        assert_eq!(
+            http.requests(),
+            [
+                feed_url(),
+                checksums_url("v99.0.0"),
+                installer_url("v99.0.0")
+            ]
+        );
+        let package = rig
+            .controller
+            .core()
+            .borrow()
+            .paths
+            .local_dir()
+            .join("updates")
+            .join("SSWriter-99.0.0-x64.msi");
+        assert_eq!(std::fs::read(&package).unwrap(), PACKAGE);
+        // The banner now offers the restart instead of the download.
+        assert_eq!(rig.banners(), [BannerKind::Update]);
+        assert!(rig.shows("ready to install"), "the banner names the state");
+        assert!(rig.services.shell_log().is_empty(), "no browser is opened");
+
+        rig.press_in(BannerKind::Update, "Restart and install");
+        let launches = launcher.launches();
+        assert_eq!(launches.len(), 1, "{launches:?}");
+        let (program, args) = &launches[0];
+        assert!(
+            program.starts_with(&temp) && program.ends_with("SSWriter-updater.exe"),
+            "{program:?} is a copy below {temp:?}"
+        );
+        assert_eq!(
+            std::fs::read(program).unwrap(),
+            std::fs::read(&exe).unwrap()
+        );
+        assert_eq!(
+            args.iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "--apply-update".to_owned(),
+                package.display().to_string(),
+                "--updater-parent".to_owned(),
+                std::process::id().to_string(),
+                "--updater-target".to_owned(),
+                exe.display().to_string(),
+            ]
+        );
+        let requests = rig.requests();
+        assert!(requests.contains(&Request::Quit), "{requests:?}");
+    });
+}
+
+#[test]
+fn a_package_that_does_not_match_its_checksum_is_refused_and_the_button_comes_back() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let wrong = format!("{:064x}  SSWriter-99.0.0-x64.msi\n", 1);
+        let http = update_network("v99.0.0", &wrong);
+        rig.controller
+            .set_update_http(Arc::clone(&http) as Arc<dyn Http>);
+        rig.command(CommandId::HelpCheckForUpdates);
+        rig.settle();
+        rig.answer(MessageBoxResult::Ok);
+        rig.press_in(BannerKind::Update, "Download");
+        rig.settle();
+
+        let shown = rig.services.dialog_log();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].title, "Download failed");
+        assert!(shown[0].message.contains("checksum"), "{:?}", shown[0]);
+        let dir = rig
+            .controller
+            .core()
+            .borrow()
+            .paths
+            .local_dir()
+            .join("updates");
+        assert!(
+            std::fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_none()),
+            "nothing is kept in {dir:?}"
+        );
+        assert!(
+            rig.shows("Download"),
+            "the banner offers the download again"
+        );
+    });
+}
+
+#[test]
+fn a_portable_build_opens_the_release_page_instead_of_downloading() {
+    with_portable_rig(|rig| {
+        let http = network_with(&["v99.0.0"]);
+        rig.controller
+            .set_update_http(Arc::clone(&http) as Arc<dyn Http>);
+        rig.command(CommandId::HelpCheckForUpdates);
+        rig.settle();
+        rig.press_in(BannerKind::Update, "Download");
+        rig.settle();
         assert_eq!(
             rig.services.shell_log(),
-            [ShellRecord::OpenUrl(release.page_url.clone())]
+            [ShellRecord::OpenUrl(
+                "https://github.com/isolmaz/ss-writer/releases/tag/v99.0.0".to_owned()
+            )]
         );
-        assert_eq!(rig.banners(), [BannerKind::Update]);
+        assert_eq!(http.requests(), [feed_url()], "nothing is downloaded");
     });
 }
 

@@ -568,3 +568,28 @@ fn assistive_technology_selects_versions_and_scrolls_the_changes() {
     assert!(row_names(&host, &panel).contains(&"line 299".to_owned()));
     assert!(!host.perform(&mut panel, bar.id, AccessAction::Invoke));
 }
+
+#[test]
+fn versions_and_buttons_ask_for_the_hand_and_the_diff_area_for_nothing() {
+    use ssw_ui::input::Cursor;
+    let (mut panel, mut host) = open();
+    select_first(&mut panel, &mut host);
+    let version = host.node(&panel, Role::ListItem, "Today 14:00 — 200 bytes");
+    let restore = host.node(&panel, Role::Button, "Restore this version");
+    let close = host.node(&panel, Role::Button, "Close");
+    for node in [&version, &restore, &close] {
+        assert_eq!(
+            host.cursor_at(&mut panel, node.bounds.center()),
+            Some(Cursor::Hand),
+            "{}",
+            node.name
+        );
+    }
+    assert_eq!(
+        host.cursor_at(
+            &mut panel,
+            Point::new(PANEL.width / 2.0, PANEL.height / 2.0)
+        ),
+        None
+    );
+}

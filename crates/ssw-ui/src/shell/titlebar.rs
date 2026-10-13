@@ -176,6 +176,7 @@ struct ToolButton {
     text: String,
     face: Face,
     on: bool,
+    enabled: bool,
     bounds: Rect,
     interaction: Interaction,
     activated: u32,
@@ -205,6 +206,7 @@ impl ToolButton {
             text: text.to_owned(),
             face,
             on: false,
+            enabled: true,
             bounds: Rect::ZERO,
             interaction: Interaction::new(Motion::full()),
             activated: 0,
@@ -233,7 +235,9 @@ impl Widget for ToolButton {
 
     fn arrange(&mut self, cx: &mut LayoutCx, bounds: Rect) {
         self.bounds = bounds;
-        cx.add_tab_stop();
+        if self.enabled {
+            cx.add_tab_stop();
+        }
     }
 
     fn paint(&self, cx: &PaintCx, canvas: &mut dyn Canvas) {
@@ -251,7 +255,13 @@ impl Widget for ToolButton {
             .interaction
             .blend(base, tokens.hover_bg, tokens.pressed_bg);
         canvas.fill_rounded_rect(self.bounds, CornerRadii::uniform(radius), fill);
-        let color = if self.on { tokens.accent } else { tokens.text };
+        let color = if !self.enabled {
+            tokens.text_disabled
+        } else if self.on {
+            tokens.accent
+        } else {
+            tokens.text
+        };
         match self.face {
             Face::Icon(glyph) => canvas.draw_icon(
                 glyph,
@@ -286,7 +296,9 @@ impl Widget for ToolButton {
     fn event(&mut self, cx: &mut EventCx, e: &Event) -> EventResult {
         match e {
             Event::Pointer(event) => {
-                let outcome = self.interaction.pointer(cx, self.bounds, event, true);
+                let outcome = self
+                    .interaction
+                    .pointer(cx, self.bounds, event, self.enabled);
                 if outcome == PointerOutcome::Clicked {
                     self.activate();
                 }
@@ -294,6 +306,7 @@ impl Widget for ToolButton {
             }
             Event::Key(key)
                 if key.is_down
+                    && self.enabled
                     && cx.is_focused()
                     && matches!(key.vk, vk::SPACE | vk::RETURN)
                     && key.mods.is_empty() =>
@@ -318,7 +331,7 @@ impl Widget for ToolButton {
     }
 
     fn access(&self, cx: &AccessCx, out: &mut AccessTree) {
-        let mut state: AccessState = control_state(cx, true);
+        let mut state: AccessState = control_state(cx, self.enabled);
         state.toggle = Some(if self.on {
             ToggleState::On
         } else {
@@ -332,11 +345,11 @@ impl Widget for ToolButton {
 
     fn perform(&mut self, cx: &mut EventCx, a: &AccessAction) -> bool {
         match a {
-            AccessAction::Invoke | AccessAction::Toggle => {
+            AccessAction::Invoke | AccessAction::Toggle if self.enabled => {
                 self.activate();
                 true
             }
-            AccessAction::Focus => perform_focus(cx),
+            AccessAction::Focus if self.enabled => perform_focus(cx),
             _ => false,
         }
     }
@@ -461,6 +474,33 @@ impl TitleBar {
     #[must_use]
     pub fn pill_visible(&self) -> bool {
         self.pill_visible
+    }
+
+    /// Enables or disables the pill items: formatting writes Markdown, so only a Markdown
+    /// document (spec §4.1) has something for them to do.
+    pub fn set_format_enabled(&mut self, enabled: bool) {
+        for button in [&mut self.bold, &mut self.italic, &mut self.underline] {
+            button.enabled = enabled;
+        }
+    }
+
+    #[must_use]
+    pub fn format_enabled(&self) -> bool {
+        self.bold.enabled
+    }
+
+    /// The icon-only button under `point` and its name, the text of its tooltip: the pane
+    /// toggles and the pill items.
+    #[must_use]
+    pub fn tooltip_at(&self, point: Point) -> Option<(Rect, &str)> {
+        let pill = [&self.bold, &self.italic, &self.underline]
+            .into_iter()
+            .filter(|_| self.pill_visible);
+        [&self.sidebar, &self.inspector]
+            .into_iter()
+            .chain(pill)
+            .find(|button| button.bounds.contains(point))
+            .map(|button| (button.bounds, button.name.as_str()))
     }
 
     /// Shows which panes are open on the two toggles.
@@ -1056,6 +1096,47 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_pill_ignores_clicks_and_keys_and_leaves_the_tab_order() {
+        let (mut harness, mut bar, _) = setup();
+        assert!(bar.format_enabled());
+        bar.set_format_enabled(false);
+        assert!(!bar.format_enabled());
+        harness.arrange(&mut bar, Rect::new(0.0, 0.0, 1000.0, 80.0));
+        assert_eq!(harness.focus.tab_order().len(), 10);
+        let center = bar.pill_item_rect(FormatToggle::Bold).center();
+        harness.click(&mut bar, center);
+        assert!(bar.take_events().is_empty());
+        let tree = harness.tree(&bar);
+        assert!(tree.node(bar.bold.id).expect("bold").state.disabled);
+        let mut cx = harness.event_cx(bar.id());
+        assert!(!bar.perform_item(&mut cx, bar.bold.id, &AccessAction::Invoke));
+        bar.set_format_enabled(true);
+        harness.click(&mut bar, center);
+        assert_eq!(
+            bar.take_events(),
+            vec![TitleEvent::Format(FormatToggle::Bold)]
+        );
+    }
+
+    #[test]
+    fn icon_buttons_name_themselves_for_the_tooltip_and_a_hidden_pill_does_not() {
+        let (_, mut bar, _) = setup();
+        let at = |rect: Rect| rect.center();
+        let sidebar = bar.sidebar_toggle_rect();
+        let bold = bar.pill_item_rect(FormatToggle::Bold);
+        assert_eq!(bar.tooltip_at(at(sidebar)), Some((sidebar, "Sidebar")));
+        assert_eq!(bar.tooltip_at(at(bold)), Some((bold, "Bold")));
+        let inspector = bar.inspector_toggle_rect();
+        assert_eq!(
+            bar.tooltip_at(at(inspector)),
+            Some((inspector, "Inspector"))
+        );
+        assert_eq!(bar.tooltip_at(Point::new(500.0, 60.0)), None);
+        bar.set_pill_visible(false);
+        assert_eq!(bar.tooltip_at(at(bold)), None);
+    }
+
+    #[test]
     fn pill_keyboard_and_access_activation() {
         let (mut harness, mut bar, _) = setup();
         let bold = bar.bold.id;
@@ -1278,6 +1359,30 @@ mod tests {
         harness.focus.focus(bar.sidebar.id);
         let canvas = harness.paint(&bar);
         assert!(canvas.is_balanced());
+    }
+
+    #[test]
+    fn buttons_and_tabs_ask_for_the_hand_and_the_draggable_gap_for_nothing() {
+        use crate::input::Cursor;
+        let (mut harness, mut bar, _) = setup();
+        let tab = bar.tabs().strip().tab_rect(0).center();
+        let targets = [
+            (bar.sidebar_toggle_rect().center(), Some(Cursor::Hand)),
+            (bar.menu_rect(MenuKind::File).center(), Some(Cursor::Hand)),
+            (
+                bar.pill_item_rect(FormatToggle::Italic).center(),
+                Some(Cursor::Hand),
+            ),
+            (bar.inspector_toggle_rect().center(), Some(Cursor::Hand)),
+            (tab, Some(Cursor::Hand)),
+            (Point::new(850.0, 20.0), None),
+            (Point::new(500.0, 60.0), None),
+        ];
+        for (at, cursor) in targets {
+            harness.requests.take_cursor();
+            harness.hover(&mut bar, at);
+            assert_eq!(harness.requests.take_cursor(), cursor, "{at:?}");
+        }
     }
 
     #[test]

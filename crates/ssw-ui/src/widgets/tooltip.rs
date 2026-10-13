@@ -72,6 +72,16 @@ impl Tooltip {
     }
 
     #[must_use]
+    pub fn target(&self) -> Rect {
+        self.target
+    }
+
+    /// Keeps the tooltip inside `area` (the client area of the window, which can change).
+    pub fn set_area(&mut self, area: Rect) {
+        self.area = Some(area);
+    }
+
+    #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -227,6 +237,19 @@ mod tests {
 
     fn move_to(harness: &mut Harness, tip: &mut Tooltip, x: f32, y: f32) {
         harness.hover(tip, Point::new(x, y));
+    }
+
+    #[test]
+    fn kit_tooltip_reports_its_target_and_keeps_inside_a_resized_area() {
+        let mut harness = Harness::new();
+        let mut tip = Tooltip::new("Bold", TARGET);
+        assert_eq!(tip.target(), TARGET);
+        tip.set_area(Rect::new(0.0, 0.0, 120.0, 200.0));
+        move_to(&mut harness, &mut tip, 110.0, 110.0);
+        let (timer, _) = timer_of(&harness).expect("timer set");
+        harness.send(&mut tip, Event::Timer(timer));
+        let rect = tip.bounds().expect("visible");
+        assert_eq!((rect.x, rect.right()), (72.0, 120.0));
     }
 
     #[test]

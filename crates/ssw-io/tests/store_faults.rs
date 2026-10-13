@@ -122,6 +122,7 @@ fn key_value_access_reports_a_missing_table() {
     d.sql("DROP TABLE kv");
     fails_with(d.store.kv_get("k"), "no such table");
     fails_with(d.store.kv_set("k", "v"), "no such table");
+    fails_with(d.store.kv_delete("k"), "no such table");
 }
 
 // ---------------------------------------------------------------------------------------------

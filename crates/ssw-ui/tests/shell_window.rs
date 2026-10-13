@@ -9,6 +9,7 @@ use ssw_core::i18n::Localizer;
 use ssw_core::markdown::parse_document;
 use ssw_core::toc::Toc;
 use ssw_ui::canvas::RecordingCanvas;
+use ssw_ui::editor::highlight::Language;
 use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{Event, PointerButton, PointerEvent, PointerEventKind, PointerType};
 use ssw_ui::services::MemoryClipboard;
@@ -19,7 +20,9 @@ use ssw_ui::shell::sidebar::{
     EntryKind, NodeKey, SidebarEntry, SidebarEvent, SidebarOptions, SidebarStrings, SidebarView,
     TreeSource,
 };
-use ssw_ui::shell::statusbar::{Eol, StatusBar, StatusInfo, StatusStrings};
+use ssw_ui::shell::statusbar::{
+    Eol, StatusBar, StatusEvent, StatusInfo, StatusLanguage, StatusSegment, StatusStrings,
+};
 use ssw_ui::shell::titlebar::{TitleBar, TitleEvent, TitleStrings};
 use ssw_ui::text::MonoTextEngine;
 use ssw_ui::theme::{DEFAULT_ACCENT, Theme};
@@ -118,6 +121,7 @@ impl Window {
                 zoom_percent: 100,
                 encoding: "UTF-8".to_owned(),
                 eol: Eol::Lf,
+                language: StatusLanguage::Hidden,
             },
             &localizer,
         );
@@ -385,6 +389,60 @@ fn clicks_reach_the_view_under_the_pointer() {
         .center();
     window.click(encoding, PointerButton::Left);
     assert_eq!(window.status.take_events().len(), 1);
+}
+
+#[test]
+fn the_language_segment_of_a_plain_document_is_a_button_of_the_status_bar() {
+    let mut window = Window::new(1280.0, 800.0, 1.0);
+    let localizer = Localizer::new("en", &[("en", MAIN_FTL), ("en", SHELL_FTL)]);
+    let info = |language| StatusInfo {
+        line: 1,
+        column: 1,
+        words: 0,
+        selected_words: None,
+        zoom_percent: 100,
+        encoding: "UTF-8".to_owned(),
+        eol: Eol::Lf,
+        language,
+    };
+    // A Markdown document has no language segment.
+    assert_eq!(window.status.text(StatusSegment::Language), "");
+    assert_eq!(
+        window.status.segment_rect(StatusSegment::Language),
+        Rect::ZERO
+    );
+    let tab_stops = window.focus.tab_order().len();
+
+    // A plain document shows its language, and the segment takes the rightmost place.
+    window
+        .status
+        .set_info(&info(StatusLanguage::Language(Language::Json)), &localizer);
+    window.layout_all();
+    assert_eq!(window.status.text(StatusSegment::Language), "JSON");
+    let language = window.status.segment_rect(StatusSegment::Language);
+    let line_ending = window.status.segment_rect(StatusSegment::LineEnding);
+    assert!(language.x > line_ending.right());
+    assert_eq!(window.focus.tab_order().len(), tab_stops + 1);
+    window.click(language.center(), PointerButton::Left);
+    assert_eq!(
+        window.status.take_events(),
+        vec![StatusEvent::LanguageClicked { anchor: language }]
+    );
+
+    // A plain document without a language says so.
+    window
+        .status
+        .set_info(&info(StatusLanguage::PlainText), &localizer);
+    window.layout_all();
+    assert_eq!(window.status.text(StatusSegment::Language), "Plain text");
+
+    // Back to Markdown: the segment is gone.
+    window
+        .status
+        .set_info(&info(StatusLanguage::Hidden), &localizer);
+    window.layout_all();
+    assert_eq!(window.status.text(StatusSegment::Language), "");
+    assert_eq!(window.focus.tab_order().len(), tab_stops);
 }
 
 #[test]

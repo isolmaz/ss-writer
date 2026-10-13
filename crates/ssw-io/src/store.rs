@@ -291,6 +291,15 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Removes the row stored under `key`; a key without a row is fine.
+    ///
+    /// # Errors
+    /// [`StoreError::Sqlite`] on database failure.
+    pub fn kv_delete(&self, key: &str) -> Result<(), StoreError> {
+        self.conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
+        Ok(())
+    }
 }
 
 /// The schema version recorded in the database file.
@@ -559,6 +568,25 @@ mod tests {
             error.to_string().contains("within a transaction"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_deleted_key_has_no_row_and_deleting_a_missing_key_is_fine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = open_store(&tmp);
+        store.kv_set("one", "1").unwrap();
+        store.kv_set("two", "2").unwrap();
+        store.kv_delete("one").unwrap();
+        assert_eq!(store.kv_get("one").unwrap(), None);
+        assert_eq!(store.kv_get("two").unwrap().as_deref(), Some("2"));
+        // A key that has no row (or was just deleted) is not an error.
+        store.kv_delete("one").unwrap();
+        store.kv_delete("never-stored").unwrap();
+        assert_eq!(store.kv_get("two").unwrap().as_deref(), Some("2"));
+        // A database that fails reports it.
+        store.conn.execute_batch("DROP TABLE kv").unwrap();
+        let error = store.kv_delete("two").unwrap_err();
+        assert_eq!(error.to_string(), "database error: no such table: kv");
     }
 
     #[test]

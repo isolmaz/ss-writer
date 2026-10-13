@@ -15,7 +15,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 ├ Sidebar (Mica) ┬ Editor surface (solid layer, rounded top-left) ┬ Inspector ─┤
 │                │        centered text column                      │ (Mica)     │
 └────────────────┴──────────────────────────────────────────────────┴────────────┘
-                   Status bar (toggle): Ln/Col · words · zoom · encoding · EOL
+                   Status bar (toggle): Ln/Col · words · zoom · encoding · EOL · language
 ```
 
 - Custom title bar: tabs live in the title row. Caption buttons drawn by the app (Segoe Fluent Icons E921/E922/E923/E8BB); hovering maximize returns `HTMAXBUTTON` so Snap Layouts appear. Rounded corners (system). Resize borders kept.
@@ -143,7 +143,8 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 | `.doc` (Word 97–2003) | ✓ | — | import only; save as `.docx` or `.md`. Encrypted files and Word 6/95 files are rejected with a message |
 | every other file | ✓ | ✓ | Opened as plain text when its content is text: a BOM, or UTF-16/32 without one, means text; a `0x00` byte in the first 8192 bytes of anything else means binary. A binary file is refused with "This file is not a text file"; from the sidebar, Quick Open and folder search it keeps going to its default app instead |
 
-- A plain document is colored in the language its file extension names (Rust, C, C++, C#, Java, JavaScript, TypeScript, JSON, Python, Go, Bash, PowerShell, HTML, XML, CSS, SQL, YAML, TOML, Markdown, diff); every other file stays uncolored. The palette is quieter than the one of fenced code blocks: comments, strings and keywords only. Inside HTML, `<style>` is colored as CSS and `<script>` as JavaScript or JSON, decided by its `type`; the end tag always closes the body, as in a browser. The "Syntax highlighting" setting turns all of it off.
+- The language of a plain document is decided in this order: the choice stored for that file, its name (`Dockerfile`, `Containerfile`, `.bashrc`, `.zshrc`, `.profile`, …), its extension, a `#!` line (`env`, options and a version suffix are skipped), and finally a first line that starts with `<?xml`, `<!DOCTYPE html` or `<html`. Nothing to go by means no language. The status bar names the language of the active plain document ("Plain text" when it has none) and its menu offers **Automatic**, **Plain text** and the known languages, the current one marked; a choice is kept per file and beats detection, **Automatic** takes it back. The segment is hidden for Markdown and Mermaid documents.
+- A plain document is colored in the language it was decided to be (Rust, C, C++, C#, Java, JavaScript, TypeScript, JSON, Python, Go, Bash, PowerShell, HTML, XML, CSS, SQL, YAML, TOML, Markdown, diff); every other file stays uncolored. The palette is quieter than the one of fenced code blocks: comments, strings and keywords only. Inside HTML, `<style>` is colored as CSS and `<script>` as JavaScript or JSON, decided by its `type`; the end tag always closes the body, as in a browser. The "Syntax highlighting" setting turns all of it off.
 - Import reports what could not be represented (merged cells, headers/footers, columns, text boxes, comments, tracked changes, VML shapes, unsupported equations) in a banner with a details list. OMML equations convert to LaTeX for fractions, scripts, radicals, n-ary operators, delimiters, matrices; others become `[equation]` placeholders and are reported.
 
 ### 4.2 Encodings & line endings
@@ -195,10 +196,11 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Search in folder (`Ctrl+Shift+F`): sidebar panel; case/word/regex; results grouped by file with line previews; click opens at match. Honors `.gitignore`; skips binaries; decodes legacy encodings.
 
 ## 8. Inspector & status bar
+- Status bar right side, left to right: zoom %, encoding, line endings and, last, the language of a plain-text document (§4.1); encoding, line endings and language are each a menu (§4.2).
 - Inspector (`Ctrl+Shift+I`), right panel, two tabs:
   - **Contents**: collapsible heading tree with staircase hairlines; current section highlighted; click scrolls and flashes the heading; level filter (H1–H6).
   - **Info**: words, characters (with/without spaces), paragraphs, sentences, reading time (default 200 wpm, setting); selection-aware; file path, size, created, modified, encoding, line endings; backlinks.
-- Status bar (View toggle): Ln/Col, words, zoom %, encoding, EOL (encoding/EOL clickable).
+- Status bar (View toggle), left to right: Ln/Col, words, zoom %, encoding, EOL, language (plain-text documents only); encoding, EOL and language are clickable.
 
 ## 9. Copy, share, export, print
 - `Ctrl+C` puts Markdown text (`CF_UNICODETEXT`), `HTML Format` and `Rich Text Format` on the clipboard (local images of the selection are embedded); `Ctrl+X` does the same and removes the selection. Edit → Copy as: Plain text (markers stripped), Markdown, Rich text (RTF + HTML, plain text as fallback), HTML (also as text). Documents that are not Markdown copy their text only.

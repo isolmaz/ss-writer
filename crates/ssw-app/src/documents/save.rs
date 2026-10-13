@@ -13,6 +13,8 @@ use ssw_io::fs::FileSystem;
 use ssw_io::history::SnapshotReason;
 use ssw_io::save::{SaveStamp, WriteAccess, save_atomic};
 
+use crate::session::remember_language;
+
 use super::{
     ConvertedFormat, DocEntry, DocError, Documents, ExternalState, Source, canonical_path,
 };
@@ -252,11 +254,13 @@ impl Documents {
     /// "Save as": writes the document to `target`, chosen by its extension: `.docx` `.odt`
     /// `.rtf` convert, `.textpack` / `.textbundle` write a bundle, anything else is text. The
     /// document is bound to the new file afterwards (an untitled buffer stops being untitled,
-    /// its backups are removed).
+    /// its backups are removed) and the language the user chose for it is remembered for that
+    /// file; the file it came from keeps its own choice, as it keeps its own history.
     ///
     /// # Errors
     /// [`DocError::AlreadyOpen`] when another tab shows `target`, [`DocError::Unsupported`] for
-    /// `.doc`, plus the errors of [`Documents::save`].
+    /// `.doc`, [`DocError::Store`] when the language choice cannot be stored (the file is saved
+    /// and the document bound anyway), plus the errors of [`Documents::save`].
     pub fn save_as(&self, entry: &DocEntry, target: &Path) -> Result<Saved, DocError> {
         let target = canonical_path(target);
         if let Some(open) = self.find(&target)
@@ -340,6 +344,7 @@ impl Documents {
             self.drop_untitled_backups(&id);
         }
         self.finish_save(entry, &target, version, stamp, tracked);
+        remember_language(&self.env.store.borrow(), &target, entry.language_choice())?;
         Ok(Saved {
             path: target,
             stamp,

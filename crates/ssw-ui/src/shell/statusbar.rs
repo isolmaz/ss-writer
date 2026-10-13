@@ -1,5 +1,6 @@
-//! The status bar (spec §8): Ln/Col, word count, zoom, encoding and line ending. The encoding and
-//! line-ending segments are buttons ([`StatusEvent`]); the others are plain text.
+//! The status bar (spec §8): Ln/Col, word count, zoom, encoding, line ending and the language of
+//! a plain-text document. The encoding, line-ending and language segments are buttons
+//! ([`StatusEvent`]); the others are plain text.
 //!
 //! The bar is transparent (Mica shows through) with a hairline on top. Segments with empty text
 //! (no document, or nothing to show) take no space and have no access node.
@@ -8,6 +9,7 @@ use ssw_core::i18n::{Arg, Localizer};
 
 use crate::access::{AccessAction, AccessNode, AccessTree, Role};
 use crate::canvas::{Canvas, Dash};
+use crate::editor::highlight::Language;
 use crate::geometry::{CornerRadii, Insets, Point, Rect, Size};
 use crate::input::{Event, FocusEvent, vk};
 use crate::widget::{AccessCx, EventCx, EventResult, LayoutCx, PaintCx, Widget, WidgetId};
@@ -38,26 +40,41 @@ pub enum StatusSegment {
     Zoom,
     Encoding,
     LineEnding,
+    Language,
 }
 
 impl StatusSegment {
     /// Visual order.
-    pub const ALL: [StatusSegment; 5] = [
+    pub const ALL: [StatusSegment; 6] = [
         StatusSegment::Position,
         StatusSegment::Words,
         StatusSegment::Zoom,
         StatusSegment::Encoding,
         StatusSegment::LineEnding,
+        StatusSegment::Language,
     ];
 
     /// Whether clicking the segment does something.
     #[must_use]
     pub const fn is_clickable(self) -> bool {
-        matches!(self, StatusSegment::Encoding | StatusSegment::LineEnding)
+        matches!(
+            self,
+            StatusSegment::Encoding | StatusSegment::LineEnding | StatusSegment::Language
+        )
     }
 
     const fn is_left(self) -> bool {
         matches!(self, StatusSegment::Position | StatusSegment::Words)
+    }
+
+    /// What a click on the segment reports; `anchor` is the segment's rectangle.
+    const fn event(self, anchor: Rect) -> Option<StatusEvent> {
+        match self {
+            StatusSegment::Encoding => Some(StatusEvent::EncodingClicked { anchor }),
+            StatusSegment::LineEnding => Some(StatusEvent::LineEndingClicked { anchor }),
+            StatusSegment::Language => Some(StatusEvent::LanguageClicked { anchor }),
+            StatusSegment::Position | StatusSegment::Words | StatusSegment::Zoom => None,
+        }
     }
 }
 
@@ -67,6 +84,40 @@ pub enum Eol {
     Lf,
     CrLf,
     Cr,
+}
+
+/// What the language segment shows for the active document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusLanguage {
+    /// Not a plain-text document (a Markdown or Mermaid one): the bar has no language segment.
+    Hidden,
+    /// A plain-text document that is not coloured.
+    PlainText,
+    /// A plain-text document coloured as this language.
+    Language(Language),
+}
+
+impl StatusLanguage {
+    /// What the segment shows for a document that is `plain` text and coloured as `language`
+    /// (`None`: not coloured).
+    #[must_use]
+    pub const fn of(plain: bool, language: Option<Language>) -> Self {
+        match (plain, language) {
+            (false, _) => StatusLanguage::Hidden,
+            (true, None) => StatusLanguage::PlainText,
+            (true, Some(language)) => StatusLanguage::Language(language),
+        }
+    }
+}
+
+/// The display name of `language` (`JSON`, `C#`, `PowerShell`, …), "Plain text" for none: the
+/// text of the language segment and the labels of its menu.
+#[must_use]
+pub fn language_label(localizer: &Localizer, language: Option<Language>) -> String {
+    match language {
+        Some(language) => localizer.text(&format!("statusbar-language-{}", language.name())),
+        None => localizer.text("statusbar-language-plain"),
+    }
 }
 
 /// What the bar shows.
@@ -84,6 +135,8 @@ pub struct StatusInfo {
     /// Display name of the encoding (`UTF-8`, `UTF-8 with BOM`, `Windows-1254`…).
     pub encoding: String,
     pub eol: Eol,
+    /// The language segment: shown for a plain-text document only.
+    pub language: StatusLanguage,
 }
 
 /// Localized strings of the bar that need no arguments.
@@ -95,6 +148,8 @@ pub struct StatusStrings {
     pub encoding_hint: String,
     /// Description of the line-ending button.
     pub eol_hint: String,
+    /// Description of the language button.
+    pub language_hint: String,
 }
 
 impl StatusStrings {
@@ -105,6 +160,17 @@ impl StatusStrings {
             label: localizer.text("statusbar-label"),
             encoding_hint: localizer.text("statusbar-encoding-hint"),
             eol_hint: localizer.text("statusbar-eol-hint"),
+            language_hint: localizer.text("statusbar-language-hint"),
+        }
+    }
+
+    /// What a click on `kind` does. Only the clickable segments are ever asked
+    /// ([`StatusSegment::is_clickable`]): the line ending stands for the last of them.
+    fn hint(&self, kind: StatusSegment) -> &str {
+        match kind {
+            StatusSegment::Encoding => &self.encoding_hint,
+            StatusSegment::Language => &self.language_hint,
+            _ => &self.eol_hint,
         }
     }
 }
@@ -116,6 +182,8 @@ pub enum StatusEvent {
     EncodingClicked { anchor: Rect },
     /// The line-ending segment.
     LineEndingClicked { anchor: Rect },
+    /// The language segment of a plain-text document: pick the language it is coloured as.
+    LanguageClicked { anchor: Rect },
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +289,12 @@ impl StatusBar {
         self.set_text(StatusSegment::Zoom, zoom);
         self.set_text(StatusSegment::Encoding, info.encoding.clone());
         self.set_text(StatusSegment::LineEnding, eol);
+        let language = match info.language {
+            StatusLanguage::Hidden => String::new(),
+            StatusLanguage::PlainText => language_label(localizer, None),
+            StatusLanguage::Language(language) => language_label(localizer, Some(language)),
+        };
+        self.set_text(StatusSegment::Language, language);
     }
 
     /// Empties every segment (no document is active).
@@ -271,11 +345,7 @@ impl StatusBar {
             .iter()
             .filter(|segment| segment.is_active())
             .find(|segment| segment.bounds.contains(point))?;
-        let hint = match segment.kind {
-            StatusSegment::Encoding => &self.strings.encoding_hint,
-            _ => &self.strings.eol_hint,
-        };
-        Some((segment.bounds, hint))
+        Some((segment.bounds, self.strings.hint(segment.kind)))
     }
 
     fn collect(&mut self) {
@@ -283,13 +353,9 @@ impl StatusBar {
             if std::mem::take(&mut segment.activated) == 0 {
                 continue;
             }
-            let anchor = segment.bounds;
-            // Only the encoding and the line ending are clickable (`is_active`), so only they are
-            // ever activated.
-            self.events.push(match segment.kind {
-                StatusSegment::Encoding => StatusEvent::EncodingClicked { anchor },
-                _ => StatusEvent::LineEndingClicked { anchor },
-            });
+            // Only the clickable segments are ever activated (`is_active`), so the other kinds
+            // contribute nothing.
+            self.events.extend(segment.kind.event(segment.bounds));
         }
     }
 
@@ -466,10 +532,7 @@ impl Widget for StatusBar {
                 let child = cx.for_widget(segment.id);
                 node = node.with_state(control_state(&child, true));
                 node.patterns.invoke = true;
-                node.description = match segment.kind {
-                    StatusSegment::Encoding => self.strings.encoding_hint.clone(),
-                    _ => self.strings.eol_hint.clone(),
-                };
+                node.description = self.strings.hint(segment.kind).to_owned();
             }
             out.insert(node);
             children.push(segment.id);
@@ -515,6 +578,37 @@ mod tests {
             zoom_percent: 100,
             encoding: "UTF-8".to_owned(),
             eol: Eol::CrLf,
+            language: StatusLanguage::Hidden,
+        }
+    }
+
+    #[test]
+    fn only_the_clickable_segments_report_a_click() {
+        let anchor = Rect::new(1.0, 2.0, 3.0, 4.0);
+        for segment in [
+            StatusSegment::Position,
+            StatusSegment::Words,
+            StatusSegment::Zoom,
+        ] {
+            assert!(!segment.is_clickable(), "{segment:?}");
+            assert_eq!(segment.event(anchor), None, "{segment:?}");
+        }
+        for (segment, event) in [
+            (
+                StatusSegment::Encoding,
+                StatusEvent::EncodingClicked { anchor },
+            ),
+            (
+                StatusSegment::LineEnding,
+                StatusEvent::LineEndingClicked { anchor },
+            ),
+            (
+                StatusSegment::Language,
+                StatusEvent::LanguageClicked { anchor },
+            ),
+        ] {
+            assert!(segment.is_clickable(), "{segment:?}");
+            assert_eq!(segment.event(anchor), Some(event), "{segment:?}");
         }
     }
 
@@ -826,6 +920,127 @@ mod tests {
             assert!(!harness.click(&mut bar, at).handled, "{kind:?}");
             assert!(bar.take_events().is_empty(), "{kind:?}");
         }
+    }
+
+    fn with_language(language: StatusLanguage) -> StatusInfo {
+        StatusInfo { language, ..info() }
+    }
+
+    #[test]
+    fn the_language_segment_is_shown_for_plain_documents_only() {
+        assert_eq!(
+            StatusLanguage::of(false, Some(Language::Json)),
+            StatusLanguage::Hidden
+        );
+        assert_eq!(StatusLanguage::of(false, None), StatusLanguage::Hidden);
+        assert_eq!(StatusLanguage::of(true, None), StatusLanguage::PlainText);
+        assert_eq!(
+            StatusLanguage::of(true, Some(Language::Json)),
+            StatusLanguage::Language(Language::Json)
+        );
+
+        let localizer = localizer();
+        let (mut harness, mut bar) = setup(&info());
+        for (language, text) in [
+            (StatusLanguage::Language(Language::Json), "JSON"),
+            (StatusLanguage::PlainText, "Plain text"),
+            (StatusLanguage::Language(Language::CSharp), "C#"),
+            (StatusLanguage::Hidden, ""),
+        ] {
+            bar.set_info(&with_language(language), &localizer);
+            harness.arrange(&mut bar, Rect::new(0.0, 576.0, 800.0, 24.0));
+            assert_eq!(bar.text(StatusSegment::Language), text);
+            assert_eq!(
+                bar.segment_rect(StatusSegment::Language) == Rect::ZERO,
+                text.is_empty(),
+                "{text:?}"
+            );
+        }
+        // No document: the segment goes with the others.
+        bar.set_info(
+            &with_language(StatusLanguage::Language(Language::Json)),
+            &localizer,
+        );
+        bar.clear();
+        assert_eq!(bar.text(StatusSegment::Language), "");
+    }
+
+    #[test]
+    fn every_language_has_a_readable_label() {
+        let localizer = localizer();
+        assert_eq!(language_label(&localizer, None), "Plain text");
+        let labels: Vec<String> = Language::ALL
+            .iter()
+            .map(|&language| language_label(&localizer, Some(language)))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Rust",
+                "C",
+                "C++",
+                "C#",
+                "Java",
+                "JavaScript",
+                "TypeScript",
+                "JSON",
+                "Python",
+                "Go",
+                "Bash",
+                "PowerShell",
+                "HTML",
+                "XML",
+                "CSS",
+                "SQL",
+                "YAML",
+                "TOML",
+                "Markdown",
+                "Diff",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_language_segment_is_the_rightmost_button() {
+        let (mut harness, mut bar) =
+            setup(&with_language(StatusLanguage::Language(Language::Json)));
+        let language = bar.segment_rect(StatusSegment::Language);
+        assert_eq!(language, Rect::new(744.0, 578.0, 48.0, 20.0));
+        assert_eq!(
+            bar.segment_rect(StatusSegment::LineEnding),
+            Rect::new(694.0, 578.0, 48.0, 20.0)
+        );
+        assert_eq!(harness.focus.tab_order().len(), 3);
+
+        harness.click(&mut bar, language.center());
+        assert_eq!(
+            bar.take_events(),
+            vec![StatusEvent::LanguageClicked { anchor: language }]
+        );
+        let id = bar.segments[5].id;
+        harness.focus.focus(id);
+        assert!(harness.key(&mut bar, vk::RETURN).handled);
+        let mut cx = harness.event_cx(bar.id());
+        assert!(bar.perform_item(&mut cx, id, &AccessAction::Invoke));
+        assert_eq!(
+            bar.take_events(),
+            vec![
+                StatusEvent::LanguageClicked { anchor: language },
+                StatusEvent::LanguageClicked { anchor: language },
+            ]
+        );
+        assert_eq!(
+            bar.tooltip_at(language.center()),
+            Some((language, "Change language"))
+        );
+
+        let tree = harness.tree(&bar);
+        let nodes: Vec<_> = tree.children(bar.id()).collect();
+        let last = nodes.last().expect("the language node");
+        assert_eq!(last.role, Role::Button);
+        assert_eq!(last.name, "JSON");
+        assert_eq!(last.description, "Change language");
+        assert!(last.patterns.invoke && last.state.focusable);
     }
 
     #[test]

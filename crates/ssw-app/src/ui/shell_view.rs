@@ -7,7 +7,7 @@
 //! recording canvas and the fixed-advance text engine.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use ssw_core::command::CommandId;
@@ -21,7 +21,7 @@ use ssw_core::stats;
 use ssw_core::text::TextRange;
 use ssw_ui::canvas::Canvas;
 use ssw_ui::editor::blocks_table::TableControl;
-use ssw_ui::editor::highlight::Language;
+use ssw_ui::editor::highlight::{Language, detect_language};
 use ssw_ui::editor::{DocumentKind, EditorConfig, EditorEvent, EditorStrings, EditorView};
 use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{Cursor, Event, FocusEvent, PointerButton, PointerEvent, PointerEventKind};
@@ -32,7 +32,9 @@ use ssw_ui::shell::layout::{Backdrop, ChromeHit, Pane, ShellLayout, ShellMode};
 use ssw_ui::shell::sidebar::{
     SidebarEvent, SidebarOptions, SidebarStrings, SidebarView, SortKey, TreeSource,
 };
-use ssw_ui::shell::statusbar::{Eol, StatusBar, StatusEvent, StatusInfo, StatusStrings};
+use ssw_ui::shell::statusbar::{
+    Eol, StatusBar, StatusEvent, StatusInfo, StatusLanguage, StatusStrings,
+};
 use ssw_ui::shell::tabs::TabHit;
 use ssw_ui::shell::titlebar::{FormatState, TitleBar, TitleEvent, TitleStrings};
 use ssw_ui::text::TextLayoutEngine;
@@ -158,6 +160,9 @@ struct StatusKey {
     /// Encoding, BOM and line endings: the status bar shows them and the user changes them
     /// without touching the text.
     file_format: ssw_io::encoding::TextFormat,
+    /// What the status bar shows as the language: a choice or a new detection changes it
+    /// without touching the text.
+    language: StatusLanguage,
 }
 
 /// The composed window content.
@@ -212,24 +217,35 @@ impl fmt::Debug for ShellView {
     }
 }
 
-/// The language a plain-text file is coloured as: the one its extension names (`.json`, `.html`,
-/// `.py`, `.css`, …); none for a file without an extension or with an unknown one. The extension
-/// goes through [`Language::from_name`] as it is, so `.ps` (PostScript) is no PowerShell and
-/// `.xhtml` is scanned as XML.
-fn plain_language_of(path: &Path) -> Option<Language> {
-    path.extension()
-        .and_then(|extension| Language::from_name(&extension.to_string_lossy()))
+/// How much of the first line of a document the language detection reads: more than any shebang
+/// or markup declaration needs, and little enough for a minified file that is one huge line.
+const DETECT_HEAD_BYTES: usize = 256;
+
+/// The language a plain-text file is coloured as: the one its name, extension, shebang or
+/// markup declaration names ([`detect_language`]); none for an untitled document or when
+/// nothing identifies one.
+fn plain_language_of(entry: &DocEntry) -> Option<Language> {
+    let path = entry.path()?;
+    let document = entry.document().borrow();
+    let buffer = document.buffer();
+    let line = buffer.line_range(0);
+    let end = line.end.min(line.start + DETECT_HEAD_BYTES);
+    let head = buffer.slice(TextRange::new(line.start, end));
+    detect_language(&path.to_string_lossy(), &head)
 }
 
 /// Makes `editor` present `entry` the way the file type wants (spec §4.1): live Markdown, plain
-/// lines (coloured by the file's extension), or a whole Mermaid diagram.
+/// lines (coloured by the language of the file), or a whole Mermaid diagram.
 fn present_as(editor: &mut EditorView, entry: &DocEntry) {
     let kind = match entry.mode() {
         DocMode::Markdown => DocumentKind::Markdown,
         DocMode::Plain => DocumentKind::PlainText,
         DocMode::Mermaid => DocumentKind::Mermaid,
     };
-    let language = entry.path().as_deref().and_then(plain_language_of);
+    // What the user chose for the document (also "no language") beats what the text says.
+    let language = entry
+        .language_choice()
+        .unwrap_or_else(|| plain_language_of(entry));
     if editor.config().document_kind != kind || editor.config().plain_language != language {
         let mut config = editor.config().clone();
         config.document_kind = kind;
@@ -1637,6 +1653,10 @@ impl ShellView {
         let document = tab.entry.document().borrow();
         let selection = document.primary_selection();
         let format = tab.entry.format();
+        let language = StatusLanguage::of(
+            tab.entry.mode() == DocMode::Plain,
+            tab.editor.config().plain_language,
+        );
         let key = StatusKey {
             tab: tab.key,
             version: document.version(),
@@ -1645,6 +1665,7 @@ impl ShellView {
             zoom: tab.editor.zoom_percent(),
             format: (bold, italic, underline),
             file_format: format,
+            language,
         };
         self.titlebar.set_format_state(FormatState {
             bold,
@@ -1714,6 +1735,7 @@ impl ShellView {
                 ssw_io::encoding::LineEnding::Crlf => Eol::CrLf,
                 ssw_io::encoding::LineEnding::Cr => Eol::Cr,
             },
+            language,
         };
         self.statusbar.set_info(&info, &self.localizer);
     }

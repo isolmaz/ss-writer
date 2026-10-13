@@ -519,8 +519,8 @@ impl Controller {
             }
             ShellAction::Banner(HostEvent::Dismissed(BannerKind::Update)) => self.dismiss_update(),
             ShellAction::Banner(HostEvent::Dismissed(kind)) => self.banner_dismissed(&cell, kind),
-            // The status bar's encoding and line-ending clicks are popups the loop owner shows
-            // (`popup_for`); a click with no document open asks for nothing.
+            // The status bar's encoding, line-ending and language clicks are popups the loop
+            // owner shows (`popup_for`); a click with no document open asks for nothing.
             ShellAction::Banner(HostEvent::Resized) | ShellAction::Status(_) => {}
             ShellAction::Editor(key, event) => self.editor_event(&cell, key, event),
             ShellAction::Inspector(event) => self.inspector_event(&cell, event),

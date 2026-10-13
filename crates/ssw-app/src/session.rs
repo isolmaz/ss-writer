@@ -11,8 +11,9 @@ use ssw_io::fs::FileSystem;
 use ssw_io::session::{
     Session, SessionTab, SessionWindow, TabDocument, ViewState, WindowPlacement,
 };
-use ssw_io::store::StoreError;
+use ssw_io::store::{Store, StoreError, path_key};
 use ssw_io::workspace::ensure_default_folder;
+use ssw_ui::editor::highlight::Language;
 
 use crate::args::Launch;
 use crate::documents::{DocEntry, DocError, Documents, SharedStore};
@@ -22,6 +23,77 @@ pub const CLOSED_TAB_LIMIT: usize = 20;
 
 /// Key in the state database that remembers the first-run workspace was created.
 const FIRST_RUN_KEY: &str = "first_run_done";
+
+/// Start of the key in the state database under which the language the user chose for a file is
+/// remembered; the rest is the file's case-insensitive path key.
+const LANGUAGE_KEY_PREFIX: &str = "plain_language.";
+
+/// The stored value of "Plain text" (no language: the document is not coloured).
+const PLAIN_TEXT_VALUE: &str = "plain";
+
+/// The key of the language remembered for `path`.
+fn language_key(path: &Path) -> Result<String, StoreError> {
+    Ok(format!("{LANGUAGE_KEY_PREFIX}{}", path_key(path)?))
+}
+
+/// Forgets the language chosen for the file `path`: its row is deleted.
+fn forget_language(store: &Store, path: &Path) -> Result<(), StoreError> {
+    store.kv_delete(&language_key(path)?)
+}
+
+/// The language the user chose for the file `path`: `None` when none was chosen (or the stored
+/// value is unreadable), `Some(None)` for "Plain text", `Some(Some(language))` otherwise. A stored
+/// choice beats the language that is detected from the file.
+pub(crate) fn stored_language(store: &Store, path: &Path) -> Option<Option<Language>> {
+    let value = store.kv_get(&language_key(path).ok()?).ok()??;
+    if value == PLAIN_TEXT_VALUE {
+        Some(None)
+    } else {
+        Language::from_name(&value).map(Some)
+    }
+}
+
+/// Remembers `language` (`None`: "Plain text") as the choice for the file `path`.
+fn store_language(
+    store: &Store,
+    path: &Path,
+    language: Option<Language>,
+) -> Result<(), StoreError> {
+    store.kv_set(
+        &language_key(path)?,
+        language.map_or(PLAIN_TEXT_VALUE, Language::name),
+    )
+}
+
+/// Makes the row of the file `path` say what an open document's `choice` says (as
+/// [`DocEntry::language_choice`]): a choice is remembered, and "Automatic" (`None`) leaves no row.
+/// What the file had stored before is replaced either way, so a file that takes the place of
+/// another one never inherits that one's choice.
+pub(crate) fn remember_language(
+    store: &Store,
+    path: &Path,
+    choice: Option<Option<Language>>,
+) -> Result<(), StoreError> {
+    match choice {
+        Some(language) => store_language(store, path, language),
+        None => forget_language(store, path),
+    }
+}
+
+/// Makes the stored choice follow the file from `from` to `to` (a rename or a move) for the open
+/// document whose choice is `choice`: the row of `from` is deleted, so nothing is left behind for
+/// an unrelated file that is created there later, and `to` gets the row (see
+/// [`remember_language`]). The row of `from` goes first: when only the case of the name changed
+/// the two paths share one key, and deleting last would delete the row just written.
+pub(crate) fn move_language(
+    store: &Store,
+    from: &Path,
+    to: &Path,
+    choice: Option<Option<Language>>,
+) -> Result<(), StoreError> {
+    forget_language(store, from)?;
+    remember_language(store, to, choice)
+}
 
 /// A document a planned tab shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -384,6 +456,40 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Remembers the language the user chose for `entry` in the status bar (`None`: "Plain
+    /// text"). The open document is coloured that way from now on, whatever its name or text say,
+    /// and a file's choice is stored, so the file comes back that way when it is opened again. A
+    /// document without a file keeps the choice only while it is open.
+    ///
+    /// # Errors
+    /// [`DocError::Store`] when the choice cannot be stored; the open document keeps it.
+    pub fn choose_language(
+        &self,
+        entry: &DocEntry,
+        language: Option<Language>,
+    ) -> Result<(), DocError> {
+        entry.set_language_choice(language);
+        if let Some(path) = entry.path() {
+            store_language(&self.store.borrow(), &path, language)?;
+        }
+        Ok(())
+    }
+
+    /// Takes back the language the user chose for `entry` ("Automatic" in the status bar): the
+    /// file's stored choice is deleted and the open document forgets it, so what the file's name
+    /// and text say decides again, at once.
+    ///
+    /// # Errors
+    /// [`DocError::Store`] when the stored choice cannot be deleted; the open document has
+    /// forgotten it anyway.
+    pub fn clear_language(&self, entry: &DocEntry) -> Result<(), DocError> {
+        entry.clear_language_choice();
+        if let Some(path) = entry.path() {
+            forget_language(&self.store.borrow(), &path)?;
+        }
+        Ok(())
+    }
+
     /// The tabs `Ctrl+Shift+T` would reopen, most recently closed last.
     #[must_use]
     pub fn closed_tabs(&self) -> Vec<ClosedTab> {
@@ -439,14 +545,15 @@ mod tests {
 
     use ssw_core::edit::Selection;
     use ssw_io::fs::RealFs;
+    use ssw_io::history::SnapshotReason;
     use ssw_io::recovery::RecoveryStore;
     use ssw_io::save::ThreadSleeper;
-    use ssw_io::store::Store;
+    use ssw_io::watch::{FsEvent, FsEventKind};
 
     use super::*;
     use crate::args::LaunchItem;
     use crate::clock::{AppClock, ManualClock};
-    use crate::documents::DocEnv;
+    use crate::documents::{DocEnv, canonical_path, replace_text};
 
     fn placement(x: i32) -> WindowPlacement {
         WindowPlacement {
@@ -707,6 +814,508 @@ mod tests {
             sessions.tab_closed(&entry, None, &view).unwrap();
         }
         assert_eq!(sessions.closed_tabs().len(), CLOSED_TAB_LIMIT);
+    }
+
+    #[test]
+    fn a_chosen_language_is_stored_per_file_and_found_when_the_file_opens_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notes.txt");
+        let other = tmp.path().join("other.txt");
+        std::fs::write(&file, "x = 1\n").unwrap();
+        std::fs::write(&other, "y = 2\n").unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let entry = docs.open(&file).unwrap();
+        assert_eq!(entry.language_choice(), None);
+
+        sessions
+            .choose_language(&entry, Some(Language::Python))
+            .unwrap();
+        assert_eq!(entry.language_choice(), Some(Some(Language::Python)));
+        docs.release(&entry);
+
+        // A later start finds the choice again; another file has none.
+        let (docs, sessions) = manager(tmp.path());
+        let reopened = docs.open(&file).unwrap();
+        assert_eq!(reopened.language_choice(), Some(Some(Language::Python)));
+        let untouched = docs.open(&other).unwrap();
+        assert_eq!(untouched.language_choice(), None);
+
+        // "Plain text" is a choice, and so is a language that detection would have found.
+        sessions.choose_language(&reopened, None).unwrap();
+        sessions
+            .choose_language(&untouched, Some(Language::Json))
+            .unwrap();
+        let (docs, _) = manager(tmp.path());
+        assert_eq!(docs.open(&file).unwrap().language_choice(), Some(None));
+        assert_eq!(
+            docs.open(&other).unwrap().language_choice(),
+            Some(Some(Language::Json))
+        );
+    }
+
+    #[test]
+    fn every_language_survives_the_trip_through_the_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = canonical_path(&tmp.path().join("a.txt"));
+        let (docs, _) = manager(tmp.path());
+        let store = docs.env().store.borrow();
+        assert_eq!(stored_language(&store, &path), None);
+        for language in Language::ALL {
+            store_language(&store, &path, Some(language)).unwrap();
+            assert_eq!(stored_language(&store, &path), Some(Some(language)));
+        }
+        store_language(&store, &path, None).unwrap();
+        assert_eq!(stored_language(&store, &path), Some(None));
+        // The key is the file's path, whatever its case or slashes.
+        let spelled = PathBuf::from(path.to_string_lossy().to_lowercase().replace('\\', "/"));
+        assert_eq!(stored_language(&store, &spelled), Some(None));
+        // A value nobody wrote is ignored.
+        store
+            .kv_set(&language_key(&path).unwrap(), "klingon")
+            .unwrap();
+        assert_eq!(stored_language(&store, &path), None);
+    }
+
+    #[test]
+    fn a_document_without_a_file_keeps_its_language_in_memory_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let scratch = docs.new_untitled();
+        sessions
+            .choose_language(&scratch, Some(Language::Rust))
+            .unwrap();
+        assert_eq!(scratch.language_choice(), Some(Some(Language::Rust)));
+        let rows: i64 = rusqlite::Connection::open(tmp.path().join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE ?1",
+                [format!("{LANGUAGE_KEY_PREFIX}%")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "nothing is stored for a buffer");
+    }
+
+    #[test]
+    fn a_language_that_cannot_be_stored_is_still_used_while_the_document_is_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, "x\n").unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let entry = docs.open(&file).unwrap();
+        sabotage(tmp.path(), "DROP TABLE kv");
+        let error = sessions
+            .choose_language(&entry, Some(Language::Go))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "database error: no such table: kv");
+        assert_eq!(entry.language_choice(), Some(Some(Language::Go)));
+    }
+
+    #[test]
+    fn taking_the_language_back_deletes_the_stored_choice_and_detection_decides_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notes.txt");
+        let other = tmp.path().join("other.txt");
+        std::fs::write(&file, "x = 1\n").unwrap();
+        std::fs::write(&other, "y = 2\n").unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let entry = docs.open(&file).unwrap();
+        let kept = docs.open(&other).unwrap();
+        sessions
+            .choose_language(&entry, Some(Language::Python))
+            .unwrap();
+        sessions.choose_language(&kept, None).unwrap();
+        let rows = |tmp: &Path| -> i64 {
+            rusqlite::Connection::open(tmp.join("state.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM kv WHERE key LIKE ?1",
+                    [format!("{LANGUAGE_KEY_PREFIX}%")],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(rows(tmp.path()), 2);
+
+        sessions.clear_language(&entry).unwrap();
+        assert_eq!(entry.language_choice(), None);
+        assert_eq!(rows(tmp.path()), 1, "the row is deleted, not overwritten");
+        // Taking back a choice that is not there is fine too.
+        sessions.clear_language(&entry).unwrap();
+        assert_eq!(rows(tmp.path()), 1);
+        docs.release(&entry);
+        docs.release(&kept);
+
+        // The next start finds no choice for the file, and the other file keeps its own.
+        let (docs, _) = manager(tmp.path());
+        assert_eq!(docs.open(&file).unwrap().language_choice(), None);
+        assert_eq!(docs.open(&other).unwrap().language_choice(), Some(None));
+    }
+
+    #[test]
+    fn a_document_without_a_file_takes_its_language_back_in_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let scratch = docs.new_untitled();
+        sessions
+            .choose_language(&scratch, Some(Language::Rust))
+            .unwrap();
+        sessions.clear_language(&scratch).unwrap();
+        assert_eq!(scratch.language_choice(), None);
+    }
+
+    #[test]
+    fn a_language_that_cannot_be_deleted_is_still_taken_back_while_the_document_is_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        std::fs::write(&file, "x\n").unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let entry = docs.open(&file).unwrap();
+        sessions
+            .choose_language(&entry, Some(Language::Go))
+            .unwrap();
+        sabotage(tmp.path(), "DROP TABLE kv");
+        let error = sessions.clear_language(&entry).unwrap_err();
+        assert_eq!(error.to_string(), "database error: no such table: kv");
+        assert_eq!(entry.language_choice(), None);
+    }
+
+    /// A path with an unpaired surrogate: a legal Windows file name that has no UTF-8 text.
+    fn non_unicode_path() -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+        let name = std::ffi::OsString::from_wide(&[0x43, 0x3A, 0x5C, 0x61, 0xD800]);
+        PathBuf::from(name)
+    }
+
+    /// How many languages the state database of [`manager`] remembers.
+    fn stored_language_rows(tmp: &Path) -> i64 {
+        rusqlite::Connection::open(tmp.join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE ?1",
+                [format!("{LANGUAGE_KEY_PREFIX}%")],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_file_name_that_is_not_unicode_has_no_key_and_no_stored_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, _) = manager(tmp.path());
+        let store = docs.env().store.borrow();
+        let odd = non_unicode_path();
+        // Not the key, not storing, not forgetting: the path has no text to be a key of.
+        for error in [
+            language_key(&odd).unwrap_err(),
+            store_language(&store, &odd, Some(Language::Rust)).unwrap_err(),
+            store_language(&store, &odd, None).unwrap_err(),
+            forget_language(&store, &odd).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("not valid Unicode"), "{error}");
+        }
+        assert_eq!(stored_language(&store, &odd), None);
+        assert_eq!(stored_language_rows(tmp.path()), 0);
+
+        // A file next to it is unaffected.
+        let good = canonical_path(&tmp.path().join("a.txt"));
+        store_language(&store, &good, Some(Language::Rust)).unwrap();
+        assert_eq!(stored_language(&store, &good), Some(Some(Language::Rust)));
+        assert_eq!(stored_language(&store, &odd), None);
+        forget_language(&store, &good).unwrap();
+        assert_eq!(stored_language(&store, &good), None);
+    }
+
+    #[test]
+    fn a_state_database_that_cannot_be_read_has_no_stored_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = canonical_path(&tmp.path().join("a.txt"));
+        let (docs, _) = manager(tmp.path());
+        let store = docs.env().store.borrow();
+        store_language(&store, &path, Some(Language::Go)).unwrap();
+        assert_eq!(stored_language(&store, &path), Some(Some(Language::Go)));
+        sabotage(tmp.path(), "DROP TABLE kv");
+        assert_eq!(stored_language(&store, &path), None);
+    }
+
+    /// The language remembered for the file `path`.
+    fn remembered(docs: &Documents, path: &Path) -> Option<Option<Language>> {
+        stored_language(&docs.env().store.borrow(), path)
+    }
+
+    /// An untitled buffer that holds `text`.
+    fn untitled_with(docs: &Documents, text: &str) -> Rc<DocEntry> {
+        let entry = docs.new_untitled();
+        assert!(replace_text(&mut entry.document().borrow_mut(), text));
+        entry
+    }
+
+    #[test]
+    fn a_renamed_file_keeps_its_language_and_nothing_stays_behind_at_the_old_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let old = tmp.path().join("notes.txt");
+        let new = tmp.path().join("renamed.txt");
+        std::fs::write(&old, "x = 1\n").unwrap();
+        let entry = docs.open(&old).unwrap();
+        sessions
+            .choose_language(&entry, Some(Language::Python))
+            .unwrap();
+        let before = entry.path().unwrap();
+
+        std::fs::rename(&old, &new).unwrap();
+        docs.rebind_path(&entry, &new).unwrap();
+        let after = entry.path().unwrap();
+        assert_ne!(before, after);
+        assert_eq!(remembered(&docs, &after), Some(Some(Language::Python)));
+        assert_eq!(remembered(&docs, &before), None, "no row is left behind");
+        assert_eq!(stored_language_rows(tmp.path()), 1);
+        assert_eq!(entry.language_choice(), Some(Some(Language::Python)));
+
+        // A file that is created at the old path later is not the renamed one: no language.
+        docs.release(&entry);
+        std::fs::write(&old, "y = 2\n").unwrap();
+        assert_eq!(docs.open(&old).unwrap().language_choice(), None);
+        // The renamed file still has its language when it is opened again.
+        assert_eq!(
+            docs.open(&new).unwrap().language_choice(),
+            Some(Some(Language::Python))
+        );
+    }
+
+    #[test]
+    fn a_plain_text_choice_follows_a_renamed_file_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let old = tmp.path().join("data.json");
+        let new = tmp.path().join("data.txt");
+        std::fs::write(&old, "{}\n").unwrap();
+        let entry = docs.open(&old).unwrap();
+        sessions.choose_language(&entry, None).unwrap();
+        let before = entry.path().unwrap();
+
+        std::fs::rename(&old, &new).unwrap();
+        docs.rebind_path(&entry, &new).unwrap();
+        assert_eq!(remembered(&docs, &entry.path().unwrap()), Some(None));
+        assert_eq!(remembered(&docs, &before), None);
+        assert_eq!(stored_language_rows(tmp.path()), 1);
+    }
+
+    #[test]
+    fn a_file_without_a_choice_does_not_inherit_a_row_left_at_its_new_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, _) = manager(tmp.path());
+        let old = tmp.path().join("notes.txt");
+        let new = tmp.path().join("renamed.txt");
+        std::fs::write(&old, "x = 1\n").unwrap();
+        let entry = docs.open(&old).unwrap();
+        // What an earlier file of that name left behind.
+        let leftover = canonical_path(&new);
+        store_language(&docs.env().store.borrow(), &leftover, Some(Language::Go)).unwrap();
+
+        std::fs::rename(&old, &new).unwrap();
+        docs.rebind_path(&entry, &new).unwrap();
+        assert_eq!(entry.language_choice(), None);
+        assert_eq!(remembered(&docs, &leftover), None);
+        assert_eq!(stored_language_rows(tmp.path()), 0);
+    }
+
+    #[test]
+    fn a_rename_that_only_changes_the_case_keeps_the_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let old = tmp.path().join("Notes.txt");
+        let new = tmp.path().join("notes.txt");
+        std::fs::write(&old, "x = 1\n").unwrap();
+        let entry = docs.open(&old).unwrap();
+        sessions
+            .choose_language(&entry, Some(Language::Go))
+            .unwrap();
+
+        // Both names are one key: the old row must be deleted before the new one is written.
+        std::fs::rename(&old, &new).unwrap();
+        docs.rebind_path(&entry, &new).unwrap();
+        assert_eq!(
+            remembered(&docs, &entry.path().unwrap()),
+            Some(Some(Language::Go))
+        );
+        assert_eq!(stored_language_rows(tmp.path()), 1);
+    }
+
+    #[test]
+    fn an_external_rename_moves_the_language_choice_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let old = tmp.path().join("notes.txt");
+        let new = tmp.path().join("moved.txt");
+        std::fs::write(&old, "x = 1\n").unwrap();
+        let entry = docs.open(&old).unwrap();
+        sessions
+            .choose_language(&entry, Some(Language::Python))
+            .unwrap();
+        let before = entry.path().unwrap();
+
+        std::fs::rename(&old, &new).unwrap();
+        let outcomes = docs.handle_fs_events(&[FsEvent {
+            path: new.clone(),
+            kind: FsEventKind::Renamed { from: old.clone() },
+        }]);
+        assert_eq!(outcomes.len(), 1);
+        let action = format!("{:?}", outcomes[0].action);
+        assert!(action.starts_with("Renamed"), "{action}");
+        assert_eq!(
+            remembered(&docs, &entry.path().unwrap()),
+            Some(Some(Language::Python))
+        );
+        assert_eq!(remembered(&docs, &before), None);
+        assert_eq!(stored_language_rows(tmp.path()), 1);
+    }
+
+    #[test]
+    fn a_history_that_cannot_follow_a_rename_does_not_leave_the_language_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let old = tmp.path().join("notes.txt");
+        let new = tmp.path().join("renamed.txt");
+        std::fs::write(&old, "x = 1\n").unwrap();
+        let entry = docs.open(&old).unwrap();
+        sessions
+            .choose_language(&entry, Some(Language::Python))
+            .unwrap();
+        let before = entry.path().unwrap();
+        sabotage(tmp.path(), "DROP TABLE history_snapshots");
+
+        std::fs::rename(&old, &new).unwrap();
+        let error = docs.rebind_path(&entry, &new).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "database error: no such table: history_snapshots"
+        );
+        assert_eq!(
+            remembered(&docs, &entry.path().unwrap()),
+            Some(Some(Language::Python))
+        );
+        assert_eq!(remembered(&docs, &before), None);
+    }
+
+    #[test]
+    fn a_language_that_cannot_follow_a_rename_does_not_leave_the_history_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, _) = manager(tmp.path());
+        let old = tmp.path().join("notes.txt");
+        let new = tmp.path().join("renamed.txt");
+        std::fs::write(&old, "x = 1\n").unwrap();
+        let entry = docs.open(&old).unwrap();
+        let before = entry.path().unwrap();
+        docs.env()
+            .store
+            .borrow_mut()
+            .history_snapshot(&before, "x = 1\n", SnapshotReason::Periodic, 100)
+            .unwrap();
+        sabotage(tmp.path(), "DROP TABLE kv");
+
+        std::fs::rename(&old, &new).unwrap();
+        let error = docs.rebind_path(&entry, &new).unwrap_err();
+        assert_eq!(error.to_string(), "database error: no such table: kv");
+        // The document is rebound and its history followed anyway.
+        let after = entry.path().unwrap();
+        assert_ne!(before, after);
+        let store = docs.env().store.borrow();
+        assert_eq!(store.history_list(&after).unwrap().len(), 1);
+        assert!(store.history_list(&before).unwrap().is_empty());
+    }
+
+    #[test]
+    fn save_as_stores_the_language_of_a_buffer_under_the_new_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        // A language and "Plain text" are both choices a buffer can carry to its file.
+        for (name, choice) in [("rust.txt", Some(Language::Rust)), ("plain.txt", None)] {
+            let scratch = untitled_with(&docs, "text\n");
+            sessions.choose_language(&scratch, choice).unwrap();
+            let target = tmp.path().join(name);
+            assert_eq!(remembered(&docs, &canonical_path(&target)), None);
+
+            docs.save_as(&scratch, &target).unwrap();
+            assert_eq!(remembered(&docs, &scratch.path().unwrap()), Some(choice));
+            docs.release(&scratch);
+            assert_eq!(docs.open(&target).unwrap().language_choice(), Some(choice));
+        }
+        assert_eq!(stored_language_rows(tmp.path()), 2);
+    }
+
+    #[test]
+    fn save_as_of_a_file_gives_the_copy_the_language_and_the_original_keeps_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, sessions) = manager(tmp.path());
+        let original = tmp.path().join("notes.txt");
+        let copy = tmp.path().join("copy.txt");
+        std::fs::write(&original, "x = 1\n").unwrap();
+        let entry = docs.open(&original).unwrap();
+        sessions
+            .choose_language(&entry, Some(Language::Python))
+            .unwrap();
+        let original_path = entry.path().unwrap();
+
+        docs.save_as(&entry, &copy).unwrap();
+        let copy_path = entry.path().unwrap();
+        assert_ne!(original_path, copy_path);
+        assert_eq!(remembered(&docs, &copy_path), Some(Some(Language::Python)));
+        // The file it was saved from is still there, and so is its choice.
+        assert_eq!(
+            remembered(&docs, &original_path),
+            Some(Some(Language::Python))
+        );
+        assert_eq!(stored_language_rows(tmp.path()), 2);
+    }
+
+    #[test]
+    fn save_as_without_a_choice_does_not_inherit_a_row_left_at_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, _) = manager(tmp.path());
+        let target = tmp.path().join("old.txt");
+        let leftover = canonical_path(&target);
+        store_language(&docs.env().store.borrow(), &leftover, Some(Language::Go)).unwrap();
+        let scratch = untitled_with(&docs, "text\n");
+
+        docs.save_as(&scratch, &target).unwrap();
+        assert_eq!(scratch.language_choice(), None);
+        assert_eq!(remembered(&docs, &leftover), None);
+        assert_eq!(stored_language_rows(tmp.path()), 0);
+    }
+
+    #[test]
+    fn a_language_that_cannot_be_stored_by_save_as_leaves_the_file_saved_and_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, _) = manager(tmp.path());
+        let target = tmp.path().join("kept.txt");
+        let scratch = untitled_with(&docs, "text\n");
+        sabotage(tmp.path(), "DROP TABLE kv");
+
+        let error = docs.save_as(&scratch, &target).unwrap_err();
+        assert_eq!(error.to_string(), "database error: no such table: kv");
+        assert_eq!(std::fs::read(&target).unwrap(), b"text\n");
+        assert_eq!(scratch.path(), Some(canonical_path(&target)));
+        assert!(!scratch.is_untitled() && !scratch.is_dirty());
+    }
+
+    #[test]
+    fn a_language_cannot_follow_a_file_from_or_to_a_name_that_is_not_unicode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, _) = manager(tmp.path());
+        let store = docs.env().store.borrow();
+        let odd = non_unicode_path();
+        let good = canonical_path(&tmp.path().join("a.txt"));
+        store_language(&store, &good, Some(Language::Rust)).unwrap();
+
+        // From a name that has no key nothing is deleted, and the other file keeps its row.
+        let error = move_language(&store, &odd, &good, None).unwrap_err();
+        assert!(error.to_string().contains("not valid Unicode"), "{error}");
+        assert_eq!(stored_language(&store, &good), Some(Some(Language::Rust)));
+        // To a name that has no key nothing is stored.
+        let error = move_language(&store, &good, &odd, Some(None)).unwrap_err();
+        assert!(error.to_string().contains("not valid Unicode"), "{error}");
+        assert_eq!(stored_language(&store, &odd), None);
     }
 
     #[test]

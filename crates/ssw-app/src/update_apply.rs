@@ -487,7 +487,8 @@ mod tests {
         .unwrap();
 
         let launches = fake.launches();
-        assert_eq!(launches.len(), 1, "{:?}", fake.events());
+        let events = fake.events();
+        assert_eq!(launches.len(), 1, "{events:?}");
         let (program, args) = &launches[0];
         // The copy lives in a new folder below the temp root, and is a byte-for-byte copy.
         assert_ne!(program, &setup.app_exe);
@@ -683,13 +684,7 @@ mod tests {
         );
         assert!(*package_present);
         // 3. The installed executable, without arguments, and the package is gone.
-        assert_eq!(
-            events[2],
-            Event::Launch {
-                program: setup.app_exe.clone(),
-                args: Vec::new()
-            }
-        );
+        assert_eq!(fake.launches(), vec![(setup.app_exe.clone(), Vec::new())]);
         assert!(!setup.package.exists());
     }
 

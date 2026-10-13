@@ -2216,10 +2216,25 @@ fn winhttp_streaming_gives_up_on_a_body_that_stops_arriving() {
 struct GetOnly {
     raw_head: String,
     body: Vec<u8>,
+    /// What `get` answers instead of the body.
+    fails: Option<NetError>,
+}
+
+impl GetOnly {
+    fn new(raw_head: String, body: Vec<u8>) -> Self {
+        Self {
+            raw_head,
+            body,
+            fails: None,
+        }
+    }
 }
 
 impl Http for GetOnly {
     fn get(&self, _request: &HttpRequest<'_>) -> Result<HttpResponse, NetError> {
+        if let Some(error) = &self.fails {
+            return Err(error.clone());
+        }
         Ok(HttpResponse {
             head: ResponseHead::parse(&self.raw_head)?,
             body: self.body.clone(),
@@ -2230,10 +2245,7 @@ impl Http for GetOnly {
 #[test]
 fn a_network_that_only_implements_get_still_streams_to_a_file() {
     let body = payload(70_000);
-    let http = GetOnly {
-        raw_head: octet_head(body.len()),
-        body: body.clone(),
-    };
+    let http = GetOnly::new(octet_head(body.len()), body.clone());
     let dir = tempdir().unwrap();
     let target = dir.path().join("a.bin");
     let mut seen = Vec::new();
@@ -2252,10 +2264,7 @@ fn a_network_that_only_implements_get_still_streams_to_a_file() {
     assert_progress(&seen, Some(70_000), 70_000);
 
     // A response whose body is not wanted hands nothing to the sink.
-    let refused = GetOnly {
-        raw_head: head("404 Not Found", &[]),
-        body: Vec::new(),
-    };
+    let refused = GetOnly::new(head("404 Not Found", &[]), Vec::new());
     let url = Url::parse(ASSET).unwrap();
     let mut calls = 0;
     let answered = refused
@@ -2270,32 +2279,20 @@ fn a_network_that_only_implements_get_still_streams_to_a_file() {
     assert_eq!((answered.status, calls), (404, 0));
 }
 
-/// A network whose `get` fails; it keeps the default `get_streaming`.
-#[derive(Debug)]
-struct GetFails;
-
-impl Http for GetFails {
-    fn get(&self, _request: &HttpRequest<'_>) -> Result<HttpResponse, NetError> {
-        Err(NetError::Timeout)
-    }
-}
-
 #[test]
 fn the_default_stream_passes_on_a_failed_get_and_a_refused_chunk() {
     let url = Url::parse(ASSET).unwrap();
     let ask = request(&url, Accept::Any, LIMIT, FIVE_SECONDS);
+    let body = payload(70_000);
 
-    let error = GetFails
-        .get_streaming(&ask, &mut |_, _| Ok(()))
-        .unwrap_err();
+    // A `get` that fails is passed on before anything reaches the sink.
+    let mut broken = GetOnly::new(octet_head(body.len()), body.clone());
+    broken.fails = Some(NetError::Timeout);
+    let error = broken.get_streaming(&ask, &mut |_, _| Ok(())).unwrap_err();
     assert_eq!(error, NetError::Timeout);
 
     // A sink that refuses stops the stream at its first chunk.
-    let body = payload(70_000);
-    let http = GetOnly {
-        raw_head: octet_head(body.len()),
-        body,
-    };
+    let http = GetOnly::new(octet_head(body.len()), body);
     let mut calls = 0;
     let error = http
         .get_streaming(&ask, &mut |_, _| {

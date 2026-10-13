@@ -123,6 +123,7 @@ impl Lab {
             folded: false,
             strings: &self.strings,
             registry: &self.registry,
+            plain_tokens: &[],
         };
         self.registry.measure(&cx, block)
     }
@@ -958,6 +959,7 @@ fn a_renderer_asked_for_another_block_shows_its_source() {
         folded: false,
         strings: &strings,
         registry: &registry,
+        plain_tokens: &[],
     };
     let layout = registry.measure(&cx, &doc.ast().blocks[0]);
     let paint = BlockPaintCx {
@@ -1004,6 +1006,7 @@ fn custom_strings_describe_the_table() {
         folded: false,
         strings: &strings,
         registry: &registry,
+        plain_tokens: &[],
     };
     let layout = registry.measure(&cx, &doc.ast().blocks[0]);
     assert_eq!(layout.access_label(&strings), "3 by 2");

@@ -18,6 +18,7 @@ use ssw_app::ui::scripted_services::ScriptedServices;
 use ssw_app::ui::shell_view::ShellAction;
 use ssw_core::command::CommandId;
 use ssw_core::edit::{Edit, Selection, Transaction};
+use ssw_ui::editor::highlight::Language;
 use ssw_ui::editor::{DocumentKind, EditorConfig};
 use ssw_ui::services::{Clock, FakeClock, MemoryClipboard};
 use ssw_ui::shell::picker::Row;
@@ -187,6 +188,17 @@ impl Rig {
             .wrap
     }
 
+    /// The language the active tab's editor colours its document as.
+    fn language(&self) -> Option<Language> {
+        let window = self.window();
+        let view = window.view.borrow();
+        view.active_tab()
+            .expect("a tab is open")
+            .editor
+            .config()
+            .plain_language
+    }
+
     /// The (enabled, checked) state of the View menu's Word wrap and Render as Markdown items.
     fn switches(&self) -> [(bool, bool); 2] {
         let window = self.window();
@@ -348,6 +360,58 @@ fn word_wrap_is_chosen_per_tab_and_survives_changed_settings() {
         assert_eq!(ended(&rig.command(CommandId::ViewWordWrap)), "handled");
         assert!(rig.wrap());
         assert_eq!(rig.switches(), [(true, true), (true, false)]);
+    });
+}
+
+// ----- syntax colours ----------------------------------------------------------------------------
+
+#[test]
+fn a_plain_file_is_coloured_as_its_extension_says_and_an_unknown_one_stays_plain() {
+    with_rig(|rig| {
+        for (name, text) in [
+            ("data.json", "{\"a\": [1, true]}\n"),
+            ("page.html", "<p class=\"x\">hi</p>\n"),
+            ("tool.py", "def f():\n    return None\n"),
+            ("style.css", "p { color: red; }\n"),
+        ] {
+            std::fs::write(rig.work.join(name), text).unwrap();
+        }
+        for (name, language) in [
+            ("data.json", Language::Json),
+            ("page.html", Language::Html),
+            ("tool.py", Language::Python),
+            ("style.css", Language::Css),
+        ] {
+            rig.open(name);
+            assert_eq!(rig.kind(), DocumentKind::PlainText, "{name}");
+            assert_eq!(rig.language(), Some(language), "{name}");
+        }
+
+        // `.txt` has no language: its lines stay uncoloured.
+        rig.open("log.txt");
+        assert_eq!(rig.kind(), DocumentKind::PlainText);
+        assert_eq!(rig.language(), None);
+
+        // New settings do not take the language away from a tab.
+        rig.activate(rig.tab_keys()[1]);
+        assert_eq!(rig.language(), Some(Language::Json));
+        let config = EditorConfig::from_settings(&rig.controller.settings());
+        assert_eq!(config.plain_language, None);
+        rig.window().view.borrow_mut().set_editor_config(config);
+        assert_eq!(rig.language(), Some(Language::Json));
+
+        // Showing the file as Markdown and back keeps it too.
+        assert_eq!(
+            ended(&rig.command(CommandId::ViewRenderAsMarkdown)),
+            "handled"
+        );
+        assert_eq!(rig.kind(), DocumentKind::Markdown);
+        assert_eq!(
+            ended(&rig.command(CommandId::ViewRenderAsMarkdown)),
+            "handled"
+        );
+        assert_eq!(rig.kind(), DocumentKind::PlainText);
+        assert_eq!(rig.language(), Some(Language::Json));
     });
 }
 

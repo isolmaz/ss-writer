@@ -739,6 +739,7 @@ fn media_renderers_show_a_block_of_another_kind_as_its_source() {
         folded: false,
         strings: &strings,
         registry: &registry,
+        plain_tokens: &[],
     };
     let block = &doc.ast().blocks[0];
     let layouts = [
@@ -793,6 +794,7 @@ fn hidden_layout(
         folded: false,
         strings: &strings,
         registry: &registry,
+        plain_tokens: &[],
     };
     registry.measure(&cx, doc.ast().blocks.last().expect("a block"))
 }

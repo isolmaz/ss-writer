@@ -30,7 +30,8 @@ use crate::theme::Theme;
 use super::config::{
     Composition, DocumentKind, EditorConfig, EditorEvent, EditorStrings, LinkTarget,
 };
-use super::display::{Display, DisplayParams, GapPolicy, Reveal, build, raw};
+use super::display::{Display, DisplayParams, GapPolicy, Reveal, SegmentKind, build, raw};
+use super::highlight::{SyntaxColors, Token};
 use super::object::InlineObjectProvider;
 
 /// Heading sizes as multiples of the body size (spec §3).
@@ -124,6 +125,10 @@ pub struct BlockCx<'a> {
     pub strings: &'a EditorStrings,
     /// Renderers of container blocks measure their children through it.
     pub registry: &'a BlockRegistry,
+    /// The syntax tokens of a plain-text line: those of the document that touch the line, in
+    /// order, with their offsets into the document text (not the line). Empty for a line that
+    /// is not coloured and for every block of a Markdown or Mermaid document.
+    pub plain_tokens: &'a [Token],
 }
 
 impl fmt::Debug for BlockCx<'_> {
@@ -724,9 +729,37 @@ impl BlockRenderer for FallbackRenderer {
 }
 
 /// Shows the source text of a plain-text document line as written (monospace, wrapped, text
-/// color): the renderer of [`DocumentKind::PlainText`].
+/// color; the tokens of [`BlockCx::plain_tokens`] in the calm syntax palette): the renderer of
+/// [`DocumentKind::PlainText`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlainTextRenderer;
+
+/// Colors the stretches of `display` that `tokens` (offsets into the document) cover. The
+/// display text is the source of one line, so a token is clipped to it and mapped to display
+/// offsets through the shown segments: an IME composition inserted inside a token splits it
+/// and is itself left in the base style. Tokens the palette would style as plain text anyway
+/// are skipped, so a calm document adds a range only for its comments, strings and keywords.
+fn color_tokens(display: &mut Display, tokens: &[Token], colors: &SyntaxColors, base: &TextStyle) {
+    let line = display.map.source_range();
+    for token in tokens.iter().filter(|token| colors.colors(token.kind)) {
+        let (start, end) = (token.start.max(line.start), token.end.min(line.end));
+        for segment in display.map.segments() {
+            if segment.kind != SegmentKind::Shown {
+                continue;
+            }
+            let (from, to) = (start.max(segment.src.start), end.min(segment.src.end));
+            if from < to {
+                let at = |offset: usize| segment.disp.start + (offset - segment.src.start);
+                let piece = Token {
+                    start: at(from),
+                    end: at(to),
+                    kind: token.kind,
+                };
+                display.styles.push(colors.styled(&piece, base, 0));
+            }
+        }
+    }
+}
 
 impl BlockRenderer for PlainTextRenderer {
     fn measure(&self, cx: &BlockCx<'_>, block: &Block) -> Box<dyn BlockLayout> {
@@ -735,7 +768,11 @@ impl BlockRenderer for PlainTextRenderer {
             .with_line_height(cx.config.line_height_for(size, 1.2));
         let source = cx.buffer.slice(block.range);
         let composition = composition_in(cx, block.range);
-        let display = raw(&source, block.range, composition);
+        let mut display = raw(&source, block.range, composition);
+        if !cx.plain_tokens.is_empty() {
+            let colors = SyntaxColors::calm(cx.theme);
+            color_tokens(&mut display, cx.plain_tokens, &colors, &base);
+        }
         let width = if cx.config.wrap {
             cx.width
         } else {

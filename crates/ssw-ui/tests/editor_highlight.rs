@@ -403,49 +403,46 @@ fn ps_is_postscript_and_no_alias_of_powershell() {
             Some(Language::PowerShell),
             "{name}"
         );
+    }
+}
+
+#[test]
 fn well_known_file_names_pick_the_language() {
     for (name, language) in [
         ("Dockerfile", Some(Language::Bash)),
         ("dockerfile", Some(Language::Bash)),
         ("DOCKERFILE", Some(Language::Bash)),
         ("Containerfile", Some(Language::Bash)),
-        ("Makefile", Some(Language::Bash)),
-        ("makefile", Some(Language::Bash)),
-        ("GNUmakefile", Some(Language::Bash)),
-        (".bashrc", Some(Language::Bash)),
+        (".bash_aliases", Some(Language::Bash)),
+        (".bash_logout", Some(Language::Bash)),
         (".bash_profile", Some(Language::Bash)),
-        (".zshrc", Some(Language::Bash)),
+        (".bashrc", Some(Language::Bash)),
         (".profile", Some(Language::Bash)),
-        (".env", Some(Language::Bash)),
-        // Config files and Ruby programs have no language here and stay plain.
-        (".gitignore", None),
-        (".gitattributes", None),
-        (".editorconfig", None),
-        ("CMakeLists.txt", None),
-        ("Rakefile", None),
-        ("Gemfile", None),
-        ("Vagrantfile", None),
+        (".zprofile", Some(Language::Bash)),
+        (".zshenv", Some(Language::Bash)),
+        (".zshrc", Some(Language::Bash)),
         // Only the last component of a path is the name, with either separator.
         ("C:\\work\\app\\Dockerfile", Some(Language::Bash)),
         ("/home/me/.bashrc", Some(Language::Bash)),
-        ("v1.2/Makefile", Some(Language::Bash)),
+        ("v1.2/Containerfile", Some(Language::Bash)),
     ] {
         assert_eq!(detect_language(name, ""), language, "{name}");
     }
 }
 
 #[test]
-fn a_known_file_name_is_not_second_guessed_by_the_text() {
-    for (name, head, language) in [
-        // A name that has no language keeps it, whatever the first line says.
-        (".gitignore", "#!/bin/sh\n", None),
-        ("Gemfile", "<?xml version=\"1.0\"?>\n", None),
-        ("CMakeLists.txt", "<html>\n", None),
-        // A name that has one keeps it too.
-        ("Makefile", "<html>\n", Some(Language::Bash)),
-        ("Dockerfile", "#!/bin/sh\n", Some(Language::Bash)),
+fn makefiles_and_dotenv_files_are_not_shell() {
+    // Bash's single-quote rule spans lines: the apostrophe of `It's done` would colour the rest
+    // of the file as a string. Make and dotenv syntax is not shell, so these have no language.
+    for name in [
+        "Makefile",
+        "makefile",
+        "GNUmakefile",
+        ".env",
+        "C:\\work\\Makefile",
     ] {
-        assert_eq!(detect_language(name, head), language, "{name}");
+        assert_eq!(detect_language(name, "# It's done\n"), None, "{name}");
+        assert_eq!(detect_language(name, ""), None, "{name}");
     }
 }
 
@@ -556,6 +553,14 @@ fn name_and_extension_win_over_the_first_line() {
         ("page.json", "<!doctype html>\n", Some(Language::Json)),
         ("main.rs", "#!/bin/sh\n", Some(Language::Rust)),
         ("tool.py", "#!/bin/sh\n", Some(Language::Python)),
+        // A known file name wins as well.
+        ("Dockerfile", "<html>\n", Some(Language::Bash)),
+        (".bashrc", "<?xml version=\"1.0\"?>\n", Some(Language::Bash)),
+        (
+            "Containerfile",
+            "#!/usr/bin/python3\n",
+            Some(Language::Bash),
+        ),
     ] {
         assert_eq!(detect_language(name, head), language, "{name}");
     }
@@ -569,6 +574,14 @@ fn nothing_to_go_by_is_no_language() {
         ("data.bin", ""),
         ("", ""),
         ("", "plain\n"),
+        // Config files and Ruby or CMake programs: no name, extension or shebang says anything.
+        (".gitignore", "target/\n"),
+        (".gitattributes", "* text=auto\n"),
+        (".editorconfig", "root = true\n"),
+        ("CMakeLists.txt", "cmake_minimum_required(VERSION 3.20)\n"),
+        ("Gemfile", "source 'https://rubygems.org'\n"),
+        ("Rakefile", "task :default\n"),
+        ("Vagrantfile", "Vagrant.configure('2') do |config|\n"),
     ] {
         assert_eq!(detect_language(name, head), None, "{name:?}: {head:?}");
     }

@@ -177,7 +177,7 @@ description = "Every command with its shortcut, also reachable as the > mode of 
 id = "inspector-status-bar"
 title = "Inspector and status bar"
 spec = "8"
-description = "A contents tree with level filter, document statistics, file information, backlinks and a status bar with caret position, word count, zoom, and clickable encoding and line-ending menus."
+description = "A contents tree with level filter, document statistics, file information, backlinks and a status bar with caret position, word count, zoom, and clickable encoding, line-ending and language menus."
 
 [[feature]]
 id = "copy-export-print"

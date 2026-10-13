@@ -187,7 +187,7 @@ The behavior of each feature is defined in [`docs/spec.md`](docs/spec.md); [`doc
 - **Window menu** — New window, Merge all windows (moves the tabs of every other window into the current one) and the tab commands in one menu.
 - **Find, replace and Quick Open** — Find with case, word and regex options, replace all as one undo step, go to line, fuzzy Quick Open for files and headings, and search across a folder.
 - **Command palette** — Every command with its shortcut, also reachable as the > mode of Quick Open; commands that do not apply to the current document are listed disabled and do not run.
-- **Inspector and status bar** — A contents tree with level filter, document statistics, file information, backlinks and a status bar with caret position, word count, zoom, and clickable encoding and line-ending menus.
+- **Inspector and status bar** — A contents tree with level filter, document statistics, file information, backlinks and a status bar with caret position, word count, zoom, and clickable encoding, line-ending and language menus.
 
 ### Output
 

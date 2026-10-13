@@ -15,6 +15,7 @@ use ssw_io::history::SnapshotReason;
 use ssw_io::save::SaveStamp;
 use ssw_io::watch::{DocChange, FsEvent, Watcher, path_key};
 
+use crate::session::move_language;
 use crate::workers::Waker;
 
 use super::{
@@ -325,11 +326,13 @@ impl Documents {
     }
 
     /// Points `entry` at `to` after its file was renamed or moved (by the sidebar or by another
-    /// program). The version history and the change tracking follow the file.
+    /// program). The version history, the change tracking and the language the user chose for
+    /// the file follow it; nothing stays behind at the old path.
     ///
     /// # Errors
-    /// [`DocError::Store`] when the history cannot be moved (the document is rebound anyway),
-    /// [`DocError::Untitled`] for buffers.
+    /// [`DocError::Store`] when the history or the language choice cannot be moved (the document
+    /// is rebound anyway; the history is moved even when the language is not, and the other way
+    /// round), [`DocError::Untitled`] for buffers.
     pub fn rebind_path(&self, entry: &DocEntry, to: &Path) -> Result<(), DocError> {
         let old = entry.path().ok_or(DocError::Untitled)?;
         let to = super::canonical_path(to);
@@ -341,7 +344,10 @@ impl Documents {
             }
         }
         entry.state.borrow_mut().path = Some(to.clone());
-        self.env.store.borrow().history_move(&old, &to)?;
-        Ok(())
+        // Both are tried: a history that cannot follow must not leave the language behind.
+        let store = self.env.store.borrow();
+        let history = store.history_move(&old, &to);
+        let language = move_language(&store, &old, &to, entry.language_choice());
+        Ok(history.and(language)?)
     }
 }

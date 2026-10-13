@@ -7,42 +7,28 @@
 
 use super::Language;
 
-/// Files that are known by their whole name, compared without regard to case; sorted by name.
+/// Files that are Bash by their whole name, compared without regard to case; sorted by name.
 ///
-/// A name in this table decides, also when it maps to `None`: the file is known and has no
-/// language here, so its first line is not second-guessed.
-const FILE_NAMES: &[(&str, Option<Language>)] = &[
+/// Only files whose text really is shell belong here. Makefiles and dotenv files do not: their
+/// syntax is not shell, and Bash's quote rule spans lines, so one apostrophe in a comment
+/// (`# It's done`) would colour the rest of the file as a string. A file that no rule
+/// recognizes has no language, so such files need no row.
+const BASH_FILE_NAMES: &[&str] = &[
     // Shell startup files: shell scripts that have no extension to say so.
-    (".bash_aliases", Some(Language::Bash)),
-    (".bash_logout", Some(Language::Bash)),
-    (".bash_profile", Some(Language::Bash)),
-    (".bashrc", Some(Language::Bash)),
-    // Editor settings in INI syntax; there is no such language.
-    (".editorconfig", None),
-    // dotenv files are `KEY=value` lines with `#` comments and shell quoting.
-    (".env", Some(Language::Bash)),
-    // Pattern lists with `#` comments (and attributes); there is no such language.
-    (".gitattributes", None),
-    (".gitignore", None),
+    ".bash_aliases",
+    ".bash_logout",
+    ".bash_profile",
+    ".bashrc",
     // Startup file of login shells.
-    (".profile", Some(Language::Bash)),
+    ".profile",
     // Zsh startup files: shell scripts, and Zsh is close enough to Bash for colouring.
-    (".zprofile", Some(Language::Bash)),
-    (".zshenv", Some(Language::Bash)),
-    (".zshrc", Some(Language::Bash)),
-    // CMake's own scripting language.
-    ("CMakeLists.txt", None),
+    ".zprofile",
+    ".zshenv",
+    ".zshrc",
     // Container build files: `#` comments, `$VAR`, quoting and `RUN` lines of shell, so Bash is
     // the closest language there is.
-    ("Containerfile", Some(Language::Bash)),
-    ("Dockerfile", Some(Language::Bash)),
-    // Ruby programs without an extension; Ruby is not a language here.
-    ("Gemfile", None),
-    // Makefiles: `#` comments, `$(VAR)` and shell recipes, so Bash again.
-    ("GNUmakefile", Some(Language::Bash)),
-    ("Makefile", Some(Language::Bash)),
-    ("Rakefile", None),
-    ("Vagrantfile", None),
+    "Containerfile",
+    "Dockerfile",
 ];
 
 /// Interpreters named in a shebang that [`Language::from_name`] does not know by that name.
@@ -65,8 +51,7 @@ const INTERPRETERS: &[(&str, Language)] = &[
 /// bounded prefix (a few hundred bytes are plenty) instead of the whole text. The first rule
 /// that matches wins:
 ///
-/// 1. The whole file name, case-insensitively: `Dockerfile`, `Makefile`, `.gitignore`,
-///    `.bashrc`, … A listed name decides even when it has no language (`.gitignore`).
+/// 1. The whole file name, case-insensitively: `Dockerfile`, `.bashrc`, … are Bash.
 /// 2. The extension, through [`Language::from_name`] and its aliases: `notes.rs`, `app.tsx`,
 ///    `data.yml`. A dot that starts the name is not an extension, so `.gitignore` has none.
 /// 3. A shebang: `#!`, then the last path component of the interpreter, looking through `env`
@@ -79,8 +64,8 @@ const INTERPRETERS: &[(&str, Language)] = &[
 #[must_use]
 pub fn detect_language(name: &str, head: &str) -> Option<Language> {
     let file_name = last_component(name);
-    if let Some(language) = known_file(file_name) {
-        return language;
+    if is_bash_file(file_name) {
+        return Some(Language::Bash);
     }
     if let Some(language) = extension(file_name).and_then(Language::from_name) {
         return Some(language);
@@ -89,13 +74,11 @@ pub fn detect_language(name: &str, head: &str) -> Option<Language> {
     from_shebang(line).or_else(|| from_markup(line))
 }
 
-/// What the table says about `file_name`: `Some(language)` for a listed name, whose language
-/// may be none.
-fn known_file(file_name: &str) -> Option<Option<Language>> {
-    FILE_NAMES
+/// Whether the table lists `file_name` as a Bash file.
+fn is_bash_file(file_name: &str) -> bool {
+    BASH_FILE_NAMES
         .iter()
-        .find(|(known, _)| known.eq_ignore_ascii_case(file_name))
-        .map(|&(_, language)| language)
+        .any(|known| known.eq_ignore_ascii_case(file_name))
 }
 
 /// What follows the last `/` or `\`.

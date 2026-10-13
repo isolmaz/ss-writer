@@ -16,6 +16,7 @@ use ssw_app::startup::ProcessEnv;
 use ssw_app::ui::context_menus::Popup;
 use ssw_app::ui::controller::{Controller, WindowCell};
 use ssw_app::ui::scripted_services::{Answer, DialogKind, ScriptedServices};
+use ssw_app::ui::shell_view::ShellAction;
 use ssw_app::workers::WindowId;
 use ssw_core::command::CommandId;
 use ssw_ui::canvas::RecordingCanvas;
@@ -23,6 +24,7 @@ use ssw_ui::editor::highlight::Language;
 use ssw_ui::geometry::Size;
 use ssw_ui::input::{Event, PointerButton, PointerEvent, PointerEventKind};
 use ssw_ui::services::{Clock, FakeClock, MemoryClipboard, MessageBoxResult};
+use ssw_ui::shell::sidebar::SidebarEvent;
 use ssw_ui::shell::statusbar::StatusSegment;
 use ssw_ui::text::MonoTextEngine;
 use ssw_ui::widgets::SharedClipboard;
@@ -817,5 +819,97 @@ fn choosing_a_language_in_a_window_without_a_tab_changes_nothing() {
             marked(&rig.status_popup(StatusSegment::Language)),
             ["Automatic"]
         );
+    });
+}
+
+// ----- the choice follows the file ---------------------------------------------------------------
+
+impl Rig {
+    /// Renames the file `from` (relative to the work folder) to `name` the way the sidebar's
+    /// rename box does, with the work folder shown in the sidebar.
+    fn rename_in_sidebar(&self, from: &str, name: &str) {
+        let window = self.window();
+        self.controller.show_workspace(&window, &self.work);
+        window
+            .view
+            .borrow_mut()
+            .sidebar_mut()
+            .expect("the sidebar exists")
+            .expand_all();
+        self.controller.refresh_all();
+        let wanted = self.work.join(from).to_string_lossy().to_lowercase();
+        let key = {
+            let tree = window.tree.borrow();
+            let paths = tree.as_ref().expect("a workspace is shown");
+            (0..)
+                .map_while(|key| paths.path(key).map(|found| (key, found)))
+                .find(|(_, found)| found.to_string_lossy().to_lowercase() == wanted)
+                .map(|(key, _)| key)
+                .unwrap_or_else(|| panic!("no sidebar entry for {from}"))
+        };
+        self.controller.handle_action(
+            self.id(),
+            ShellAction::Sidebar(SidebarEvent::RenameCommitted {
+                key,
+                name: name.to_owned(),
+            }),
+        );
+        self.controller.refresh_all();
+    }
+}
+
+#[test]
+fn renaming_a_file_in_the_sidebar_keeps_its_language_and_leaves_nothing_at_the_old_name() {
+    let files: [(&str, &[u8]); 2] = [("keep.md", b"# Keep\n"), ("notes.txt", b"print('hi')\n")];
+    with_rig(&files, |rig| {
+        rig.open("notes.txt");
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Python", None);
+
+        rig.rename_in_sidebar("notes.txt", "renamed.txt");
+        assert!(rig.work.join("renamed.txt").exists());
+        assert!(rig.entry().path().unwrap().ends_with("renamed.txt"));
+        assert_eq!(rig.language(), Some(Language::Python));
+        assert_eq!(rig.status(StatusSegment::Language), "Python");
+
+        // Closed and opened again under the new name, the file still shows Python.
+        rig.close_active_tab();
+        rig.open("renamed.txt");
+        assert_eq!(rig.language(), Some(Language::Python));
+        assert_eq!(rig.entry().language_choice(), Some(Some(Language::Python)));
+
+        // A file that is created at the old name later is another file: no language.
+        std::fs::write(rig.work.join("notes.txt"), "print('hi')\n").unwrap();
+        rig.open("notes.txt");
+        assert_eq!(rig.entry().language_choice(), None);
+        assert_eq!(rig.language(), None);
+    });
+}
+
+#[test]
+fn saving_a_file_under_another_name_gives_the_new_file_the_language_too() {
+    let files: [(&str, &[u8]); 2] = [("keep.md", b"# Keep\n"), ("notes.txt", b"print('hi')\n")];
+    with_rig(&files, |rig| {
+        rig.open("notes.txt");
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Python", None);
+
+        let copy = rig.work.join("copy.txt");
+        rig.services
+            .answer(DialogKind::SaveFile, Answer::Paths(vec![copy.clone()]));
+        rig.command(CommandId::FileSaveAs);
+        assert!(copy.exists());
+        assert!(rig.entry().path().unwrap().ends_with("copy.txt"));
+        assert_eq!(rig.language(), Some(Language::Python));
+
+        // Opened again, the copy is Python: the choice was stored under its name.
+        rig.close_active_tab();
+        rig.open("copy.txt");
+        assert_eq!(rig.language(), Some(Language::Python));
+        assert_eq!(rig.entry().language_choice(), Some(Some(Language::Python)));
+        // The file it was saved from is still there, and keeps its own choice.
+        rig.close_active_tab();
+        rig.open("notes.txt");
+        assert_eq!(rig.language(), Some(Language::Python));
     });
 }

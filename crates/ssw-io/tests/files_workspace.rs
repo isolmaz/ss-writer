@@ -9,9 +9,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use ssw_io::fs::{Attributes, FaultFs, FileSystem, FsError, FsFailure, FsOp, RealFs};
 use ssw_io::watch::{FsEvent, FsEventKind};
 use ssw_io::workspace::{
-    DEFAULT_FOLDER_NAME, FileClass, Node, NodeKind, SortKey, UNTITLED_BASE_NAME, ViewOptions,
-    WELCOME_FILE_NAME, Workspace, classify_extension, compare_logical, ensure_default_folder,
-    known_documents_dir, untitled_name,
+    DEFAULT_FOLDER_NAME, FileClass, FileKind, Node, NodeKind, SortKey, UNTITLED_BASE_NAME,
+    ViewOptions, WELCOME_FILE_NAME, Workspace, classify_extension, compare_logical,
+    ensure_default_folder, file_kind, known_documents_dir, untitled_name,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -95,12 +95,85 @@ fn extensions_are_classified_case_insensitively() {
 }
 
 #[test]
+fn every_text_extension_is_prose_or_code() {
+    let prose = ["txt", "text", "log", "rst"];
+    let code = [
+        "csv", "tsv", "json", "jsonc", "yaml", "yml", "ini", "toml", "xml", "html", "htm", "css",
+        "js", "ts", "tsx", "jsx", "py", "rs", "go", "java", "c", "h", "cpp", "cs", "sh", "bat",
+        "ps1", "sql", "tex", "mmd", "cfg", "conf",
+    ];
+    for ext in prose {
+        assert_eq!(classify_extension(ext), FileClass::Text, "{ext}");
+        assert_eq!(file_kind(ext), FileKind::Prose, "{ext}");
+    }
+    for ext in code {
+        assert_eq!(classify_extension(ext), FileClass::Text, "{ext}");
+        assert_eq!(file_kind(ext), FileKind::Code, "{ext}");
+    }
+}
+
+#[test]
+fn extensions_have_the_icon_class_the_tree_draws() {
+    let table = [
+        ("md", FileKind::Prose),
+        ("MD", FileKind::Prose),
+        ("markdown", FileKind::Prose),
+        ("mdx", FileKind::Prose),
+        ("TXT", FileKind::Prose),
+        ("JSON", FileKind::Code),
+        ("Py", FileKind::Code),
+        ("png", FileKind::Image),
+        ("SVG", FileKind::Image),
+        ("jpg", FileKind::Image),
+        // A file without an extension is read as plain text.
+        ("", FileKind::Prose),
+        // What no list names is read as text by the editor, so it is drawn like code: the app
+        // imports word-processor files itself and claims them as prose.
+        ("docx", FileKind::Code),
+        ("kt", FileKind::Code),
+        ("KT", FileKind::Code),
+        ("vue", FileKind::Code),
+        ("lua", FileKind::Code),
+        ("swift", FileKind::Code),
+        ("xyz", FileKind::Code),
+        // Only types known to open in another program are `Other`, in any case.
+        ("pdf", FileKind::Other),
+        ("PDF", FileKind::Other),
+        ("zip", FileKind::Other),
+        ("exe", FileKind::Other),
+    ];
+    for (ext, expected) in table {
+        assert_eq!(file_kind(ext), expected, "extension {ext:?}");
+    }
+}
+
+#[test]
+fn every_extension_known_to_open_elsewhere_is_other() {
+    let foreign = [
+        "pdf", "zip", "7z", "rar", "gz", "tar", "exe", "msi", "dll", "sys", "bin", "iso", "mp3",
+        "mp4", "wav", "avi", "mkv", "mov", "ttf", "otf", "woff", "woff2", "db", "sqlite", "pyc",
+        "o", "obj", "lib", "pdb", "class", "jar",
+    ];
+    assert_eq!(foreign.len(), 31);
+    for ext in foreign {
+        assert_eq!(classify_extension(ext), FileClass::Other, "{ext}");
+        assert_eq!(file_kind(ext), FileKind::Other, "{ext}");
+        assert_eq!(
+            file_kind(&ext.to_uppercase()),
+            FileKind::Other,
+            "{ext} in capitals"
+        );
+    }
+}
+
+#[test]
 fn nodes_carry_what_the_disk_reports() {
     let dir = tempfile::tempdir().unwrap();
     touch(&dir.path().join("Doc.MD"), "# hello");
     touch(&dir.path().join("noext"), "");
     touch(&dir.path().join(".gitignore"), "target");
     touch(&dir.path().join("archive.tar.gz"), "xyz");
+    touch(&dir.path().join("Main.kt"), "fun main() {}");
     std::fs::create_dir(dir.path().join("sub.d")).unwrap();
     let ws = Workspace::open(real(), dir.path()).unwrap();
 
@@ -110,7 +183,14 @@ fn nodes_carry_what_the_disk_reports() {
     assert!(tree.is_dir());
     assert_eq!(
         child_names(tree),
-        [".gitignore", "Doc.MD", "archive.tar.gz", "noext", "sub.d"]
+        [
+            ".gitignore",
+            "Doc.MD",
+            "Main.kt",
+            "archive.tar.gz",
+            "noext",
+            "sub.d"
+        ]
     );
 
     let doc = ws.node(&dir.path().join("Doc.MD")).unwrap();
@@ -118,6 +198,7 @@ fn nodes_carry_what_the_disk_reports() {
     assert_eq!(doc.ext, "md");
     assert_eq!(doc.size, 7);
     assert_eq!(doc.class(), FileClass::Markdown);
+    assert_eq!(doc.kind(), FileKind::Prose);
     assert!(doc.children.is_none());
     assert!(!doc.placeholder && !doc.is_hidden());
     assert!(doc.created.0 > 0 && doc.modified.0 > 0);
@@ -127,16 +208,36 @@ fn nodes_carry_what_the_disk_reports() {
         ws.node(&dir.path().join("noext")).unwrap().class(),
         FileClass::Other
     );
+    // An extensionless file and a dotfile are plain text to the tree.
+    assert_eq!(
+        ws.node(&dir.path().join("noext")).unwrap().kind(),
+        FileKind::Prose
+    );
     assert_eq!(ws.node(&dir.path().join(".gitignore")).unwrap().ext, "");
+    assert_eq!(
+        ws.node(&dir.path().join(".gitignore")).unwrap().kind(),
+        FileKind::Prose
+    );
     assert_eq!(
         ws.node(&dir.path().join("archive.tar.gz")).unwrap().ext,
         "gz"
+    );
+    assert_eq!(
+        ws.node(&dir.path().join("archive.tar.gz")).unwrap().kind(),
+        FileKind::Other
+    );
+    // A source file the lists do not know is read as text, so it is drawn like code.
+    assert_eq!(
+        ws.node(&dir.path().join("Main.kt")).unwrap().kind(),
+        FileKind::Code
     );
     let sub = ws.node(&dir.path().join("sub.d")).unwrap();
     assert_eq!(sub.kind, NodeKind::Dir);
     assert_eq!(sub.ext, "");
     assert_eq!(sub.size, 0);
     assert_eq!(sub.class(), FileClass::Other);
+    // A folder is never a document, whatever its (empty) extension says.
+    assert_eq!(sub.kind(), FileKind::Other);
     assert!(sub.children.is_none());
 }
 

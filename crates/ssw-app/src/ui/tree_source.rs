@@ -12,10 +12,12 @@ use std::sync::Arc;
 
 use ssw_io::fs::{FileSystem, FsError};
 use ssw_io::watch::{FsEvent, FsEventKind};
-use ssw_io::workspace::{FileClass, Node, SortKey as IoSortKey, ViewOptions, Workspace};
+use ssw_io::workspace::{FileKind, Node, SortKey as IoSortKey, ViewOptions, Workspace};
 use ssw_ui::shell::sidebar::{
     EntryKind, NodeKey, SidebarEntry, SidebarOptions, SortKey as UiSortKey, TreeSource,
 };
+
+use crate::documents::{DocMode, mode_for_path};
 
 /// Key of the workspace root.
 const ROOT_KEY: NodeKey = 0;
@@ -121,17 +123,28 @@ fn view_options(options: &SidebarOptions) -> ViewOptions {
     }
 }
 
+/// The icon class of a file. The word-processor files and TextBundle packs the app imports as
+/// Markdown open in the editor, so they are prose: `ssw_io` classifies by text type only (they
+/// land among its code files, like every unknown type) and leaves them to [`mode_for_path`],
+/// which owns the list of what the editor opens as Markdown. Only the types `ssw_io` knows to
+/// open in another app are [`EntryKind::Other`], which the tree dims.
+fn entry_kind(node: &Node) -> EntryKind {
+    match node.kind() {
+        FileKind::Prose => EntryKind::Prose,
+        FileKind::Code if mode_for_path(Path::new(&node.name)) == DocMode::Markdown => {
+            EntryKind::Prose
+        }
+        FileKind::Code => EntryKind::Code,
+        FileKind::Image => EntryKind::Image,
+        FileKind::Other => EntryKind::Other,
+    }
+}
+
 fn entry_for(key: NodeKey, node: &Node) -> SidebarEntry {
     let mut entry = if node.is_dir() {
         SidebarEntry::folder(key, node.name.clone())
     } else {
-        let kind = match node.class() {
-            FileClass::Markdown => EntryKind::Markdown,
-            FileClass::Image => EntryKind::Image,
-            FileClass::Text => EntryKind::Text,
-            FileClass::Other => EntryKind::Other,
-        };
-        SidebarEntry::file(key, node.name.clone(), kind)
+        SidebarEntry::file(key, node.name.clone(), entry_kind(node))
     };
     entry.placeholder = node.placeholder;
     entry.hidden = node.is_hidden();
@@ -189,7 +202,7 @@ mod tests {
         let names: Vec<_> = top.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["notes", "a.md", "b.bin", "pic.png"]);
         assert_eq!(top[0].kind, EntryKind::Folder);
-        assert_eq!(top[1].kind, EntryKind::Markdown);
+        assert_eq!(top[1].kind, EntryKind::Prose);
         assert_eq!(top[2].kind, EntryKind::Other);
         assert_eq!(top[3].kind, EntryKind::Image);
         assert_eq!(paths.path(top[1].key).unwrap(), tmp.path().join("a.md"));
@@ -217,6 +230,79 @@ mod tests {
         );
         assert!(tree.children(9999, &options).is_empty());
         assert_eq!(paths.path(9999), None);
+    }
+
+    #[test]
+    fn files_the_editor_opens_are_full_strength_and_only_known_foreign_types_are_dimmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "a.md",
+            "b.txt",
+            "Makefile",
+            "c.py",
+            "d.json",
+            "e.html",
+            "E.JSON",
+            "f.docx",
+            "g.odt",
+            "h.rtf",
+            "i.doc",
+            "j.textpack",
+            "k.png",
+            "l.zip",
+            "m.exe",
+            "n.xyz",
+            "p.kt",
+            "q.vue",
+            "r.lua",
+            "s.swift",
+            "Procfile",
+            ".gitignore",
+            "t.pdf",
+            "u.MP4",
+        ] {
+            std::fs::write(tmp.path().join(name), "x").unwrap();
+        }
+        std::fs::create_dir(tmp.path().join("o.textbundle")).unwrap();
+        let mut tree = WorkspaceTree::open(Arc::new(RealFs), tmp.path()).unwrap();
+        let entries = tree.children(tree.root_key(), &SidebarOptions::default());
+        let entry_of = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .expect("the file is listed")
+        };
+        for (name, kind, dimmed) in [
+            ("a.md", EntryKind::Prose, false),
+            ("b.txt", EntryKind::Prose, false),
+            ("Makefile", EntryKind::Prose, false),
+            ("c.py", EntryKind::Code, false),
+            ("d.json", EntryKind::Code, false),
+            ("e.html", EntryKind::Code, false),
+            ("E.JSON", EntryKind::Code, false),
+            ("f.docx", EntryKind::Prose, false),
+            ("g.odt", EntryKind::Prose, false),
+            ("h.rtf", EntryKind::Prose, false),
+            ("i.doc", EntryKind::Prose, false),
+            ("j.textpack", EntryKind::Prose, false),
+            ("k.png", EntryKind::Image, true),
+            ("l.zip", EntryKind::Other, true),
+            ("m.exe", EntryKind::Other, true),
+            ("n.xyz", EntryKind::Code, false),
+            ("p.kt", EntryKind::Code, false),
+            ("q.vue", EntryKind::Code, false),
+            ("r.lua", EntryKind::Code, false),
+            ("s.swift", EntryKind::Code, false),
+            ("Procfile", EntryKind::Prose, false),
+            (".gitignore", EntryKind::Prose, false),
+            ("t.pdf", EntryKind::Other, true),
+            ("u.MP4", EntryKind::Other, true),
+            ("o.textbundle", EntryKind::Folder, false),
+        ] {
+            let entry = entry_of(name);
+            assert_eq!(entry.kind, kind, "{name}");
+            assert_eq!(entry.is_dimmed(), dimmed, "{name}");
+        }
     }
 
     #[test]

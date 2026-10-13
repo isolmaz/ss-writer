@@ -41,32 +41,81 @@ pub enum FileClass {
     Image,
     /// Other text formats: plain mode.
     Text,
-    /// Everything else: dimmed, opened by the default app.
+    /// Everything else: not text by its extension (word-processor files, which the app imports,
+    /// and extensionless files are in this class too).
     Other,
 }
+
+/// Text formats written as prose: plain text, logs and reStructuredText.
+const PROSE_TEXT: [&str; 4] = ["txt", "text", "log", "rst"];
+/// The other text formats: source code, markup, data and configuration files.
+const CODE_TEXT: [&str; 32] = [
+    "csv", "tsv", "json", "jsonc", "yaml", "yml", "ini", "toml", "xml", "html", "htm", "css", "js",
+    "ts", "tsx", "jsx", "py", "rs", "go", "java", "c", "h", "cpp", "cs", "sh", "bat", "ps1", "sql",
+    "tex", "mmd", "cfg", "conf",
+];
 
 /// Classifies an extension (without the dot, any case).
 #[must_use]
 pub fn classify_extension(ext: &str) -> FileClass {
+    classify_lowercase(&ext.to_lowercase())
+}
+
+fn classify_lowercase(lower: &str) -> FileClass {
     const MARKDOWN: [&str; 3] = ["md", "markdown", "mdx"];
     const IMAGE: [&str; 11] = [
         "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "heic", "ico", "svg",
     ];
-    const TEXT: [&str; 36] = [
-        "txt", "text", "log", "csv", "tsv", "json", "jsonc", "yaml", "yml", "ini", "toml", "xml",
-        "html", "htm", "css", "js", "ts", "tsx", "jsx", "py", "rs", "go", "java", "c", "h", "cpp",
-        "cs", "sh", "bat", "ps1", "sql", "tex", "rst", "mmd", "cfg", "conf",
-    ];
-    let lower = ext.to_lowercase();
-    let lower = lower.as_str();
     if MARKDOWN.contains(&lower) {
         FileClass::Markdown
     } else if IMAGE.contains(&lower) {
         FileClass::Image
-    } else if TEXT.contains(&lower) {
+    } else if PROSE_TEXT.contains(&lower) || CODE_TEXT.contains(&lower) {
         FileClass::Text
     } else {
         FileClass::Other
+    }
+}
+
+/// Extensions of the non-text types that open in another app (pictures are classified apart):
+/// documents, archives, executables and libraries, audio and video, fonts, databases and
+/// compiled objects. Any other file is read as text by the editor, so only these are dimmed.
+const OPENS_ELSEWHERE: [&str; 31] = [
+    "pdf", "zip", "7z", "rar", "gz", "tar", "exe", "msi", "dll", "sys", "bin", "iso", "mp3", "mp4",
+    "wav", "avi", "mkv", "mov", "ttf", "otf", "woff", "woff2", "db", "sqlite", "pyc", "o", "obj",
+    "lib", "pdb", "class", "jar",
+];
+
+/// How the tree draws a file: one of four classes of icon, and whether the name is dimmed
+/// (a picture or a type known to open in another app is dimmed, everything else opens in the
+/// editor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileKind {
+    /// Markdown and plain text, and files without an extension (read as plain text).
+    Prose,
+    /// Source code, markup, data and configuration files, and any file of an unknown type: the
+    /// editor opens it as text.
+    Code,
+    /// Raster and vector images.
+    Image,
+    /// A type known to open in another app: pictures aside, the `OPENS_ELSEWHERE` list.
+    Other,
+}
+
+/// The [`FileKind`] of an extension (without the dot, any case). Word-processor files, which the
+/// app imports as Markdown, are [`FileKind::Code`] here like every unknown type: the app owns
+/// that list.
+#[must_use]
+pub fn file_kind(ext: &str) -> FileKind {
+    let lower = ext.to_lowercase();
+    match classify_lowercase(&lower) {
+        FileClass::Markdown => FileKind::Prose,
+        FileClass::Image => FileKind::Image,
+        FileClass::Text if CODE_TEXT.contains(&lower.as_str()) => FileKind::Code,
+        FileClass::Text => FileKind::Prose,
+        FileClass::Other if lower.is_empty() => FileKind::Prose,
+        FileClass::Other if OPENS_ELSEWHERE.contains(&lower.as_str()) => FileKind::Other,
+        FileClass::Other => FileKind::Code,
     }
 }
 
@@ -146,6 +195,16 @@ impl Node {
             FileClass::Other
         } else {
             classify_extension(&self.ext)
+        }
+    }
+
+    /// How the tree draws this file (folders are [`FileKind::Other`]).
+    #[must_use]
+    pub fn kind(&self) -> FileKind {
+        if self.is_dir() {
+            FileKind::Other
+        } else {
+            file_kind(&self.ext)
         }
     }
 

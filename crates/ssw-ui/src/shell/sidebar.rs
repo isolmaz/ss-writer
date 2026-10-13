@@ -4,8 +4,8 @@
 //! The tree is lazy: the view asks its [`TreeSource`] for the children of a folder the first time
 //! it is expanded. The app implements [`TreeSource`] on top of `ssw_io::workspace` (which already
 //! sorts and filters by the [`SidebarOptions`] it receives); the view only decides how entries
-//! look: extensions shown or not, non-Markdown files dimmed, a cloud icon for placeholders, the
-//! modified date under the name.
+//! look: extensions shown or not, files that do not open in the editor dimmed, one icon per class
+//! of file, a cloud icon for placeholders, the modified date under the name.
 //!
 //! Everything the user can ask for is a [`SidebarEvent`]: opening, expanding, context menu
 //! requests (the app shows the native menu), the ⋯ and + menus, inline rename results, delete,
@@ -54,22 +54,29 @@ const HEADER_BUTTON: f32 = 32.0;
 const FOLDER: char = '\u{E8B7}';
 const FOLDER_OPEN: char = '\u{E838}';
 const DOCUMENT: char = '\u{E8A5}';
+const CODE: char = '\u{E943}';
 const IMAGE: char = '\u{E91B}';
+const PAGE: char = '\u{E7C3}';
 const CLOUD: char = '\u{E753}';
 const MORE: char = '\u{E712}';
 
 /// The identity of a tree entry, unique within one [`TreeSource`].
 pub type NodeKey = u64;
 
-/// What kind of entry a file is; decides the icon and whether the name is dimmed.
+/// What kind of entry a file is; decides the icon and whether the name is dimmed. A file that
+/// opens in the editor is drawn at full strength, one known to open in another app is dimmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     Folder,
-    Markdown,
+    /// Markdown, plain text and word-processor documents (opened in the editor).
+    Prose,
+    /// Source code, markup, data and configuration files, and files of a type nobody listed:
+    /// the editor opens them as text (opened in the editor).
+    Code,
+    /// Pictures (opened by the default app).
     Image,
-    /// Other text formats (opened in plain mode).
-    Text,
-    /// Anything else (opened by the default app).
+    /// Types known not to be text, such as archives, executables and media (opened by the
+    /// default app).
     Other,
 }
 
@@ -118,10 +125,10 @@ impl SidebarEntry {
         self.kind == EntryKind::Folder
     }
 
-    /// Whether the name is drawn dimmed: every file that is not Markdown.
+    /// Whether the name is drawn dimmed: a file that does not open in the editor.
     #[must_use]
     pub fn is_dimmed(&self) -> bool {
-        !matches!(self.kind, EntryKind::Folder | EntryKind::Markdown)
+        matches!(self.kind, EntryKind::Image | EntryKind::Other)
     }
 
     /// The name shown in the tree: files lose their extension when `show_extensions` is off.
@@ -1247,8 +1254,10 @@ impl SidebarView {
         let icon = match entry.kind {
             EntryKind::Folder if row.expanded => FOLDER_OPEN,
             EntryKind::Folder => FOLDER,
+            EntryKind::Prose => DOCUMENT,
+            EntryKind::Code => CODE,
             EntryKind::Image => IMAGE,
-            _ => DOCUMENT,
+            EntryKind::Other => PAGE,
         };
         canvas.draw_icon(
             icon,
@@ -1614,9 +1623,7 @@ mod tests {
                 .unwrap_or_default();
             entries.retain(|e| {
                 !(options.hide_images && e.kind == EntryKind::Image)
-                    && !(options.hide_non_markdown
-                        && !e.is_folder()
-                        && e.kind != EntryKind::Markdown)
+                    && !(options.hide_non_markdown && !e.is_folder() && !e.name.ends_with(".md"))
             });
             entries.sort_by_key(|e| {
                 let group = u8::from(!(options.folders_first && e.is_folder()));
@@ -1630,11 +1637,11 @@ mod tests {
     }
 
     fn entries() -> Vec<(NodeKey, Vec<SidebarEntry>)> {
-        let mut cloud = SidebarEntry::file(9, "cloud.md", EntryKind::Markdown);
+        let mut cloud = SidebarEntry::file(9, "cloud.md", EntryKind::Prose);
         cloud.placeholder = true;
         let mut data = SidebarEntry::file(10, "data.bin", EntryKind::Other);
         data.hidden = true;
-        let mut readme = SidebarEntry::file(7, "readme.md", EntryKind::Markdown);
+        let mut readme = SidebarEntry::file(7, "readme.md", EntryKind::Prose);
         readme.modified = "1 Oct 2026".to_owned();
         vec![
             (
@@ -1651,12 +1658,12 @@ mod tests {
             (
                 1,
                 vec![
-                    SidebarEntry::file(3, "a.md", EntryKind::Markdown),
-                    SidebarEntry::file(4, "b.txt", EntryKind::Text),
+                    SidebarEntry::file(3, "a.md", EntryKind::Prose),
+                    SidebarEntry::file(4, "b.txt", EntryKind::Prose),
                     SidebarEntry::folder(5, "deep"),
                 ],
             ),
-            (5, vec![SidebarEntry::file(6, "c.md", EntryKind::Markdown)]),
+            (5, vec![SidebarEntry::file(6, "c.md", EntryKind::Prose)]),
         ]
     }
 
@@ -1827,11 +1834,11 @@ mod tests {
         );
         // Extensionless and dotfiles keep their names.
         assert_eq!(
-            SidebarEntry::file(1, "Makefile", EntryKind::Other).display_name(false),
+            SidebarEntry::file(1, "Makefile", EntryKind::Prose).display_name(false),
             "Makefile"
         );
         assert_eq!(
-            SidebarEntry::file(1, ".gitignore", EntryKind::Other).display_name(false),
+            SidebarEntry::file(1, ".gitignore", EntryKind::Prose).display_name(false),
             ".gitignore"
         );
         assert_eq!(SidebarEntry::folder(1, "v1.2").display_name(false), "v1.2");
@@ -1851,7 +1858,7 @@ mod tests {
     }
 
     #[test]
-    fn non_markdown_files_are_dimmed_and_placeholders_get_a_cloud() {
+    fn pictures_and_foreign_files_are_dimmed_and_placeholders_get_a_cloud() {
         let mut f = fixture(SidebarOptions::default());
         let canvas = f.harness.paint(&f.view);
         let tokens = f.harness.theme.tokens;
@@ -1878,6 +1885,10 @@ mod tests {
             .collect();
         assert_eq!(glyphs.iter().filter(|g| **g == CLOUD).count(), 1);
         assert!(glyphs.contains(&FOLDER) && glyphs.contains(&DOCUMENT) && glyphs.contains(&IMAGE));
+        assert!(
+            glyphs.contains(&PAGE),
+            "data.bin is a type that opens elsewhere"
+        );
         assert!(glyphs.contains(&MORE) && glyphs.contains(&glyph::ADD));
         assert!(canvas.texts().contains(&"Notes"));
 
@@ -1896,6 +1907,73 @@ mod tests {
             .find(|n| n.name == "cloud.md")
             .expect("cloud node");
         assert_eq!(cloud.description, "Available online only");
+    }
+
+    #[test]
+    fn each_class_has_its_icon_and_only_files_that_open_elsewhere_are_dimmed() {
+        for (kind, dimmed) in [
+            (EntryKind::Folder, false),
+            (EntryKind::Prose, false),
+            (EntryKind::Code, false),
+            (EntryKind::Image, true),
+            (EntryKind::Other, true),
+        ] {
+            assert_eq!(
+                SidebarEntry::file(1, "x", kind).is_dimmed(),
+                dimmed,
+                "{kind:?}"
+            );
+        }
+
+        let mut f = fixture(SidebarOptions::default());
+        let mut hidden = SidebarEntry::file(26, "hidden.json", EntryKind::Code);
+        hidden.hidden = true;
+        f.listings.borrow_mut()[0].1 = vec![
+            SidebarEntry::folder(1, "docs"),
+            SidebarEntry::file(20, "a.md", EntryKind::Prose),
+            SidebarEntry::file(21, "b.txt", EntryKind::Prose),
+            SidebarEntry::file(22, "c.py", EntryKind::Code),
+            SidebarEntry::file(23, "d.docx", EntryKind::Prose),
+            SidebarEntry::file(24, "e.png", EntryKind::Image),
+            SidebarEntry::file(25, "f.zip", EntryKind::Other),
+            hidden,
+        ];
+        f.view.refresh_all();
+        f.layout();
+        let canvas = f.harness.paint(&f.view);
+        let tokens = f.harness.theme.tokens;
+        // The icon is tinted with the colour of the name: full strength, dimmed or dimmest.
+        let expected = [
+            ("docs", FOLDER, tokens.text),
+            ("a.md", DOCUMENT, tokens.text),
+            ("b.txt", DOCUMENT, tokens.text),
+            ("c.py", CODE, tokens.text),
+            ("d.docx", DOCUMENT, tokens.text),
+            ("e.png", IMAGE, tokens.text_muted),
+            ("f.zip", PAGE, tokens.text_muted),
+            ("hidden.json", CODE, tokens.text_disabled),
+        ];
+        let names = f.names();
+        for (index, (name, glyph, color)) in expected.into_iter().enumerate() {
+            assert_eq!(names[index], name);
+            let middle = f.view.row_rect(index).center().y;
+            let icon = canvas.ops().find_map(|op| match op {
+                DrawOp::Icon {
+                    glyph,
+                    color,
+                    size,
+                    center,
+                    ..
+                } if *size == ICON && center.y == middle => Some((*glyph, *color)),
+                _ => None,
+            });
+            assert_eq!(icon, Some((glyph, color)), "icon of {name}");
+            let label = canvas.ops().find_map(|op| match op {
+                DrawOp::Text { text, color, .. } if text == name => Some(*color),
+                _ => None,
+            });
+            assert_eq!(label, Some(color), "name {name}");
+        }
     }
 
     #[test]
@@ -2441,7 +2519,7 @@ mod tests {
         f.listings.borrow_mut()[1].1.remove(1);
         f.listings.borrow_mut()[1]
             .1
-            .push(SidebarEntry::file(11, "new.md", EntryKind::Markdown));
+            .push(SidebarEntry::file(11, "new.md", EntryKind::Prose));
         f.view.refresh_folder(1);
         assert_eq!(
             f.names()[..5],
@@ -2583,7 +2661,7 @@ mod tests {
         {
             let mut listings = f.listings.borrow_mut();
             listings[0].1 = (0..80)
-                .map(|n| SidebarEntry::file(100 + n, format!("note{n:02}.md"), EntryKind::Markdown))
+                .map(|n| SidebarEntry::file(100 + n, format!("note{n:02}.md"), EntryKind::Prose))
                 .collect();
         }
         f.view.refresh_all();
@@ -2649,7 +2727,7 @@ mod tests {
 
     fn many_files(f: &mut Fixture) {
         f.listings.borrow_mut()[0].1.extend(
-            (100..140).map(|n| SidebarEntry::file(n, format!("note-{n}.md"), EntryKind::Markdown)),
+            (100..140).map(|n| SidebarEntry::file(n, format!("note-{n}.md"), EntryKind::Prose)),
         );
         f.view.refresh_all();
         f.layout();

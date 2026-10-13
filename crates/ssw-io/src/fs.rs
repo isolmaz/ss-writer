@@ -511,10 +511,9 @@ impl FileSystem for RealFs {
 
     fn read_prefix(&self, path: &Path, max: usize) -> Result<Vec<u8>, FsError> {
         use std::io::Read;
-        let file = io(std::fs::File::open(path), path)?;
         let mut head = Vec::new();
         io(
-            file.take(max as u64).read_to_end(&mut head).map(|_| ()),
+            std::fs::File::open(path).and_then(|file| file.take(max as u64).read_to_end(&mut head)),
             path,
         )?;
         Ok(head)

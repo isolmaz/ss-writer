@@ -965,12 +965,7 @@ impl Controller {
     /// open is under way; `false` for every other file (the caller opens it directly).
     /// `launch_binary` is set for a file the user only browsed to: when it turns out to be no
     /// text, its default app starts instead of an error showing.
-    pub fn begin_hydration(
-        &self,
-        cell: &Rc<WindowCell>,
-        path: &Path,
-        launch_binary: bool,
-    ) -> bool {
+    pub fn begin_hydration(&self, cell: &Rc<WindowCell>, path: &Path, launch_binary: bool) -> bool {
         let env = self.docs().env();
         if !env
             .fs

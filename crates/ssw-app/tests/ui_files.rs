@@ -2099,7 +2099,10 @@ fn a_utf16_file_with_a_bom_is_text_although_it_holds_nul_bytes() {
 fn a_binary_file_clicked_in_the_sidebar_starts_its_default_app_with_no_tab_and_no_message() {
     let files = vec![
         text_file("a.md", "# A\n"),
-        byte_file("report.pdf", b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\x00\x00"),
+        byte_file(
+            "report.pdf",
+            b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\x00\x00",
+        ),
         byte_file("tool.exe", b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00"),
         byte_file("blob", b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00"),
         byte_file("pic.png", PNG_START),
@@ -2117,7 +2120,11 @@ fn a_binary_file_clicked_in_the_sidebar_starts_its_default_app_with_no_tab_and_n
             .map(|name| ShellRecord::OpenPath(rig.work.join(name)))
             .collect();
         assert_eq!(rig.services.shell_log(), started);
-        assert_eq!(rig.controller.docs().all().len(), 1, "no document holds one");
+        assert_eq!(
+            rig.controller.docs().all().len(),
+            1,
+            "no document holds one"
+        );
     });
 }
 

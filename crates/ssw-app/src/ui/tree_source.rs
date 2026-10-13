@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use ssw_io::fs::{FileSystem, FsError};
 use ssw_io::watch::{FsEvent, FsEventKind};
-use ssw_io::workspace::{FileKind, Node, SortKey as IoSortKey, ViewOptions, Workspace};
+use ssw_io::workspace::{
+    FileClass, Node, SortKey as IoSortKey, ViewOptions, Workspace, opens_elsewhere,
+};
 use ssw_ui::shell::sidebar::{
     EntryKind, NodeKey, SidebarEntry, SidebarOptions, SortKey as UiSortKey, TreeSource,
 };
@@ -123,21 +125,32 @@ fn view_options(options: &SidebarOptions) -> ViewOptions {
     }
 }
 
-/// The icon class of a file. The word-processor files and TextBundle packs the app imports as
-/// Markdown open in the editor, so they are prose: `ssw_io` classifies by text type only (they
-/// land among its code files, like every unknown type) and leaves them to [`mode_for_path`],
-/// which owns the list of what the editor opens as Markdown. Only the types `ssw_io` knows to
-/// open in another app are [`EntryKind::Other`], which the tree dims.
+/// Text types written as prose; every other [`FileClass::Text`] type is source code, markup, data
+/// or configuration.
+const PROSE_TEXT: [&str; 4] = ["txt", "text", "log", "rst"];
+
+/// The icon class of a file, and with it whether the tree dims it: the one place that decides.
+/// `ssw_io` names the type by its extension ([`FileClass`], [`opens_elsewhere`]) and
+/// [`mode_for_path`] says what the editor opens as Markdown, which includes the word-processor
+/// files and TextBundle packs the app imports. Prose is Markdown, those imports, [`PROSE_TEXT`]
+/// and a file without an extension (read as plain text); any other file the editor opens is
+/// code. Pictures and the types known to open in another app are the only ones dimmed.
 fn entry_kind(node: &Node) -> EntryKind {
-    match node.kind() {
-        FileKind::Prose => EntryKind::Prose,
-        FileKind::Code if mode_for_path(Path::new(&node.name)) == DocMode::Markdown => {
-            EntryKind::Prose
-        }
-        FileKind::Code => EntryKind::Code,
-        FileKind::Image => EntryKind::Image,
-        FileKind::Other => EntryKind::Other,
+    let ext = node.ext.as_str();
+    match node.class() {
+        FileClass::Image => EntryKind::Image,
+        FileClass::Markdown => EntryKind::Prose,
+        FileClass::Text if PROSE_TEXT.contains(&ext) => EntryKind::Prose,
+        FileClass::Text => EntryKind::Code,
+        FileClass::Other if opens_elsewhere(ext) => EntryKind::Other,
+        FileClass::Other if ext.is_empty() || opens_as_markdown(&node.name) => EntryKind::Prose,
+        FileClass::Other => EntryKind::Code,
     }
+}
+
+/// Whether the editor opens the file `name` in Markdown mode.
+fn opens_as_markdown(name: &str) -> bool {
+    mode_for_path(Path::new(name)) == DocMode::Markdown
 }
 
 fn entry_for(key: NodeKey, node: &Node) -> SidebarEntry {
@@ -184,6 +197,7 @@ impl TreeSource for WorkspaceTree {
 #[cfg(test)]
 mod tests {
     use ssw_io::fs::RealFs;
+    use ssw_io::workspace::classify_extension;
 
     use super::*;
 
@@ -260,6 +274,15 @@ mod tests {
             ".gitignore",
             "t.pdf",
             "u.MP4",
+            "v.epub",
+            "w.XLSX",
+            "x.pptx",
+            "y.lnk",
+            "z.wasm",
+            "a.flac",
+            "b.zst",
+            "c.dylib",
+            ".zip",
         ] {
             std::fs::write(tmp.path().join(name), "x").unwrap();
         }
@@ -297,11 +320,29 @@ mod tests {
             (".gitignore", EntryKind::Prose, false),
             ("t.pdf", EntryKind::Other, true),
             ("u.MP4", EntryKind::Other, true),
+            ("v.epub", EntryKind::Other, true),
+            ("w.XLSX", EntryKind::Other, true),
+            ("x.pptx", EntryKind::Other, true),
+            ("y.lnk", EntryKind::Other, true),
+            ("z.wasm", EntryKind::Other, true),
+            ("a.flac", EntryKind::Other, true),
+            ("b.zst", EntryKind::Other, true),
+            ("c.dylib", EntryKind::Other, true),
+            // A dot only is no extension: the name of the type alone is a plain file.
+            (".zip", EntryKind::Prose, false),
             ("o.textbundle", EntryKind::Folder, false),
         ] {
             let entry = entry_of(name);
             assert_eq!(entry.kind, kind, "{name}");
             assert_eq!(entry.is_dimmed(), dimmed, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_prose_types_are_text_types_of_ssw_io_and_none_opens_elsewhere() {
+        for ext in PROSE_TEXT {
+            assert_eq!(classify_extension(ext), FileClass::Text, "{ext}");
+            assert!(!opens_elsewhere(ext), "{ext}");
         }
     }
 

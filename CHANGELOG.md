@@ -16,7 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- The sidebar dimmed every file that was not Markdown, which said "you cannot work with this" about files SS Writer now opens and colors. A dimmed name means one thing: the file opens in another app (pictures, archives, executables, media, fonts, databases). Everything the editor opens is drawn at full strength with a prose or a code glyph.
+- The sidebar dimmed every file that was not Markdown, which said "you cannot work with this" about files SS Writer now opens and colors. A dimmed name means one thing: the file opens in another app (pictures, archives, executables and libraries, audio and video, fonts, databases, spreadsheets and presentations, ePub, shortcuts). Everything the editor opens is drawn at full strength with a prose or a code glyph.
 
 ### Fixed
 

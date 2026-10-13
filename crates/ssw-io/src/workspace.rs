@@ -37,7 +37,8 @@ pub enum NodeKind {
 pub enum FileClass {
     /// `.md`, `.markdown`, `.mdx`: Markdown mode.
     Markdown,
-    /// Raster and vector images: opened in the image viewer tab.
+    /// Raster and vector images: the app has no viewer for them, so a click in the tree hands
+    /// them to their default app.
     Image,
     /// Other text formats: plain mode.
     Text,
@@ -46,77 +47,50 @@ pub enum FileClass {
     Other,
 }
 
-/// Text formats written as prose: plain text, logs and reStructuredText.
-const PROSE_TEXT: [&str; 4] = ["txt", "text", "log", "rst"];
-/// The other text formats: source code, markup, data and configuration files.
-const CODE_TEXT: [&str; 32] = [
-    "csv", "tsv", "json", "jsonc", "yaml", "yml", "ini", "toml", "xml", "html", "htm", "css", "js",
-    "ts", "tsx", "jsx", "py", "rs", "go", "java", "c", "h", "cpp", "cs", "sh", "bat", "ps1", "sql",
-    "tex", "mmd", "cfg", "conf",
-];
-
 /// Classifies an extension (without the dot, any case).
 #[must_use]
 pub fn classify_extension(ext: &str) -> FileClass {
-    classify_lowercase(&ext.to_lowercase())
-}
-
-fn classify_lowercase(lower: &str) -> FileClass {
     const MARKDOWN: [&str; 3] = ["md", "markdown", "mdx"];
     const IMAGE: [&str; 11] = [
         "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "heic", "ico", "svg",
     ];
+    const TEXT: [&str; 36] = [
+        "txt", "text", "log", "csv", "tsv", "json", "jsonc", "yaml", "yml", "ini", "toml", "xml",
+        "html", "htm", "css", "js", "ts", "tsx", "jsx", "py", "rs", "go", "java", "c", "h", "cpp",
+        "cs", "sh", "bat", "ps1", "sql", "tex", "rst", "mmd", "cfg", "conf",
+    ];
+    let lower = ext.to_lowercase();
+    let lower = lower.as_str();
     if MARKDOWN.contains(&lower) {
         FileClass::Markdown
     } else if IMAGE.contains(&lower) {
         FileClass::Image
-    } else if PROSE_TEXT.contains(&lower) || CODE_TEXT.contains(&lower) {
+    } else if TEXT.contains(&lower) {
         FileClass::Text
     } else {
         FileClass::Other
     }
 }
 
-/// Extensions of the non-text types that open in another app (pictures are classified apart):
-/// documents, archives, executables and libraries, audio and video, fonts, databases and
-/// compiled objects. Any other file is read as text by the editor, so only these are dimmed.
-const OPENS_ELSEWHERE: [&str; 31] = [
-    "pdf", "zip", "7z", "rar", "gz", "tar", "exe", "msi", "dll", "sys", "bin", "iso", "mp3", "mp4",
-    "wav", "avi", "mkv", "mov", "ttf", "otf", "woff", "woff2", "db", "sqlite", "pyc", "o", "obj",
-    "lib", "pdb", "class", "jar",
+/// Extensions of the non-text types known to open in another app, sorted: e-books (`epub` is an
+/// export format of the app itself), PDF and office files, archives and disk images, executables,
+/// libraries and compiled objects, audio and video, fonts, databases and shortcuts. Pictures are
+/// not here: [`FileClass::Image`] names them.
+const OPENS_ELSEWHERE: [&str; 52] = [
+    "7z", "avi", "bin", "bz2", "class", "db", "dll", "dylib", "epub", "exe", "flac", "gz", "iso",
+    "jar", "lib", "lnk", "m4a", "mkv", "mov", "mp3", "mp4", "msi", "o", "obj", "odp", "ods", "ogg",
+    "otf", "pdb", "pdf", "ppt", "pptx", "pyc", "rar", "rlib", "rmeta", "so", "sqlite", "sys",
+    "tar", "ttf", "wasm", "wav", "webm", "wmv", "woff", "woff2", "xls", "xlsx", "xz", "zip", "zst",
 ];
 
-/// How the tree draws a file: one of four classes of icon, and whether the name is dimmed
-/// (a picture or a type known to open in another app is dimmed, everything else opens in the
-/// editor).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FileKind {
-    /// Markdown and plain text, and files without an extension (read as plain text).
-    Prose,
-    /// Source code, markup, data and configuration files, and any file of an unknown type: the
-    /// editor opens it as text.
-    Code,
-    /// Raster and vector images.
-    Image,
-    /// A type known to open in another app: pictures aside, the `OPENS_ELSEWHERE` list.
-    Other,
-}
-
-/// The [`FileKind`] of an extension (without the dot, any case). Word-processor files, which the
-/// app imports as Markdown, are [`FileKind::Code`] here like every unknown type: the app owns
-/// that list.
+/// Whether a file of this extension (without the dot, any case) is known to open in another app
+/// instead of the editor, so the tree dims it. Every other extension, an unknown one included,
+/// and a file without extension are not listed: the editor reads them as text.
 #[must_use]
-pub fn file_kind(ext: &str) -> FileKind {
-    let lower = ext.to_lowercase();
-    match classify_lowercase(&lower) {
-        FileClass::Markdown => FileKind::Prose,
-        FileClass::Image => FileKind::Image,
-        FileClass::Text if CODE_TEXT.contains(&lower.as_str()) => FileKind::Code,
-        FileClass::Text => FileKind::Prose,
-        FileClass::Other if lower.is_empty() => FileKind::Prose,
-        FileClass::Other if OPENS_ELSEWHERE.contains(&lower.as_str()) => FileKind::Other,
-        FileClass::Other => FileKind::Code,
-    }
+pub fn opens_elsewhere(ext: &str) -> bool {
+    OPENS_ELSEWHERE
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(ext))
 }
 
 /// One entry of the workspace tree.
@@ -195,16 +169,6 @@ impl Node {
             FileClass::Other
         } else {
             classify_extension(&self.ext)
-        }
-    }
-
-    /// How the tree draws this file (folders are [`FileKind::Other`]).
-    #[must_use]
-    pub fn kind(&self) -> FileKind {
-        if self.is_dir() {
-            FileKind::Other
-        } else {
-            file_kind(&self.ext)
         }
     }
 
@@ -615,5 +579,13 @@ mod tests {
         let unknown = GUID::from_u128(0x6a1e_70c0_3b1a_4a35_8a7f_0d3e_5d83_a001);
         let error = known_folder(&unknown, "Nowhere").unwrap_err();
         assert_eq!(error.path(), Path::new("Nowhere"));
+    }
+
+    #[test]
+    fn the_list_of_types_that_open_elsewhere_is_sorted_and_has_no_duplicates() {
+        assert!(
+            OPENS_ELSEWHERE.windows(2).all(|pair| pair[0] < pair[1]),
+            "{OPENS_ELSEWHERE:?}"
+        );
     }
 }

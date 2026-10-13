@@ -40,6 +40,7 @@ pub fn category(command: CommandId) -> CommandCategory {
         | C::EditCopyAsRichText
         | C::EditCopyAsHtml
         | C::EditInsertDate
+        | C::EditFormatDocument
         | C::FormatBold
         | C::FormatItalic
         | C::FormatUnderline

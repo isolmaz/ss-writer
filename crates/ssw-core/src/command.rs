@@ -163,6 +163,7 @@ define_commands! {
     EditCopyAsRichText = Edit, "edit.copy_as_rich_text", "cmd-edit-copy-as-rich-text";
     EditCopyAsHtml = Edit, "edit.copy_as_html", "cmd-edit-copy-as-html";
     EditInsertDate = Edit, "edit.insert_date", "cmd-edit-insert-date";
+    EditFormatDocument = Edit, "edit.format_document", "cmd-edit-format-document";
     FormatBold = Format, "format.bold", "cmd-format-bold";
     FormatItalic = Format, "format.italic", "cmd-format-italic";
     FormatUnderline = Format, "format.underline", "cmd-format-underline";
@@ -461,6 +462,17 @@ mod tests {
         ] {
             assert!(id.parse::<CommandId>().is_ok(), "{id}");
         }
+    }
+
+    #[test]
+    fn format_document_is_an_edit_command_without_a_default_shortcut() {
+        let command = CommandId::EditFormatDocument;
+        assert_eq!("edit.format_document".parse::<CommandId>(), Ok(command));
+        assert_eq!(command.group(), CommandGroup::Edit);
+        assert_eq!(command.label_id(), "cmd-edit-format-document");
+        // Spec §11: no default shortcut uses Ctrl+Alt (AltGr), which is the only chord the
+        // command was wanted on; it is reached from the Edit menu and the command palette.
+        assert_eq!(crate::keymap::Keymap::default_chords(command).count(), 0);
     }
 
     #[test]

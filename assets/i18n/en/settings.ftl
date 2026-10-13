@@ -67,6 +67,7 @@ settings-opt-indent-align = Align with the item text
 settings-opt-indent-2 = 2 spaces
 settings-opt-indent-4 = 4 spaces
 settings-opt-indent-tab = Tab
+settings-editor-format-indent = Format indent
 settings-editor-auto-hide = Hide Markdown markers away from the caret
 settings-editor-typewriter-position = Typewriter position
 settings-editor-typewriter-dead-zone = Typewriter dead zone

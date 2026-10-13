@@ -14,13 +14,16 @@ use ssw_app::startup::ProcessEnv;
 use ssw_app::ui::controller::{Controller, WindowCell};
 use ssw_app::ui::inspector::toc_of;
 use ssw_app::ui::menus::{build_menu, menu_id};
-use ssw_app::ui::scripted_services::ScriptedServices;
+use ssw_app::ui::scripted_services::{Answer, DialogKind, ScriptedServices};
 use ssw_app::ui::shell_view::ShellAction;
 use ssw_core::command::CommandId;
 use ssw_core::edit::{Edit, Selection, Transaction};
+use ssw_core::format_text::{FormatIndent, FormatOutcome, format_json};
+use ssw_core::settings::{FormatDocumentIndent, Settings};
 use ssw_ui::editor::highlight::Language;
 use ssw_ui::editor::{DocumentKind, EditorConfig};
-use ssw_ui::services::{Clock, FakeClock, MemoryClipboard};
+use ssw_ui::geometry::Size;
+use ssw_ui::services::{Clock, FakeClock, MemoryClipboard, MessageBoxResult};
 use ssw_ui::shell::picker::Row;
 use ssw_ui::shell::titlebar::MenuKind;
 use ssw_ui::widgets::SharedClipboard;
@@ -47,6 +50,7 @@ fn process(args: &Args) -> ProcessEnv {
 struct Rig {
     controller: Rc<Controller>,
     work: PathBuf,
+    services: ScriptedServices,
 }
 
 struct Host<B> {
@@ -67,6 +71,7 @@ impl<B: FnOnce(&Rig)> ShellHost for Host<B> {
         let rig = Rig {
             controller,
             work: self.work.clone(),
+            services: services.clone(),
         };
         (self.body.take().expect("the body runs once"))(&rig);
         assert_eq!(services.take_unexpected(), None, "a dialog nobody expected");
@@ -81,6 +86,11 @@ impl<B: FnOnce(&Rig)> ShellHost for Host<B> {
 /// Runs `body` over a started application whose first window shows `notes.md` of a folder that
 /// also holds the plain-text files `log.txt` and `other.txt`.
 fn with_rig(body: impl FnOnce(&Rig)) {
+    with_settings(NO_AUTOSAVE, body);
+}
+
+/// [`with_rig`] with `settings` as the content of `settings.json`.
+fn with_settings(settings: &str, body: impl FnOnce(&Rig)) {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -89,7 +99,7 @@ fn with_rig(body: impl FnOnce(&Rig)) {
     std::fs::write(work.join("other.txt"), "other\n").unwrap();
     let roaming = tmp.path().join("profile").join("roaming").join("SS Writer");
     std::fs::create_dir_all(&roaming).unwrap();
-    std::fs::write(roaming.join("settings.json"), NO_AUTOSAVE).unwrap();
+    std::fs::write(roaming.join("settings.json"), settings).unwrap();
     let mut args = Args {
         paths: vec![work.join("notes.md")],
         ..Args::default()
@@ -547,5 +557,342 @@ fn the_palette_runs_the_switches_for_a_plain_file_and_follows_their_state() {
         assert!(rig.choose(">Render as Markdown"));
         assert_eq!(rig.kind(), DocumentKind::PlainText);
         assert!(!rig.wrap(), "the tab kept its choice of not wrapping");
+    });
+}
+
+// ----- Format document ---------------------------------------------------------------------------
+
+/// A JSON document on one line.
+const MINIFIED: &str = r#"{"a":[1,2],"b":{"c":true}}"#;
+
+/// What the engine makes of `text` (which it must change).
+fn formatted_json(text: &str, indent: FormatIndent) -> String {
+    match format_json(text, indent) {
+        FormatOutcome::Formatted(formatted) => formatted,
+        other => panic!("the engine should change {text:?}: {other:?}"),
+    }
+}
+
+/// The text without any whitespace: what a formatter must not change.
+fn significant(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+impl Rig {
+    fn write(&self, name: &str, text: &str) {
+        std::fs::write(self.work.join(name), text).unwrap();
+    }
+
+    fn text(&self) -> String {
+        self.entry().document().borrow().text()
+    }
+
+    fn version(&self) -> u64 {
+        self.entry().document().borrow().version()
+    }
+
+    fn selection(&self) -> Selection {
+        self.entry().document().borrow().primary_selection()
+    }
+
+    fn select(&self, selection: Selection) {
+        self.window()
+            .view
+            .borrow_mut()
+            .active_editor_mut()
+            .expect("an editor")
+            .go_to(selection);
+    }
+
+    fn format(&self) -> Dispatch {
+        self.command(CommandId::EditFormatDocument)
+    }
+
+    /// The label and enabled state of "Format document" in the Edit menu.
+    fn format_item(&self) -> (String, bool) {
+        let window = self.window();
+        let model = build_menu(
+            MenuKind::Edit,
+            self.controller.i18n(),
+            &self.controller.keymap(),
+            &self.controller.menu_state(&window),
+        );
+        model
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                MenuEntry::Item(item) if item.id == menu_id(CommandId::EditFormatDocument) => {
+                    Some((item.label.clone(), item.enabled))
+                }
+                _ => None,
+            })
+            .expect("the Edit menu lists Format document")
+    }
+}
+
+#[test]
+fn format_document_is_enabled_for_json_xml_and_html_documents_only() {
+    with_rig(|rig| {
+        // The Markdown document of the window and an untitled buffer.
+        assert_eq!(rig.format_item(), ("Format document".to_owned(), false));
+        rig.command(CommandId::TabNew);
+        assert_eq!(rig.format_item(), ("Format document".to_owned(), false));
+        for (name, text, enabled) in [
+            ("data.json", "{}\n", true),
+            ("data.xml", "<a/>\n", true),
+            ("page.html", "<p>x</p>\n", true),
+            ("tool.py", "x = 1\n", false),
+            ("log.txt", "plain\n", false),
+            ("style.css", "p { color: red; }\n", false),
+        ] {
+            rig.write(name, text);
+            rig.open(name);
+            assert_eq!(rig.kind(), DocumentKind::PlainText, "{name}");
+            assert_eq!(rig.format_item().1, enabled, "{name}");
+            let expected = if enabled { "handled" } else { "unhandled" };
+            assert_eq!(ended(&rig.format()), expected, "{name}");
+        }
+
+        // Shown as Markdown the JSON file is not plain text any more.
+        rig.open("data.json");
+        assert!(rig.format_item().1);
+        rig.command(CommandId::ViewRenderAsMarkdown);
+        assert_eq!(rig.kind(), DocumentKind::Markdown);
+        assert!(!rig.format_item().1);
+        assert_eq!(ended(&rig.format()), "unhandled");
+
+        // A window without a tab has nothing to format.
+        let empty = rig
+            .controller
+            .create_window(None, Size::new(800.0, 600.0), 1.0);
+        let outcome = rig
+            .controller
+            .run_command(empty.id, CommandId::EditFormatDocument);
+        assert_eq!(ended(&outcome), "unhandled");
+    });
+}
+
+#[test]
+fn format_document_indents_minified_json_and_one_undo_restores_it() {
+    with_rig(|rig| {
+        rig.write("min.json", MINIFIED);
+        rig.open("min.json");
+        let expected = formatted_json(MINIFIED, FormatIndent::Two);
+        assert!(expected.starts_with("{\n  \"a\""), "{expected}");
+
+        assert_eq!(ended(&rig.format()), "handled");
+        assert_eq!(rig.text(), expected);
+        assert!(rig.entry().is_dirty());
+
+        // Formatted again: nothing changes, nothing is shown.
+        let version = rig.version();
+        assert_eq!(ended(&rig.format()), "handled");
+        assert_eq!((rig.text(), rig.version()), (expected.clone(), version));
+        assert!(rig.services.dialog_log().is_empty());
+
+        // One Ctrl+Z brings the document back; redo formats it again.
+        assert_eq!(ended(&rig.command(CommandId::EditUndo)), "handled");
+        assert_eq!(rig.text(), MINIFIED);
+        assert_eq!(ended(&rig.command(CommandId::EditRedo)), "handled");
+        assert_eq!(rig.text(), expected);
+    });
+}
+
+#[test]
+fn format_document_keeps_the_caret_at_its_place_in_the_text() {
+    with_rig(|rig| {
+        // Only the indentation is wrong: every line stays, so the caret stays on its line.
+        let messy = "{\n        \"a\": 1,\n    \"bee\": 2\n}\n";
+        rig.write("messy.json", messy);
+        rig.open("messy.json");
+        let tidy = formatted_json(messy, FormatIndent::Two);
+        let line_of = |text: &str, offset: usize| text[..offset].matches('\n').count();
+        let in_bee = messy.find("bee").unwrap() + 1;
+        let line_start = messy.find("    \"bee\"").unwrap();
+        // Inside a token, in the first line, at the start of a line and a selection.
+        for selection in [
+            Selection::caret(in_bee),
+            Selection::caret(1),
+            Selection::caret(line_start),
+            Selection::new(in_bee, messy.find("a\"").unwrap()),
+        ] {
+            rig.command(CommandId::EditUndo);
+            rig.select(selection);
+            assert_eq!(rig.text(), messy);
+            assert_eq!(ended(&rig.format()), "handled");
+            assert_eq!(rig.text(), tidy);
+            let after = rig.selection();
+            for (before, now) in [
+                (selection.anchor, after.anchor),
+                (selection.head, after.head),
+            ] {
+                assert_eq!(line_of(&tidy, now), line_of(messy, before), "{selection:?}");
+                if before == line_start {
+                    assert!(tidy[now..].starts_with("\"bee\""), "{selection:?}");
+                } else {
+                    assert_eq!(
+                        significant(&tidy[..now]),
+                        significant(&messy[..before]),
+                        "{selection:?}"
+                    );
+                }
+            }
+        }
+
+        // One line becomes many: the caret follows its token.
+        rig.write("min.json", MINIFIED);
+        rig.open("min.json");
+        rig.select(Selection::caret(MINIFIED.find("\"c\"").unwrap() + 1));
+        rig.format();
+        let text = rig.text();
+        let head = rig.selection().head;
+        assert!(text[head..].starts_with("c\""), "{text}");
+        assert!(line_of(&text, head) > 0);
+        // The start of the document stays the start.
+        rig.command(CommandId::EditUndo);
+        rig.select(Selection::caret(0));
+        rig.format();
+        assert_eq!(rig.selection(), Selection::caret(0));
+    });
+}
+
+#[test]
+fn format_document_keeps_the_caret_on_its_line_when_the_line_breaks_are_lone_cr() {
+    with_rig(|rig| {
+        // A file is read with its line breaks turned into LF, but the text of an open document
+        // can hold lone CRs; the formatter keeps that spelling, and the caret must follow it.
+        rig.write("cr.json", "{");
+        rig.open("cr.json");
+        append(&rig.entry(), "\r        \"a\": 1,\r    \"bee\": 2\r}\r");
+        let messy = rig.text();
+        assert_eq!(messy, "{\r        \"a\": 1,\r    \"bee\": 2\r}\r");
+        let tidy = formatted_json(&messy, FormatIndent::Two);
+        assert_eq!(tidy, "{\r  \"a\": 1,\r  \"bee\": 2\r}\r");
+        let bee = tidy.find("\"bee\"").unwrap();
+        let line_start = messy.find("    \"bee\"").unwrap();
+
+        // At the start of the line and in its indentation: before the first token of the line,
+        // not at the end of the line above.
+        for offset in [line_start, line_start + 2, line_start + 4] {
+            rig.select(Selection::caret(offset));
+            assert_eq!(ended(&rig.format()), "handled");
+            assert_eq!(rig.text(), tidy);
+            assert_eq!(rig.selection(), Selection::caret(bee), "{offset}");
+            assert_eq!(ended(&rig.command(CommandId::EditUndo)), "handled");
+            assert_eq!(rig.text(), messy);
+        }
+
+        // Inside a token: the same place in the text, on the same line.
+        let in_bee = messy.find("bee").unwrap() + 1;
+        rig.select(Selection::caret(in_bee));
+        assert_eq!(ended(&rig.format()), "handled");
+        let head = rig.selection().head;
+        assert_eq!(significant(&tidy[..head]), significant(&messy[..in_bee]));
+        assert_eq!(tidy[..head].matches('\r').count(), 2);
+    });
+}
+
+#[test]
+fn format_document_leaves_a_refused_document_and_a_read_only_one_unchanged() {
+    with_rig(|rig| {
+        let bad = "{\"a\": }\n";
+        rig.write("bad.json", bad);
+        rig.open("bad.json");
+        let version = rig.version();
+        rig.services
+            .answer(DialogKind::MessageBox, Answer::Button(MessageBoxResult::Ok));
+        assert_eq!(ended(&rig.format()), "handled");
+        assert_eq!((rig.text().as_str(), rig.version()), (bad, version));
+        let FormatOutcome::Refused(refusal) = format_json(bad, FormatIndent::Two) else {
+            panic!("the engine refuses {bad:?}");
+        };
+        let log = rig.services.dialog_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].title, "Format document");
+        assert_eq!(
+            log[0].message,
+            format!("The document was not changed: {refusal}.")
+        );
+
+        // A read-only editor takes no edit: the command does nothing and says nothing.
+        rig.write("min.json", MINIFIED);
+        rig.open("min.json");
+        let window = rig.window();
+        let set_read_only = |read_only: bool| {
+            let mut view = window.view.borrow_mut();
+            view.active_editor_mut().unwrap().set_read_only(read_only);
+        };
+        set_read_only(true);
+        assert_eq!(ended(&rig.format()), "handled");
+        assert_eq!(rig.text(), MINIFIED);
+        set_read_only(false);
+        assert_eq!(ended(&rig.format()), "handled");
+        assert_ne!(rig.text(), MINIFIED);
+        assert_eq!(rig.services.dialog_log().len(), 1);
+    });
+}
+
+#[test]
+fn the_palette_lists_format_document_and_runs_it_for_a_json_document() {
+    with_rig(|rig| {
+        rig.command(CommandId::SearchCommandPalette);
+        assert!(rig.row("Format document").disabled);
+        assert!(!rig.choose(">Format document"));
+        assert!(rig.palette_visible(), "refused: the palette stays open");
+        assert_eq!(rig.text(), "# Notes\n");
+    });
+    with_rig(|rig| {
+        rig.write("min.json", MINIFIED);
+        rig.open("min.json");
+        rig.command(CommandId::SearchCommandPalette);
+        assert!(!rig.row("Format document").disabled);
+        assert!(rig.choose(">Format document"));
+        assert!(!rig.palette_visible());
+        assert_eq!(rig.text(), formatted_json(MINIFIED, FormatIndent::Two));
+    });
+}
+
+#[test]
+fn the_format_indent_setting_reaches_the_command_and_is_stored_in_settings_json() {
+    let stored = r#"{"general":{"autosave":false},"editor":{"format_indent":"tab"}}"#;
+    with_settings(stored, |rig| {
+        // Read from settings.json at start-up.
+        assert_eq!(
+            rig.controller.settings().editor.format_indent,
+            FormatDocumentIndent::Tab
+        );
+        rig.write("min.json", MINIFIED);
+        rig.open("min.json");
+        rig.format();
+        assert_eq!(rig.text(), formatted_json(MINIFIED, FormatIndent::Tab));
+        assert!(rig.text().starts_with("{\n\t\"a\""));
+
+        // Changed while the app runs (the Settings window does this): the next run uses it.
+        let mut settings: Settings = rig.controller.settings().clone();
+        settings.editor.format_indent = FormatDocumentIndent::Four;
+        rig.controller.install_settings(settings, true);
+        rig.format();
+        assert_eq!(rig.text(), formatted_json(MINIFIED, FormatIndent::Four));
+        assert!(rig.text().starts_with("{\n    \"a\""));
+        settings = rig.controller.settings().clone();
+        settings.editor.format_indent = FormatDocumentIndent::Two;
+        rig.controller.install_settings(settings, true);
+        rig.format();
+        assert_eq!(rig.text(), formatted_json(MINIFIED, FormatIndent::Two));
+
+        // And written back to settings.json.
+        rig.controller.flush_settings();
+        let file = rig
+            .work
+            .parent()
+            .unwrap()
+            .join("profile")
+            .join("roaming")
+            .join("SS Writer")
+            .join("settings.json");
+        let written = std::fs::read_to_string(file).unwrap();
+        let reloaded = Settings::from_json_str(&written).unwrap();
+        assert_eq!(reloaded.editor.format_indent, FormatDocumentIndent::Two);
+        assert!(written.contains("\"format_indent\": \"2\""), "{written}");
     });
 }

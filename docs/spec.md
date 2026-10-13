@@ -171,6 +171,13 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 ### 4.6 Crash recovery
 - Worker panics drop only that task. UI-thread panic → minidump (`MiniDumpWriteDump`) + emergency save of dirty documents to the recovery folder; next launch offers recovery. Local rolling log (5 × 1 MB). No telemetry.
 
+### 4.7 Format document
+- Edit → Format document (also in the command palette; no shortcut, §11 forbids Ctrl+Alt) indents a plain-text document whose language is JSON, XML or HTML; it is disabled for every other document.
+- Whitespace only: the text is tokenized, validated and written back with every token copied byte for byte, so numbers, escapes, duplicate keys, comments and key order survive. Line endings, a BOM and the final newline are kept, and running it twice changes nothing the second time.
+- Markup is re-laid out only where whitespace cannot matter. `pre`, `textarea`, `script`, `style`, `template`, CDATA, comments, processing instructions, DOCTYPE, mixed content and anything marked `xml:space="preserve"` are copied verbatim. Malformed markup (unbalanced tags, an unterminated comment or attribute value) is refused with its reason and byte offset, and the document is not touched.
+- Rendered whitespace is preserved where the formatter can tell. HTML: an element counts as block-level only by its default `display`, so a container with an inline-level or unknown child, or with a child whose `style` attribute mentions `display`, is kept verbatim; stylesheets and classes are not consulted. XML has no notion of inline or block: an element that holds only elements, comments and processing instructions gets them one per line, unless a whitespace gap between two of them has no line break (that gap is kept as data), and children that touch with no whitespace at all are split too. Touching children keep their absence of whitespace **only** inside the names known to render their children inline: SVG `text`, `tspan`, `textPath`, `title`, `desc` and XAML `TextBlock`, `Paragraph`, `Span`, `Run`, `Bold`, `Italic`, `Underline`, `Hyperlink` (case-sensitive, any namespace prefix). In any other vocabulary that renders such whitespace (`<a>x</a><a>y</a>` reads `xy` and would gain a line break) mark the element `xml:space="preserve"`.
+- Indent from the "Format indent" setting (2 spaces, 4 spaces, Tab). One undo step.
+
 ## 5. Workspace & sidebar
 - Open folder: `Ctrl+Shift+O`, drag a folder onto the window, `SSWriter.exe <folder>`, Explorer "Open with SS Writer" on folders. First run creates `Documents\SS Writer\` with `Welcome.md` (localized).
 - One root per tab; the sidebar shows the active tab's workspace. Header: root name, ⋯ menu, + menu (New file, New folder).

@@ -144,6 +144,12 @@ spec = "4.6"
 description = "Emergency save of unsaved documents on a crash and an offer to recover them at the next launch; a local rolling log and no telemetry."
 
 [[feature]]
+id = "format-document"
+title = "Format document"
+spec = "4.7"
+description = "Indents a JSON, XML or HTML file without rewriting it: every token is copied byte for byte, preserved content stays verbatim and malformed markup is refused instead of changed."
+
+[[feature]]
 id = "workspace-sidebar"
 title = "Workspace sidebar"
 spec = "5"

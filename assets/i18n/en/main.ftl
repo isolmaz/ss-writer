@@ -88,6 +88,7 @@ cmd-edit-copy-as-markdown = Copy as Markdown
 cmd-edit-copy-as-rich-text = Copy as rich text
 cmd-edit-copy-as-html = Copy as HTML
 cmd-edit-insert-date = Insert date
+cmd-edit-format-document = Format document
 
 ## Format
 

@@ -6,8 +6,8 @@
 
 use ssw_core::i18n::{Arg, Localizer};
 use ssw_core::settings::{
-    AccentMode, AttachmentLocation, ExportFormat, ListIndent, NewFileLocation, PageSize, Settings,
-    SettingsSection, SortBy, StartupBehavior, Theme,
+    AccentMode, AttachmentLocation, ExportFormat, FormatDocumentIndent, ListIndent,
+    NewFileLocation, PageSize, Settings, SettingsSection, SortBy, StartupBehavior, Theme,
 };
 
 /// How a field is edited.
@@ -514,6 +514,14 @@ define_fields! {
             ListIndent::Two => "settings-opt-indent-2",
             ListIndent::Four => "settings-opt-indent-4",
             ListIndent::Tab => "settings-opt-indent-tab",
+        ]
+    );
+    FormatIndent: choice(
+        Editor, "settings-editor-format-indent", None, editor.format_indent, FormatDocumentIndent,
+        [
+            FormatDocumentIndent::Two => "settings-opt-indent-2",
+            FormatDocumentIndent::Four => "settings-opt-indent-4",
+            FormatDocumentIndent::Tab => "settings-opt-indent-tab",
         ]
     );
     AutoHideMarkdown: toggle(Editor, "settings-editor-auto-hide", None, editor.auto_hide_markdown);

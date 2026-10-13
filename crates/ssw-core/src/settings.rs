@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::format_text::FormatIndent;
 use crate::keymap::{Keymap, Overrides};
 
 /// Keys not modelled by this version of the app, preserved verbatim.
@@ -138,6 +139,28 @@ pub enum ListIndent {
     Four,
     #[serde(rename = "tab")]
     Tab,
+}
+
+/// One indent level of Edit → Format document (JSON, XML and HTML).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FormatDocumentIndent {
+    #[default]
+    #[serde(rename = "2")]
+    Two,
+    #[serde(rename = "4")]
+    Four,
+    #[serde(rename = "tab")]
+    Tab,
+}
+
+impl From<FormatDocumentIndent> for FormatIndent {
+    fn from(indent: FormatDocumentIndent) -> Self {
+        match indent {
+            FormatDocumentIndent::Two => FormatIndent::Two,
+            FormatDocumentIndent::Four => FormatIndent::Four,
+            FormatDocumentIndent::Tab => FormatIndent::Tab,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,6 +304,8 @@ pub struct Editor {
     /// Maximum text column width in DIPs.
     pub line_width: u32,
     pub list_indent: ListIndent,
+    /// Indent of one level in Edit → Format document.
+    pub format_indent: FormatDocumentIndent,
     pub auto_hide_markdown: bool,
     /// Typewriter caret line position, fraction of the viewport height (0.0–1.0).
     pub typewriter_position: f32,
@@ -311,6 +336,7 @@ impl Default for Editor {
             paragraph_spacing: 0.5,
             line_width: 720,
             list_indent: ListIndent::default(),
+            format_indent: FormatDocumentIndent::default(),
             auto_hide_markdown: true,
             typewriter_position: 0.5,
             typewriter_dead_zone: 0.10,
@@ -522,6 +548,7 @@ mod tests {
         assert_eq!(s.editor.font_size, 16.0);
         assert_eq!(s.editor.line_height, 1.75);
         assert_eq!(s.editor.list_indent, ListIndent::Align);
+        assert_eq!(s.editor.format_indent, FormatDocumentIndent::Two);
         assert!(s.editor.auto_hide_markdown);
         assert_eq!(s.editor.typewriter_position, 0.5);
         assert_eq!(s.editor.typewriter_dead_zone, 0.10);
@@ -651,6 +678,34 @@ mod tests {
             assert!(value.get(key).is_some(), "{key}");
         }
         assert_eq!(value["editor"]["list_indent"], json!("align"));
+        assert_eq!(value["editor"]["format_indent"], json!("2"));
+    }
+
+    #[test]
+    fn the_format_indent_is_stored_in_the_editor_section_and_converts_to_the_engine_indent() {
+        for (indent, stored, engine) in [
+            (FormatDocumentIndent::Two, "2", FormatIndent::Two),
+            (FormatDocumentIndent::Four, "4", FormatIndent::Four),
+            (FormatDocumentIndent::Tab, "tab", FormatIndent::Tab),
+        ] {
+            let mut settings = Settings::default();
+            settings.editor.format_indent = indent;
+            let text = settings.to_json_string_pretty();
+            let value: Value = serde_json::from_str(&text).expect("json");
+            assert_eq!(value["editor"]["format_indent"], json!(stored));
+            let reloaded = Settings::from_json_str(&text).expect("reparse");
+            assert_eq!(reloaded.editor.format_indent, indent);
+            assert_eq!(FormatIndent::from(reloaded.editor.format_indent), engine);
+        }
+        // A file written by hand picks the indent; an older file without the key keeps two spaces.
+        let by_hand =
+            Settings::from_json_str(r#"{"editor":{"format_indent":"tab"}}"#).expect("partial");
+        assert_eq!(by_hand.editor.format_indent, FormatDocumentIndent::Tab);
+        let older = Settings::from_json_str(r#"{"editor":{"font_size":18}}"#).expect("older");
+        assert_eq!(older.editor.format_indent, FormatDocumentIndent::Two);
+        let SettingsError::Parse(unknown) =
+            Settings::from_json_str(r#"{"editor":{"format_indent":"8"}}"#).unwrap_err();
+        assert!(unknown.is_data(), "{unknown}");
     }
 
     #[test]

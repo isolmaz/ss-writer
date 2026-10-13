@@ -69,18 +69,15 @@ Dependency direction (no cycles): `core` <- `io`, `convert`, `render`, `ui` <- `
 
 ## The gate
 
-A change is ready when all of these pass:
+**The gate runs on GitHub, not on the development machine.** Push the change and read the run: `.github/workflows/ci.yml` runs format, clippy with `-D warnings`, the whole suite under `cargo nextest`, doc tests, `cargo xtask docs-check --strict` and the 100 % coverage gate on `windows-latest` for every push and pull request. Mutation testing (`.github/workflows/mutants.yml`) runs there too, by hand or weekly, in eight shards, and the tag-triggered release workflow builds the installer and the portable zip. A change is ready when that run is green.
 
 ```powershell
-cargo fmt --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo xtask docs-check --strict
+git push                      # the checks run on GitHub
+gh run watch --exit-status    # read the result
+gh run view --log-failed      # what failed, in full
 ```
 
-and the coverage gate below is still at 100 %. CI (`.github/workflows/ci.yml`) runs format, clippy, tests under `cargo nextest`, doc tests, the docs check and the coverage gate on `windows-latest` for every push and pull request; mutation testing (`.github/workflows/mutants.yml`) runs there too, by hand or weekly, in eight shards; the tag-triggered release workflow builds the installer and the portable zip. The full suite, the coverage gate and mutation testing are meant to run on GitHub: locally, run the tests of the crate you changed (`cargo nextest run -p <crate> --all-features`). A test that hangs is stopped after three minutes (`.config/nextest.toml`).
-
-`.cargo/config.toml` caps the build at `jobs = 4` so the machine stays usable while it compiles: do not raise it with `-j` or `CARGO_BUILD_JOBS`, keep `--test-threads` at 4 or below, and never run two cargo processes at once (two of them cost twice the jobs).
+Do not build or test this workspace locally: the machine it is developed on has six cores and a local run of the suite, and above all of the coverage gate, makes it unusable for everything else. If a local check is unavoidable (debugging a failure CI cannot explain), ask first, run one cargo process, never the full workspace, and keep it inside the cap in `.cargo/config.toml` (`jobs = 4`, `--test-threads` 4 or below). A test that hangs is stopped after three minutes (`.config/nextest.toml`).
 
 Workspace lints are strict: `clippy::all` is denied, `clippy::undocumented_unsafe_blocks` is denied, `unsafe_op_in_unsafe_fn` is denied and every public type implements `Debug`. Rustfmt uses `max_width = 100`; files use LF line endings (`.gitattributes`).
 
@@ -100,7 +97,7 @@ cargo llvm-cov nextest --workspace --all-features `
   --fail-under-lines 100 --fail-under-regions 100 --fail-under-functions 100
 ```
 
-`cargo xtask coverage` is the project's wrapper around this gate: it runs the instrumented tests, writes `lcov.info` and `target/coverage-summary.txt`, and fails below 100 % lines, regions or functions. Branch coverage is reported on nightly but not gated.
+`cargo xtask coverage` is the project's wrapper around this gate: it runs the instrumented tests, writes `lcov.info` and `target/coverage-summary.txt`, and fails below 100 % lines, regions or functions. Branch coverage is reported on nightly but not gated. **The CI job runs it; it is not a local command.** Its report tells which lines are missing: `gh run view --log-failed` prints the table, and the run's `coverage` artifact holds `lcov.info`.
 
 There is **one documented coverage exception**: `crates/ssw-win/src/system_ui.rs`. It holds only the calls that put system UI on the screen and wait for the user (`TrackPopupMenuEx`, `IModalWindow::Show`, `TaskDialogIndirect`, `PrintDlgEx`), because no test may show system UI. Everything around those calls (building menus, dialog configurations and print requests, reading their answers) lives in the covered modules and is tested through hosts that answer as a user would. Apart from that file there are no exclusions: no `#[coverage(off)]`, no `#[cfg(not(coverage))]`, no `#[ignore]` tests, and no ignore pattern beyond `tests/`, `xtask/` and the vendored `third_party/` code. Code that cannot be reached is deleted or restructured (for example by making an impossible error arm impossible through types), not excluded. Error paths of OS calls are reached with real failing inputs (invalid handles, bad paths, malformed data, closed streams) or through the `fault-injection` Cargo feature of `ssw-io`, `ssw-win`, `ssw-convert` and `ssw-preview` (a test-only `fault` module that makes the n-th checked system call fail).
 
@@ -169,4 +166,4 @@ The vendored `third_party/mermaid-rs-renderer` is not a workspace member: it kee
 - Subject line: imperative mood, sentence case, no trailing period, at most 72 characters ("Retry atomic saves on sharing violations"). A crate or area prefix is welcome when it helps ("ssw-io: …"). Use the body to explain why the change is needed and what was verified.
 - The gate above passes on every commit you propose, and the commit includes the tests, spec, features, README and changelog updates that the change needs.
 - Do not commit generated output (`target/`, `dist/`, `lcov.info`).
-- Describe in the pull request what you ran, and for anything the automated tests cannot see (rendering, input devices, installer behavior) which checklist items of `docs/manual-test.md` you ran.
+- Link the green CI run in the pull request, and for anything the automated tests cannot see (rendering, input devices, installer behavior) name the checklist items of `docs/manual-test.md` you ran on the installed build.

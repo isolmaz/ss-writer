@@ -234,6 +234,70 @@ fn a_clean_quit_ends_the_loop_through_the_idle_handler() {
 }
 
 #[test]
+fn text_of_an_untitled_buffer_survives_the_quit_that_closes_its_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let services = ScriptedServices::new();
+
+    // A start without files opens one untitled buffer; it gets text nobody saves.
+    let code = start(&[], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let app = UiApp::new(core, options(&services, None)).unwrap();
+        app.pump();
+        let cell = Rc::clone(&app.controller().windows()[0]);
+        app.controller().new_untitled(&cell);
+        app.pump();
+        let entry = cell
+            .view
+            .borrow()
+            .active_tab()
+            .expect("a tab")
+            .entry
+            .clone();
+        assert!(
+            entry.untitled_id().is_some(),
+            "the new tab is an untitled buffer"
+        );
+        {
+            let mut document = entry.document().borrow_mut();
+            let edit = Transaction::single(
+                Edit::insert(0, "work in progress"),
+                Selection::caret(0),
+                Selection::caret(16),
+            );
+            document.apply(edit).unwrap();
+        }
+
+        // Quitting closes the window, which drops the document: the text has to be stored
+        // before that, not when the session is written at the end.
+        app.controller().push(Request::Quit);
+        assert_eq!(app.idle(), None, "the loop ends");
+        app.finish();
+        0
+    });
+    assert_eq!(code, 0);
+
+    // The next start finds the buffer again, with its text.
+    let code = start(&[], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let app = UiApp::new(core, options(&services, None)).unwrap();
+        app.pump();
+        let window = &app.controller().windows()[0];
+        let view = window.view.borrow();
+        let texts: Vec<String> = view
+            .tabs()
+            .iter()
+            .map(|tab| tab.entry.document().borrow().text())
+            .collect();
+        assert!(
+            texts.iter().any(|text| text == "work in progress"),
+            "the buffer came back: {texts:?}"
+        );
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+#[test]
 fn the_settings_window_opens_without_an_owner_takes_events_and_closes_when_destroyed() {
     let tmp = tempfile::tempdir().unwrap();
     let file = note(tmp.path(), "a.md", "text");

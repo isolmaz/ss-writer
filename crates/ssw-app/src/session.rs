@@ -230,6 +230,20 @@ impl SessionManager {
     /// # Errors
     /// [`StoreError`] when the database rejects the write; nothing is changed then.
     pub fn save(&self, session: &Session) -> Result<(), StoreError> {
+        self.back_up_untitled(session)?;
+        self.store.borrow_mut().save_session(session)
+    }
+
+    /// Stores the text of every untitled buffer `session` names; a tab whose document is no
+    /// longer open keeps the text of the last backup.
+    ///
+    /// Quitting closes the windows before the session is written, and a closed window drops
+    /// its documents: the texts have to be taken while they are still there, or the next start
+    /// would find a tab without a buffer and drop it.
+    ///
+    /// # Errors
+    /// [`StoreError`] when the database rejects a write.
+    pub fn back_up_untitled(&self, session: &Session) -> Result<(), StoreError> {
         let now = self.docs.env().clock.unix_seconds();
         for window in &session.windows {
             for tab in &window.tabs {
@@ -245,7 +259,7 @@ impl SessionManager {
                 }
             }
         }
-        self.store.borrow_mut().save_session(session)
+        Ok(())
     }
 
     /// Reads the stored session.

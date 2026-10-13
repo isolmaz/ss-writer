@@ -425,6 +425,19 @@ impl UiApp {
             services.clipboard,
             clock,
         );
+        // An update that just finished left the copy of the application it installed from in
+        // the temp folder: a running program cannot delete itself.
+        let removed = crate::update_apply::clean_updater_folders(
+            controller.docs().env().fs.as_ref(),
+            &std::env::temp_dir(),
+        );
+        if removed > 0 {
+            logger.log(
+                Level::Info,
+                "update",
+                &format!("removed {removed} updater folder(s) of an earlier update"),
+            );
+        }
         let system = read_system_theme(&Win32Settings);
         controller.set_system_theme(system);
         let _ = apply_menu_theme(MenuTheme::System);
@@ -764,7 +777,23 @@ impl UiApp {
     /// Every window agreed to close: the session is captured while the tabs still exist, then
     /// the windows go and the loop ends.
     fn finish_quit(&self) {
-        *self.final_session.borrow_mut() = Some(self.controller.session());
+        let session = self.controller.session();
+        // The texts of untitled buffers belong to their documents, which the closing windows
+        // drop: they are stored here, the structure follows when the loop ends.
+        if let Err(error) = self
+            .controller
+            .core()
+            .borrow()
+            .session
+            .back_up_untitled(&session)
+        {
+            self.controller.core().borrow().logger.log(
+                Level::Error,
+                "shutdown",
+                &format!("unsaved buffers not stored: {error}"),
+            );
+        }
+        *self.final_session.borrow_mut() = Some(session);
         for cell in self.controller.windows() {
             self.controller.close_window(cell.id);
         }

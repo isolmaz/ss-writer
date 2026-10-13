@@ -205,6 +205,35 @@ pub fn start(
     started
 }
 
+/// Removes the updater folders earlier runs left below `temp_root`, and returns how many went.
+///
+/// The updater is a copy of the application that runs while it installs the package, so it
+/// cannot delete itself: its folder (around 60 MB) is still there when the new build starts.
+/// Everything that is still in use, and everything that belongs to another process, is left
+/// alone; the names carry the process id only to keep attempts apart.
+pub fn clean_updater_folders(fs: &dyn FileSystem, temp_root: &Path) -> usize {
+    let prefix = format!("{UPDATER_FOLDER_PREFIX}-");
+    let Ok(entries) = std::fs::read_dir(temp_root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_ours = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix));
+        if !is_ours || !path.is_dir() {
+            continue;
+        }
+        // The copy first: a folder with a running updater in it keeps both.
+        if fs.delete_file(&path.join(UPDATER_FILE_NAME)).is_ok() && fs.remove_dir(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Creates a folder below `temp_root` that did not exist before: `create_dir` fails for an
 /// existing one (the leftover of an earlier attempt of this process id), so the next counter
 /// value is tried.
@@ -467,6 +496,48 @@ mod tests {
 
     fn os(parts: &[&OsString]) -> Vec<OsString> {
         parts.iter().map(|part| (*part).clone()).collect()
+    }
+
+    // ---- leftovers ----
+
+    #[test]
+    fn the_folders_of_finished_updates_are_swept_and_everything_else_is_left() {
+        let setup = setup();
+        let fake = Fake::new(&setup.package);
+        start(
+            &setup.package,
+            &setup.app_exe,
+            &setup.temp_root,
+            4242,
+            &RealFs,
+            &fake,
+        )
+        .unwrap();
+        // A folder of another run, a folder with something else in it, and a file and a folder
+        // that are not the updater's.
+        let other = setup.temp_root.join("SSWriter-update-99-0");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join(UPDATER_FILE_NAME), EXE_BYTES).unwrap();
+        let busy = setup.temp_root.join("SSWriter-update-99-1");
+        std::fs::create_dir(&busy).unwrap();
+        std::fs::write(busy.join("something-else.txt"), b"x").unwrap();
+        let stranger = setup.temp_root.join("other-program");
+        std::fs::create_dir(&stranger).unwrap();
+        let loose = setup.temp_root.join("SSWriter-update-99-2.txt");
+        std::fs::write(&loose, b"not a folder").unwrap();
+
+        let removed = clean_updater_folders(&RealFs, &setup.temp_root);
+
+        assert_eq!(removed, 2, "both updater folders went");
+        assert!(!other.exists());
+        assert!(busy.exists(), "a folder without the updater copy stays");
+        assert!(stranger.exists(), "another program's folder stays");
+        assert!(loose.exists(), "a file that only looks like one stays");
+        // A temp root that is not there at all is no failure.
+        assert_eq!(
+            clean_updater_folders(&RealFs, &setup.temp_root.join("missing")),
+            0
+        );
     }
 
     // ---- start ----

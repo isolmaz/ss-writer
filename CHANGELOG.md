@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-13
+
+### Fixed
+
+- Unsaved text of an untitled document was lost when SS Writer was closed: the session remembered the tab, but the text was written after the windows had been closed, and a closed window drops its documents, so the next start found a tab without a buffer and dropped it. The text is now stored while the tabs are still open.
+- The update left the copy of the application it installed from (about 60 MB) in the temp folder, because the updater cannot delete itself while it runs. The next start removes it.
+
 ## [0.1.4] - 2026-10-13
 
 ### Fixed
@@ -140,7 +147,8 @@ First release.
 
 - Scrolling very large documents (60 000 lines) at high speed does not yet keep up with a 144 Hz display: in the stress test a frame takes about 16 ms instead of 7 ms. See [docs/performance.md](docs/performance.md#known-issues).
 
-[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/isolmaz/ss-writer/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/isolmaz/ss-writer/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/isolmaz/ss-writer/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/isolmaz/ss-writer/compare/v0.1.1...v0.1.2

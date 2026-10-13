@@ -3057,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "ssw-app"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "image",
  "rusqlite",
@@ -3075,7 +3075,7 @@ dependencies = [
 
 [[package]]
 name = "ssw-convert"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
  "cfb",
@@ -3091,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "ssw-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "fluent-bundle",
  "nucleo-matcher",
@@ -3109,7 +3109,7 @@ dependencies = [
 
 [[package]]
 name = "ssw-io"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "blake3",
  "chardetng",
@@ -3134,7 +3134,7 @@ dependencies = [
 
 [[package]]
 name = "ssw-preview"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ssw-core",
  "ssw-render",
@@ -3147,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "ssw-render"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "comemo",
  "image",
@@ -3166,7 +3166,7 @@ dependencies = [
 
 [[package]]
 name = "ssw-ui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -3178,7 +3178,7 @@ dependencies = [
 
 [[package]]
 name = "ssw-win"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ssw-core",
  "ssw-render",
@@ -4714,7 +4714,7 @@ checksum = "9440ea3e5aeabb0ac63af70daf835274065238cdd0cec83418f417eae38bacee"
 
 [[package]]
 name = "xtask"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "fluent-syntax",
  "regex",

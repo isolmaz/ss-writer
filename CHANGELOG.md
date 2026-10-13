@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-13
+
 ### Added
 
 - Edit → Format document indents a JSON, XML or HTML file with the indent of the new "Format indent" setting (2 spaces, 4 spaces, Tab). It changes whitespace only: every token is copied byte for byte, so numbers, escapes, comments, duplicate keys and key order survive, and `pre`, `textarea`, `script`, `style`, CDATA, declarations and mixed content stay verbatim. Malformed markup is refused with its reason and byte offset instead of being rewritten. The command has no shortcut, because no default shortcut may use Ctrl+Alt.
@@ -164,7 +166,8 @@ First release.
 
 - Scrolling very large documents (60 000 lines) at high speed does not yet keep up with a 144 Hz display: in the stress test a frame takes about 16 ms instead of 7 ms. See [docs/performance.md](docs/performance.md#known-issues).
 
-[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/isolmaz/ss-writer/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/isolmaz/ss-writer/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/isolmaz/ss-writer/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/isolmaz/ss-writer/compare/v0.1.2...v0.1.3

@@ -7,7 +7,7 @@
 //! recording canvas and the fixed-advance text engine.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use ssw_core::command::CommandId;
@@ -21,6 +21,7 @@ use ssw_core::stats;
 use ssw_core::text::TextRange;
 use ssw_ui::canvas::Canvas;
 use ssw_ui::editor::blocks_table::TableControl;
+use ssw_ui::editor::highlight::Language;
 use ssw_ui::editor::{DocumentKind, EditorConfig, EditorEvent, EditorStrings, EditorView};
 use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{Cursor, Event, FocusEvent, PointerButton, PointerEvent, PointerEventKind};
@@ -211,17 +212,26 @@ impl fmt::Debug for ShellView {
     }
 }
 
-/// Makes `editor` present its document the way the file type wants (spec §4.1): live Markdown,
-/// plain lines, or a whole Mermaid diagram.
-fn present_as(editor: &mut EditorView, mode: DocMode) {
-    let kind = match mode {
+/// The language a plain-text file is coloured as: the one its extension names (`.json`, `.html`,
+/// `.py`, `.css`, …); none for a file without an extension or with an unknown one.
+fn plain_language_of(path: &Path) -> Option<Language> {
+    path.extension()
+        .and_then(|extension| Language::from_name(&extension.to_string_lossy()))
+}
+
+/// Makes `editor` present `entry` the way the file type wants (spec §4.1): live Markdown, plain
+/// lines (coloured by the file's extension), or a whole Mermaid diagram.
+fn present_as(editor: &mut EditorView, entry: &DocEntry) {
+    let kind = match entry.mode() {
         DocMode::Markdown => DocumentKind::Markdown,
         DocMode::Plain => DocumentKind::PlainText,
         DocMode::Mermaid => DocumentKind::Mermaid,
     };
-    if editor.config().document_kind != kind {
+    let language = entry.path().as_deref().and_then(plain_language_of);
+    if editor.config().document_kind != kind || editor.config().plain_language != language {
         let mut config = editor.config().clone();
         config.document_kind = kind;
+        config.plain_language = language;
         editor.set_config(config);
     }
 }
@@ -679,7 +689,7 @@ impl ShellView {
             .iter_mut()
             .filter(|tab| Rc::ptr_eq(&tab.entry, &entry))
         {
-            present_as(&mut tab.editor, entry.mode());
+            present_as(&mut tab.editor, &entry);
         }
         // The word count of the status bar follows the document's kind.
         self.words = None;
@@ -733,7 +743,7 @@ impl ShellView {
         }
         let mut editor = EditorView::new(Rc::clone(entry.document()), Rc::clone(&self.clock));
         editor.set_config(self.editor_config.clone());
-        present_as(&mut editor, entry.mode());
+        present_as(&mut editor, &entry);
         editor.set_strings(self.editor_strings.clone());
         editor.set_clipboard(Rc::clone(&self.clipboard));
         let table = self
@@ -887,7 +897,7 @@ impl ShellView {
     /// documents that changed.
     pub fn sync_tabs(&mut self, show_dirty: bool) {
         for tab in &mut self.tabs {
-            present_as(&mut tab.editor, tab.entry.mode());
+            present_as(&mut tab.editor, &tab.entry);
             tab.folds.sync(&mut tab.editor);
             let tabs = self.titlebar.tabs_mut();
             if let Some(path) = tab.entry.path() {
@@ -903,11 +913,12 @@ impl ShellView {
     /// Applies new editor settings (fonts, spacing, zoom) to every editor.
     pub fn set_editor_config(&mut self, config: EditorConfig) {
         for tab in &mut self.tabs {
-            // How a document is presented (Markdown, plain text, Mermaid; wrapping) belongs
-            // to the tab, not to the settings.
+            // How a document is presented (Markdown, plain text, Mermaid; wrapping; the
+            // language it is coloured as) belongs to the tab, not to the settings.
             let mut own = config.clone();
             own.document_kind = tab.editor.config().document_kind;
             own.wrap = tab.editor.config().wrap;
+            own.plain_language = tab.editor.config().plain_language;
             tab.editor.set_config(own);
         }
         self.editor_config = config;

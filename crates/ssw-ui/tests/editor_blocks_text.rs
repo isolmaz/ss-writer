@@ -97,6 +97,7 @@ impl Fixture {
             folded: false,
             strings: &self.strings,
             registry: &self.registry,
+            plain_tokens: &[],
         };
         self.registry.measure(&cx, self.block(index))
     }
@@ -1220,6 +1221,7 @@ fn a_stray_list_item_is_laid_out_as_a_one_item_list() {
         folded: false,
         strings: &f.strings,
         registry: &f.registry,
+        plain_tokens: &[],
     };
     let layout = f.registry.measure(&cx, &item);
     assert!(close(layout.height(), f.line()));
@@ -1424,6 +1426,7 @@ fn contexts_and_registries_show_what_identifies_them() {
         folded: true,
         strings: &f.strings,
         registry: &f.registry,
+        plain_tokens: &[],
     };
     let printed = format!("{cx:?}");
     assert!(printed.contains("width: 352.0"), "{printed}");

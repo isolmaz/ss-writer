@@ -92,7 +92,7 @@ pub enum Language {
     Bash,
     /// PowerShell.
     PowerShell,
-    /// HTML.
+    /// HTML (the bodies of `<script>` and `<style>` are JavaScript, JSON and CSS).
     Html,
     /// XML (also SVG, XAML).
     Xml,
@@ -223,6 +223,9 @@ enum Mode {
 struct State {
     mode: Mode,
     depth: u8,
+    /// HTML only: the `<script>` or `<style>` element being opened or scanned. In its body
+    /// `mode` and `depth` belong to the guest language.
+    embed: markup::Embed,
 }
 
 /// Scans one line (without its terminator); tokens are relative to the line. The markup
@@ -244,7 +247,8 @@ fn scan_line(language: Language, line: &str, state: State, out: &mut Vec<Token>)
         Language::Sql => &langs::SQL,
         Language::Yaml => &langs::YAML,
         Language::Toml => &langs::TOML,
-        Language::Html | Language::Xml => return markup::scan_markup(line, state, out),
+        Language::Html => return markup::scan_markup(line, state, true, out),
+        Language::Xml => return markup::scan_markup(line, state, false, out),
         Language::Css => return markup::scan_css(line, state, out),
         Language::Markdown => return markup::scan_markdown(line, state, out),
         Language::Diff => {
@@ -383,7 +387,7 @@ impl Highlighter {
 
 /// Token colors derived from the theme tokens (callout and accent colors are tuned for contrast
 /// on the surface in every theme); high contrast uses the text color for everything but
-/// comments.
+/// comments. [`SyntaxColors::calm`] is the quieter variant for whole documents.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SyntaxColors {
     text: Color,
@@ -402,9 +406,13 @@ pub struct SyntaxColors {
     removed: Color,
     heading: Color,
     colored: bool,
+    calm: bool,
 }
 
 impl SyntaxColors {
+    /// The kinds the calm palette colors.
+    const CALM_KINDS: [TokenKind; 3] = [TokenKind::Comment, TokenKind::Keyword, TokenKind::String];
+
     /// The colors of `theme`.
     #[must_use]
     pub fn from_theme(theme: &Theme) -> Self {
@@ -427,6 +435,18 @@ impl SyntaxColors {
             removed: tokens.error,
             heading: tokens.accent,
             colored: theme.mode != ThemeMode::HighContrast,
+            calm: false,
+        }
+    }
+
+    /// The colors of `theme` for a whole document: a page full of colored types, tags and numbers
+    /// is noisy, so only comments, strings and keywords are colored and everything else keeps the
+    /// text color.
+    #[must_use]
+    pub fn calm(theme: &Theme) -> Self {
+        Self {
+            calm: true,
+            ..Self::from_theme(theme)
         }
     }
 
@@ -438,6 +458,9 @@ impl SyntaxColors {
                 TokenKind::Comment => self.muted,
                 _ => self.text,
             };
+        }
+        if self.calm && !Self::CALM_KINDS.contains(&kind) {
+            return self.text;
         }
         match kind {
             TokenKind::Plain => self.text,

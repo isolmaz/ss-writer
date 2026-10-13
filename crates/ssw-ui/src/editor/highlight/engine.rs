@@ -316,6 +316,7 @@ impl<'a> Scanner<'a> {
             self.state = State {
                 mode: Mode::Str(u8::try_from(rule_index).unwrap_or(u8::MAX)),
                 depth: u8::from(raw),
+                ..State::default()
             };
         }
         line.len()
@@ -338,6 +339,7 @@ impl<'a> Scanner<'a> {
                 self.state = State {
                     mode: Mode::RawStr,
                     depth: u8::try_from(hashes).unwrap_or(u8::MAX),
+                    ..State::default()
                 };
                 line.len()
             }
@@ -446,6 +448,7 @@ impl<'a> Scanner<'a> {
             self.state = State {
                 mode: Mode::Comment,
                 depth: 1,
+                ..State::default()
             };
             return self.comment_body(delimiters, i, i + delimiters.0.len());
         }

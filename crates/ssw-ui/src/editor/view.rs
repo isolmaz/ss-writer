@@ -29,6 +29,7 @@ use crate::widgets::{Control, SharedClipboard};
 use super::block::{BlockCx, BlockDrag, BlockLayout, BlockPaintCx, BlockRegistry, GapLayout};
 use super::config::{Composition, DocumentKind, EditorConfig, EditorEvent, EditorStrings};
 use super::display::Reveal;
+use super::highlight::{Highlighter, Language, Token};
 use super::layout::{HeightIndex, Item, ItemKind, build_document_items, document_block, item_at};
 use super::modes::{reveal_scroll, typewriter_scroll};
 use super::object::{InlineObjectProvider, NoObjects};
@@ -169,6 +170,15 @@ pub(super) struct Cache {
     /// Height of one line of body text as the engine lays it out (estimates and blank lines).
     pub line_px: f32,
     line_key: Option<(u64, u32)>,
+    /// Tokenizer of a plain-text document as a whole; the code blocks of a Markdown document
+    /// have their own. It keeps the tokens of every line, so a new document version rescans
+    /// only the lines that changed.
+    plain_highlighter: Highlighter,
+    /// The document version and language `plain_tokens` were computed for.
+    plain_key: Option<(u64, Option<Language>)>,
+    /// The syntax tokens of the whole plain-text document (offsets into its text); empty unless
+    /// [`EditorView::plain_highlight_language`] names a language.
+    plain_tokens: Vec<Token>,
 }
 
 /// The editing surface of spec §2: a centred text column over a shared [`Document`], rendered
@@ -730,13 +740,25 @@ impl EditorView {
 
     // ----- lazy layout ----------------------------------------------------------------------
 
+    /// The language the lines of a plain-text document are coloured as: none for any other
+    /// document kind, with `syntax_highlighting` off and for a file type without a language.
+    fn plain_highlight_language(&self) -> Option<Language> {
+        if self.config.document_kind == DocumentKind::PlainText && self.config.syntax_highlighting {
+            self.config.plain_language
+        } else {
+            None
+        }
+    }
+
+    /// Lays `item` out in `width`; `cache` supplies the height of a blank line and the syntax
+    /// tokens of a plain-text document.
     fn make_layout(
         &self,
         doc: &Document,
         env: &Env<'_>,
         reveal: &Reveal,
         width: f32,
-        line_px: f32,
+        cache: &Cache,
         item: &Item,
     ) -> Rc<dyn BlockLayout> {
         match item.kind {
@@ -748,6 +770,15 @@ impl EditorView {
                 } else {
                     synthesized = document_block(doc, item, kind);
                     &synthesized
+                };
+                // The tokens of the document that touch this line (sorted, disjoint).
+                let line_tokens: &[Token] = if kind == DocumentKind::PlainText {
+                    let all = &cache.plain_tokens;
+                    let first = all.partition_point(|token| token.end <= item.content.start);
+                    let last = all.partition_point(|token| token.start < item.content.end);
+                    all.get(first..last).unwrap_or_default()
+                } else {
+                    &[]
                 };
                 let cx = BlockCx {
                     text: env.text,
@@ -765,6 +796,7 @@ impl EditorView {
                         .is_ok(),
                     strings: &self.strings,
                     registry: &self.registry,
+                    plain_tokens: line_tokens,
                 };
                 if kind == DocumentKind::Markdown {
                     Rc::from(self.registry.measure(&cx, block))
@@ -777,7 +809,7 @@ impl EditorView {
                 let height = if separator && !touched {
                     self.config.spacing_px().max(1.0)
                 } else {
-                    line_px
+                    cache.line_px
                 };
                 Rc::new(GapLayout::new(item.content, height))
             }
@@ -803,7 +835,7 @@ impl EditorView {
         if let Some(layout) = cache.layouts.get(&index) {
             return Some(Rc::clone(layout));
         }
-        let layout = self.make_layout(doc, env, reveal, width, cache.line_px, &item);
+        let layout = self.make_layout(doc, env, reveal, width, cache, &item);
         cache.heights.set(index, layout.height());
         cache.layouts.insert(index, Rc::clone(&layout));
         Some(layout)
@@ -833,6 +865,20 @@ impl EditorView {
             }
         }
         let line_px = c.line_px;
+        // One tokenizer run over the whole plain-text document per version (or language
+        // change), never one per line: the highlighter rescans only the lines that changed.
+        let language = self.plain_highlight_language();
+        let plain_key = (doc.version(), language);
+        if c.plain_key != Some(plain_key) {
+            c.plain_tokens = match language {
+                Some(language) => c.plain_highlighter.highlight(0, language, &doc.text()),
+                None => {
+                    c.plain_highlighter = Highlighter::new();
+                    Vec::new()
+                }
+            };
+            c.plain_key = Some(plain_key);
+        }
         let items_key = (doc.version(), self.folds_epoch);
         if c.items_key != Some(items_key) {
             let items = build_document_items(&doc, &self.hidden, self.config.document_kind);

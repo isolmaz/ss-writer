@@ -478,6 +478,64 @@ fn high_contrast_colors_everything_but_comments_like_the_text() {
 }
 
 #[test]
+fn the_calm_palette_colors_only_comments_strings_and_keywords() {
+    let theme = Theme::light(DEFAULT_ACCENT);
+    let full = SyntaxColors::from_theme(&theme);
+    let calm = SyntaxColors::calm(&theme);
+    let text = theme.tokens.text;
+    assert_ne!(calm, full);
+    assert_eq!(calm.color(Comment), theme.tokens.text_muted);
+    assert_eq!(calm.color(Str), full.color(Str));
+    assert_eq!(calm.color(Keyword), full.color(Keyword));
+    assert_ne!(calm.color(Str), text);
+    assert_ne!(calm.color(Keyword), text);
+    for kind in KINDS {
+        if !matches!(kind, Comment | Keyword | Str) {
+            assert_eq!(calm.color(kind), text, "{kind:?} is calm");
+        }
+    }
+    for kind in [Number, Type, Function, Property, Tag, Attribute] {
+        assert_ne!(full.color(kind), text, "{kind:?} is colored");
+    }
+}
+
+#[test]
+fn the_calm_palette_keeps_italic_comments_and_the_high_contrast_rule() {
+    let theme = Theme::light(DEFAULT_ACCENT);
+    let calm = SyntaxColors::calm(&theme);
+    let base = TextStyle::new("Mono", 12.0);
+    let token = Token {
+        start: 0,
+        end: 3,
+        kind: Comment,
+    };
+    let comment = calm.styled(&token, &base, 0);
+    assert!(comment.style.italic);
+    assert_eq!(comment.style.color, Some(theme.tokens.text_muted));
+
+    let system = SystemColors {
+        window: Color::BLACK,
+        window_text: Color::WHITE,
+        gray_text: Color::from_rgb_u32(0x3FF23F),
+        highlight: Color::from_rgb_u32(0x1AEBFF),
+        highlight_text: Color::BLACK,
+        button_face: Color::from_rgb_u32(0x202020),
+        button_text: Color::WHITE,
+        hotlight: Color::from_rgb_u32(0xFFFF00),
+    };
+    let contrast = Theme::high_contrast(system);
+    let calm = SyntaxColors::calm(&contrast);
+    for kind in KINDS {
+        let wanted = if kind == Comment {
+            contrast.tokens.text_muted
+        } else {
+            contrast.tokens.text
+        };
+        assert_eq!(calm.color(kind), wanted, "{kind:?}");
+    }
+}
+
+#[test]
 fn styled_ranges_shift_into_the_display_text_and_style_comments_and_headings() {
     let theme = Theme::light(DEFAULT_ACCENT);
     let colors = SyntaxColors::from_theme(&theme);
@@ -691,6 +749,293 @@ fn html_self_closing_tags_stray_brackets_and_ampersands() {
     assert_eq!(
         toks(Language::Xml, "a < b <i> & &amp; &x"),
         [("<i", Tag), ("&amp;", Escape)]
+    );
+}
+
+#[test]
+fn html_style_and_script_bodies_are_css_and_javascript_over_several_lines() {
+    assert_eq!(
+        toks(Language::Html, "<style>\na { color: #fff; }\n</style>"),
+        [
+            ("<style", Tag),
+            ("a", Tag),
+            ("color", Property),
+            ("#fff", Number),
+            ("</style", Tag)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Html, "<style>\na {\n  margin: 0;\n}\n</style>"),
+        [
+            ("<style", Tag),
+            ("a", Tag),
+            ("margin", Property),
+            ("0", Number),
+            ("</style", Tag)
+        ],
+        "the brace depth flows from line to line"
+    );
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script>\nconst a = 1;\n/* x\ny */ b();\n</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("const", Keyword),
+            ("1", Number),
+            ("/* x", Comment),
+            ("y */", Comment),
+            ("b", Function),
+            ("</script", Tag)
+        ]
+    );
+}
+
+#[test]
+fn html_script_types_pick_the_body_language() {
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type=\"application/json\">\n{\"a\": [1, true]}\n</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("\"application/json\"", Str),
+            ("\"a\"", Property),
+            ("1", Number),
+            ("true", Constant),
+            ("</script", Tag)
+        ]
+    );
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type=\"application/ld+json\">{\"a\": 1}</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("\"application/ld+json\"", Str),
+            ("\"a\"", Property),
+            ("1", Number),
+            ("</script", Tag)
+        ]
+    );
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type=importmap>{\"key\": 1}</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("importmap", Attribute),
+            ("\"key\"", Property),
+            ("1", Number),
+            ("</script", Tag)
+        ],
+        "unquoted values count too"
+    );
+    assert_eq!(
+        toks(Language::Html, "<SCRIPT TYPE='Module'>let a</SCRIPT>"),
+        [
+            ("<SCRIPT", Tag),
+            ("TYPE", Attribute),
+            ("'Module'", Str),
+            ("let", Keyword),
+            ("</SCRIPT", Tag)
+        ],
+        "names and types ignore case; module is JavaScript"
+    );
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type=\"text/template\">\n<b class=\"x\">&amp;</b>\n</script>\n<i>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("\"text/template\"", Str),
+            ("</script", Tag),
+            ("<i", Tag)
+        ],
+        "any other type is plain text up to the end tag"
+    );
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<style type=\"text/less\">\na { color: #fff; }\n</style>"
+        ),
+        [
+            ("<style", Tag),
+            ("type", Attribute),
+            ("\"text/less\"", Str),
+            ("</style", Tag)
+        ]
+    );
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<style type=\"text/css\">a{margin:0}</style>"
+        ),
+        [
+            ("<style", Tag),
+            ("type", Attribute),
+            ("\"text/css\"", Str),
+            ("a", Tag),
+            ("margin", Property),
+            ("0", Number),
+            ("</style", Tag)
+        ]
+    );
+}
+
+#[test]
+fn html_open_tags_may_span_lines_before_the_body_starts() {
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script\n  type=\"module\"\n  src=\"a.js\"\n>\nlet x\n</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("\"module\"", Str),
+            ("src", Attribute),
+            ("\"a.js\"", Str),
+            ("let", Keyword),
+            ("</script", Tag)
+        ]
+    );
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script\n  type=\"application/json\"\n>\n{\"a\": 1}\n</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("\"application/json\"", Str),
+            ("\"a\"", Property),
+            ("1", Number),
+            ("</script", Tag)
+        ],
+        "the type read on one line decides the body that starts on a later one"
+    );
+}
+
+#[test]
+fn an_end_tag_inside_a_guest_string_or_comment_still_ends_the_element() {
+    assert_eq!(
+        toks(Language::Html, "<script>var s = \"</script><b>x</b>"),
+        [
+            ("<script", Tag),
+            ("var", Keyword),
+            ("\"", Str),
+            ("</script", Tag),
+            ("<b", Tag),
+            ("</b", Tag)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Html, "<script>// c </script><i>"),
+        [
+            ("<script", Tag),
+            ("// c ", Comment),
+            ("</script", Tag),
+            ("<i", Tag)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Html, "<script>f(\"</scripts>\") </SCRIPT ><i>"),
+        [
+            ("<script", Tag),
+            ("f", Function),
+            ("\"</scripts>\"", Str),
+            ("</SCRIPT", Tag),
+            ("<i", Tag)
+        ],
+        "only </script followed by a space, slash, > or the line end counts, in any case"
+    );
+}
+
+#[test]
+fn html_resumes_after_the_end_tag_on_the_same_line() {
+    assert_eq!(
+        toks(Language::Html, "<script>f()</script><b>"),
+        [
+            ("<script", Tag),
+            ("f", Function),
+            ("</script", Tag),
+            ("<b", Tag)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Html, "<style>a{margin:0}</style>&amp;"),
+        [
+            ("<style", Tag),
+            ("a", Tag),
+            ("margin", Property),
+            ("0", Number),
+            ("</style", Tag),
+            ("&amp;", Escape)
+        ]
+    );
+    assert_eq!(
+        toks(Language::Html, "<script>f()</script"),
+        [("<script", Tag), ("f", Function), ("</script", Tag)],
+        "the end of the line ends the name of the end tag"
+    );
+}
+
+#[test]
+fn an_unterminated_css_comment_in_a_style_continues_on_the_next_line() {
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<style>/* a\nb { margin: 0 }\n*/ c {}\n</style>"
+        ),
+        [
+            ("<style", Tag),
+            ("/* a", Comment),
+            ("b { margin: 0 }", Comment),
+            ("*/", Comment),
+            ("c", Tag),
+            ("</style", Tag)
+        ]
+    );
+}
+
+#[test]
+fn editing_an_open_tag_rescans_the_body_it_hands_to_another_language() {
+    let mut highlighter = Highlighter::new();
+    let text = "<script>\nlet a\n</script>\n<b>\n";
+    let tokens = highlighter.highlight(3, Language::Html, text);
+    assert_eq!(highlighter.last_scanned_lines(), 4);
+    assert!(tokens.iter().any(|token| token.kind == Keyword));
+    let edited = "<script type=\"text/x\">\nlet a\n</script>\n<b>\n";
+    let tokens = highlighter.highlight(3, Language::Html, edited);
+    assert_eq!(
+        highlighter.last_scanned_lines(),
+        3,
+        "the open tag and the two lines whose incoming state changed"
+    );
+    assert!(tokens.iter().all(|token| token.kind != Keyword));
+    assert_eq!(tokens, tokenize(Language::Html, edited));
+}
+
+#[test]
+fn xml_has_no_raw_text_elements() {
+    assert_eq!(
+        toks(Language::Xml, "<script>f()</script>"),
+        [("<script", Tag), ("</script", Tag)]
+    );
+    assert_eq!(
+        toks(Language::Xml, "<Style>\n<Setter/>\n</Style>"),
+        [("<Style", Tag), ("<Setter", Tag), ("</Style", Tag)],
+        "a XAML Style is not CSS"
     );
 }
 

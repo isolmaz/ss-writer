@@ -1,7 +1,7 @@
 //! Line scanners for markup-like languages: HTML/XML, CSS, Markdown and unified diffs.
 
 use super::engine::escape_len;
-use super::{Mode, State, Token, TokenKind};
+use super::{Language, Mode, State, Token, TokenKind};
 
 fn push(out: &mut Vec<Token>, start: usize, end: usize, kind: TokenKind) {
     if start < end {
@@ -35,13 +35,219 @@ fn entities(line: &str, from: usize, to: usize, out: &mut Vec<Token>) {
     }
 }
 
-/// HTML and XML: comments, tags, attributes, attribute values and character references.
-pub(super) fn scan_markup(line: &str, state: State, out: &mut Vec<Token>) -> State {
+/// The elements whose body is raw text that another language scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Element {
+    Script,
+    Style,
+}
+
+impl Element {
+    fn of(tag_name: &str) -> Option<Self> {
+        if tag_name.eq_ignore_ascii_case("script") {
+            Some(Self::Script)
+        } else if tag_name.eq_ignore_ascii_case("style") {
+            Some(Self::Style)
+        } else {
+            None
+        }
+    }
+
+    /// The lowercase tag name, which the end tag repeats.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Script => "script",
+            Self::Style => "style",
+        }
+    }
+}
+
+/// What the `type` attribute of a `<script>` or `<style>` says about its body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TypeAttr {
+    /// No `type`, or an empty one: the element's own default language.
+    Absent,
+    JavaScript,
+    Json,
+    Css,
+    /// Any other type: data or a template for somebody else, shown as plain text.
+    Other,
+}
+
+/// The JavaScript types of the WHATWG MIME Sniffing standard, and `module`.
+const JAVASCRIPT_TYPES: &[&str] = &[
+    "module",
+    "application/ecmascript",
+    "application/javascript",
+    "application/x-ecmascript",
+    "application/x-javascript",
+    "text/ecmascript",
+    "text/javascript",
+    "text/javascript1.0",
+    "text/javascript1.1",
+    "text/javascript1.2",
+    "text/javascript1.3",
+    "text/javascript1.4",
+    "text/javascript1.5",
+    "text/jscript",
+    "text/livescript",
+    "text/x-ecmascript",
+    "text/x-javascript",
+];
+
+impl TypeAttr {
+    /// The meaning of an attribute value: types ignore case and surrounding whitespace.
+    fn of(value: &str) -> Self {
+        let value = value.trim_ascii();
+        let is_one_of = |types: &[&str]| types.iter().any(|ty| value.eq_ignore_ascii_case(ty));
+        if value.is_empty() {
+            Self::Absent
+        } else if is_one_of(JAVASCRIPT_TYPES) {
+            Self::JavaScript
+        } else if is_one_of(&["application/json", "importmap"])
+            || ends_with_ignore_case(value, "+json")
+        {
+            Self::Json
+        } else if value.eq_ignore_ascii_case("text/css") {
+            Self::Css
+        } else {
+            Self::Other
+        }
+    }
+
+    /// The language of the body of `element`, `None` for plain text.
+    fn guest(self, element: Element) -> Option<Language> {
+        match (element, self) {
+            (Element::Script, Self::Absent | Self::JavaScript) => Some(Language::JavaScript),
+            (Element::Script, Self::Json) => Some(Language::Json),
+            (Element::Style, Self::Absent | Self::Css) => Some(Language::Css),
+            _ => None,
+        }
+    }
+}
+
+/// Where the HTML scanner is in a `<script>` or `<style>` element, from its open tag to its end
+/// tag. All of it is `Copy` and flat, so the highlighter can compare it per line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum Embed {
+    /// Not in such an element.
+    #[default]
+    None,
+    /// In the open tag, which may span lines: the `type` seen so far decides the body.
+    Open(Element, TypeAttr),
+    /// In the body. The guest language (`None` for plain text) keeps its scanner state in
+    /// `State::mode` and `State::depth`: the host has nothing of its own to remember until the
+    /// end tag.
+    Body(Element, Option<Language>),
+}
+
+fn ends_with_ignore_case(text: &str, suffix: &str) -> bool {
+    let (text, suffix) = (text.as_bytes(), suffix.as_bytes());
+    text.len() >= suffix.len() && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// The attribute value at the start of `text` (what follows the `=`), if it ends on this line.
+fn attribute_value(text: &str) -> Option<&str> {
+    let text = text.trim_ascii_start();
+    match text.chars().next()? {
+        quote @ ('"' | '\'') => text[1..].split_once(quote).map(|(value, _)| value),
+        _ => {
+            let end = text.find(|c: char| c.is_ascii_whitespace() || c == '>');
+            Some(end.map_or(text, |end| &text[..end]))
+        }
+    }
+}
+
+/// The state after the `>` of a tag: the body of a `<script>` or `<style>` starts, any other
+/// tag is followed by text.
+fn after_tag(state: State) -> State {
+    match state.embed {
+        Embed::Open(element, ty) => State {
+            embed: Embed::Body(element, ty.guest(element)),
+            ..State::default()
+        },
+        _ => State::default(),
+    }
+}
+
+/// Where the end tag of the raw-text element `name` starts in `text`: `</name` in any case,
+/// followed by whitespace, `/`, `>` or the end of the line. Only this ends the element, whatever
+/// the guest language is in the middle of (a string, a comment): that is what the HTML spec says
+/// and what browsers do.
+fn find_end_tag(text: &str, name: &str) -> Option<usize> {
+    let name = name.as_bytes();
+    let mut from = 0;
+    while let Some(at) = text[from..].find("</") {
+        let start = from + at;
+        let tail = &text.as_bytes()[start + 2..];
+        let named = tail
+            .get(..name.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(name));
+        let ended = tail
+            .get(name.len())
+            .is_none_or(|b| b" \t\n\r\x0C/>".contains(b));
+        if named && ended {
+            return Some(start);
+        }
+        from = start + 2;
+    }
+    None
+}
+
+/// Scans `line[from..]` in the body of `element`. The guest language gets the text up to the end
+/// tag as a line of its own, so a `</script>` inside one of its strings or comments still ends
+/// the element; at the end tag the guest state is dropped and the host resumes there. Returns
+/// where the host resumes.
+fn scan_body(
+    line: &str,
+    from: usize,
+    element: Element,
+    guest: Option<Language>,
+    state: &mut State,
+    out: &mut Vec<Token>,
+) -> usize {
+    let end_tag = find_end_tag(&line[from..], element.name());
+    let end = end_tag.map_or(line.len(), |at| from + at);
+    if let Some(language) = guest
+        && from < end
+    {
+        let before = out.len();
+        let inner = State {
+            embed: Embed::None,
+            ..*state
+        };
+        let next = super::scan_line(language, &line[from..end], inner, out);
+        for token in &mut out[before..] {
+            token.start += from;
+            token.end += from;
+        }
+        *state = State {
+            embed: Embed::Body(element, guest),
+            ..next
+        };
+    }
+    if end_tag.is_some() {
+        *state = State::default();
+    }
+    end
+}
+
+/// HTML and XML: comments, tags, attributes, attribute values and character references. In HTML
+/// (`html`) the body of a `<script>` or `<style>` is JavaScript, JSON or CSS as its `type` says;
+/// XML has no raw-text elements (XAML has a `<Style>` that is no CSS).
+pub(super) fn scan_markup(line: &str, state: State, html: bool, out: &mut Vec<Token>) -> State {
     let bytes = line.as_bytes();
     let len = line.len();
     let mut state = state;
     let mut i = 0;
+    // The attribute name just before an `=` is `type`; a name and its `=` share a line in
+    // practice, so this does not need to survive a line break.
+    let mut after_type = false;
     while i < len {
+        if let Embed::Body(element, guest) = state.embed {
+            i = scan_body(line, i, element, guest, &mut state, out);
+            continue;
+        }
         match state.mode {
             Mode::Comment => match line[i..].find("-->") {
                 Some(at) => {
@@ -69,10 +275,20 @@ pub(super) fn scan_markup(line: &str, state: State, out: &mut Vec<Token>) -> Sta
                 let rest = &line[i..];
                 let ch = rest.chars().next().unwrap_or(' ');
                 if rest.starts_with("/>") {
-                    state = State::default();
+                    // Browsers ignore the slash of a non-void element: the body starts anyway.
+                    state = after_tag(state);
                     i += 2;
                 } else if ch == '>' {
-                    state = State::default();
+                    state = after_tag(state);
+                    i += 1;
+                } else if ch == '=' {
+                    if after_type
+                        && let Embed::Open(element, TypeAttr::Absent) = state.embed
+                        && let Some(value) = attribute_value(&rest[1..])
+                    {
+                        state.embed = Embed::Open(element, TypeAttr::of(value));
+                    }
+                    after_type = false;
                     i += 1;
                 } else if ch == '"' || ch == '\'' {
                     match rest[1..].find(ch) {
@@ -89,6 +305,7 @@ pub(super) fn scan_markup(line: &str, state: State, out: &mut Vec<Token>) -> Sta
                 } else if is_name_char(ch) {
                     let end = rest.find(|c: char| !is_name_char(c)).unwrap_or(rest.len());
                     push(out, i, i + end, TokenKind::Attribute);
+                    after_type = rest[..end].eq_ignore_ascii_case("type");
                     i += end;
                 } else {
                     i += ch.len_utf8();
@@ -112,7 +329,7 @@ pub(super) fn scan_markup(line: &str, state: State, out: &mut Vec<Token>) -> Sta
                             push(out, open, len, TokenKind::Comment);
                             return State {
                                 mode: Mode::Comment,
-                                depth: 0,
+                                ..State::default()
                             };
                         }
                     }
@@ -131,6 +348,13 @@ pub(super) fn scan_markup(line: &str, state: State, out: &mut Vec<Token>) -> Sta
                         let end = open + name_from + name_len;
                         push(out, open, end, TokenKind::Tag);
                         state.mode = Mode::Tag;
+                        after_type = false;
+                        if html
+                            && name_from == 1
+                            && let Some(element) = Element::of(&rest[1..=name_len])
+                        {
+                            state.embed = Embed::Open(element, TypeAttr::Absent);
+                        }
                         i = end;
                     }
                 }
@@ -282,7 +506,7 @@ pub(super) fn scan_markdown(line: &str, state: State, out: &mut Vec<Token>) -> S
         push(out, indent + marks, len, TokenKind::Type);
         return State {
             mode: Mode::Fence,
-            depth: 0,
+            ..State::default()
         };
     }
     let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();

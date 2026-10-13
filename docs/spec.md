@@ -134,7 +134,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 | Format | Open | Save | Notes |
 |---|---|---|---|
 | `.md` `.markdown` `.mdx` | ✓ | ✓ | Markdown mode |
-| `.txt` and other text (`.log` `.csv` `.json` `.yaml` `.ini` `.toml` source code…) | ✓ | ✓ | Plain mode: no rendering, wrap toggle, optional "Render as Markdown" |
+| `.txt` and other text (`.log` `.csv` `.json` `.yaml` `.ini` `.toml` source code…) | ✓ | ✓ | Plain mode: no rendering, wrap toggle, optional "Render as Markdown", syntax colors for the languages the editor knows |
 | `.mmd` | ✓ | ✓ | Mermaid source + live diagram |
 | `.textbundle` `.textpack` | ✓ | ✓ | |
 | `.docx` | ✓ | ✓ | import to Markdown; "Save back to Word" |
@@ -143,6 +143,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 | `.doc` (Word 97–2003) | ✓ | — | import only; save as `.docx` or `.md`. Encrypted files and Word 6/95 files are rejected with a message |
 | every other file | ✓ | ✓ | Opened as plain text when its content is text: a BOM, or UTF-16/32 without one, means text; a `0x00` byte in the first 8192 bytes of anything else means binary. A binary file is refused with "This file is not a text file"; from the sidebar, Quick Open and folder search it keeps going to its default app instead |
 
+- A plain document is colored in the language its file extension names (Rust, C, C++, C#, Java, JavaScript, TypeScript, JSON, Python, Go, Bash, PowerShell, HTML, XML, CSS, SQL, YAML, TOML, Markdown, diff); every other file stays uncolored. The palette is quieter than the one of fenced code blocks: comments, strings and keywords only. Inside HTML, `<style>` is colored as CSS and `<script>` as JavaScript or JSON, decided by its `type`; the end tag always closes the body, as in a browser. The "Syntax highlighting" setting turns all of it off.
 - Import reports what could not be represented (merged cells, headers/footers, columns, text boxes, comments, tracked changes, VML shapes, unsupported equations) in a banner with a details list. OMML equations convert to LaTeX for fractions, scripts, radicals, n-ary operators, delimiters, matrices; others become `[equation]` placeholders and are reported.
 
 ### 4.2 Encodings & line endings

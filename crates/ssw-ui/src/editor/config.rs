@@ -14,6 +14,7 @@ use crate::input::ImeAttr;
 use crate::text::LineHeight;
 
 use super::blocks_media::MediaEvent;
+use super::highlight::Language;
 
 /// How the editor presents the whole document (spec §4.1). The host chooses it from the file
 /// type with [`EditorConfig::document_kind`].
@@ -69,7 +70,8 @@ pub struct EditorConfig {
     pub format_tables_on_exit: bool,
     /// Hide the front matter card unless the caret is inside it.
     pub hide_front_matter: bool,
-    /// Color the tokens of fenced code blocks whose language is known.
+    /// Color the tokens of fenced code blocks whose language is known, and of plain-text
+    /// documents that have a [`plain_language`](Self::plain_language).
     pub syntax_highlighting: bool,
     /// How the whole document is presented (spec §4.1). The host sets it from the file type;
     /// "Render as Markdown" for a plain file is [`DocumentKind::Markdown`]. In
@@ -81,6 +83,11 @@ pub struct EditorConfig {
     /// stay on one row and the view scrolls horizontally (Shift+wheel, horizontal wheel, caret
     /// reveal).
     pub wrap: bool,
+    /// The language a [`DocumentKind::PlainText`] document is coloured as (the host derives it
+    /// from the file type); `None` leaves the text uncoloured. The
+    /// [`syntax_highlighting`](Self::syntax_highlighting) setting still gates it: with that off
+    /// no plain document is coloured whatever the language. Other document kinds ignore it.
+    pub plain_language: Option<Language>,
     /// Zoom in percent (100 = 1:1).
     pub zoom_percent: u32,
 }
@@ -108,6 +115,7 @@ impl EditorConfig {
             syntax_highlighting: editor.syntax_highlighting,
             document_kind: DocumentKind::Markdown,
             wrap: true,
+            plain_language: None,
             zoom_percent: settings
                 .appearance
                 .zoom_percent

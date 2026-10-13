@@ -2129,6 +2129,42 @@ fn a_binary_file_clicked_in_the_sidebar_starts_its_default_app_with_no_tab_and_n
 }
 
 #[test]
+fn a_binary_placeholder_clicked_in_the_sidebar_starts_its_default_app_once_it_is_downloaded() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        byte_file(
+            "report.pdf",
+            b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\x00\x00",
+        ),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        let report = rig.work.join("report.pdf");
+        make_placeholder(&report);
+        rig.progress();
+
+        open_in_sidebar(rig, &report);
+        assert!(
+            rig.services.shell_log().is_empty(),
+            "nothing starts while the file downloads"
+        );
+        rig.wait_for("the default app", || !rig.services.shell_log().is_empty());
+
+        assert_eq!(
+            rig.services.shell_log(),
+            [ShellRecord::OpenPath(report.clone())]
+        );
+        assert_eq!(rig.tab_count(), 1, "no tab shows a binary file");
+        assert_eq!(message_boxes(rig), Vec::<String>::new());
+        assert_eq!(
+            rig.progress(),
+            [Progress::Indeterminate, Progress::None],
+            "the taskbar button is a plain one again"
+        );
+    });
+}
+
+#[test]
 fn a_binary_file_is_refused_with_a_message_by_every_way_of_asking_the_editor_to_open_it() {
     let files = vec![
         text_file("a.md", "# A\n"),

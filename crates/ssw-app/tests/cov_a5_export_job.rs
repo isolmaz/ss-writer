@@ -363,6 +363,76 @@ fn a_plain_text_document_exports_to_txt_byte_for_byte() {
 }
 
 #[test]
+fn a_plain_text_with_backticks_is_fenced_by_a_longer_run_so_it_stays_one_code_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("fenced.html");
+    let mut export = plain_job(ExportFormat::Html, target.clone());
+    // A run of three, a run of one after it and a run of five: the fence must beat the five.
+    export.markdown = "```\ncode `x`\n`````\nafter\n".to_owned();
+    run(&export).unwrap();
+    let html = std::fs::read_to_string(&target).unwrap();
+    let start = html.find("<pre").expect("a code block");
+    let end = html.find("</pre>").expect("a closed code block");
+    let block = &html[start..end];
+    assert!(block.contains("```\ncode `x`\n`````\nafter\n"), "{html}");
+    assert!(!html.contains("<code>x</code>"), "{html}");
+    assert_eq!(html.matches("<pre").count(), 1, "{html}");
+}
+
+#[test]
+fn a_plain_text_is_copied_as_it_is_by_markdown_with_attachments_and_its_links_are_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a.png"), picture()).unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let target = out.join("notes.md");
+    let text = "![a](a.png)\n# not a heading";
+    let mut export = job(
+        ExportFormat::MarkdownWithAttachments,
+        text,
+        Some(&source),
+        target.clone(),
+    );
+    export.plain = true;
+    assert_eq!(run(&export).unwrap(), [target.clone()]);
+    assert_eq!(std::fs::read(&target).unwrap(), text.as_bytes());
+    assert!(!out.join("attachments").exists(), "no file is copied");
+}
+
+#[test]
+fn a_plain_text_goes_into_a_textbundle_with_no_assets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a.png"), picture()).unwrap();
+    let text = "![a](a.png)\n# not a heading";
+    let bundle = |target: &Path| {
+        let mut export = job(
+            ExportFormat::Textbundle,
+            text,
+            Some(&source),
+            target.to_path_buf(),
+        );
+        export.plain = true;
+        run(&export).unwrap()
+    };
+
+    let pack = tmp.path().join("doc.textpack");
+    assert_eq!(bundle(&pack), [pack.clone()]);
+    let read = ssw_convert::textbundle::read_pack(&std::fs::read(&pack).unwrap()).unwrap();
+    assert_eq!(read.text, text);
+    assert!(read.assets.is_empty());
+
+    let folder = tmp.path().join("doc.textbundle");
+    assert_eq!(bundle(&folder), [folder.clone()]);
+    let read = ssw_convert::textbundle::read_dir(&folder).unwrap();
+    assert_eq!(read.text, text);
+    assert!(read.assets.is_empty());
+}
+
+#[test]
 fn a_diagram_that_cannot_be_written_names_the_file() {
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("missing").join("diagram.svg");

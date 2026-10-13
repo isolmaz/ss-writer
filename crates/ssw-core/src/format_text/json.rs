@@ -446,14 +446,15 @@ fn gap(tokens: &[Token], x: usize, last_real: Option<Kind>) -> Gap {
 
 /// Whether the run of block comments that starts at `tokens[x]` ends its line — by a line
 /// break, a `//` comment or a closing bracket — before another value begins.
+///
+/// The run ends at the first token that is not a block comment on the same line. The validator
+/// accepts a comment after an opening bracket or a comma only when a token that is not a comment
+/// follows, so that token always exists.
 fn ends_line(tokens: &[Token], x: usize) -> bool {
-    for token in &tokens[x + 1..] {
-        if token.breaks > 0 || token.kind.is_close() || token.kind == Kind::LineComment {
-            return true;
-        }
-        if token.kind != Kind::BlockComment {
-            return false;
-        }
-    }
-    true
+    tokens[x + 1..]
+        .iter()
+        .find(|token| token.breaks > 0 || token.kind != Kind::BlockComment)
+        .is_some_and(|token| {
+            token.breaks > 0 || token.kind.is_close() || token.kind == Kind::LineComment
+        })
 }

@@ -8,13 +8,17 @@
 //!
 //! * every child is an element, a comment or a processing instruction (no text, no CDATA);
 //! * in XML every whitespace gap between the children contains a line break, so a gap such as
-//!   `<a>x</a> <b>y</b>` stays data;
+//!   `<a>x</a> <b>y</b>` stays data. Touching children without any gap cannot be told from
+//!   structure in generic XML, so they are split — except in the elements of `INLINE_XML`,
+//!   which render their children inline;
 //! * in HTML every child element is block-level — a known `display: block`, table or
-//!   `display: none` element. An inline-level or unknown child keeps the whole container
-//!   verbatim, because whitespace between inline elements is rendered. Only the user-agent
-//!   default `display` is known: stylesheets and classes are not consulted;
-//! * the element is not `pre`, `textarea`, `script`, `style` (or, in HTML, `template`), has no
-//!   `xml:space="preserve"` and no `style` attribute that mentions `white-space` or `display`.
+//!   `display: none` element that has no `style` attribute mentioning `display`. An
+//!   inline-level or unknown child keeps the whole container verbatim, because whitespace
+//!   between inline elements is rendered. Only the user-agent default `display` and an inline
+//!   `style` are known: stylesheets and classes are not consulted;
+//! * the element is not `pre`, `textarea`, `script`, `style` (or, in HTML, `template`; in XML,
+//!   one of `INLINE_XML`), has no `xml:space="preserve"` and no `style` attribute that
+//!   mentions `white-space` or `display`.
 //!
 //! Every other element — text-only, mixed, preserved, childless — is copied byte for byte
 //! from its start tag to its end tag. Start tags, end tags, attributes, comments, processing
@@ -117,15 +121,55 @@ const RAW_TEXT: &[&str] = &[
     "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes",
 ];
 
+/// XML elements that render their children inline, the way HTML's `span` does: whitespace
+/// between two children is shown as a space, and none is shown as none, so a line break put
+/// between touching children (`<tspan>a</tspan><tspan>b</tspan>` reads `ab`) changes what the
+/// document displays. Generic XML has no such knowledge, so the vocabularies that need it are
+/// listed by name, the way HTML has its block list. Anything not listed is laid out as plain
+/// structure; `xml:space="preserve"` protects an element of any other vocabulary.
+const INLINE_XML: &[&str] = &[
+    // SVG text.
+    "text",
+    "tspan",
+    "textPath",
+    "title",
+    "desc",
+    // XAML text: text blocks and the inline elements of flow documents.
+    "TextBlock",
+    "Paragraph",
+    "Span",
+    "Run",
+    "Bold",
+    "Italic",
+    "Underline",
+    "Hyperlink",
+];
+
 fn name_in(name: &[u8], list: &[&str]) -> bool {
     list.iter()
         .any(|candidate| name.eq_ignore_ascii_case(candidate.as_bytes()))
 }
 
+/// Whether the XML element `name` is one of `INLINE_XML`. Names are case-sensitive, as in
+/// XML; a namespace prefix (`svg:text`) is ignored.
+fn is_inline_xml(name: &[u8]) -> bool {
+    let local = name
+        .iter()
+        .rposition(|&byte| byte == b':')
+        .map_or(name, |colon| &name[colon + 1..]);
+    INLINE_XML
+        .iter()
+        .any(|candidate| local == candidate.as_bytes())
+}
+
 /// Elements whose content is never touched.
 fn keeps_whitespace(name: &[u8], html: bool) -> bool {
     name_in(name, &["pre", "textarea", "script", "style"])
-        || (html && name_in(name, &["template", "listing", "xmp"]))
+        || if html {
+            name_in(name, &["template", "listing", "xmp"])
+        } else {
+            is_inline_xml(name)
+        }
 }
 
 /// Whitespace inside a tag.
@@ -202,7 +246,8 @@ struct Node {
     next: usize,
     /// Elements: the content must not be touched.
     verbatim: bool,
-    /// Elements: whitespace-only text next to the element is not rendered (always in XML).
+    /// Elements: whitespace-only text next to the element is not rendered (always in XML; in
+    /// HTML a known block-level element whose `style` does not mention `display`).
     block: bool,
 }
 
@@ -252,8 +297,11 @@ struct TagEnd {
     self_closing: bool,
     /// `xml:space="preserve"`.
     preserve: bool,
-    /// A `style` attribute that mentions `white-space` or `display`.
-    css: bool,
+    /// A `style` attribute that mentions `white-space`: the content is laid out by CSS.
+    white_space: bool,
+    /// A `style` attribute that mentions `display`: the content is laid out by CSS, and the
+    /// element may be inline-level, so it is no block for its parent either.
+    display: bool,
 }
 
 struct Parser<'a> {
@@ -523,8 +571,15 @@ impl<'a> Parser<'a> {
             return Err(Refusal::at(RefusalReason::NestingTooDeep, at));
         }
         let mut node = Node::leaf(NodeKind::Element, at, tag.end);
-        node.verbatim = tag.preserve || tag.css || raw_text || keeps_whitespace(name, html);
-        node.block = !html || name_in(name, BLOCK);
+        node.verbatim = tag.preserve
+            || tag.white_space
+            || tag.display
+            || raw_text
+            || keeps_whitespace(name, html);
+        // `white-space` changes how the content is laid out, not what the element is to its
+        // neighbours; `display` may turn a block into an inline element, so the parent must
+        // not put line breaks between it and its siblings.
+        node.block = !html || (name_in(name, BLOCK) && !tag.display);
         let index = self.append(node);
         if closed {
             self.pos = tag.end;
@@ -613,7 +668,8 @@ impl<'a> Parser<'a> {
             end: 0,
             self_closing: false,
             preserve: false,
-            css: false,
+            white_space: false,
+            display: false,
         };
         let mut i = from;
         loop {
@@ -691,10 +747,9 @@ impl<'a> Parser<'a> {
             if name.eq_ignore_ascii_case(b"xml:space") && value.eq_ignore_ascii_case(b"preserve") {
                 tag.preserve = true;
             }
-            if name.eq_ignore_ascii_case(b"style")
-                && (contains_ci(value, b"white-space") || contains_ci(value, b"display"))
-            {
-                tag.css = true;
+            if name.eq_ignore_ascii_case(b"style") {
+                tag.white_space |= contains_ci(value, b"white-space");
+                tag.display |= contains_ci(value, b"display");
             }
         }
     }

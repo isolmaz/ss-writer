@@ -1140,9 +1140,10 @@ fn carry_offset(text: &str, formatted: &str, offset: usize) -> usize {
             .map(|(index, _)| index + 1),
     );
     let carried = after_each.nth(passed).unwrap_or(formatted.len());
+    // A line break is LF, CRLF or a lone CR: the formatters keep all three spellings.
     let line_start = before
         .iter()
-        .rposition(|&b| b == b'\n')
+        .rposition(|&b| matches!(b, b'\n' | b'\r'))
         .map_or(0, |index| index + 1);
     if before[line_start..].iter().all(u8::is_ascii_whitespace) {
         let indentation = formatted.as_bytes()[carried..]

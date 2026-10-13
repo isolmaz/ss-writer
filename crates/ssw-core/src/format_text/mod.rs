@@ -16,6 +16,8 @@
 //!   byte for byte — text, mixed content, `<pre>`, `<textarea>`, `<script>`, `<style>`, CDATA,
 //!   comments, processing instructions, DOCTYPE. HTML additionally keeps every container that
 //!   has an inline-level child, because the whitespace between inline elements is significant.
+//!   Generic XML cannot tell inline from block content: it keeps only the elements of the SVG
+//!   text and XAML text vocabularies, which it knows by name, byte for byte.
 //!
 //! All formatters keep the byte order mark, the dominant line ending and whether the document
 //! ends with a line break, and formatting the output again changes nothing.
@@ -194,7 +196,9 @@ pub fn format_html(text: &str, indent: FormatIndent) -> FormatOutcome {
 // ------------------------------------------------------------------------------------ shared
 
 /// Packages a formatter's result: guards that only whitespace changed, and tells a changed
-/// document from an unchanged one.
+/// document from an unchanged one. The formatters keep every token, so the guard never trips on
+/// their output; it stays as the last line of defence for the user's file, and `tests` drives it
+/// directly with output that lost or gained a byte.
 fn finish(text: &str, formatted: String) -> FormatOutcome {
     if !significant(text).eq(significant(&formatted)) {
         return FormatOutcome::Refused(Refusal::new(RefusalReason::Inconsistent));
@@ -279,9 +283,11 @@ fn line_ending(layout: EolCounts, text: &str) -> &'static str {
 /// Byte offset of the first occurrence of `needle` in `bytes` at or after `from`.
 fn find(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     bytes
-        .get(from..)?
-        .windows(needle.len())
-        .position(|window| window == needle)
+        .get(from..)
+        .and_then(|tail| {
+            tail.windows(needle.len())
+                .position(|window| window == needle)
+        })
         .map(|position| position + from)
 }
 
@@ -298,5 +304,31 @@ fn bom_len(text: &str) -> usize {
         '\u{feff}'.len_utf8()
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No formatter produces output that differs by more than whitespace, so the guard of
+    /// `finish` is driven with output that does.
+    #[test]
+    fn finish_refuses_output_that_lost_or_gained_more_than_whitespace() {
+        let refusal = Refusal::new(RefusalReason::Inconsistent);
+        for (text, formatted) in [
+            ("[1, 2]", "[1, 3]"),
+            ("[1, 2]", "[1,\n"),
+            ("[1]", "[\n  1\n]x"),
+        ] {
+            assert_eq!(
+                finish(text, formatted.to_owned()),
+                FormatOutcome::Refused(refusal),
+                "{formatted:?} for {text:?}"
+            );
+        }
+        // The refusal knows no offset: nothing in the document is to blame.
+        assert_eq!(refusal.offset, None);
+        assert_eq!(refusal.to_string(), "internal consistency check failed");
     }
 }

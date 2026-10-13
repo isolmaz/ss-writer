@@ -757,6 +757,42 @@ fn format_document_keeps_the_caret_at_its_place_in_the_text() {
 }
 
 #[test]
+fn format_document_keeps_the_caret_on_its_line_when_the_line_breaks_are_lone_cr() {
+    with_rig(|rig| {
+        // A file is read with its line breaks turned into LF, but the text of an open document
+        // can hold lone CRs; the formatter keeps that spelling, and the caret must follow it.
+        rig.write("cr.json", "{");
+        rig.open("cr.json");
+        append(&rig.entry(), "\r        \"a\": 1,\r    \"bee\": 2\r}\r");
+        let messy = rig.text();
+        assert_eq!(messy, "{\r        \"a\": 1,\r    \"bee\": 2\r}\r");
+        let tidy = formatted_json(&messy, FormatIndent::Two);
+        assert_eq!(tidy, "{\r  \"a\": 1,\r  \"bee\": 2\r}\r");
+        let bee = tidy.find("\"bee\"").unwrap();
+        let line_start = messy.find("    \"bee\"").unwrap();
+
+        // At the start of the line and in its indentation: before the first token of the line,
+        // not at the end of the line above.
+        for offset in [line_start, line_start + 2, line_start + 4] {
+            rig.select(Selection::caret(offset));
+            assert_eq!(ended(&rig.format()), "handled");
+            assert_eq!(rig.text(), tidy);
+            assert_eq!(rig.selection(), Selection::caret(bee), "{offset}");
+            assert_eq!(ended(&rig.command(CommandId::EditUndo)), "handled");
+            assert_eq!(rig.text(), messy);
+        }
+
+        // Inside a token: the same place in the text, on the same line.
+        let in_bee = messy.find("bee").unwrap() + 1;
+        rig.select(Selection::caret(in_bee));
+        assert_eq!(ended(&rig.format()), "handled");
+        let head = rig.selection().head;
+        assert_eq!(significant(&tidy[..head]), significant(&messy[..in_bee]));
+        assert_eq!(tidy[..head].matches('\r').count(), 2);
+    });
+}
+
+#[test]
 fn format_document_leaves_a_refused_document_and_a_read_only_one_unchanged() {
     with_rig(|rig| {
         let bad = "{\"a\": }\n";

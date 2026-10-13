@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::Args;
@@ -281,22 +281,54 @@ fn text_of_an_untitled_buffer_survives_the_quit_that_closes_its_window() {
     });
     assert_eq!(code, 0);
 
+    // The text is in the database before anything reads the session back.
+    let db = tmp
+        .path()
+        .join("profile")
+        .join("local")
+        .join("SS Writer")
+        .join("state.db");
+    let stored: Vec<String> = {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut query = conn
+            .prepare("SELECT content FROM untitled_buffers")
+            .unwrap();
+        let rows = query.query_map([], |row| row.get(0)).unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    };
+    assert!(
+        stored.iter().any(|text| text == "work in progress"),
+        "the text was stored: {stored:?}"
+    );
+
     // The next start finds the buffer again, with its text.
     let code = start_with(AUTOSAVE, &[], tmp.path(), |core, _| {
         let _ole = OleGuard::initialize().unwrap();
         let app = UiApp::new(core, options(&services, None)).unwrap();
-        app.pump();
-        let window = &app.controller().windows()[0];
-        let view = window.view.borrow();
-        let texts: Vec<String> = view
-            .tabs()
-            .iter()
-            .map(|tab| tab.entry.document().borrow().text())
-            .collect();
-        assert!(
-            texts.iter().any(|text| text == "work in progress"),
-            "the buffer came back: {texts:?}"
-        );
+        // The session is opened over several turns: pump until the documents are there.
+        let texts = || -> Vec<String> {
+            app.controller()
+                .windows()
+                .iter()
+                .flat_map(|window| {
+                    let view = window.view.borrow();
+                    view.tabs()
+                        .iter()
+                        .map(|tab| tab.entry.document().borrow().text())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !texts().iter().any(|text| text == "work in progress") {
+            assert!(
+                Instant::now() < deadline,
+                "the buffer stayed away: {:?}",
+                texts()
+            );
+            app.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
         0
     });
     assert_eq!(code, 0);

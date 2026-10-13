@@ -427,17 +427,10 @@ impl UiApp {
         );
         // An update that just finished left the copy of the application it installed from in
         // the temp folder: a running program cannot delete itself.
-        let removed = crate::update_apply::clean_updater_folders(
+        crate::update_apply::clean_updater_folders(
             controller.docs().env().fs.as_ref(),
             &std::env::temp_dir(),
         );
-        if removed > 0 {
-            logger.log(
-                Level::Info,
-                "update",
-                &format!("removed {removed} updater folder(s) of an earlier update"),
-            );
-        }
         let system = read_system_theme(&Win32Settings);
         controller.set_system_theme(system);
         let _ = apply_menu_theme(MenuTheme::System);

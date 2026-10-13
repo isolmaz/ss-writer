@@ -350,6 +350,54 @@ fn text_of_an_untitled_buffer_survives_the_quit_that_closes_its_window() {
 }
 
 #[test]
+fn unsaved_buffers_that_cannot_be_stored_are_reported_and_the_quit_goes_on() {
+    const AUTOSAVE: &str = r#"{"general":{"autosave":true}}"#;
+    let tmp = tempfile::tempdir().unwrap();
+    let services = ScriptedServices::new();
+    let db = tmp
+        .path()
+        .join("profile")
+        .join("local")
+        .join("SS Writer")
+        .join("state.db");
+
+    let code = start_with(AUTOSAVE, &[], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let app = UiApp::new(core, options(&services, None)).unwrap();
+        app.pump();
+        let cell = Rc::clone(&app.controller().windows()[0]);
+        app.controller().new_untitled(&cell);
+        app.pump();
+
+        // The table the texts go into is dropped behind the application's back.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("DROP TABLE untitled_buffers", []).unwrap();
+        }
+        app.controller().push(Request::Quit);
+        app.pump();
+        assert!(app.controller().windows().is_empty(), "the window closed");
+        app.finish();
+        0
+    });
+
+    assert_eq!(code, 0, "the quit went through");
+    let log = std::fs::read_to_string(
+        tmp.path()
+            .join("profile")
+            .join("local")
+            .join("SS Writer")
+            .join("logs")
+            .join("ssw.log"),
+    )
+    .unwrap();
+    assert!(
+        log.contains("unsaved buffers not stored"),
+        "the failure is in the log: {log}"
+    );
+}
+
+#[test]
 fn the_settings_window_opens_without_an_owner_takes_events_and_closes_when_destroyed() {
     let tmp = tempfile::tempdir().unwrap();
     let file = note(tmp.path(), "a.md", "text");

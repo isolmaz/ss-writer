@@ -875,7 +875,7 @@ mod tests {
         let error = sessions
             .choose_language(&entry, Some(Language::Go))
             .unwrap_err();
-        assert!(matches!(error, DocError::Store(_)), "{error}");
+        assert_eq!(error.to_string(), "database error: no such table: kv");
         assert_eq!(entry.language_choice(), Some(Some(Language::Go)));
     }
 
@@ -944,8 +944,66 @@ mod tests {
             .unwrap();
         sabotage(tmp.path(), "DROP TABLE kv");
         let error = sessions.clear_language(&entry).unwrap_err();
-        assert!(matches!(error, DocError::Store(_)), "{error}");
+        assert_eq!(error.to_string(), "database error: no such table: kv");
         assert_eq!(entry.language_choice(), None);
+    }
+
+    /// A path with an unpaired surrogate: a legal Windows file name that has no UTF-8 text.
+    fn non_unicode_path() -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+        let name = std::ffi::OsString::from_wide(&[0x43, 0x3A, 0x5C, 0x61, 0xD800]);
+        PathBuf::from(name)
+    }
+
+    /// How many languages the state database of [`manager`] remembers.
+    fn stored_language_rows(tmp: &Path) -> i64 {
+        rusqlite::Connection::open(tmp.join("state.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE ?1",
+                [format!("{LANGUAGE_KEY_PREFIX}%")],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_file_name_that_is_not_unicode_has_no_key_and_no_stored_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (docs, _) = manager(tmp.path());
+        let store = docs.env().store.borrow();
+        let odd = non_unicode_path();
+        // Not the key, not storing, not forgetting: the path has no text to be a key of.
+        for error in [
+            language_key(&odd).unwrap_err(),
+            store_language(&store, &odd, Some(Language::Rust)).unwrap_err(),
+            store_language(&store, &odd, None).unwrap_err(),
+            forget_language(&store, &odd).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("not valid Unicode"), "{error}");
+        }
+        assert_eq!(stored_language(&store, &odd), None);
+        assert_eq!(stored_language_rows(tmp.path()), 0);
+
+        // A file next to it is unaffected.
+        let good = canonical_path(&tmp.path().join("a.txt"));
+        store_language(&store, &good, Some(Language::Rust)).unwrap();
+        assert_eq!(stored_language(&store, &good), Some(Some(Language::Rust)));
+        assert_eq!(stored_language(&store, &odd), None);
+        forget_language(&store, &good).unwrap();
+        assert_eq!(stored_language(&store, &good), None);
+    }
+
+    #[test]
+    fn a_state_database_that_cannot_be_read_has_no_stored_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = canonical_path(&tmp.path().join("a.txt"));
+        let (docs, _) = manager(tmp.path());
+        let store = docs.env().store.borrow();
+        store_language(&store, &path, Some(Language::Go)).unwrap();
+        assert_eq!(stored_language(&store, &path), Some(Some(Language::Go)));
+        sabotage(tmp.path(), "DROP TABLE kv");
+        assert_eq!(stored_language(&store, &path), None);
     }
 
     #[test]

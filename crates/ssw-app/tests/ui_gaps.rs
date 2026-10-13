@@ -20,6 +20,7 @@ use ssw_app::workers::WindowId;
 use ssw_core::command::CommandId;
 use ssw_ui::canvas::RecordingCanvas;
 use ssw_ui::editor::highlight::Language;
+use ssw_ui::geometry::Size;
 use ssw_ui::input::{Event, PointerButton, PointerEvent, PointerEventKind};
 use ssw_ui::services::{Clock, FakeClock, MemoryClipboard, MessageBoxResult};
 use ssw_ui::shell::statusbar::StatusSegment;
@@ -525,6 +526,17 @@ impl Rig {
         self.command(CommandId::TabClose);
         assert!(self.controller.docs().find(&path).is_none(), "{path:?}");
     }
+
+    /// Chooses the item `label` of `popup` in window `window`, which need not be the window the
+    /// menu was opened in.
+    fn choose_in(&self, window: WindowId, popup: &Popup, label: &str) {
+        let id = items(&popup.model)
+            .into_iter()
+            .find(|item| item.label == label)
+            .unwrap_or_else(|| panic!("no item {label:?}"))
+            .id;
+        self.controller.run_popup_choice(window, popup, id);
+    }
 }
 
 /// The labels of the items of `popup` that carry a mark.
@@ -774,5 +786,36 @@ fn a_stored_choice_beats_detection_even_when_it_names_the_detected_language() {
         rig.open("data.json");
         assert_eq!(rig.language(), Some(Language::Json));
         assert_eq!(rig.entry().language_choice(), Some(Some(Language::Json)));
+    });
+}
+
+#[test]
+fn choosing_a_language_in_a_window_without_a_tab_changes_nothing() {
+    with_rig(&[("data.json", b"{\"a\": 1}\n")], |rig| {
+        let popup = rig.status_popup(StatusSegment::Language);
+        // A window without any tab has no document to colour, whatever menu is chosen in it.
+        let empty = rig
+            .controller
+            .create_window(None, Size::new(800.0, 600.0), 1.0);
+        assert!(empty.view.borrow().tabs().is_empty());
+        let window = rig.window();
+        window.dirty.set(false);
+        let _ = window.view.borrow_mut().requests_mut().take_invalidation();
+
+        for label in ["Python", "Plain text", "Automatic"] {
+            rig.choose_in(empty.id, &popup, label);
+            assert!(empty.view.borrow().tabs().is_empty(), "{label}");
+        }
+        // The first window is not repainted and its document is still detected as before.
+        assert!(!window.dirty.get());
+        let repaints = window.view.borrow_mut().requests_mut().take_invalidation();
+        assert!(repaints.is_clean());
+        assert_eq!(rig.entry().language_choice(), None);
+        assert_eq!(rig.language(), Some(Language::Json));
+        assert_eq!(rig.status(StatusSegment::Language), "JSON");
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Automatic"]
+        );
     });
 }

@@ -585,10 +585,8 @@ mod tests {
         assert_eq!(store.kv_get("two").unwrap().as_deref(), Some("2"));
         // A database that fails reports it.
         store.conn.execute_batch("DROP TABLE kv").unwrap();
-        assert!(matches!(
-            store.kv_delete("two").unwrap_err(),
-            StoreError::Sqlite(_)
-        ));
+        let error = store.kv_delete("two").unwrap_err();
+        assert_eq!(error.to_string(), "database error: no such table: kv");
     }
 
     #[test]

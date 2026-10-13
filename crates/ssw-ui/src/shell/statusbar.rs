@@ -164,13 +164,13 @@ impl StatusStrings {
         }
     }
 
-    /// What a click on `kind` does; empty for the text segments.
+    /// What a click on `kind` does. Only the clickable segments are ever asked
+    /// ([`StatusSegment::is_clickable`]): the line ending stands for the last of them.
     fn hint(&self, kind: StatusSegment) -> &str {
         match kind {
             StatusSegment::Encoding => &self.encoding_hint,
-            StatusSegment::LineEnding => &self.eol_hint,
             StatusSegment::Language => &self.language_hint,
-            StatusSegment::Position | StatusSegment::Words | StatusSegment::Zoom => "",
+            _ => &self.eol_hint,
         }
     }
 }

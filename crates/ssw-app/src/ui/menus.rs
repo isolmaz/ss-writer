@@ -37,6 +37,9 @@ pub struct MenuState {
     pub plain_file: bool,
     /// The active plain-text file is shown as Markdown ("Render as Markdown" is on).
     pub render_markdown: bool,
+    /// The active document is plain text in a language "Format document" lays out (JSON, XML
+    /// or HTML).
+    pub formattable: bool,
     /// The active tab shows plain text and wraps its long lines at the window edge (off: the
     /// lines run on and the view scrolls sideways).
     pub word_wrap: bool,
@@ -72,13 +75,15 @@ impl MenuState {
 
     /// Whether `command` can run now: the document commands need a document, merging needs a
     /// second window, saving back needs an imported word-processor file, "Render as Markdown"
-    /// needs a plain-text file and "Word wrap" a plain-text file that is shown as plain text.
-    /// The menus and the command palette both ask this.
+    /// needs a plain-text file, "Word wrap" a plain-text file that is shown as plain text and
+    /// "Format document" a JSON, XML or HTML document shown as plain text. The menus and the
+    /// command palette both ask this.
     #[must_use]
     pub fn enabled(&self, command: CommandId) -> bool {
         match command {
             C::WindowMergeAll => self.other_windows,
             C::FileSaveBackToWord => self.save_back,
+            C::EditFormatDocument => self.formattable,
             C::ViewRenderAsMarkdown => self.plain_file,
             C::ViewWordWrap => self.plain_file && !self.render_markdown,
             C::SidebarNewFile
@@ -169,6 +174,7 @@ const EDIT: &[Section] = &[
         ],
     ),
     Section::Items(&[C::EditInsertDate]),
+    Section::Items(&[C::EditFormatDocument]),
     Section::Items(&[
         C::SearchFind,
         C::SearchReplace,
@@ -465,6 +471,52 @@ mod tests {
             .find(|entry| entry.id == menu_id(CommandId::FileSaveBackToWord))
             .unwrap();
         assert!(!back.enabled);
+    }
+
+    #[test]
+    fn format_document_follows_the_edit_menu_items_for_the_document_and_needs_a_language() {
+        let i18n = localizer_for("en");
+        let keymap = Keymap::default();
+        // The item as the Edit menu lists it: label, enabled, has a shortcut.
+        let item = |state: &MenuState| {
+            let edit = build_menu(MenuKind::Edit, &i18n, &keymap, state);
+            items(&edit)
+                .into_iter()
+                .find(|entry| entry.id == menu_id(CommandId::EditFormatDocument))
+                .map(|entry| {
+                    (
+                        entry.label.clone(),
+                        entry.enabled,
+                        entry.accelerator.is_some(),
+                    )
+                })
+        };
+        let none = MenuState::default();
+        let document = MenuState {
+            has_document: true,
+            ..none
+        };
+        let formattable = MenuState {
+            formattable: true,
+            ..document
+        };
+        // Listed for every document, greyed unless the document is JSON, XML or HTML as text;
+        // spec §11: no Ctrl+Alt default, so no shortcut either.
+        for state in [none, document] {
+            assert_eq!(
+                item(&state),
+                Some(("Format document".to_owned(), false, false))
+            );
+            assert!(!state.enabled(CommandId::EditFormatDocument));
+        }
+        assert_eq!(
+            item(&formattable),
+            Some(("Format document".to_owned(), true, false))
+        );
+        assert!(formattable.enabled(CommandId::EditFormatDocument));
+        // The other Edit commands do not look at the language.
+        assert!(document.enabled(CommandId::EditInsertDate));
+        assert!(!none.enabled(CommandId::EditInsertDate));
     }
 
     #[test]

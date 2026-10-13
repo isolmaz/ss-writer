@@ -171,6 +171,12 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 ### 4.6 Crash recovery
 - Worker panics drop only that task. UI-thread panic → minidump (`MiniDumpWriteDump`) + emergency save of dirty documents to the recovery folder; next launch offers recovery. Local rolling log (5 × 1 MB). No telemetry.
 
+### 4.7 Format document
+- Edit → Format document (also in the command palette; no shortcut, §11 forbids Ctrl+Alt) indents a plain-text document whose language is JSON, XML or HTML; it is disabled for every other document.
+- Whitespace only: the text is tokenized, validated and written back with every token copied byte for byte, so numbers, escapes, duplicate keys, comments and key order survive. Line endings, a BOM and the final newline are kept, and running it twice changes nothing the second time.
+- Markup is re-laid out only where whitespace cannot matter. `pre`, `textarea`, `script`, `style`, `template`, CDATA, comments, processing instructions, DOCTYPE, mixed content and anything marked `xml:space="preserve"` are copied verbatim. Malformed markup (unbalanced tags, an unterminated comment or attribute value) is refused with its reason and byte offset, and the document is not touched.
+- Indent from the "Format indent" setting (2 spaces, 4 spaces, Tab). One undo step.
+
 ## 5. Workspace & sidebar
 - Open folder: `Ctrl+Shift+O`, drag a folder onto the window, `SSWriter.exe <folder>`, Explorer "Open with SS Writer" on folders. First run creates `Documents\SS Writer\` with `Welcome.md` (localized).
 - One root per tab; the sidebar shows the active tab's workspace. Header: root name, ⋯ menu, + menu (New file, New folder).

@@ -18,6 +18,10 @@ window-folder-missing = The folder { $path } does not exist.
 window-unsaved-title = Unsaved changes
 window-unsaved-message = Do you want to save the changes to { $name }?
 
+# Edit → Format document refused a document it cannot lay out; the text was not changed.
+window-format-refused-title = Format document
+window-format-refused-message = The document was not changed: { $reason }.
+
 window-save-as-title = Save as
 window-open-title = Open file
 window-open-folder-title = Open folder

@@ -218,6 +218,12 @@ fn choice_table() -> Vec<ChoiceEntry> {
             |s| format!("{:?}", s.editor.list_indent),
             "Two",
         ),
+        // Two spaces by default; one Down key makes it four.
+        choice(
+            FieldId::FormatIndent,
+            |s| format!("{:?}", s.editor.format_indent),
+            "Four",
+        ),
         choice(
             FieldId::SidebarSortBy,
             |s| format!("{:?}", s.sidebar.sort_by),
@@ -1069,4 +1075,33 @@ fn typing_in_the_shortcut_filter_after_a_click_narrows_the_list() {
         !shown.iter().any(|row| row.starts_with("Save —")),
         "{shown:?}"
     );
+}
+
+#[test]
+fn format_indent_offers_two_spaces_four_spaces_and_tab_on_the_editor_page() {
+    use ssw_core::settings::FormatDocumentIndent;
+    assert_eq!(FieldId::FormatIndent.section(), SettingsSection::Editor);
+    assert_eq!(label(FieldId::FormatIndent), "Format indent");
+    let (mut window, mut host) = open(Settings::default(), SettingsSection::Editor);
+    let name = label(FieldId::FormatIndent);
+    // The default shows its choice; the keys walk through all three.
+    assert_eq!(
+        host.control(&window, &name).value.as_deref(),
+        Some("2 spaces")
+    );
+    host.focus_control(&mut window, &name);
+    for (key, expected, shown) in [
+        (vk::DOWN, FormatDocumentIndent::Four, "4 spaces"),
+        (vk::DOWN, FormatDocumentIndent::Tab, "Tab"),
+        (vk::HOME, FormatDocumentIndent::Two, "2 spaces"),
+    ] {
+        host.key(&mut window, key, Modifiers::NONE);
+        assert_eq!(window.settings().editor.format_indent, expected);
+        assert_eq!(host.control(&window, &name).value.as_deref(), Some(shown));
+    }
+    // A stored value is shown when the window opens.
+    let mut settings = Settings::default();
+    settings.editor.format_indent = FormatDocumentIndent::Tab;
+    let (window, host) = open(settings, SettingsSection::Editor);
+    assert_eq!(host.control(&window, &name).value.as_deref(), Some("Tab"));
 }

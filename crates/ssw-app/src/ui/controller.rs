@@ -14,11 +14,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ssw_core::command::CommandId;
+use ssw_core::edit::Selection;
+use ssw_core::format_text::{
+    FormatIndent, FormatOutcome, Refusal, format_html, format_json, format_xml,
+};
 use ssw_core::i18n::{Arg, Localizer};
 use ssw_core::keymap::Keymap;
 use ssw_core::settings::Settings;
 use ssw_io::session::{Session, ViewState, WindowPlacement};
 use ssw_ui::editor::blocks_media::MediaEvent;
+use ssw_ui::editor::highlight::Language;
 use ssw_ui::editor::{
     DocumentKind, EditorEvent, LinkTarget, MAX_ZOOM_PERCENT, MIN_ZOOM_PERCENT, ZOOM_STEP_PERCENT,
 };
@@ -45,7 +50,7 @@ use super::shell_view::{ShellAction, ShellView, TabView, ViewConfig, sidebar_opt
 use super::tree_source::{TreePaths, WorkspaceTree};
 use crate::app::AppCore;
 use crate::commands::{AppActions, Dispatch};
-use crate::documents::{DocEntry, DocError, DocMode, LoadError};
+use crate::documents::{DocEntry, DocError, DocMode, LoadError, replace_text};
 use crate::session::{PlannedDocument, SessionManager, StartupPlan, TabState, WindowState};
 use crate::workers::{JobKey, JobKind, JobSpec, WindowId};
 
@@ -1015,6 +1020,61 @@ impl Controller {
         true
     }
 
+    /// Edit → Format document: lays out the whole JSON, XML or HTML document with the indent of
+    /// the settings. The formatted text replaces the document's as one undo step and the caret
+    /// stays at the same place in the text. A document that is already formatted stays as it is;
+    /// one the formatter refuses is not touched and the user is told why. Returns `false` when
+    /// the active document is not one the command applies to.
+    pub(super) fn format_document(&self, cell: &Rc<WindowCell>) -> bool {
+        let indent = FormatIndent::from(self.settings.borrow().editor.format_indent);
+        let refused = {
+            let mut view = cell.view.borrow_mut();
+            let Some((tab, format)) = view.active_tab_mut().and_then(|tab| {
+                let format = formatter_of(tab)?;
+                Some((tab, format))
+            }) else {
+                return false;
+            };
+            if tab.editor.is_read_only() {
+                return true;
+            }
+            let document = tab.entry.document();
+            let text = document.borrow().text();
+            match format(&text, indent) {
+                FormatOutcome::Formatted(formatted) => {
+                    let selection = document.borrow().primary_selection();
+                    replace_text(&mut document.borrow_mut(), &formatted);
+                    tab.editor.go_to(Selection::new(
+                        carry_offset(&text, &formatted, selection.anchor),
+                        carry_offset(&text, &formatted, selection.head),
+                    ));
+                    None
+                }
+                FormatOutcome::AlreadyFormatted => None,
+                FormatOutcome::Refused(refusal) => Some(self.refusal_message(&refusal)),
+            }
+        };
+        if let Some(message) = refused {
+            let _ = self.dialogs.borrow_mut().message_box(&MessageBoxOptions {
+                title: self.i18n.text("window-format-refused-title"),
+                message,
+                buttons: MessageBoxButtons::Ok,
+                icon: Some(MessageBoxIcon::Warning),
+            });
+        }
+        true
+    }
+
+    /// Why Format document left the document alone: the short reason of the refusal and, where
+    /// the formatter knows it, the byte offset.
+    fn refusal_message(&self, refusal: &Refusal) -> String {
+        let reason = refusal.to_string();
+        self.i18n.format(
+            "window-format-refused-message",
+            &[("reason", Arg::Str(&reason))],
+        )
+    }
+
     fn open_dialog(&self) -> Vec<PathBuf> {
         let options = OpenFileOptions {
             title: self.i18n.text("window-open-title"),
@@ -1043,6 +1103,55 @@ impl Controller {
             .pick_folder(&options)
             .ok()
             .flatten()
+    }
+}
+
+/// A whole-document formatter of `ssw_core::format_text`.
+type Formatter = fn(&str, FormatIndent) -> FormatOutcome;
+
+/// The formatter Edit → Format document uses for `tab`: the one of the language of a document
+/// shown as plain text (JSON, XML, HTML); none for any other document.
+fn formatter_of(tab: &TabView) -> Option<Formatter> {
+    let config = tab.editor.config();
+    if config.document_kind != DocumentKind::PlainText {
+        return None;
+    }
+    match config.plain_language? {
+        Language::Json => Some(format_json),
+        Language::Xml => Some(format_xml),
+        Language::Html => Some(format_html),
+        _ => None,
+    }
+}
+
+/// The offset in `formatted` that has the same non-whitespace text before it as `offset` has in
+/// `text` (the formatters change whitespace only), so the caret stays at the same place in the
+/// content and on its line wherever the layout keeps it there. A caret at the start or in the
+/// indentation of a line stays before the first token of that line.
+fn carry_offset(text: &str, formatted: &str, offset: usize) -> usize {
+    let before = &text.as_bytes()[..offset];
+    let passed = before.iter().filter(|b| !b.is_ascii_whitespace()).count();
+    // The offsets of `formatted` right after each non-whitespace byte, and its start.
+    let mut after_each = std::iter::once(0).chain(
+        formatted
+            .bytes()
+            .enumerate()
+            .filter(|(_, b)| !b.is_ascii_whitespace())
+            .map(|(index, _)| index + 1),
+    );
+    let carried = after_each.nth(passed).unwrap_or(formatted.len());
+    let line_start = before
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |index| index + 1);
+    if before[line_start..].iter().all(u8::is_ascii_whitespace) {
+        let indentation = formatted.as_bytes()[carried..]
+            .iter()
+            .take_while(|b| b.is_ascii_whitespace())
+            .count();
+        carried + indentation
+    } else {
+        carried
     }
 }
 
@@ -1189,6 +1298,7 @@ impl Controller {
             save_back: active.is_some_and(|tab| tab.entry.can_save_back()),
             plain_file: active.is_some_and(|tab| tab.entry.file_mode() == DocMode::Plain),
             render_markdown: active.is_some_and(|tab| tab.entry.render_as_markdown()),
+            formattable: active.is_some_and(|tab| formatter_of(tab).is_some()),
             word_wrap,
             sidebar: layout.sidebar_visible(),
             inspector: layout.inspector_visible(),
@@ -1417,6 +1527,7 @@ impl AppActions for WindowActions<'_> {
         }
         match command {
             CommandId::EditInsertDate => return self.controller.insert_date(&self.cell),
+            CommandId::EditFormatDocument => return self.controller.format_document(&self.cell),
             CommandId::FormatImage => return self.controller.insert_image_file(&self.cell),
             _ => {}
         }

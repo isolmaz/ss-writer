@@ -362,12 +362,10 @@ fn the_whole_document_is_tokenized_so_a_comment_runs_over_the_lines_after_it() {
     let spy = Spy::new();
     let mut h = coloured("let a = 1;\nlet b = 2;\n", &spy);
     let calm = SyntaxColors::calm(&h.theme);
+    // The calm palette colours the keyword; the number keeps the text colour and gets no range.
     assert_eq!(
         stretches(&spy, "let b = 2;"),
-        [
-            ("let".to_owned(), Some(calm.color(TokenKind::Keyword))),
-            ("2".to_owned(), Some(calm.color(TokenKind::Number)))
-        ]
+        [("let".to_owned(), Some(calm.color(TokenKind::Keyword)))]
     );
 
     // Typing the start of a block comment on the first line recolours the second one too.
@@ -395,15 +393,23 @@ fn the_whole_document_is_tokenized_so_a_comment_runs_over_the_lines_after_it() {
 
 #[test]
 fn a_line_deep_in_a_large_document_gets_the_tokens_of_its_own_text() {
-    let text: String = (0..5000).map(|n| format!("let n{n} = {n};\n")).collect();
+    let text: String = (0..5000)
+        .map(|n| format!("let n{n} = \"{n}\";\n"))
+        .collect();
     let spy = Spy::new();
     let mut h = coloured(&text, &spy);
     let start = h.doc.borrow().buffer().line_range(4000).start;
     h.view.go_to(Selection::caret(start));
     arrange_with(&mut h, &spy);
-    let found = stretches(&spy, "let n4000 = 4000;");
-    let words: Vec<&str> = found.iter().map(|(text, _)| text.as_str()).collect();
-    assert_eq!(words, ["let", "4000"]);
+    let calm = SyntaxColors::calm(&h.theme);
+    // The string carries the line's own number, so it is only found at the right offsets.
+    assert_eq!(
+        stretches(&spy, "let n4000 = \"4000\";"),
+        [
+            ("let".to_owned(), Some(calm.color(TokenKind::Keyword))),
+            ("\"4000\"".to_owned(), Some(calm.color(TokenKind::String)))
+        ]
+    );
 }
 
 #[test]
@@ -419,8 +425,8 @@ fn an_ime_composition_inside_a_token_splits_it_and_stays_uncoloured() {
         caret: 6,
         attrs: Vec::new(),
     });
-    // The composition is not in the document; measure the line again with it displayed.
-    h.config(|config| config.wrap = false);
+    // The composition is not in the document; the update bumped the layout epoch, so the line is
+    // measured again with it displayed (here with the default word wrap).
     spy.forget();
     arrange_with(&mut h, &spy);
     let string = Some(calm.color(TokenKind::String));

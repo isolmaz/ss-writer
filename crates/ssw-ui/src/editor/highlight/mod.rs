@@ -1,11 +1,12 @@
-//! Dependency-free syntax highlighting for fenced code blocks.
+//! Dependency-free syntax highlighting for fenced code blocks and for whole plain-text documents.
 //!
-//! [`Language::from_name`] resolves an info string (`rust`, `c++`, `js`, `ps1`, …) to one of the
-//! supported [`Language`]s; unknown names are plain code. [`tokenize`] splits a text into
-//! [`Token`]s (everything not listed is plain). [`Highlighter`] caches the tokens of every code
-//! block by line together with the scanner state at the start of each line, so after an edit only
-//! the lines whose text or incoming state changed are scanned again. [`SyntaxColors`] maps token
-//! kinds to colors derived from the theme tokens.
+//! [`Language::from_name`] resolves an info string or a file extension (`rust`, `c++`, `js`,
+//! `ps1`, …) to one of the supported [`Language`]s; unknown names are plain code. [`tokenize`]
+//! splits a text into [`Token`]s (everything not listed is plain). [`Highlighter`] caches the
+//! tokens of every code block, or of a plain-text document as a whole, by line together with the
+//! scanner state at the start of each line, so after an edit only the lines whose text or
+//! incoming state changed are scanned again. [`SyntaxColors`] maps token kinds to colors derived
+//! from the theme tokens.
 
 use std::collections::HashMap;
 
@@ -94,7 +95,7 @@ pub enum Language {
     PowerShell,
     /// HTML (the bodies of `<script>` and `<style>` are JavaScript, JSON and CSS).
     Html,
-    /// XML (also SVG, XAML).
+    /// XML (also SVG, XAML and XHTML, whose `<script/>` is an empty element, not a raw-text one).
     Xml,
     /// CSS.
     Css,
@@ -137,7 +138,8 @@ impl Language {
 
     /// The language named by an info string word: case-insensitive, with the usual aliases
     /// (`rs`, `c++`, `cs`, `js`, `ts`, `py`, `sh`, `ps1`, `yml`, `md`, `patch`, …). Decorations
-    /// such as `{.rust}` or `rust,ignore` are ignored.
+    /// such as `{.rust}` or `rust,ignore` are ignored. The names double as file extensions, so
+    /// none is an alias that names another kind of file (`ps` is PostScript, not PowerShell).
     #[must_use]
     pub fn from_name(name: &str) -> Option<Language> {
         let name = name.trim().trim_start_matches(['{', '.']);
@@ -157,9 +159,9 @@ impl Language {
             "python" | "py" | "python3" => Language::Python,
             "go" | "golang" => Language::Go,
             "bash" | "sh" | "shell" | "zsh" | "console" => Language::Bash,
-            "powershell" | "ps1" | "pwsh" | "ps" => Language::PowerShell,
-            "html" | "htm" | "xhtml" => Language::Html,
-            "xml" | "svg" | "xaml" | "xsd" | "xsl" | "plist" => Language::Xml,
+            "powershell" | "ps1" | "pwsh" => Language::PowerShell,
+            "html" | "htm" => Language::Html,
+            "xml" | "xhtml" | "svg" | "xaml" | "xsd" | "xsl" | "plist" => Language::Xml,
             "css" => Language::Css,
             "sql" => Language::Sql,
             "yaml" | "yml" => Language::Yaml,
@@ -297,7 +299,8 @@ const CACHE_LIMIT: usize = 256;
 /// its start offset) remembers its lines, their tokens and the scanner state before each line.
 /// Highlighting changed text reuses every line whose content and incoming state are unchanged,
 /// so typing in a large block rescans one line (plus the lines whose state it changes, such as
-/// the rest of a block comment).
+/// the rest of a block comment). Lines are matched by index: inserting or deleting a line break
+/// moves every line below it to another index and rescans them.
 #[derive(Debug, Default)]
 pub struct Highlighter {
     entries: HashMap<usize, Entry>,
@@ -441,13 +444,21 @@ impl SyntaxColors {
 
     /// The colors of `theme` for a whole document: a page full of colored types, tags and numbers
     /// is noisy, so only comments, strings and keywords are colored and everything else keeps the
-    /// text color.
+    /// text color and weight (headings are not bold either).
     #[must_use]
     pub fn calm(theme: &Theme) -> Self {
         Self {
             calm: true,
             ..Self::from_theme(theme)
         }
+    }
+
+    /// Whether [`SyntaxColors::styled`] can make a token of `kind` look different from plain
+    /// text: every kind can in the full palette, only comments, keywords and strings in the calm
+    /// one. A caller skips the other tokens instead of styling them as the text they already are.
+    #[must_use]
+    pub fn colors(&self, kind: TokenKind) -> bool {
+        !self.calm || Self::CALM_KINDS.contains(&kind)
     }
 
     /// The color of `kind`.
@@ -481,14 +492,15 @@ impl SyntaxColors {
         }
     }
 
-    /// The style range of `token` over `base` (color, italic comments, bold headings), with
-    /// offsets shifted by `shift` into the display text.
+    /// The style range of `token` over `base` (color, italic comments, bold headings except in
+    /// the calm palette, which only changes colors and keeps the italic comments), with offsets
+    /// shifted by `shift` into the display text.
     #[must_use]
     pub fn styled(&self, token: &Token, base: &TextStyle, shift: usize) -> StyledRange {
         let mut style = base.clone().with_color(self.color(token.kind));
         match token.kind {
             TokenKind::Comment => style = style.with_italic(true),
-            TokenKind::Heading => style = style.with_weight(FontWeight::BOLD),
+            TokenKind::Heading if !self.calm => style = style.with_weight(FontWeight::BOLD),
             _ => {}
         }
         StyledRange {

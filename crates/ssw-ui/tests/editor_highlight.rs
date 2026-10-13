@@ -372,6 +372,11 @@ fn language_names_and_aliases() {
         ("py", Language::Python),
         ("sh", Language::Bash),
         ("ps1", Language::PowerShell),
+        ("pwsh", Language::PowerShell),
+        ("PowerShell", Language::PowerShell),
+        ("htm", Language::Html),
+        ("xhtml", Language::Xml),
+        ("svg", Language::Xml),
         ("yml", Language::Yaml),
         ("md", Language::Markdown),
         ("patch", Language::Diff),
@@ -382,6 +387,21 @@ fn language_names_and_aliases() {
     }
     assert_eq!(Language::from_name("brainfuck"), None);
     assert_eq!(Language::from_name(""), None);
+}
+
+#[test]
+fn ps_is_postscript_and_no_alias_of_powershell() {
+    // A plain-text `.ps` file is handed to `from_name` by its extension.
+    for name in ["ps", "PS", ".ps", "{.ps}"] {
+        assert_eq!(Language::from_name(name), None, "{name}");
+    }
+    for name in ["powershell", "ps1", "pwsh"] {
+        assert_eq!(
+            Language::from_name(name),
+            Some(Language::PowerShell),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -497,10 +517,22 @@ fn the_calm_palette_colors_only_comments_strings_and_keywords() {
     for kind in [Number, Type, Function, Property, Tag, Attribute] {
         assert_ne!(full.color(kind), text, "{kind:?} is colored");
     }
+    // What a caller may skip: the full palette styles every kind, the calm one three.
+    for kind in KINDS {
+        assert!(full.colors(kind), "{kind:?} is styled in the full palette");
+        assert_eq!(
+            calm.colors(kind),
+            matches!(kind, Comment | Keyword | Str),
+            "{kind:?}"
+        );
+        if !calm.colors(kind) {
+            assert_eq!(calm.color(kind), text, "{kind:?} is skipped as plain text");
+        }
+    }
 }
 
 #[test]
-fn the_calm_palette_keeps_italic_comments_and_the_high_contrast_rule() {
+fn the_calm_palette_keeps_italic_comments_without_bold_headings_and_the_high_contrast_rule() {
     let theme = Theme::light(DEFAULT_ACCENT);
     let calm = SyntaxColors::calm(&theme);
     let base = TextStyle::new("Mono", 12.0);
@@ -512,6 +544,20 @@ fn the_calm_palette_keeps_italic_comments_and_the_high_contrast_rule() {
     let comment = calm.styled(&token, &base, 0);
     assert!(comment.style.italic);
     assert_eq!(comment.style.color, Some(theme.tokens.text_muted));
+
+    // Only colors change: a heading token is not bold, whereas the full palette makes it bold.
+    let heading = Token {
+        start: 0,
+        end: 3,
+        kind: Heading,
+    };
+    let calm_heading = calm.styled(&heading, &base, 0);
+    assert_eq!(calm_heading.style.weight, base.weight);
+    assert_ne!(calm_heading.style.weight, FontWeight::BOLD);
+    assert!(!calm_heading.style.italic);
+    assert_eq!(calm_heading.style.color, Some(theme.tokens.text));
+    let full_heading = SyntaxColors::from_theme(&theme).styled(&heading, &base, 0);
+    assert_eq!(full_heading.style.weight, FontWeight::BOLD);
 
     let system = SystemColors {
         window: Color::BLACK,
@@ -750,6 +796,52 @@ fn html_self_closing_tags_stray_brackets_and_ampersands() {
         toks(Language::Xml, "a < b <i> & &amp; &x"),
         [("<i", Tag), ("&amp;", Escape)]
     );
+}
+
+#[test]
+fn a_self_closing_script_opens_a_javascript_body_in_html_but_not_in_xhtml_or_xml() {
+    let text = "<script src=\"a.js\"/>let a</script>";
+    assert_eq!(
+        toks(Language::Html, text),
+        [
+            ("<script", Tag),
+            ("src", Attribute),
+            ("\"a.js\"", Str),
+            ("let", Keyword),
+            ("</script", Tag)
+        ],
+        "a browser ignores the slash, so the body starts and is JavaScript"
+    );
+
+    // An XHTML file is XML: there `<script/>` is an empty element and `let` is only text.
+    let xhtml = Language::from_name("xhtml").unwrap();
+    let after = "<script src=\"a.js\"/>\n<p class=\"x\">let a</p>";
+    for language in [xhtml, Language::Xml] {
+        assert_eq!(
+            toks(language, text),
+            [
+                ("<script", Tag),
+                ("src", Attribute),
+                ("\"a.js\"", Str),
+                ("</script", Tag)
+            ],
+            "{language:?}"
+        );
+        // Nothing after the empty element is read as JavaScript.
+        assert_eq!(
+            toks(language, after),
+            [
+                ("<script", Tag),
+                ("src", Attribute),
+                ("\"a.js\"", Str),
+                ("<p", Tag),
+                ("class", Attribute),
+                ("\"x\"", Str),
+                ("</p", Tag)
+            ],
+            "{language:?}"
+        );
+    }
 }
 
 #[test]

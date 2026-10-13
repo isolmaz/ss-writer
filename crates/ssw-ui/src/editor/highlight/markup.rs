@@ -234,7 +234,8 @@ fn scan_body(
 
 /// HTML and XML: comments, tags, attributes, attribute values and character references. In HTML
 /// (`html`) the body of a `<script>` or `<style>` is JavaScript, JSON or CSS as its `type` says;
-/// XML has no raw-text elements (XAML has a `<Style>` that is no CSS).
+/// XML (XHTML files too) has no raw-text elements: XAML has a `<Style>` that is no CSS, and an
+/// XHTML `<script/>` is an empty element.
 pub(super) fn scan_markup(line: &str, state: State, html: bool, out: &mut Vec<Token>) -> State {
     let bytes = line.as_bytes();
     let len = line.len();
@@ -275,7 +276,8 @@ pub(super) fn scan_markup(line: &str, state: State, html: bool, out: &mut Vec<To
                 let rest = &line[i..];
                 let ch = rest.chars().next().unwrap_or(' ');
                 if rest.starts_with("/>") {
-                    // Browsers ignore the slash of a non-void element: the body starts anyway.
+                    // HTML browsers ignore the slash of a non-void element: the body starts
+                    // anyway. XML (XHTML files too) opens no body, so `<script/>` stays empty.
                     state = after_tag(state);
                     i += 2;
                 } else if ch == '>' {

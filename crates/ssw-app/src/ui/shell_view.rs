@@ -213,7 +213,9 @@ impl fmt::Debug for ShellView {
 }
 
 /// The language a plain-text file is coloured as: the one its extension names (`.json`, `.html`,
-/// `.py`, `.css`, …); none for a file without an extension or with an unknown one.
+/// `.py`, `.css`, …); none for a file without an extension or with an unknown one. The extension
+/// goes through [`Language::from_name`] as it is, so `.ps` (PostScript) is no PowerShell and
+/// `.xhtml` is scanned as XML.
 fn plain_language_of(path: &Path) -> Option<Language> {
     path.extension()
         .and_then(|extension| Language::from_name(&extension.to_string_lossy()))

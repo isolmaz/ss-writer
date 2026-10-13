@@ -171,8 +171,10 @@ pub(super) struct Cache {
     pub line_px: f32,
     line_key: Option<(u64, u32)>,
     /// Tokenizer of a plain-text document as a whole; the code blocks of a Markdown document
-    /// have their own. It keeps the tokens of every line, so a new document version rescans
-    /// only the lines that changed.
+    /// have their own. It keeps the tokens of every line by line index: a new document version
+    /// rescans the lines whose text or incoming scanner state differs from the cached line at
+    /// the same index. Typing inside a line costs that line, but inserting or deleting a line
+    /// break shifts every line below it to another index and rescans them all.
     plain_highlighter: Highlighter,
     /// The document version and language `plain_tokens` were computed for.
     plain_key: Option<(u64, Option<Language>)>,

@@ -737,10 +737,11 @@ pub struct PlainTextRenderer;
 /// Colors the stretches of `display` that `tokens` (offsets into the document) cover. The
 /// display text is the source of one line, so a token is clipped to it and mapped to display
 /// offsets through the shown segments: an IME composition inserted inside a token splits it
-/// and is itself left in the base style.
+/// and is itself left in the base style. Tokens the palette would style as plain text anyway
+/// are skipped, so a calm document adds a range only for its comments, strings and keywords.
 fn color_tokens(display: &mut Display, tokens: &[Token], colors: &SyntaxColors, base: &TextStyle) {
     let line = display.map.source_range();
-    for token in tokens {
+    for token in tokens.iter().filter(|token| colors.colors(token.kind)) {
         let (start, end) = (token.start.max(line.start), token.end.min(line.end));
         for segment in display.map.segments() {
             if segment.kind != SegmentKind::Shown {

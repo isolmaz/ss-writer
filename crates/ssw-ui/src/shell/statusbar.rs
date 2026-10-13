@@ -353,10 +353,9 @@ impl StatusBar {
             if std::mem::take(&mut segment.activated) == 0 {
                 continue;
             }
-            // Only the clickable segments are ever activated (`is_active`).
-            if let Some(event) = segment.kind.event(segment.bounds) {
-                self.events.push(event);
-            }
+            // Only the clickable segments are ever activated (`is_active`), so the other kinds
+            // contribute nothing.
+            self.events.extend(segment.kind.event(segment.bounds));
         }
     }
 
@@ -580,6 +579,36 @@ mod tests {
             encoding: "UTF-8".to_owned(),
             eol: Eol::CrLf,
             language: StatusLanguage::Hidden,
+        }
+    }
+
+    #[test]
+    fn only_the_clickable_segments_report_a_click() {
+        let anchor = Rect::new(1.0, 2.0, 3.0, 4.0);
+        for segment in [
+            StatusSegment::Position,
+            StatusSegment::Words,
+            StatusSegment::Zoom,
+        ] {
+            assert!(!segment.is_clickable(), "{segment:?}");
+            assert_eq!(segment.event(anchor), None, "{segment:?}");
+        }
+        for (segment, event) in [
+            (
+                StatusSegment::Encoding,
+                StatusEvent::EncodingClicked { anchor },
+            ),
+            (
+                StatusSegment::LineEnding,
+                StatusEvent::LineEndingClicked { anchor },
+            ),
+            (
+                StatusSegment::Language,
+                StatusEvent::LanguageClicked { anchor },
+            ),
+        ] {
+            assert!(segment.is_clickable(), "{segment:?}");
+            assert_eq!(segment.event(anchor), Some(event), "{segment:?}");
         }
     }
 

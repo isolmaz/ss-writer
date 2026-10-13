@@ -67,32 +67,19 @@ pub enum FormatOutcome {
 pub struct Refusal {
     pub reason: RefusalReason,
     /// Byte offset into the document passed to the formatter (a leading byte order mark
-    /// counts), where it is known.
-    pub offset: Option<usize>,
+    /// counts) where the formatter stopped.
+    pub offset: usize,
 }
 
 impl Refusal {
-    const fn new(reason: RefusalReason) -> Self {
-        Self {
-            reason,
-            offset: None,
-        }
-    }
-
     const fn at(reason: RefusalReason, offset: usize) -> Self {
-        Self {
-            reason,
-            offset: Some(offset),
-        }
+        Self { reason, offset }
     }
 }
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.offset {
-            Some(offset) => write!(f, "{} (at byte {offset})", self.reason),
-            None => fmt::Display::fmt(&self.reason, f),
-        }
+        write!(f, "{} (at byte {})", self.reason, self.offset)
     }
 }
 
@@ -136,8 +123,6 @@ pub enum RefusalReason {
     /// Markup the formatter cannot lay out without risking its meaning (template tags, a
     /// double-escaped script, a declaration XML does not have).
     UnsupportedSyntax,
-    /// The formatted text lost or gained something besides whitespace; a bug guard.
-    Inconsistent,
 }
 
 impl RefusalReason {
@@ -163,7 +148,6 @@ impl RefusalReason {
             Self::UnterminatedConstruct => "unterminated markup construct",
             Self::ContentOutsideRoot => "content outside the root element",
             Self::UnsupportedSyntax => "unsupported syntax",
-            Self::Inconsistent => "internal consistency check failed",
         }
     }
 }
@@ -195,24 +179,15 @@ pub fn format_html(text: &str, indent: FormatIndent) -> FormatOutcome {
 
 // ------------------------------------------------------------------------------------ shared
 
-/// Packages a formatter's result: guards that only whitespace changed, and tells a changed
-/// document from an unchanged one. The formatters keep every token, so the guard never trips on
-/// their output; it stays as the last line of defence for the user's file, and `tests` drives it
-/// directly with output that lost or gained a byte.
+/// Packages a formatter's result: tells a changed document from an unchanged one. Every
+/// formatter copies the tokens of the document and writes only the whitespace between them; the
+/// tests assert that invariant on every document they format.
 fn finish(text: &str, formatted: String) -> FormatOutcome {
-    if !significant(text).eq(significant(&formatted)) {
-        return FormatOutcome::Refused(Refusal::new(RefusalReason::Inconsistent));
-    }
     if formatted == text {
         FormatOutcome::AlreadyFormatted
     } else {
         FormatOutcome::Formatted(formatted)
     }
-}
-
-/// The bytes of `text` that are not ASCII whitespace.
-fn significant(text: &str) -> impl Iterator<Item = u8> + '_ {
-    text.bytes().filter(|b| !b.is_ascii_whitespace())
 }
 
 /// Counts of the three line break spellings.
@@ -304,31 +279,5 @@ fn bom_len(text: &str) -> usize {
         '\u{feff}'.len_utf8()
     } else {
         0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// No formatter produces output that differs by more than whitespace, so the guard of
-    /// `finish` is driven with output that does.
-    #[test]
-    fn finish_refuses_output_that_lost_or_gained_more_than_whitespace() {
-        let refusal = Refusal::new(RefusalReason::Inconsistent);
-        for (text, formatted) in [
-            ("[1, 2]", "[1, 3]"),
-            ("[1, 2]", "[1,\n"),
-            ("[1]", "[\n  1\n]x"),
-        ] {
-            assert_eq!(
-                finish(text, formatted.to_owned()),
-                FormatOutcome::Refused(refusal),
-                "{formatted:?} for {text:?}"
-            );
-        }
-        // The refusal knows no offset: nothing in the document is to blame.
-        assert_eq!(refusal.offset, None);
-        assert_eq!(refusal.to_string(), "internal consistency check failed");
     }
 }

@@ -40,10 +40,7 @@ fn assert_refused(formatter: Formatter, src: &str, reason: RefusalReason, offset
     for indent in INDENTS {
         assert_eq!(
             formatter(src, indent),
-            FormatOutcome::Refused(Refusal {
-                reason,
-                offset: Some(offset)
-            }),
+            FormatOutcome::Refused(Refusal { reason, offset }),
             "{src:?}"
         );
     }
@@ -159,25 +156,13 @@ fn every_refusal_reason_has_a_short_description() {
             "content outside the root element",
         ),
         (RefusalReason::UnsupportedSyntax, "unsupported syntax"),
-        (
-            RefusalReason::Inconsistent,
-            "internal consistency check failed",
-        ),
     ];
     for (reason, description) in reasons {
         assert_eq!(reason.as_str(), description);
         assert_eq!(reason.to_string(), description);
-        // The offset, where the formatter knows it, follows the description.
-        let refusal = Refusal {
-            reason,
-            offset: Some(12),
-        };
+        // The offset the formatter stopped at follows the description.
+        let refusal = Refusal { reason, offset: 12 };
         assert_eq!(refusal.to_string(), format!("{description} (at byte 12)"));
-        let unlocated = Refusal {
-            reason,
-            offset: None,
-        };
-        assert_eq!(unlocated.to_string(), description);
     }
 }
 
@@ -462,7 +447,7 @@ fn a_missing_closing_brace_is_refused_and_nothing_is_offered() {
         panic!("not refused: {outcome:?}");
     };
     assert_eq!(refusal.reason, RefusalReason::UnexpectedEnd);
-    assert_eq!(refusal.offset, Some(src.len()));
+    assert_eq!(refusal.offset, src.len());
     assert_eq!(
         refusal.to_string(),
         format!("the document ends unexpectedly (at byte {})", src.len())

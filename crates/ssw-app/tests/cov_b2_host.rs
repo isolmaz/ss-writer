@@ -271,11 +271,26 @@ fn text_of_an_untitled_buffer_survives_the_quit_that_closes_its_window() {
             document.apply(edit).unwrap();
         }
 
+        let id = entry.untitled_id().expect("an untitled id");
+
         // Quitting closes the window, which drops the document: the text has to be stored
         // before that, not when the session is written at the end.
         app.controller().push(Request::Quit);
         app.pump();
         assert!(app.controller().windows().is_empty(), "the window closed");
+        let stored = app
+            .controller()
+            .docs()
+            .env()
+            .store
+            .borrow()
+            .untitled_get(&id)
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("work in progress"),
+            "the text is stored before the session is written"
+        );
         app.finish();
         0
     });

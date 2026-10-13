@@ -1,7 +1,9 @@
 //! Syntax highlighting: token tables per language, incremental caching, language names and
 //! theme colors.
 
-use ssw_ui::editor::highlight::{Highlighter, Language, SyntaxColors, Token, TokenKind, tokenize};
+use ssw_ui::editor::highlight::{
+    Highlighter, Language, SyntaxColors, Token, TokenKind, detect_language, tokenize,
+};
 use ssw_ui::geometry::Color;
 use ssw_ui::text::{FontWeight, TextStyle};
 use ssw_ui::theme::{DEFAULT_ACCENT, SystemColors, Theme};
@@ -401,6 +403,174 @@ fn ps_is_postscript_and_no_alias_of_powershell() {
             Some(Language::PowerShell),
             "{name}"
         );
+fn well_known_file_names_pick_the_language() {
+    for (name, language) in [
+        ("Dockerfile", Some(Language::Bash)),
+        ("dockerfile", Some(Language::Bash)),
+        ("DOCKERFILE", Some(Language::Bash)),
+        ("Containerfile", Some(Language::Bash)),
+        ("Makefile", Some(Language::Bash)),
+        ("makefile", Some(Language::Bash)),
+        ("GNUmakefile", Some(Language::Bash)),
+        (".bashrc", Some(Language::Bash)),
+        (".bash_profile", Some(Language::Bash)),
+        (".zshrc", Some(Language::Bash)),
+        (".profile", Some(Language::Bash)),
+        (".env", Some(Language::Bash)),
+        // Config files and Ruby programs have no language here and stay plain.
+        (".gitignore", None),
+        (".gitattributes", None),
+        (".editorconfig", None),
+        ("CMakeLists.txt", None),
+        ("Rakefile", None),
+        ("Gemfile", None),
+        ("Vagrantfile", None),
+        // Only the last component of a path is the name, with either separator.
+        ("C:\\work\\app\\Dockerfile", Some(Language::Bash)),
+        ("/home/me/.bashrc", Some(Language::Bash)),
+        ("v1.2/Makefile", Some(Language::Bash)),
+    ] {
+        assert_eq!(detect_language(name, ""), language, "{name}");
+    }
+}
+
+#[test]
+fn a_known_file_name_is_not_second_guessed_by_the_text() {
+    for (name, head, language) in [
+        // A name that has no language keeps it, whatever the first line says.
+        (".gitignore", "#!/bin/sh\n", None),
+        ("Gemfile", "<?xml version=\"1.0\"?>\n", None),
+        ("CMakeLists.txt", "<html>\n", None),
+        // A name that has one keeps it too.
+        ("Makefile", "<html>\n", Some(Language::Bash)),
+        ("Dockerfile", "#!/bin/sh\n", Some(Language::Bash)),
+    ] {
+        assert_eq!(detect_language(name, head), language, "{name}");
+    }
+}
+
+#[test]
+fn the_extension_names_the_language() {
+    for (name, language) in [
+        ("notes.rs", Some(Language::Rust)),
+        ("app.tsx", Some(Language::TypeScript)),
+        ("data.yml", Some(Language::Yaml)),
+        ("NOTES.RS", Some(Language::Rust)),
+        ("types.d.ts", Some(Language::TypeScript)),
+        ("src\\lib.rs", Some(Language::Rust)),
+        ("/site/page.HTM", Some(Language::Html)),
+        // A dot that starts the name is no extension, but one after it is.
+        (".hidden.rs", Some(Language::Rust)),
+        (".hidden", None),
+        // The extension is the one of the file, not of a folder.
+        ("my.rs/notes", None),
+        ("notes.txt", None),
+        ("archive.tar.gz", None),
+        ("README", None),
+        ("", None),
+    ] {
+        assert_eq!(detect_language(name, ""), language, "{name}");
+    }
+}
+
+#[test]
+fn a_shebang_names_the_interpreter() {
+    for (head, language) in [
+        ("#!/usr/bin/env python3.11\n", Some(Language::Python)),
+        ("#!/bin/sh\n", Some(Language::Bash)),
+        ("#!/usr/bin/python3\n", Some(Language::Python)),
+        ("#!/usr/bin/python2.7 -u\n", Some(Language::Python)),
+        ("#!/bin/bash -e\n", Some(Language::Bash)),
+        ("#! /usr/bin/zsh\n", Some(Language::Bash)),
+        ("#!/usr/bin/env FOO=bar bash\n", Some(Language::Bash)),
+        ("#!/usr/bin/env -i pwsh\n", Some(Language::PowerShell)),
+        ("#!/usr/bin/env -u HOME zsh\n", Some(Language::Bash)),
+        ("#!/usr/bin/env tsx\n", Some(Language::TypeScript)),
+        ("#!/usr/local/bin/node\n", Some(Language::JavaScript)),
+        ("#!/usr/bin/nodejs\n", Some(Language::JavaScript)),
+        ("#!/bin/dash\n", Some(Language::Bash)),
+        ("#!/usr/bin/ksh93\n", Some(Language::Bash)),
+        // The first line ends at either kind of terminator; a byte order mark is ignored.
+        ("#!/bin/sh\r\necho hi\r\n", Some(Language::Bash)),
+        ("#!/bin/sh\recho hi\r", Some(Language::Bash)),
+        ("\u{feff}#!/bin/sh\n", Some(Language::Bash)),
+        ("#!/usr/bin/python3\nprint(1)\n", Some(Language::Python)),
+        // An interpreter without a language, or without a name, is no language.
+        ("#!/usr/bin/env perl\n", None),
+        ("#!/usr/bin/env\n", None),
+        ("#!/usr/bin/env -S\n", None),
+        ("#!\n", None),
+        // Only a `#!` at the very start of the first line is a shebang.
+        ("# !/bin/sh\n", None),
+        (" #!/bin/sh\n", None),
+        ("\n#!/bin/sh\n", None),
+        ("# header\n#!/bin/sh\n", None),
+    ] {
+        assert_eq!(detect_language("script", head), language, "{head:?}");
+    }
+    // `env` is looked through, with its options.
+    assert_eq!(
+        detect_language("script", "#!/usr/bin/env -S node --flag\n"),
+        Some(Language::JavaScript)
+    );
+    // The shebang only decides when the extension named no language.
+    assert_eq!(
+        detect_language("run.txt", "#!/bin/sh\n"),
+        Some(Language::Bash)
+    );
+}
+
+#[test]
+fn a_markup_declaration_names_the_language() {
+    for (head, language) in [
+        ("<?xml version=\"1.0\"?>\n<root/>\n", Some(Language::Xml)),
+        ("<?XML version=\"1.0\"?>", Some(Language::Xml)),
+        ("<!doctype html>\n<p>hi</p>\n", Some(Language::Html)),
+        ("<!DOCTYPE html>", Some(Language::Html)),
+        ("<!DOCTYPE HTML>", Some(Language::Html)),
+        ("<html lang=\"en\">", Some(Language::Html)),
+        ("<HTML>", Some(Language::Html)),
+        ("\u{feff}<?xml version=\"1.0\"?>", Some(Language::Xml)),
+        ("<div>\n", None),
+        ("<?php echo 1; ?>\n", None),
+        ("<!-- <html> -->\n", None),
+        ("<!DOCTYPE note>\n", None),
+        // Only the first line counts.
+        ("\n<?xml version=\"1.0\"?>\n", None),
+        ("<!-- note -->\n<html>\n", None),
+    ] {
+        // Neither a file name nor an extension that says anything.
+        for name in ["page", "data.txt", "export.unknown"] {
+            assert_eq!(detect_language(name, head), language, "{name}: {head:?}");
+        }
+    }
+}
+
+#[test]
+fn name_and_extension_win_over_the_first_line() {
+    assert_eq!(
+        detect_language("notes.py", "<?xml version=\"1.0\"?>\n"),
+        Some(Language::Python)
+    );
+    for (name, head, language) in [
+        ("page.json", "<!doctype html>\n", Some(Language::Json)),
+        ("main.rs", "#!/bin/sh\n", Some(Language::Rust)),
+        ("tool.py", "#!/bin/sh\n", Some(Language::Python)),
+    ] {
+        assert_eq!(detect_language(name, head), language, "{name}");
+    }
+}
+
+#[test]
+fn nothing_to_go_by_is_no_language() {
+    for (name, head) in [
+        ("notes", "just some text\n"),
+        ("notes", "# A heading\n"),
+        ("data.bin", ""),
+        ("", ""),
+        ("", "plain\n"),
+    ] {
+        assert_eq!(detect_language(name, head), None, "{name:?}: {head:?}");
     }
 }
 

@@ -1,6 +1,6 @@
 //! Context menus (spec §2.6, §3.1, §4.2, §5, §6, §8): the tab menu, the sidebar item / root /
 //! header menus, the editor menus (plain edit menu, spelling suggestions, table cell menu, callout
-//! type) and the status bar's encoding and line-ending menus.
+//! type) and the status bar's encoding, line-ending and language menus.
 //!
 //! A window callback never shows a menu. The loop owner turns a [`ShellAction`] into a
 //! [`Popup`] with [`Controller::popup_for`], shows [`Popup::model`] at [`Popup::at`] with
@@ -22,13 +22,14 @@ use ssw_io::encoding::{LineEnding, TextEncoding, TextFormat};
 use ssw_io::fileops::{self, FileOpError, NameError};
 use ssw_ui::editor::EditorEvent;
 use ssw_ui::editor::blocks_media::MediaEvent;
+use ssw_ui::editor::highlight::Language;
 use ssw_ui::editor::spell::SpellCheck;
 use ssw_ui::geometry::{Point, Rect};
 use ssw_ui::services::{
     ClipboardContent, MessageBoxButtons, MessageBoxIcon, MessageBoxOptions, MessageBoxResult,
 };
 use ssw_ui::shell::sidebar::{HeaderMenu, NodeKey, SidebarEntry, SidebarEvent};
-use ssw_ui::shell::statusbar::StatusEvent;
+use ssw_ui::shell::statusbar::{StatusEvent, language_label};
 use ssw_ui::shell::tabs::{TabMenu, TabsEvent};
 use ssw_ui::shell::titlebar::TitleEvent;
 use ssw_win::menus::{MenuEntry, MenuItem, MenuModel, Submenu};
@@ -39,7 +40,7 @@ use super::controller::{Browsed, Controller, WindowCell};
 use super::export::DiagramFormat;
 use super::menus::menu_id;
 use super::shell_view::{ShellAction, ShellView};
-use crate::documents::{DocEntry, DocError, Source, canonical_path};
+use crate::documents::{DocEntry, DocError, DocMode, Source, canonical_path};
 use crate::workers::WindowId;
 
 /// Ids of menu items that are not commands start here (above every command id).
@@ -96,6 +97,12 @@ pub enum Action {
     },
     /// Write the active document with these line endings from now on.
     LineEnding(LineEnding),
+    /// Colour the active plain-text document as this language (`None`: not at all) and remember
+    /// the choice.
+    Language(Option<Language>),
+    /// Take back the language chosen for the active plain-text document ("Automatic"): the
+    /// stored choice is deleted and detection decides again.
+    AutomaticLanguage,
 }
 
 /// What an item of a sidebar menu does to its entry.
@@ -600,6 +607,49 @@ pub fn line_ending_menu(
     builder.finish(below(anchor))
 }
 
+/// The status bar's language menu: "Automatic" (what the file's name and text say), "Plain text",
+/// then every language the highlighter knows by the order of their names. The entry the user
+/// chose for the document (`choice`, as [`DocEntry::language_choice`]) is marked: "Automatic"
+/// when nothing was chosen.
+#[must_use]
+pub fn language_menu(
+    choice: Option<Option<Language>>,
+    anchor: Rect,
+    i18n: &Localizer,
+    keymap: &Keymap,
+) -> Popup {
+    let mut builder = Builder::new(i18n, keymap);
+    let automatic = choice.is_none();
+    builder.custom(
+        i18n.text("statusbar-language-automatic"),
+        move |item| if automatic { item.radio() } else { item },
+        Some(Action::AutomaticLanguage),
+    );
+    builder.separator();
+    let mut languages: Vec<(String, Language)> = Language::ALL
+        .iter()
+        .map(|&language| (language_label(i18n, Some(language)), language))
+        .collect();
+    languages.sort_by_cached_key(|(label, _)| label.to_lowercase());
+    let entries = std::iter::once((language_label(i18n, None), None)).chain(
+        languages
+            .into_iter()
+            .map(|(label, language)| (label, Some(language))),
+    );
+    for (label, language) in entries {
+        let selected = choice == Some(language);
+        builder.custom(
+            label,
+            move |item| if selected { item.radio() } else { item },
+            Some(Action::Language(language)),
+        );
+        if language.is_none() {
+            builder.separator();
+        }
+    }
+    builder.finish(below(anchor))
+}
+
 impl Controller {
     /// The popup menu `action` asks for (tab, sidebar, editor, spelling, table, callout, status
     /// bar), if it is a menu request.
@@ -661,8 +711,23 @@ impl Controller {
             ShellAction::Status(StatusEvent::LineEndingClicked { anchor }) => {
                 Self::format_menu(&cell).map(|menu| line_ending_menu(menu, *anchor, i18n, &keymap))
             }
+            ShellAction::Status(StatusEvent::LanguageClicked { anchor }) => {
+                Self::language_choice(&cell)
+                    .map(|choice| language_menu(choice, *anchor, i18n, &keymap))
+            }
             _ => None,
         }
+    }
+
+    /// What the language menu needs to know about the active document of `cell`: the language
+    /// the user chose for it (`Some(None)`: "Plain text"; the outer `None`: nothing chosen,
+    /// detection decides). The outer `None` of the result: not a plain-text document.
+    fn language_choice(cell: &WindowCell) -> Option<Option<Option<Language>>> {
+        cell.view
+            .borrow()
+            .active_tab()
+            .filter(|tab| tab.entry.mode() == DocMode::Plain)
+            .map(|tab| tab.entry.language_choice())
     }
 
     /// What the status bar menus need to know about the active document of `cell`.
@@ -721,8 +786,37 @@ impl Controller {
                     tab.entry.set_save_line_ending(line_ending);
                 }
             }
+            Action::Language(language) => self.change_language(&cell, Some(language)),
+            Action::AutomaticLanguage => self.change_language(&cell, None),
         }
         self.refresh(&cell);
+    }
+
+    /// Colours the active document of `cell` as `choice` (`None`: automatic, what detection
+    /// says) and remembers it.
+    fn change_language(&self, cell: &Rc<WindowCell>, choice: Option<Option<Language>>) {
+        let entry = cell
+            .view
+            .borrow()
+            .active_tab()
+            .map(|tab| Rc::clone(&tab.entry));
+        // A store that cannot be written costs the choice its next start, nothing else.
+        if let Some(entry) = entry {
+            let _ = match choice {
+                Some(language) => self
+                    .core()
+                    .borrow()
+                    .session
+                    .choose_language(&entry, language),
+                None => self.core().borrow().session.clear_language(&entry),
+            };
+            // Every tab of the document, in any window, is coloured the new way.
+            for other in self.windows() {
+                other.view.borrow_mut().requests_mut().invalidate_all();
+                other.dirty.set(true);
+            }
+            self.refresh_all();
+        }
     }
 
     /// Reads the active document's file again as `encoding` (spec §4.2). Unsaved changes are

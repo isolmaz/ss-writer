@@ -1,8 +1,9 @@
-//! The status bar menus (spec §4.2, §8) and the first look at a new file (spec §6): the real
-//! controller over a started application in a temporary profile, with scripted dialogs and shell.
-//! Nothing is shown: pointer input is delivered to the window content at the position of the
-//! status bar segments, and what the user would see is read back from the menus the loop owner
-//! would show, the status bar texts, the document text and the bytes on disk.
+//! The status bar menus (spec §4.2, §8: encoding, line endings, language) and the first look at a
+//! new file (spec §6): the real controller over a started application in a temporary profile,
+//! with scripted dialogs and shell. Nothing is shown: pointer input is delivered to the window
+//! content at the position of the status bar segments, and what the user would see is read back
+//! from the menus the loop owner would show, the status bar texts, the document text and the
+//! bytes on disk.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ use ssw_app::ui::scripted_services::{Answer, DialogKind, ScriptedServices};
 use ssw_app::workers::WindowId;
 use ssw_core::command::CommandId;
 use ssw_ui::canvas::RecordingCanvas;
+use ssw_ui::editor::highlight::Language;
 use ssw_ui::input::{Event, PointerButton, PointerEvent, PointerEventKind};
 use ssw_ui::services::{Clock, FakeClock, MemoryClipboard, MessageBoxResult};
 use ssw_ui::shell::statusbar::StatusSegment;
@@ -492,5 +494,285 @@ fn the_other_status_segments_are_not_clickable() {
         ] {
             assert!(rig.click_status(segment).is_empty(), "{segment:?}");
         }
+    });
+}
+
+// ----- the language menu -------------------------------------------------------------------------
+
+impl Rig {
+    /// The language the active tab colours its document as.
+    fn language(&self) -> Option<Language> {
+        let window = self.window();
+        let view = window.view.borrow();
+        view.active_tab()
+            .expect("a tab is open")
+            .editor
+            .config()
+            .plain_language
+    }
+
+    /// Makes the tab at `index` the active one.
+    fn activate(&self, index: usize) {
+        let window = self.window();
+        let key = window.view.borrow().tabs()[index].key;
+        window.view.borrow_mut().activate_tab(key);
+        self.controller.refresh_all();
+    }
+
+    /// Closes the active tab; its document is gone from the registry with it.
+    fn close_active_tab(&self) {
+        let path = self.entry().path().expect("a file is open");
+        self.command(CommandId::TabClose);
+        assert!(self.controller.docs().find(&path).is_none(), "{path:?}");
+    }
+}
+
+/// The labels of the items of `popup` that carry a mark.
+fn marked(popup: &Popup) -> Vec<String> {
+    items(&popup.model)
+        .iter()
+        .filter(|item| item.check == CheckState::Radio)
+        .map(|item| item.label.clone())
+        .collect()
+}
+
+#[test]
+fn the_language_segment_is_shown_for_plain_text_documents_only() {
+    let files: [(&str, &[u8]); 3] = [
+        ("page.md", b"# Title\n"),
+        ("data.json", b"{\"a\": 1}\n"),
+        ("notes.txt", b"hello\n"),
+    ];
+    with_rig(&files, |rig| {
+        // A Markdown document has no language; the segment takes no room.
+        assert_eq!(rig.status(StatusSegment::Language), "");
+        let rect = rig
+            .window()
+            .view
+            .borrow()
+            .statusbar()
+            .segment_rect(StatusSegment::Language);
+        assert_eq!(rect.width, 0.0);
+
+        rig.open("data.json");
+        assert_eq!(rig.status(StatusSegment::Language), "JSON");
+        rig.open("notes.txt");
+        assert_eq!(rig.status(StatusSegment::Language), "Plain text");
+        rig.activate(0);
+        assert_eq!(rig.status(StatusSegment::Language), "");
+
+        // Showing a plain file as Markdown takes the language away, showing it as text brings
+        // it back.
+        rig.activate(1);
+        rig.command(CommandId::ViewRenderAsMarkdown);
+        assert_eq!(rig.status(StatusSegment::Language), "");
+        rig.command(CommandId::ViewRenderAsMarkdown);
+        assert_eq!(rig.status(StatusSegment::Language), "JSON");
+
+        // No file, no language; no document, no segment.
+        rig.command(CommandId::TabNew);
+        assert_eq!(rig.status(StatusSegment::Language), "");
+    });
+}
+
+#[test]
+fn the_language_menu_lists_automatic_plain_text_and_every_language_with_the_choice_marked() {
+    let files: [(&str, &[u8]); 2] = [("data.json", b"{}\n"), ("notes.txt", b"hello\n")];
+    with_rig(&files, |rig| {
+        let popup = rig.status_popup(StatusSegment::Language);
+        let labels: Vec<&str> = items(&popup.model)
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(labels.len(), 2 + Language::ALL.len());
+        assert_eq!(labels.len(), 22);
+        assert_eq!(labels[0], "Automatic");
+        assert_eq!(labels[1], "Plain text");
+        let mut sorted = labels[2..].to_vec();
+        sorted.sort_by_key(|label| label.to_lowercase());
+        assert_eq!(
+            labels[2..],
+            sorted,
+            "the languages are in the order of their names"
+        );
+        for readable in [
+            "C#",
+            "C++",
+            "JavaScript",
+            "PowerShell",
+            "JSON",
+            "YAML",
+            "TOML",
+            "HTML",
+            "XML",
+            "CSS",
+            "SQL",
+            "Markdown",
+            "Diff",
+        ] {
+            assert!(labels.contains(&readable), "{readable}");
+        }
+        assert!(
+            items(&popup.model)
+                .iter()
+                .all(|item| popup.action(item.id).is_some()),
+            "every entry can be chosen"
+        );
+        // Nothing was chosen: "Automatic" is the current entry, whatever the file is detected as.
+        assert_eq!(marked(&popup), ["Automatic"]);
+        assert_eq!(rig.status(StatusSegment::Language), "JSON");
+
+        rig.open("notes.txt");
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Automatic"]
+        );
+        assert_eq!(rig.status(StatusSegment::Language), "Plain text");
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Plain text", None);
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Plain text"]
+        );
+    });
+}
+
+#[test]
+fn choosing_automatic_gives_the_file_back_to_detection_for_good() {
+    let files: [(&str, &[u8]); 2] = [("keep.md", b"# Keep\n"), ("data.json", b"{\"a\": 1}\n")];
+    with_rig(&files, |rig| {
+        rig.open("data.json");
+        assert_eq!(rig.language(), Some(Language::Json));
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Automatic"]
+        );
+
+        // A wrong pick is stored and marked.
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Python", None);
+        assert_eq!(rig.language(), Some(Language::Python));
+        assert_eq!(rig.status(StatusSegment::Language), "Python");
+        assert_eq!(rig.entry().language_choice(), Some(Some(Language::Python)));
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Python"]
+        );
+        // The choice is stored: it is back after a close and reopen.
+        rig.close_active_tab();
+        rig.open("data.json");
+        assert_eq!(rig.language(), Some(Language::Python));
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Python"]
+        );
+
+        // "Automatic" deletes the row and detection colours the file as JSON at once; the
+        // segment shows that language, never the word "Automatic".
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Automatic", None);
+        assert_eq!(rig.entry().language_choice(), None);
+        assert_eq!(rig.language(), Some(Language::Json), "no refresh needed");
+        assert_eq!(rig.status(StatusSegment::Language), "JSON");
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Automatic"]
+        );
+
+        // Closed and opened again, the stored row is gone and the file is still automatic.
+        rig.close_active_tab();
+        rig.open("data.json");
+        assert_eq!(rig.entry().language_choice(), None);
+        assert_eq!(rig.language(), Some(Language::Json));
+        assert_eq!(rig.status(StatusSegment::Language), "JSON");
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Automatic"]
+        );
+    });
+}
+
+#[test]
+fn automatic_takes_a_stored_plain_text_choice_back_too() {
+    with_rig(&[("a.md", b"# A\n"), ("data.json", b"{}\n")], |rig| {
+        rig.open("data.json");
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Plain text", None);
+        assert_eq!(rig.language(), None);
+        assert_eq!(rig.status(StatusSegment::Language), "Plain text");
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Automatic", None);
+        assert_eq!(rig.language(), Some(Language::Json));
+        assert_eq!(rig.status(StatusSegment::Language), "JSON");
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Automatic"]
+        );
+    });
+}
+
+#[test]
+fn choosing_a_language_colours_the_document_at_once_and_the_file_keeps_it() {
+    let files: [(&str, &[u8]); 2] = [("keep.md", b"# Keep\n"), ("notes.txt", b"print('hi')\n")];
+    with_rig(&files, |rig| {
+        rig.open("notes.txt");
+        assert_eq!(rig.language(), None);
+        assert_eq!(rig.entry().language_choice(), None);
+
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Python", None);
+        assert_eq!(rig.language(), Some(Language::Python), "no refresh needed");
+        assert_eq!(rig.status(StatusSegment::Language), "Python");
+        assert_eq!(rig.entry().language_choice(), Some(Some(Language::Python)));
+        assert_eq!(
+            marked(&rig.status_popup(StatusSegment::Language)),
+            ["Python"]
+        );
+
+        // Opened again, the file still shows Python.
+        rig.close_active_tab();
+        rig.open("notes.txt");
+        assert_eq!(rig.language(), Some(Language::Python));
+        assert_eq!(rig.status(StatusSegment::Language), "Python");
+
+        // "Plain text" takes the colors away, and that is remembered as well.
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Plain text", None);
+        assert_eq!(rig.language(), None);
+        assert_eq!(rig.status(StatusSegment::Language), "Plain text");
+        rig.close_active_tab();
+        rig.open("notes.txt");
+        assert_eq!(rig.language(), None);
+        assert_eq!(rig.status(StatusSegment::Language), "Plain text");
+        assert_eq!(rig.entry().language_choice(), Some(None));
+    });
+}
+
+#[test]
+fn a_stored_choice_beats_detection_even_when_it_names_the_detected_language() {
+    let files: [(&str, &[u8]); 2] = [("keep.md", b"# Keep\n"), ("data.json", b"{\"a\": 1}\n")];
+    with_rig(&files, |rig| {
+        rig.open("data.json");
+        assert_eq!(rig.language(), Some(Language::Json), "detected");
+        assert_eq!(rig.entry().language_choice(), None, "nothing chosen yet");
+
+        // Plain text for a JSON file: later refreshes and reopening keep it.
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "Plain text", None);
+        rig.controller.refresh_all();
+        assert_eq!(rig.language(), None);
+        rig.close_active_tab();
+        rig.open("data.json");
+        assert_eq!(rig.language(), None);
+        assert_eq!(rig.status(StatusSegment::Language), "Plain text");
+
+        // Choosing what detection says anyway is a choice too: it is stored.
+        let popup = rig.status_popup(StatusSegment::Language);
+        rig.choose(&popup, "JSON", None);
+        assert_eq!(rig.language(), Some(Language::Json));
+        rig.close_active_tab();
+        rig.open("data.json");
+        assert_eq!(rig.language(), Some(Language::Json));
+        assert_eq!(rig.entry().language_choice(), Some(Some(Language::Json)));
     });
 }

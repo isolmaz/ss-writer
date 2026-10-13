@@ -31,8 +31,10 @@ use ssw_io::save::{SaveError, Sleeper, WriteAccess};
 use ssw_io::session::RecentKind;
 use ssw_io::store::{Store, StoreError};
 use ssw_io::watch::{ExternalChanges, path_key};
+use ssw_ui::editor::highlight::Language;
 
 use crate::clock::AppClock;
+use crate::session::stored_language;
 
 pub use external::{ExternalAction, ExternalOutcome, FolderWatches, Resolution};
 pub use load::{
@@ -149,6 +151,10 @@ struct DocState {
     /// "Render as Markdown" (spec §4.1) is on: a plain-text file is shown and edited as
     /// Markdown. Only the presentation changes; the file is written as it was.
     render_markdown: bool,
+    /// The language the user chose for the document: `None` when nothing was chosen (the file's
+    /// name and text decide), `Some(None)` for "Plain text", `Some(Some(language))` otherwise.
+    /// A file's stored choice is read when the file is opened.
+    language: Option<Option<Language>>,
     /// The scroll position and folds remembered for the file (spec §6); a tab opening the
     /// document starts from them.
     remembered: Option<ssw_io::session::ViewState>,
@@ -306,6 +312,28 @@ impl DocEntry {
         }
         self.state.borrow_mut().render_markdown = render;
         true
+    }
+
+    /// The language the user chose for this document in the status bar: `None` when nothing was
+    /// chosen (what the file's name and text say decides), `Some(None)` for "Plain text" (no
+    /// colors), `Some(Some(language))` for a language. A choice always beats detection, and a
+    /// file's choice is stored (`SessionManager::choose_language`): it is back when the file is
+    /// opened again.
+    #[must_use]
+    pub fn language_choice(&self) -> Option<Option<Language>> {
+        self.state.borrow().language
+    }
+
+    /// Remembers the language the user chose (`None`: "Plain text") while the document is open.
+    /// `SessionManager::choose_language` also stores the choice of a file.
+    pub fn set_language_choice(&self, language: Option<Language>) {
+        self.state.borrow_mut().language = Some(language);
+    }
+
+    /// Forgets the language the user chose: the file's name and text decide again.
+    /// `SessionManager::clear_language` also deletes the stored choice of a file.
+    pub fn clear_language_choice(&self) {
+        self.state.borrow_mut().language = None;
     }
 
     /// Whether the file can be written.
@@ -511,6 +539,7 @@ impl Documents {
             document.set_selections(Selection::caret(caret), &[]);
         }
         let tracked = !matches!(loaded.source, Source::TextBundle { .. });
+        let language = stored_language(&self.env.store.borrow(), &canonical);
         let state = DocState {
             path: Some(canonical.clone()),
             untitled: None,
@@ -524,6 +553,7 @@ impl Documents {
             lossy: loaded.lossy,
             mixed_endings_notice: loaded.format.had_mixed_endings,
             render_markdown: false,
+            language,
             remembered,
         };
         if tracked {
@@ -564,6 +594,7 @@ impl Documents {
             lossy: false,
             mixed_endings_notice: false,
             render_markdown: false,
+            language: None,
             remembered: None,
         }
     }

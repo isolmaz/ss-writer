@@ -14,9 +14,12 @@ use crate::geometry::Color;
 use crate::text::{FontWeight, StyledRange, TextStyle};
 use crate::theme::{Theme, ThemeMode};
 
+mod detect;
 mod engine;
 mod langs;
 mod markup;
+
+pub use detect::detect_language;
 
 /// What a token is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -37,6 +37,32 @@ statusbar-eol-crlf = CRLF
 statusbar-eol-cr = CR
 statusbar-encoding-hint = Change encoding
 statusbar-eol-hint = Change line endings
+statusbar-language-hint = Change language
+# The language segment and its menu: the language a plain-text document is coloured as. The ids
+# after `statusbar-language-` are the canonical language names of the highlighter.
+# The first entry of the menu (never the text of the segment): the language the editor detects.
+statusbar-language-automatic = Automatic
+statusbar-language-plain = Plain text
+statusbar-language-rust = Rust
+statusbar-language-c = C
+statusbar-language-cpp = C++
+statusbar-language-csharp = C#
+statusbar-language-java = Java
+statusbar-language-javascript = JavaScript
+statusbar-language-typescript = TypeScript
+statusbar-language-json = JSON
+statusbar-language-python = Python
+statusbar-language-go = Go
+statusbar-language-bash = Bash
+statusbar-language-powershell = PowerShell
+statusbar-language-html = HTML
+statusbar-language-xml = XML
+statusbar-language-css = CSS
+statusbar-language-sql = SQL
+statusbar-language-yaml = YAML
+statusbar-language-toml = TOML
+statusbar-language-markdown = Markdown
+statusbar-language-diff = Diff
 
 ## Banners
 

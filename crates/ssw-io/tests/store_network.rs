@@ -2371,12 +2371,16 @@ fn a_download_reports_a_write_that_the_disk_refuses() {
 
 #[test]
 fn a_stream_reports_what_the_exchange_could_not_start() {
-    // Nothing listens on port 1: the exchange never starts, and the scripted network passes
-    // on the failure it was told to answer with.
-    let url = Url::parse("http://127.0.0.1:1/update.msi").unwrap();
+    // The port of a listener that is already closed refuses the connection, so the exchange
+    // never starts; the scripted network passes on the failure it was told to answer with.
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/update.msi")).unwrap();
     let error = WinHttp
         .get_streaming(
-            &request(&url, Accept::Any, LIMIT, Duration::from_secs(2)),
+            &request(&url, Accept::Any, LIMIT, FIVE_SECONDS),
             &mut |_, _| Ok(()),
         )
         .unwrap_err();

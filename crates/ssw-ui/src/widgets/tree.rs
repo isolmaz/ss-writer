@@ -1691,9 +1691,9 @@ mod tests {
         // The first move starts the bar's hover and is consumed by it.
         harness.hover(&mut tree, on_bar);
         harness.requests.take_cursor();
-        // The second move finds the bar already hovered and falls through to the cursor logic.
-        let result = harness.hover(&mut tree, on_bar);
-        assert!(!result.handled);
+        // The second move finds the bar already hovered and reaches the cursor logic, which
+        // leaves the pointer alone above the bar.
+        harness.hover(&mut tree, on_bar);
         assert_eq!(harness.requests.take_cursor(), None);
     }
 

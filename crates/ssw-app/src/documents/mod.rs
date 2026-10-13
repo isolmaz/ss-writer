@@ -95,6 +95,7 @@ impl DocError {
         match self {
             Self::Load(LoadError::Fs(FsError::NotFound(_))) => "app-error-not-found",
             Self::Load(LoadError::Import(ImportError::Encrypted)) => "app-error-encrypted",
+            Self::Load(LoadError::NotText(_)) => "app-error-not-text",
             Self::Load(LoadError::Import(_) | LoadError::Bundle(_)) | Self::Convert(_) => {
                 "app-error-conversion"
             }

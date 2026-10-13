@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use ssw_io::encoding::{
     EncodeError, LineEnding, MAX_REPORTED_UNMAPPABLE, TextEncoding, TextFormat, UnmappableChar,
-    decode, decode_as, detect, encode, system_locale_name, system_tld_hint, tld_hint_for_locale,
+    decode, decode_as, detect, encode, looks_binary, system_locale_name, system_tld_hint,
+    tld_hint_for_locale,
 };
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -151,6 +152,130 @@ fn tiny_wide_files_are_sniffed() {
     assert_eq!(detect(b"A\x00B", None), TextEncoding::Utf8);
     assert_eq!(detect(b"", None), TextEncoding::Utf8);
     assert_eq!(decode(b"", None).text, "");
+}
+
+#[test]
+fn text_without_nul_bytes_is_not_binary() {
+    assert!(!looks_binary(b"fn main() {}\n"));
+    assert!(!looks_binary("héllo ☃\n".as_bytes()));
+    // Legacy code pages and malformed UTF-8 are still text.
+    assert!(!looks_binary(b"caf\xE9\n"));
+    assert!(!looks_binary(b"\xC3\x28"));
+    assert!(!looks_binary(b"\xEF\xBB\xBFwith a UTF-8 BOM\n"));
+    // An empty file has nothing that says otherwise.
+    assert!(!looks_binary(b""));
+}
+
+#[test]
+fn a_nul_byte_makes_a_file_binary() {
+    // The signature of a PNG and the header of an executable carry NUL bytes early.
+    assert!(looks_binary(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
+    assert!(looks_binary(b"MZ\x90\x00\x03\x00\x00\x00"));
+    assert!(looks_binary(b"\x00"));
+    assert!(looks_binary(b"text and then\x00more text"));
+    // A zero-filled start, as a disk image has, reads as UTF-32 whose characters are all NUL:
+    // that is no text.
+    assert!(looks_binary(&[0; 4]));
+    assert!(looks_binary(&vec![0; 8192]));
+    assert!(looks_binary(&vec![0; 1 << 20]));
+    // Bytes that only start like UTF-16 or UTF-32 are still binary: the sniff finds no wide
+    // text in them.
+    assert!(looks_binary(b"A\x00B\x00\x00\x00"));
+}
+
+#[test]
+fn utf16_and_utf32_text_without_a_bom_is_text_as_detect_finds_it() {
+    // The same bytes open as text whatever the file is called: `detect` sniffs them, so the
+    // binary check agrees with it.
+    assert!(!looks_binary(b"A\x00B\x00"));
+    assert!(!looks_binary(b"\x00A\x00B"));
+    assert!(!looks_binary(b"A\x00\x00\x00"));
+    assert!(!looks_binary(b"\x00\x00\x00A"));
+    for (name, encoding) in [
+        ("uchardet-ja-utf-16le.txt", TextEncoding::Utf16Le),
+        ("uchardet-ja-utf-16be.txt", TextEncoding::Utf16Be),
+    ] {
+        let bytes = fixture(name);
+        assert!(bytes.contains(&0), "{name} has no NUL byte");
+        assert_eq!(detect(&bytes, None), encoding, "{name}");
+        assert!(!looks_binary(&bytes), "{name}");
+    }
+}
+
+#[test]
+fn a_window_that_ends_inside_a_surrogate_pair_is_still_utf16_text() {
+    // The 8192 bytes inspected end between the two halves of U+1F600.
+    let mut text = "a".repeat(4095);
+    text.push('\u{1F600}');
+    text.push('b');
+    for big_endian in [false, true] {
+        let bytes: Vec<u8> = text
+            .encode_utf16()
+            .flat_map(|unit| {
+                if big_endian {
+                    unit.to_be_bytes()
+                } else {
+                    unit.to_le_bytes()
+                }
+            })
+            .collect();
+        assert_eq!(bytes.len(), 8196);
+        assert!(!looks_binary(&bytes), "big endian: {big_endian}");
+        // A caller that fetched only the window sees the same bytes.
+        assert!(!looks_binary(&bytes[..8192]), "big endian: {big_endian}");
+    }
+}
+
+#[test]
+fn utf_text_is_text_with_or_without_a_bom_although_it_holds_nul_bytes() {
+    let text = "héllo\nwörld ☃\n";
+    for encoding in [
+        TextEncoding::Utf8,
+        TextEncoding::Utf16Le,
+        TextEncoding::Utf16Be,
+        TextEncoding::Utf32Le,
+        TextEncoding::Utf32Be,
+    ] {
+        let mut format = TextFormat {
+            encoding,
+            bom: true,
+            line_ending: LineEnding::Lf,
+            had_mixed_endings: false,
+        };
+        let with_bom = encode(text, &format).unwrap();
+        assert!(!looks_binary(&with_bom), "{encoding:?} with a BOM");
+        // The same text without the BOM is text too, as `detect` finds its encoding.
+        format.bom = false;
+        let without_bom = encode(text, &format).unwrap();
+        assert_eq!(detect(&without_bom, None), encoding, "{encoding:?}");
+        assert!(!looks_binary(&without_bom), "{encoding:?} without a BOM");
+    }
+    // The BOM fixtures of the decoder tests are text too.
+    for name in [
+        "derived-tr-utf-16le-bom.txt",
+        "derived-tr-utf-16be-bom.txt",
+        "derived-ja-utf-16le-bom.txt",
+    ] {
+        let bytes = fixture(name);
+        assert!(bytes.contains(&0), "{name} has no NUL byte");
+        assert!(!looks_binary(&bytes), "{name}");
+    }
+}
+
+#[test]
+fn only_the_first_8192_bytes_are_inspected() {
+    let mut bytes = vec![b'a'; 8192];
+    bytes.push(0);
+    assert!(!looks_binary(&bytes), "a NUL after 8192 bytes");
+    bytes[8191] = 0;
+    assert!(looks_binary(&bytes), "a NUL as the 8192nd byte");
+    let mut late = vec![b'a'; 1 << 20];
+    late[1 << 19] = 0;
+    assert!(!looks_binary(&late), "a NUL half a megabyte in");
+    // A BOM wins over a NUL inside the window.
+    let mut bom = b"\xEF\xBB\xBF".to_vec();
+    bom.extend_from_slice(b"a\x00b");
+    assert!(!looks_binary(&bom));
 }
 
 #[test]

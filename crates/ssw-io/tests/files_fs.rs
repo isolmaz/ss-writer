@@ -194,6 +194,27 @@ fn real_fs_files_and_metadata() {
 }
 
 #[test]
+fn real_fs_reads_at_most_the_requested_start_of_a_file() {
+    let dir = temp();
+    let fs = RealFs;
+    let file = dir.path().join("a.bin");
+    fs.write_new(&file, b"0123456789").unwrap();
+    // Longer than the prefix: only the start comes back.
+    assert_eq!(fs.read_prefix(&file, 4).unwrap(), b"0123");
+    // Exactly as long, and shorter than the prefix: the whole file.
+    assert_eq!(fs.read_prefix(&file, 10).unwrap(), b"0123456789");
+    assert_eq!(fs.read_prefix(&file, 4096).unwrap(), b"0123456789");
+    assert_eq!(fs.read_prefix(&file, 0).unwrap(), b"");
+    let empty = dir.path().join("empty.bin");
+    fs.write_new(&empty, b"").unwrap();
+    assert_eq!(fs.read_prefix(&empty, 4).unwrap(), b"");
+    assert!(matches!(
+        fs.read_prefix(&dir.path().join("nope"), 4),
+        Err(FsError::NotFound(_))
+    ));
+}
+
+#[test]
 fn real_fs_replace_keeps_attributes_and_move_replace_overwrites() {
     let dir = temp();
     let fs = RealFs;
@@ -379,6 +400,24 @@ fn fault_fs_fails_every_operation_with_the_scripted_code() {
         }
         assert_eq!(fs.calls(op), 1, "{op:?}");
     }
+}
+
+#[test]
+fn fault_fs_prefix_reads_fail_like_reads_and_otherwise_pass_through() {
+    let dir = temp();
+    let file = dir.path().join("f.txt");
+    RealFs.write_new(&file, b"0123456789").unwrap();
+    let fs = FaultFs::new();
+    assert_eq!(fs.read_prefix(&file, 4).unwrap(), b"0123");
+    assert_eq!(fs.calls(FsOp::Read), 1, "a prefix read counts as a read");
+    // The scripted read failure hits the prefix read, once.
+    fs.fail(FsOp::Read, FsFailure::AccessDenied, 1);
+    assert!(matches!(
+        fs.read_prefix(&file, 4),
+        Err(FsError::AccessDenied(_))
+    ));
+    assert_eq!(fs.read_prefix(&file, 100).unwrap(), b"0123456789");
+    assert_eq!(fs.calls(FsOp::Read), 3);
 }
 
 #[test]

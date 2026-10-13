@@ -35,7 +35,7 @@ use ssw_win::menus::{MenuEntry, MenuItem, MenuModel, Submenu};
 
 use CommandId as C;
 
-use super::controller::{Controller, WindowCell};
+use super::controller::{Browsed, Controller, WindowCell};
 use super::export::DiagramFormat;
 use super::menus::menu_id;
 use super::shell_view::{ShellAction, ShellView};
@@ -840,18 +840,24 @@ impl Controller {
             .map_or(target.is_none(), SidebarEntry::is_folder);
         let fs = self.docs().env().fs.clone();
         match command {
-            S::Open | S::OpenInNewTab => self.open_path(cell, &path, true),
+            S::Open | S::OpenInNewTab => {
+                self.open_path(cell, &path, true);
+            }
             S::OpenInNewWindow => {
                 let (size, scale) = {
                     let view = cell.view.borrow();
                     (view.layout().size(), view.layout().scale())
                 };
                 let fresh = self.create_window(None, size, scale);
-                if let Err(error) = self.open_file(&fresh, &path) {
-                    self.report(&error);
+                // Like every other way into a file of the sidebar: a binary file goes to its
+                // default app, and then there is nothing to show in the new window. A window
+                // that reports a failure stays, so the user sees it there.
+                if self.open_path(&fresh, &path, true) == Browsed::Launched {
+                    self.close_window(fresh.id);
+                } else {
+                    self.set_active_window(fresh.id);
+                    self.refresh(&fresh);
                 }
-                self.set_active_window(fresh.id);
-                self.refresh(&fresh);
             }
             S::Rename => cell.view.borrow_mut().request_rename(key),
             S::Duplicate => match fileops::duplicate(fs.as_ref(), &path) {
@@ -912,7 +918,9 @@ impl Controller {
         });
         match revealed {
             Some(key) => cell.view.borrow_mut().request_rename(key),
-            None if created.is_file() => self.open_path(cell, created, true),
+            None if created.is_file() => {
+                self.open_path(cell, created, true);
+            }
             None => {}
         }
     }

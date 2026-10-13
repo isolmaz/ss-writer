@@ -373,6 +373,13 @@ pub trait FileSystem: Send + Sync + std::fmt::Debug {
     /// Any [`FsError`]; placeholders are hydrated by this call.
     fn read(&self, path: &Path) -> Result<Vec<u8>, FsError>;
 
+    /// Reads at most `max` bytes from the start of the file: what a file of unknown type is
+    /// classified by, so a picture or an archive is never read whole.
+    ///
+    /// # Errors
+    /// Any [`FsError`]; placeholders are hydrated by this call.
+    fn read_prefix(&self, path: &Path, max: usize) -> Result<Vec<u8>, FsError>;
+
     /// Metadata without opening the file.
     ///
     /// # Errors
@@ -500,6 +507,16 @@ impl RealFs {
 impl FileSystem for RealFs {
     fn read(&self, path: &Path) -> Result<Vec<u8>, FsError> {
         io(std::fs::read(path), path)
+    }
+
+    fn read_prefix(&self, path: &Path, max: usize) -> Result<Vec<u8>, FsError> {
+        use std::io::Read;
+        let mut head = Vec::new();
+        io(
+            std::fs::File::open(path).and_then(|file| file.take(max as u64).read_to_end(&mut head)),
+            path,
+        )?;
+        Ok(head)
     }
 
     fn metadata(&self, path: &Path) -> Result<FileMeta, FsError> {
@@ -937,6 +954,11 @@ impl FileSystem for FaultFs {
     fn read(&self, path: &Path) -> Result<Vec<u8>, FsError> {
         self.check(FsOp::Read, path)?;
         self.inner.read(path)
+    }
+
+    fn read_prefix(&self, path: &Path, max: usize) -> Result<Vec<u8>, FsError> {
+        self.check(FsOp::Read, path)?;
+        self.inner.read_prefix(path, max)
     }
 
     fn metadata(&self, path: &Path) -> Result<FileMeta, FsError> {

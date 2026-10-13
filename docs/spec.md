@@ -110,7 +110,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 ### 3.1 Tables
 - Rendered grid; caret inside a cell edits that cell's source text. Tab/Shift+Tab next/previous cell (Tab in last cell adds a row). Enter moves down (in the last row it adds a row).
 - Cell context menu: insert row above/below, column left/right, delete row/column, align left/center/right, Copy table as Markdown/CSV/HTML, Edit as raw Markdown.
-- On leaving the table, pipes are re-aligned (setting "Format tables on exit", default on).
+- On leaving the table, pipes are re-aligned (setting "Format tables on exit", default on). Only in a Markdown document: a plain-text or Mermaid document is never rewritten by the table formatter.
 - Tables the cell model cannot represent (escaped `|`, `|` inside inline code spanning cells) open in raw mode automatically.
 
 ### 3.2 Links & wikilinks
@@ -141,6 +141,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 | `.odt` | ✓ | ✓ | same model as docx |
 | `.rtf` | ✓ | ✓ | same model |
 | `.doc` (Word 97–2003) | ✓ | — | import only; save as `.docx` or `.md`. Encrypted files and Word 6/95 files are rejected with a message |
+| every other file | ✓ | ✓ | Opened as plain text when its content is text: a BOM, or UTF-16/32 without one, means text; a `0x00` byte in the first 8192 bytes of anything else means binary. A binary file is refused with "This file is not a text file"; from the sidebar, Quick Open and folder search it keeps going to its default app instead |
 
 - Import reports what could not be represented (merged cells, headers/footers, columns, text boxes, comments, tracked changes, VML shapes, unsupported equations) in a banner with a details list. OMML equations convert to LaTeX for fractions, scripts, radicals, n-ary operators, delimiters, matrices; others become `[equation]` placeholders and are reported.
 
@@ -202,6 +203,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - `Ctrl+C` puts Markdown text (`CF_UNICODETEXT`), `HTML Format` and `Rich Text Format` on the clipboard (local images of the selection are embedded); `Ctrl+X` does the same and removes the selection. Edit → Copy as: Plain text (markers stripped), Markdown, Rich text (RTF + HTML, plain text as fallback), HTML (also as text). Documents that are not Markdown copy their text only.
 - Share (`DataTransferManager` via `IDataTransferManagerInterop`): shares the file.
 - Export (File → Export): PDF, PNG, JPG, HTML (single file, embedded CSS/images, math as SVG), ePub, DOCX, ODT, RTF, TXT, Markdown with attachments, TextBundle. Options: page size (A4/Letter), margins, base font size, page numbers, black text, light theme, include title. PDF/PNG/JPG through Typst. Mermaid exportable as PNG/SVG from its context menu.
+- A plain-text document is never read as Markdown on export: TXT, Markdown with attachments and TextBundle get its text verbatim, every other format receives it inside a code block, so `#`, `*` and `|` stay what they are.
 - Print (`Ctrl+P`): system print dialog; pages from the Typst layout drawn as vectors through `ID2D1PrintControl`.
 - Long exports show taskbar progress (`ITaskbarList3`).
 
@@ -249,6 +251,7 @@ Stored in `settings.json` (human-editable; unknown keys preserved).
 
 ## 12. Windows integration
 - File associations registered per user by the installer (`OpenWithProgids`; Settings button opens `ms-settings:defaultapps`). Folder verb "Open with SS Writer".
+- The installer also registers the application itself (`Applications\SSWriter.exe` with its open command, friendly name and icon) and lists it under `*\OpenWithProgids`, so "Open with" offers SS Writer for any file. `.json`, `.csv`, `.log`, `.xml`, `.html`, `.css`, `.js`, `.yml` and `.py` name it directly. No default association is taken.
 - Jump List: recent files/folders, "New window".
 - Explorer preview pane handler (`ssw-preview.dll`, `IPreviewHandler`) for `.md`/`.markdown`/`.mmd`.
 - DirectManipulation for touchpad/touch panning with inertia; animated mouse wheel; pen acts as pointer (barrel button = right click). Touch keyboard appears on tap into text (TSF + UIA).

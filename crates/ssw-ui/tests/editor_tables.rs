@@ -20,7 +20,9 @@ use ssw_ui::editor::display::Reveal;
 use ssw_ui::editor::object::{
     InlineObjectProvider, NoObjects, ObjectInfo, ObjectRequest, ObjectState, ObjectVisual,
 };
-use ssw_ui::editor::{Composition, EditorConfig, EditorEvent, EditorStrings, LinkTarget};
+use ssw_ui::editor::{
+    Composition, DocumentKind, EditorConfig, EditorEvent, EditorStrings, LinkTarget,
+};
 use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{Cursor, Event, Modifiers, PointerButton, PointerEvent, PointerEventKind, vk};
 use ssw_ui::services::MemoryClipboard;
@@ -789,6 +791,19 @@ fn pipes_are_realigned_when_the_caret_leaves_the_table_if_the_setting_is_on() {
             "format on exit = {on}: {widths:?}"
         );
     }
+}
+
+#[test]
+fn plain_text_documents_are_never_realigned_when_the_caret_leaves_pipe_lines() {
+    let text = "a | b\n--|--\n1 | 2\n\nafter\n";
+    let mut h = Harness::new(text);
+    h.config(|config| {
+        config.document_kind = DocumentKind::PlainText;
+        config.format_tables_on_exit = true;
+    });
+    h.set_caret(h.text().find("1 | 2").expect("pipe row") + 1);
+    h.set_caret(h.text().find("after").expect("after"));
+    assert_eq!(h.text(), text, "plain text is byte-identical");
 }
 
 #[test]

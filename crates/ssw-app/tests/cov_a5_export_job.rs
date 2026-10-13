@@ -29,6 +29,7 @@ fn job(
         format,
         options: ExportOptions::from(&ExportSettings::default()),
         markdown: markdown.to_owned(),
+        plain: false,
         source_dir: source_dir.map(Path::to_path_buf),
         title: "Doc".to_owned(),
         target,
@@ -104,7 +105,7 @@ fn a_picture_typst_cannot_decode_fails_the_page_formats_with_the_layout_message(
     }
     // Printing lays the same document out and fails the same way.
     let options = ExportOptions::from(&ExportSettings::default());
-    let failure = layout_pages(markdown, Some(tmp.path()), &options, "Doc").unwrap_err();
+    let failure = layout_pages(markdown, false, Some(tmp.path()), &options, "Doc").unwrap_err();
     assert!(matches!(failure, ExportFailure::Convert(_)), "{failure:?}");
 }
 
@@ -134,7 +135,7 @@ fn diagrams_are_drawn_for_the_paper_the_document_goes_on() {
     assert_ne!(std::fs::read(drawn).unwrap(), std::fs::read(code).unwrap());
 
     let options = ExportOptions::from(&ExportSettings::default());
-    let pages = layout_pages(DIAGRAM, None, &options, "Doc").unwrap();
+    let pages = layout_pages(DIAGRAM, false, None, &options, "Doc").unwrap();
     assert_eq!(pages.len(), 1);
 }
 
@@ -330,6 +331,123 @@ fn a_textbundle_names_what_blocks_it() {
     let _lock = locked(&source.join("a.png"));
     let failure = bundle(tmp.path().join("free.textpack")).unwrap_err();
     assert!(matches!(failure, ExportFailure::Convert(_)), "{failure:?}");
+}
+
+const PLAIN_TEXT: &str = "# not a heading\n**not bold**\n| a | b |";
+
+/// The job of a plain-text document: its text is never read as Markdown.
+fn plain_job(format: ExportFormat, target: PathBuf) -> ExportJob {
+    let mut job = job(format, PLAIN_TEXT, None, target);
+    job.plain = true;
+    job
+}
+
+#[test]
+fn a_plain_text_document_exports_to_html_without_being_read_as_markdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("plain.html");
+    run(&plain_job(ExportFormat::Html, target.clone())).unwrap();
+    let html = std::fs::read_to_string(&target).unwrap();
+    assert!(html.contains("# not a heading"), "{html}");
+    assert!(html.contains("**not bold**"), "{html}");
+    assert!(!html.contains("<h1"), "{html}");
+    assert!(!html.contains("<strong"), "{html}");
+}
+
+#[test]
+fn a_plain_text_document_exports_to_txt_byte_for_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("plain.txt");
+    run(&plain_job(ExportFormat::Txt, target.clone())).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), PLAIN_TEXT.as_bytes());
+}
+
+#[test]
+fn a_plain_text_with_backticks_is_fenced_by_a_longer_run_so_it_stays_one_code_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("fenced.html");
+    let mut export = plain_job(ExportFormat::Html, target.clone());
+    // A run of three, a run of one after it and a run of five: the fence must beat the five.
+    export.markdown = "```\ncode `x`\n`````\nafter\n".to_owned();
+    run(&export).unwrap();
+    let html = std::fs::read_to_string(&target).unwrap();
+    let start = html.find("<pre").expect("a code block");
+    let end = html.find("</pre>").expect("a closed code block");
+    let block = &html[start..end];
+    assert!(block.contains("```\ncode `x`\n`````\nafter\n"), "{html}");
+    assert!(!html.contains("<code>x</code>"), "{html}");
+    assert_eq!(html.matches("<pre").count(), 1, "{html}");
+}
+
+#[test]
+fn a_plain_text_is_copied_as_it_is_by_markdown_with_attachments_and_its_links_are_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a.png"), picture()).unwrap();
+    let out = tmp.path().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let target = out.join("notes.md");
+    let text = "![a](a.png)\n# not a heading";
+    let mut export = job(
+        ExportFormat::MarkdownWithAttachments,
+        text,
+        Some(&source),
+        target.clone(),
+    );
+    export.plain = true;
+    assert_eq!(run(&export).unwrap(), std::slice::from_ref(&target));
+    assert_eq!(std::fs::read(&target).unwrap(), text.as_bytes());
+    assert!(!out.join("attachments").exists(), "no file is copied");
+}
+
+#[test]
+fn a_plain_text_that_cannot_be_written_by_markdown_with_attachments_names_the_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("missing");
+    let target = out.join("notes.md");
+    let mut export = job(
+        ExportFormat::MarkdownWithAttachments,
+        PLAIN_TEXT,
+        None,
+        target.clone(),
+    );
+    export.plain = true;
+    let failure = run(&export).unwrap_err();
+    assert_eq!(written_path(failure), target);
+    assert!(!target.exists());
+    assert!(!out.exists(), "nothing is created");
+}
+
+#[test]
+fn a_plain_text_goes_into_a_textbundle_with_no_assets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a.png"), picture()).unwrap();
+    let text = "![a](a.png)\n# not a heading";
+    let bundle = |target: &Path| {
+        let mut export = job(
+            ExportFormat::Textbundle,
+            text,
+            Some(&source),
+            target.to_path_buf(),
+        );
+        export.plain = true;
+        run(&export).unwrap()
+    };
+
+    let pack = tmp.path().join("doc.textpack");
+    assert_eq!(bundle(&pack), std::slice::from_ref(&pack));
+    let read = ssw_convert::textbundle::read_pack(&std::fs::read(&pack).unwrap()).unwrap();
+    assert_eq!(read.text, text);
+    assert!(read.assets.is_empty());
+
+    let folder = tmp.path().join("doc.textbundle");
+    assert_eq!(bundle(&folder), std::slice::from_ref(&folder));
+    let read = ssw_convert::textbundle::read_dir(&folder).unwrap();
+    assert_eq!(read.text, text);
+    assert!(read.assets.is_empty());
 }
 
 #[test]

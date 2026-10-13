@@ -172,7 +172,7 @@ The behavior of each feature is defined in [`docs/spec.md`](docs/spec.md); [`doc
 ### Files
 
 - **Markdown, text, Office and TextBundle files** — Open and save Markdown, plain text, Mermaid, TextBundle, DOCX, ODT and RTF; import legacy DOC; every import reports what could not be represented. The file type decides how a document is shown: live Markdown, plain lines or a Mermaid diagram.
-- **Plain text mode** — Text files such as .txt, logs and source code open as plain lines: every line is shown as written and nothing is rendered; Enter inserts a line break, Tab an indent, and the Markdown formatting commands are off. View → Word wrap wraps long lines at the window edge or lets them run on and scroll sideways, and View → Render as Markdown shows the file as live Markdown without changing how it is saved.
+- **Plain text mode** — Every file whose content is text opens, whatever its name: .txt, logs, source code, Dockerfile, .gitignore, a file without an extension. Binary files are refused with a message instead of being shown as mojibake. They open as plain lines: every line is shown as written and nothing is rendered; Enter inserts a line break, Tab an indent, and the Markdown formatting commands are off. View → Word wrap wraps long lines at the window edge or lets them run on and scroll sideways, and View → Render as Markdown shows the file as live Markdown without changing how it is saved.
 - **Mermaid diagram files** — A .mmd file shows its Mermaid source with the live diagram, drawn as a vector, below it.
 - **Encodings and line endings** — Automatic encoding detection including legacy code pages, BOM and original line endings preserved on save, status bar menus to reopen or save with another encoding, and a line-ending menu (LF, CRLF, CR).
 - **Autosave and safe saving** — Autosave after a pause, atomic writes, retries on sharing violations, read-only handling, external change detection with diff-based reload, and OneDrive placeholders that are never hydrated by indexing.
@@ -223,7 +223,7 @@ winget install isolmaz.SSWriter
 1. Run `SSWriter-<version>-x64.msi`. It needs no administrator rights: SS Writer is installed to `%LOCALAPPDATA%\Programs\SS Writer`, everything it registers goes under `HKCU`, and a Start menu entry is added.
 2. For a silent install: `msiexec /i SSWriter-<version>-x64.msi /qn`.
 
-The installer adds SS Writer to **Open with** for `.md`, `.markdown`, `.mdx`, `.mmd`, `.txt`, `.textbundle`, `.textpack`, `.docx`, `.doc`, `.odt` and `.rtf`, adds the folder context menu entry **Open with SS Writer**, and registers the Explorer preview pane for `.md`, `.markdown` and `.mmd`. It does not change any default app; choose SS Writer in **Settings > Apps > Default apps**, or use **Settings > General > Default apps…** inside SS Writer, which opens that page.
+The installer adds SS Writer to **Open with** for `.md`, `.markdown`, `.mdx`, `.mmd`, `.txt`, `.textbundle`, `.textpack`, `.docx`, `.doc`, `.odt`, `.rtf`, `.json`, `.csv`, `.log`, `.xml`, `.html`, `.css`, `.js`, `.yml` and `.py`, offers it under **Open with → Choose another app** for every other file, adds the folder context menu entry **Open with SS Writer**, and registers the Explorer preview pane for `.md`, `.markdown` and `.mmd`. It does not change any default app; choose SS Writer in **Settings > Apps > Default apps**, or use **Settings > General > Default apps…** inside SS Writer, which opens that page.
 
 A newer MSI replaces an older one in place. Uninstall from **Settings > Apps > Installed apps**; your settings and data in `%APPDATA%\SS Writer` and `%LOCALAPPDATA%\SS Writer` are kept.
 
@@ -283,6 +283,7 @@ Cut, copy, paste and select all (`Ctrl+X`, `Ctrl+C`, `Ctrl+V`, `Ctrl+A`) and the
 |---|---|---|---|
 | `.md` `.markdown` `.mdx` | yes | yes | Markdown, shown with live rendering |
 | `.txt` and other text files (`.log`, `.csv`, `.json`, `.yaml`, `.ini`, `.toml`, source code…) | yes | yes | Plain text mode: shown as written, nothing rendered; View → Word wrap and View → Render as Markdown |
+| any other file whose content is text (`Dockerfile`, `.gitignore`, `.kt`, no extension at all…) | yes | yes | Plain text mode. A binary file is refused with a message instead |
 | `.mmd` | yes | yes | Mermaid source with a live diagram |
 | `.textbundle` `.textpack` | yes | yes | TextBundle |
 | `.docx` | yes | yes | Imported as Markdown; **Save back to Word** writes it back to Word format |

@@ -279,6 +279,32 @@ fn lossless_legacy(guess: &'static Encoding, bytes: &[u8]) -> TextEncoding {
     TextEncoding::Legacy(if exact { guess } else { WINDOWS_1252 })
 }
 
+/// Number of leading bytes [`looks_binary`] inspects: what a caller reads when it classifies a
+/// file without reading it whole.
+pub const BINARY_SNIFF_LEN: usize = 8192;
+
+/// Whether `bytes` look like a binary file rather than text. A UTF-8, UTF-16 or UTF-32 BOM
+/// means text (UTF-16/32 text is full of NUL bytes); otherwise a NUL byte among the first 8192
+/// bytes means binary, unless [`detect`] takes the bytes for UTF-16 or UTF-32 text without a
+/// BOM, whatever the file is called (the text itself has no NUL character: a zero-filled
+/// start, as a disk image has, is no text); everything else, an empty file included, is text.
+#[must_use]
+pub fn looks_binary(bytes: &[u8]) -> bool {
+    let window = &bytes[..bytes.len().min(BINARY_SNIFF_LEN)];
+    window.contains(&0) && bom_encoding(bytes).is_none() && !is_wide_text(window)
+}
+
+/// Whether `window` (the start of a file, without a BOM) is UTF-16 or UTF-32 text: [`detect`]
+/// sniffs a wide encoding and the text it decodes to holds no NUL character.
+fn is_wide_text(window: &[u8]) -> bool {
+    let wide = |bytes: &[u8]| {
+        sniff_wide(bytes).is_some_and(|encoding| !decode_as(bytes, encoding).text.contains('\0'))
+    };
+    // A file longer than the window is cut at its end, maybe inside a surrogate pair: the text
+    // before that counts.
+    wide(window) || (window.len() == BINARY_SNIFF_LEN && wide(&window[..BINARY_SNIFF_LEN - 2]))
+}
+
 /// Detects the encoding and decodes `bytes` (BOM stripped, line endings normalized).
 #[must_use]
 pub fn decode(bytes: &[u8], tld: Option<&str>) -> Decoded {

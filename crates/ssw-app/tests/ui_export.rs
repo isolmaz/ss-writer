@@ -13,6 +13,7 @@ use ssw_core::command::CommandId;
 use ssw_core::settings::{ExportFormat, ExportSettings};
 use ssw_io::fs::RealFs;
 use ssw_io::save::ThreadSleeper;
+use ssw_render::scene::{Glyph, Scene, SceneItem};
 use ssw_ui::shell::export_dialog::ExportOptions;
 
 const DOCUMENT: &str =
@@ -29,6 +30,7 @@ fn job(
         format,
         options: ExportOptions::from(&ExportSettings::default()),
         markdown: markdown.to_owned(),
+        plain: false,
         source_dir: source_dir.map(Path::to_path_buf),
         title: "Doc".to_owned(),
         target,
@@ -211,13 +213,48 @@ fn an_unwritable_target_names_the_file_and_leaves_nothing_behind() {
 #[test]
 fn printing_gets_one_scene_per_page() {
     let options = ExportOptions::from(&ExportSettings::default());
-    let pages = layout_pages(&"A line of text.\n\n".repeat(200), None, &options, "Doc").unwrap();
+    let text = "A line of text.\n\n".repeat(200);
+    let pages = layout_pages(&text, false, None, &options, "Doc").unwrap();
     assert!(pages.len() > 1);
     assert!(
         pages
             .iter()
             .all(|page| page.size.width > 0.0 && page.size.height > 0.0)
     );
+}
+
+/// Every glyph the pages draw, in drawing order (position included).
+fn glyphs_of(pages: &[Scene]) -> Vec<Glyph> {
+    fn collect(items: &[SceneItem], found: &mut Vec<Glyph>) {
+        for item in items {
+            if let Some(group) = item.as_group() {
+                collect(&group.items, found);
+            }
+            if let Some(run) = item.as_glyphs() {
+                found.extend_from_slice(&run.glyphs);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for page in pages {
+        collect(&page.items, &mut found);
+    }
+    found
+}
+
+#[test]
+fn printing_a_plain_text_document_lays_its_text_out_as_it_is() {
+    let options = ExportOptions::from(&ExportSettings::default());
+    let text = "# not a heading\n**not bold**\n";
+    let layout = |text: &str, plain: bool| {
+        glyphs_of(&layout_pages(text, plain, None, &options, "Doc").unwrap())
+    };
+    let printed = layout(text, true);
+    assert!(!printed.is_empty());
+    // The same pages as a code block holding the text, which is what the PDF export lays out.
+    assert_eq!(printed, layout(&format!("```\n{text}```\n"), false));
+    // Read as Markdown, `#` and `**` would be a heading and bold text, not drawn as typed.
+    assert_ne!(printed, layout(text, false));
 }
 
 fn dark_job(format: ExportFormat, markdown: &str, target: PathBuf) -> ExportJob {

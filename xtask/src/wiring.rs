@@ -145,10 +145,10 @@ pub fn public_names(text: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for line in text.lines() {
         // Top level only: an indented `pub fn` belongs to an `impl` block or an inner module.
-        if line.starts_with("pub ") {
-            if let Some(name) = declared_name(line) {
-                names.insert(name);
-            }
+        if line.starts_with("pub ")
+            && let Some(name) = declared_name(line)
+        {
+            names.insert(name);
         }
     }
     names

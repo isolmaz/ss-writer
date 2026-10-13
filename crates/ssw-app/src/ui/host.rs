@@ -778,24 +778,31 @@ impl UiApp {
     /// the windows go and the loop ends.
     fn finish_quit(&self) {
         let session = self.controller.session();
-        // The texts of untitled buffers belong to their documents, which the closing windows
-        // drop: they are stored here, the structure follows when the loop ends.
+        // Closing a tab drops its document and deletes the stored text of an untitled buffer:
+        // the texts are taken here and written again when the windows are gone, so the session
+        // the loop owner saves has buffers to restore.
+        let texts = self
+            .controller
+            .core()
+            .borrow()
+            .session
+            .untitled_texts(&session);
+        *self.final_session.borrow_mut() = Some(session);
+        for cell in self.controller.windows() {
+            self.controller.close_window(cell.id);
+        }
         if let Err(error) = self
             .controller
             .core()
             .borrow()
             .session
-            .back_up_untitled(&session)
+            .store_untitled(&texts)
         {
             self.controller.core().borrow().logger.log(
                 Level::Error,
                 "shutdown",
                 &format!("unsaved buffers not stored: {error}"),
             );
-        }
-        *self.final_session.borrow_mut() = Some(session);
-        for cell in self.controller.windows() {
-            self.controller.close_window(cell.id);
         }
         self.close_settings();
         self.exit.set(Some(0));

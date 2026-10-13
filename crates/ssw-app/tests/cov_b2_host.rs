@@ -272,29 +272,9 @@ fn text_of_an_untitled_buffer_survives_the_quit_that_closes_its_window() {
         }
 
         let id = entry.untitled_id().expect("an untitled id");
-        // The manager stores what the session names while the documents are open.
-        let described = app.controller().session();
-        app.controller()
-            .core()
-            .borrow()
-            .session
-            .back_up_untitled(&described)
-            .expect("the text is written");
-        assert_eq!(
-            app.controller()
-                .docs()
-                .env()
-                .store
-                .borrow()
-                .untitled_get(&id)
-                .unwrap()
-                .as_deref(),
-            Some("work in progress"),
-            "the manager stored the text"
-        );
 
-        // Quitting closes the window, which drops the document: the text has to be stored
-        // before that, not when the session is written at the end.
+        // Quitting closes the window, which drops the document and deletes the buffer's
+        // stored text: the text has to be taken before that and written again afterwards.
         app.controller().push(Request::Quit);
         app.pump();
         assert!(app.controller().windows().is_empty(), "the window closed");

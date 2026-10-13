@@ -230,34 +230,42 @@ impl SessionManager {
     /// # Errors
     /// [`StoreError`] when the database rejects the write; nothing is changed then.
     pub fn save(&self, session: &Session) -> Result<(), StoreError> {
-        self.back_up_untitled(session)?;
+        self.store_untitled(&self.untitled_texts(session))?;
         self.store.borrow_mut().save_session(session)
     }
 
-    /// Stores the text of every untitled buffer `session` names; a tab whose document is no
-    /// longer open keeps the text of the last backup.
+    /// The text of every untitled buffer `session` names whose document is still open, as
+    /// (id, text) pairs.
     ///
-    /// Quitting closes the windows before the session is written, and a closed window drops
-    /// its documents: the texts have to be taken while they are still there, or the next start
-    /// would find a tab without a buffer and drop it.
+    /// Quitting closes the windows before the session is written, and closing a tab both drops
+    /// its document and deletes the buffer's stored text: the texts have to be taken while the
+    /// tabs are there and written again afterwards ([`SessionManager::store_untitled`]), or
+    /// the next start finds a tab without a buffer and drops it.
+    #[must_use]
+    pub fn untitled_texts(&self, session: &Session) -> Vec<(String, String)> {
+        let open = self.docs.all();
+        session
+            .windows
+            .iter()
+            .flat_map(|window| &window.tabs)
+            .filter_map(|tab| match &tab.document {
+                TabDocument::Untitled(id) => open
+                    .iter()
+                    .find(|entry| entry.untitled_id().as_deref() == Some(id.as_str()))
+                    .map(|entry| (id.clone(), entry.document().borrow().text())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Writes the texts [`SessionManager::untitled_texts`] took.
     ///
     /// # Errors
     /// [`StoreError`] when the database rejects a write.
-    pub fn back_up_untitled(&self, session: &Session) -> Result<(), StoreError> {
+    pub fn store_untitled(&self, texts: &[(String, String)]) -> Result<(), StoreError> {
         let now = self.docs.env().clock.unix_seconds();
-        for window in &session.windows {
-            for tab in &window.tabs {
-                if let TabDocument::Untitled(id) = &tab.document
-                    && let Some(entry) = self
-                        .docs
-                        .all()
-                        .into_iter()
-                        .find(|entry| entry.untitled_id().as_deref() == Some(id.as_str()))
-                {
-                    let text = entry.document().borrow().text();
-                    self.store.borrow().untitled_put(id, &text, now)?;
-                }
-            }
+        for (id, text) in texts {
+            self.store.borrow().untitled_put(id, text, now)?;
         }
         Ok(())
     }

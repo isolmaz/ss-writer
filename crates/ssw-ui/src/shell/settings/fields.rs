@@ -68,7 +68,7 @@ impl FieldValue {
 
 /// Why a typed value was refused. The setting keeps its previous value.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Problem {
+pub(crate) enum Problem {
     /// Not a number.
     NotANumber,
     /// A fractional number where a whole number is needed.
@@ -94,8 +94,7 @@ pub enum Problem {
 
 impl Problem {
     /// The message shown under the control, in the language of `loc`.
-    #[must_use]
-    pub fn message(&self, loc: &Localizer) -> String {
+    pub(crate) fn message(&self, loc: &Localizer) -> String {
         match self {
             Problem::NotANumber => loc.text("settings-error-number"),
             Problem::NotAnInteger => loc.text("settings-error-integer"),

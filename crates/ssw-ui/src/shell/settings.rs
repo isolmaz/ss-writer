@@ -42,7 +42,7 @@ use fields::{FIELDS, FieldDef, FieldKind, FieldValue, display_number, is_enabled
 use form::{Change, Form, FormScroll, Input, PAD, Row, forward};
 use shortcuts_page::{Edit, Env, ShortcutsPage};
 
-pub use fields::{FieldId, Problem};
+pub use fields::FieldId;
 pub use shortcuts_page::{DisplayKeyNames, KeyNames};
 
 /// Width of the navigation column.

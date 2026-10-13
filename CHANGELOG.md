@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-13
+
 ### Added
 
 - The update banner downloads the new version itself: Download fetches the release's installer while a bar in the banner shows how far it got, checks it against the release's `SHA256SUMS.txt`, and then offers "Restart and install", which closes SS Writer, installs the package and opens the new version. A package that does not match its checksum is deleted and the reason is shown. A portable copy still gets the release page.
@@ -132,7 +134,8 @@ First release.
 
 - Scrolling very large documents (60 000 lines) at high speed does not yet keep up with a 144 Hz display: in the stress test a frame takes about 16 ms instead of 7 ms. See [docs/performance.md](docs/performance.md#known-issues).
 
-[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/isolmaz/ss-writer/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/isolmaz/ss-writer/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/isolmaz/ss-writer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/isolmaz/ss-writer/releases/tag/v0.1.0

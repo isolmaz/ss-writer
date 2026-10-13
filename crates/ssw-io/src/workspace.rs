@@ -37,11 +37,13 @@ pub enum NodeKind {
 pub enum FileClass {
     /// `.md`, `.markdown`, `.mdx`: Markdown mode.
     Markdown,
-    /// Raster and vector images: opened in the image viewer tab.
+    /// Raster and vector images: the app has no viewer for them, so a click in the tree hands
+    /// them to their default app.
     Image,
     /// Other text formats: plain mode.
     Text,
-    /// Everything else: dimmed, opened by the default app.
+    /// Everything else: not text by its extension (word-processor files, which the app imports,
+    /// and extensionless files are in this class too).
     Other,
 }
 
@@ -68,6 +70,27 @@ pub fn classify_extension(ext: &str) -> FileClass {
     } else {
         FileClass::Other
     }
+}
+
+/// Extensions of the non-text types known to open in another app, sorted: e-books (`epub` is an
+/// export format of the app itself), PDF and office files, archives and disk images, executables,
+/// libraries and compiled objects, audio and video, fonts, databases and shortcuts. Pictures are
+/// not here: [`FileClass::Image`] names them.
+const OPENS_ELSEWHERE: [&str; 52] = [
+    "7z", "avi", "bin", "bz2", "class", "db", "dll", "dylib", "epub", "exe", "flac", "gz", "iso",
+    "jar", "lib", "lnk", "m4a", "mkv", "mov", "mp3", "mp4", "msi", "o", "obj", "odp", "ods", "ogg",
+    "otf", "pdb", "pdf", "ppt", "pptx", "pyc", "rar", "rlib", "rmeta", "so", "sqlite", "sys",
+    "tar", "ttf", "wasm", "wav", "webm", "wmv", "woff", "woff2", "xls", "xlsx", "xz", "zip", "zst",
+];
+
+/// Whether a file of this extension (without the dot, any case) is known to open in another app
+/// instead of the editor, so the tree dims it. Every other extension, an unknown one included,
+/// and a file without extension are not listed: the editor reads them as text.
+#[must_use]
+pub fn opens_elsewhere(ext: &str) -> bool {
+    OPENS_ELSEWHERE
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(ext))
 }
 
 /// One entry of the workspace tree.
@@ -556,5 +579,13 @@ mod tests {
         let unknown = GUID::from_u128(0x6a1e_70c0_3b1a_4a35_8a7f_0d3e_5d83_a001);
         let error = known_folder(&unknown, "Nowhere").unwrap_err();
         assert_eq!(error.path(), Path::new("Nowhere"));
+    }
+
+    #[test]
+    fn the_list_of_types_that_open_elsewhere_is_sorted_and_has_no_duplicates() {
+        assert!(
+            OPENS_ELSEWHERE.windows(2).all(|pair| pair[0] < pair[1]),
+            "{OPENS_ELSEWHERE:?}"
+        );
     }
 }

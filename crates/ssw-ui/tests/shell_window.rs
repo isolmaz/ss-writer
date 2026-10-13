@@ -65,9 +65,9 @@ impl TreeSource for Workspace {
         match folder {
             0 => vec![
                 SidebarEntry::folder(1, "docs"),
-                SidebarEntry::file(2, "todo.md", EntryKind::Markdown),
+                SidebarEntry::file(2, "todo.md", EntryKind::Prose),
             ],
-            1 => vec![SidebarEntry::file(3, "guide.md", EntryKind::Markdown)],
+            1 => vec![SidebarEntry::file(3, "guide.md", EntryKind::Prose)],
             _ => Vec::new(),
         }
     }

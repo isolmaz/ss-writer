@@ -12,10 +12,14 @@ use std::sync::Arc;
 
 use ssw_io::fs::{FileSystem, FsError};
 use ssw_io::watch::{FsEvent, FsEventKind};
-use ssw_io::workspace::{FileClass, Node, SortKey as IoSortKey, ViewOptions, Workspace};
+use ssw_io::workspace::{
+    FileClass, Node, SortKey as IoSortKey, ViewOptions, Workspace, opens_elsewhere,
+};
 use ssw_ui::shell::sidebar::{
     EntryKind, NodeKey, SidebarEntry, SidebarOptions, SortKey as UiSortKey, TreeSource,
 };
+
+use crate::documents::{DocMode, mode_for_path};
 
 /// Key of the workspace root.
 const ROOT_KEY: NodeKey = 0;
@@ -121,17 +125,39 @@ fn view_options(options: &SidebarOptions) -> ViewOptions {
     }
 }
 
+/// Text types written as prose; every other [`FileClass::Text`] type is source code, markup, data
+/// or configuration.
+const PROSE_TEXT: [&str; 4] = ["txt", "text", "log", "rst"];
+
+/// The icon class of a file, and with it whether the tree dims it: the one place that decides.
+/// `ssw_io` names the type by its extension ([`FileClass`], [`opens_elsewhere`]) and
+/// [`mode_for_path`] says what the editor opens as Markdown, which includes the word-processor
+/// files and TextBundle packs the app imports. Prose is Markdown, those imports, [`PROSE_TEXT`]
+/// and a file without an extension (read as plain text); any other file the editor opens is
+/// code. Pictures and the types known to open in another app are the only ones dimmed.
+fn entry_kind(node: &Node) -> EntryKind {
+    let ext = node.ext.as_str();
+    match node.class() {
+        FileClass::Image => EntryKind::Image,
+        FileClass::Markdown => EntryKind::Prose,
+        FileClass::Text if PROSE_TEXT.contains(&ext) => EntryKind::Prose,
+        FileClass::Text => EntryKind::Code,
+        FileClass::Other if opens_elsewhere(ext) => EntryKind::Other,
+        FileClass::Other if ext.is_empty() || opens_as_markdown(&node.name) => EntryKind::Prose,
+        FileClass::Other => EntryKind::Code,
+    }
+}
+
+/// Whether the editor opens the file `name` in Markdown mode.
+fn opens_as_markdown(name: &str) -> bool {
+    mode_for_path(Path::new(name)) == DocMode::Markdown
+}
+
 fn entry_for(key: NodeKey, node: &Node) -> SidebarEntry {
     let mut entry = if node.is_dir() {
         SidebarEntry::folder(key, node.name.clone())
     } else {
-        let kind = match node.class() {
-            FileClass::Markdown => EntryKind::Markdown,
-            FileClass::Image => EntryKind::Image,
-            FileClass::Text => EntryKind::Text,
-            FileClass::Other => EntryKind::Other,
-        };
-        SidebarEntry::file(key, node.name.clone(), kind)
+        SidebarEntry::file(key, node.name.clone(), entry_kind(node))
     };
     entry.placeholder = node.placeholder;
     entry.hidden = node.is_hidden();
@@ -171,6 +197,7 @@ impl TreeSource for WorkspaceTree {
 #[cfg(test)]
 mod tests {
     use ssw_io::fs::RealFs;
+    use ssw_io::workspace::classify_extension;
 
     use super::*;
 
@@ -189,7 +216,7 @@ mod tests {
         let names: Vec<_> = top.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, ["notes", "a.md", "b.bin", "pic.png"]);
         assert_eq!(top[0].kind, EntryKind::Folder);
-        assert_eq!(top[1].kind, EntryKind::Markdown);
+        assert_eq!(top[1].kind, EntryKind::Prose);
         assert_eq!(top[2].kind, EntryKind::Other);
         assert_eq!(top[3].kind, EntryKind::Image);
         assert_eq!(paths.path(top[1].key).unwrap(), tmp.path().join("a.md"));
@@ -217,6 +244,106 @@ mod tests {
         );
         assert!(tree.children(9999, &options).is_empty());
         assert_eq!(paths.path(9999), None);
+    }
+
+    #[test]
+    fn files_the_editor_opens_are_full_strength_and_only_known_foreign_types_are_dimmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in [
+            "a.md",
+            "b.txt",
+            "Makefile",
+            "c.py",
+            "d.json",
+            "e.html",
+            "E.JSON",
+            "f.docx",
+            "g.odt",
+            "h.rtf",
+            "i.doc",
+            "j.textpack",
+            "k.png",
+            "l.zip",
+            "m.exe",
+            "n.xyz",
+            "p.kt",
+            "q.vue",
+            "r.lua",
+            "s.swift",
+            "Procfile",
+            ".gitignore",
+            "t.pdf",
+            "u.MP4",
+            "v.epub",
+            "w.XLSX",
+            "x.pptx",
+            "y.lnk",
+            "z.wasm",
+            "a.flac",
+            "b.zst",
+            "c.dylib",
+            ".zip",
+        ] {
+            std::fs::write(tmp.path().join(name), "x").unwrap();
+        }
+        std::fs::create_dir(tmp.path().join("o.textbundle")).unwrap();
+        let mut tree = WorkspaceTree::open(Arc::new(RealFs), tmp.path()).unwrap();
+        let entries = tree.children(tree.root_key(), &SidebarOptions::default());
+        let entry_of = |name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .expect("the file is listed")
+        };
+        for (name, kind, dimmed) in [
+            ("a.md", EntryKind::Prose, false),
+            ("b.txt", EntryKind::Prose, false),
+            ("Makefile", EntryKind::Prose, false),
+            ("c.py", EntryKind::Code, false),
+            ("d.json", EntryKind::Code, false),
+            ("e.html", EntryKind::Code, false),
+            ("E.JSON", EntryKind::Code, false),
+            ("f.docx", EntryKind::Prose, false),
+            ("g.odt", EntryKind::Prose, false),
+            ("h.rtf", EntryKind::Prose, false),
+            ("i.doc", EntryKind::Prose, false),
+            ("j.textpack", EntryKind::Prose, false),
+            ("k.png", EntryKind::Image, true),
+            ("l.zip", EntryKind::Other, true),
+            ("m.exe", EntryKind::Other, true),
+            ("n.xyz", EntryKind::Code, false),
+            ("p.kt", EntryKind::Code, false),
+            ("q.vue", EntryKind::Code, false),
+            ("r.lua", EntryKind::Code, false),
+            ("s.swift", EntryKind::Code, false),
+            ("Procfile", EntryKind::Prose, false),
+            (".gitignore", EntryKind::Prose, false),
+            ("t.pdf", EntryKind::Other, true),
+            ("u.MP4", EntryKind::Other, true),
+            ("v.epub", EntryKind::Other, true),
+            ("w.XLSX", EntryKind::Other, true),
+            ("x.pptx", EntryKind::Other, true),
+            ("y.lnk", EntryKind::Other, true),
+            ("z.wasm", EntryKind::Other, true),
+            ("a.flac", EntryKind::Other, true),
+            ("b.zst", EntryKind::Other, true),
+            ("c.dylib", EntryKind::Other, true),
+            // A dot only is no extension: the name of the type alone is a plain file.
+            (".zip", EntryKind::Prose, false),
+            ("o.textbundle", EntryKind::Folder, false),
+        ] {
+            let entry = entry_of(name);
+            assert_eq!(entry.kind, kind, "{name}");
+            assert_eq!(entry.is_dimmed(), dimmed, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_prose_types_are_text_types_of_ssw_io_and_none_opens_elsewhere() {
+        for ext in PROSE_TEXT {
+            assert_eq!(classify_extension(ext), FileClass::Text, "{ext}");
+            assert!(!opens_elsewhere(ext), "{ext}");
+        }
     }
 
     #[test]

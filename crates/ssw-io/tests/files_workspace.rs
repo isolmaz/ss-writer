@@ -11,7 +11,7 @@ use ssw_io::watch::{FsEvent, FsEventKind};
 use ssw_io::workspace::{
     DEFAULT_FOLDER_NAME, FileClass, Node, NodeKind, SortKey, UNTITLED_BASE_NAME, ViewOptions,
     WELCOME_FILE_NAME, Workspace, classify_extension, compare_logical, ensure_default_folder,
-    known_documents_dir, untitled_name,
+    known_documents_dir, opens_elsewhere, untitled_name,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -95,12 +95,76 @@ fn extensions_are_classified_case_insensitively() {
 }
 
 #[test]
+fn every_text_extension_is_text_and_none_of_them_opens_elsewhere() {
+    let text = [
+        "txt", "text", "log", "csv", "tsv", "json", "jsonc", "yaml", "yml", "ini", "toml", "xml",
+        "html", "htm", "css", "js", "ts", "tsx", "jsx", "py", "rs", "go", "java", "c", "h", "cpp",
+        "cs", "sh", "bat", "ps1", "sql", "tex", "rst", "mmd", "cfg", "conf",
+    ];
+    for ext in text {
+        assert_eq!(classify_extension(ext), FileClass::Text, "{ext}");
+        assert!(!opens_elsewhere(ext), "{ext}");
+    }
+}
+
+#[test]
+fn only_the_listed_extensions_open_elsewhere_in_any_case() {
+    let table = [
+        ("pdf", true),
+        ("PDF", true),
+        ("Zip", true),
+        ("exe", true),
+        ("EPUB", true),
+        // Pictures are classified apart (`FileClass::Image`), not listed.
+        ("png", false),
+        ("SVG", false),
+        ("md", false),
+        ("MD", false),
+        ("txt", false),
+        ("JSON", false),
+        ("Py", false),
+        // The app imports these itself: no list here claims them.
+        ("docx", false),
+        ("odt", false),
+        ("rtf", false),
+        ("doc", false),
+        ("textpack", false),
+        // What no list names is read as text by the editor: unknown types and a file without an
+        // extension.
+        ("kt", false),
+        ("xyz", false),
+        ("", false),
+    ];
+    for (ext, expected) in table {
+        assert_eq!(opens_elsewhere(ext), expected, "extension {ext:?}");
+    }
+}
+
+#[test]
+fn every_extension_known_to_open_elsewhere_is_other() {
+    let foreign = [
+        "7z", "avi", "bin", "bz2", "class", "db", "dll", "dylib", "epub", "exe", "flac", "gz",
+        "iso", "jar", "lib", "lnk", "m4a", "mkv", "mov", "mp3", "mp4", "msi", "o", "obj", "odp",
+        "ods", "ogg", "otf", "pdb", "pdf", "ppt", "pptx", "pyc", "rar", "rlib", "rmeta", "so",
+        "sqlite", "sys", "tar", "ttf", "wasm", "wav", "webm", "wmv", "woff", "woff2", "xls",
+        "xlsx", "xz", "zip", "zst",
+    ];
+    assert_eq!(foreign.len(), 52);
+    for ext in foreign {
+        assert_eq!(classify_extension(ext), FileClass::Other, "{ext}");
+        assert!(opens_elsewhere(ext), "{ext}");
+        assert!(opens_elsewhere(&ext.to_uppercase()), "{ext} in capitals");
+    }
+}
+
+#[test]
 fn nodes_carry_what_the_disk_reports() {
     let dir = tempfile::tempdir().unwrap();
     touch(&dir.path().join("Doc.MD"), "# hello");
     touch(&dir.path().join("noext"), "");
     touch(&dir.path().join(".gitignore"), "target");
     touch(&dir.path().join("archive.tar.gz"), "xyz");
+    touch(&dir.path().join("Main.kt"), "fun main() {}");
     std::fs::create_dir(dir.path().join("sub.d")).unwrap();
     let ws = Workspace::open(real(), dir.path()).unwrap();
 
@@ -110,7 +174,14 @@ fn nodes_carry_what_the_disk_reports() {
     assert!(tree.is_dir());
     assert_eq!(
         child_names(tree),
-        [".gitignore", "Doc.MD", "archive.tar.gz", "noext", "sub.d"]
+        [
+            ".gitignore",
+            "Doc.MD",
+            "Main.kt",
+            "archive.tar.gz",
+            "noext",
+            "sub.d"
+        ]
     );
 
     let doc = ws.node(&dir.path().join("Doc.MD")).unwrap();
@@ -118,20 +189,27 @@ fn nodes_carry_what_the_disk_reports() {
     assert_eq!(doc.ext, "md");
     assert_eq!(doc.size, 7);
     assert_eq!(doc.class(), FileClass::Markdown);
+    assert!(!opens_elsewhere(&doc.ext));
     assert!(doc.children.is_none());
     assert!(!doc.placeholder && !doc.is_hidden());
     assert!(doc.created.0 > 0 && doc.modified.0 > 0);
 
-    assert_eq!(ws.node(&dir.path().join("noext")).unwrap().ext, "");
-    assert_eq!(
-        ws.node(&dir.path().join("noext")).unwrap().class(),
-        FileClass::Other
-    );
-    assert_eq!(ws.node(&dir.path().join(".gitignore")).unwrap().ext, "");
-    assert_eq!(
-        ws.node(&dir.path().join("archive.tar.gz")).unwrap().ext,
-        "gz"
-    );
+    // An extensionless file and a dotfile are read as text: nothing opens them elsewhere.
+    let bare = ws.node(&dir.path().join("noext")).unwrap();
+    assert_eq!(bare.ext, "");
+    assert_eq!(bare.class(), FileClass::Other);
+    assert!(!opens_elsewhere(&bare.ext));
+    let dotfile = ws.node(&dir.path().join(".gitignore")).unwrap();
+    assert_eq!(dotfile.ext, "");
+    assert!(!opens_elsewhere(&dotfile.ext));
+    let archive = ws.node(&dir.path().join("archive.tar.gz")).unwrap();
+    assert_eq!(archive.ext, "gz");
+    assert!(opens_elsewhere(&archive.ext));
+    // A source file the lists do not know is read as text, so it is not listed either.
+    let main = ws.node(&dir.path().join("Main.kt")).unwrap();
+    assert_eq!(main.ext, "kt");
+    assert_eq!(main.class(), FileClass::Other);
+    assert!(!opens_elsewhere(&main.ext));
     let sub = ws.node(&dir.path().join("sub.d")).unwrap();
     assert_eq!(sub.kind, NodeKind::Dir);
     assert_eq!(sub.ext, "");

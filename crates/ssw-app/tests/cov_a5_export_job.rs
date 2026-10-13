@@ -396,7 +396,7 @@ fn a_plain_text_is_copied_as_it_is_by_markdown_with_attachments_and_its_links_ar
         target.clone(),
     );
     export.plain = true;
-    assert_eq!(run(&export).unwrap(), [target.clone()]);
+    assert_eq!(run(&export).unwrap(), std::slice::from_ref(&target));
     assert_eq!(std::fs::read(&target).unwrap(), text.as_bytes());
     assert!(!out.join("attachments").exists(), "no file is copied");
 }
@@ -420,13 +420,13 @@ fn a_plain_text_goes_into_a_textbundle_with_no_assets() {
     };
 
     let pack = tmp.path().join("doc.textpack");
-    assert_eq!(bundle(&pack), [pack.clone()]);
+    assert_eq!(bundle(&pack), std::slice::from_ref(&pack));
     let read = ssw_convert::textbundle::read_pack(&std::fs::read(&pack).unwrap()).unwrap();
     assert_eq!(read.text, text);
     assert!(read.assets.is_empty());
 
     let folder = tmp.path().join("doc.textbundle");
-    assert_eq!(bundle(&folder), [folder.clone()]);
+    assert_eq!(bundle(&folder), std::slice::from_ref(&folder));
     let read = ssw_convert::textbundle::read_dir(&folder).unwrap();
     assert_eq!(read.text, text);
     assert!(read.assets.is_empty());

@@ -2186,8 +2186,14 @@ mod tests {
         let strings = strings();
         let more = f.view.more.bounds();
         let new = f.view.new.bounds();
-        assert_eq!(f.view.tooltip_at(more.center()), Some((more, strings.more.as_str())));
-        assert_eq!(f.view.tooltip_at(new.center()), Some((new, strings.new.as_str())));
+        assert_eq!(
+            f.view.tooltip_at(more.center()),
+            Some((more, strings.more.as_str()))
+        );
+        assert_eq!(
+            f.view.tooltip_at(new.center()),
+            Some((new, strings.new.as_str()))
+        );
         // The root name and the rows carry no tooltip.
         assert_eq!(f.view.tooltip_at(Point::new(20.0, 100.0)), None);
         assert_eq!(f.view.tooltip_at(f.row_center(0)), None);

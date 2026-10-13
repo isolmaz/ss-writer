@@ -132,7 +132,10 @@ fn a_download_that_ends_after_the_application_is_gone_finds_nobody_to_tell() {
             assert!(Instant::now() < deadline, "the check never finished");
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(controller.available_update().is_some(), "an update is known");
+        assert!(
+            controller.available_update().is_some(),
+            "an update is known"
+        );
 
         // The release carries no package, so the download fails without asking anybody; its
         // answer is delivered to a controller that is gone by then.

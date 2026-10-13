@@ -563,8 +563,7 @@ fn big_package() -> Vec<u8> {
         .collect()
 }
 
-const BIG_PACKAGE_SHA256: &str =
-    "ab721b7d12240623bb53bb5f8a54673b082fd9696292f0a348b5b741e3d95542";
+const BIG_PACKAGE_SHA256: &str = "ab721b7d12240623bb53bb5f8a54673b082fd9696292f0a348b5b741e3d95542";
 
 /// Serves the release, its checksum list and its package.
 fn update_network(tag: &str, sums: &str) -> Arc<ScriptedHttp> {

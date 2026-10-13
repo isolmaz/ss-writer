@@ -2330,8 +2330,14 @@ fn a_download_whose_target_cannot_be_written_fails_and_keeps_nothing() {
     let file = dir.path().join("a-file");
     std::fs::write(&file, b"x").unwrap();
     let blocked = file.join("inside.bin");
-    let error =
-        download(&empty, ASSET, &options(Accept::Any), &blocked, &mut |_, _| {}).unwrap_err();
+    let error = download(
+        &empty,
+        ASSET,
+        &options(Accept::Any),
+        &blocked,
+        &mut |_, _| {},
+    )
+    .unwrap_err();
     assert!(
         matches!(error, NetError::Os { call, .. } if call == "CreateFileW"),
         "{error:?}"

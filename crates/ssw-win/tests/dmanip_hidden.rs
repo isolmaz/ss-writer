@@ -667,12 +667,19 @@ fn a_wheel_notch_stops_a_running_manipulation_and_continues_from_where_it_was() 
     assert!(driver.on_wheel(&wheel(-1.0, false)).unwrap());
     assert!(!driver.manipulation().status().unwrap().is_moving());
     assert!(driver.is_stale());
-    // The scroller continues from where DirectManipulation stopped.
+    // The scroller continues from where DirectManipulation was when the notch stopped it. That
+    // offset is sampled inside `on_wheel`; the transform read here may already have advanced
+    // past it, so the target is bounded, not compared to a later sample.
+    let target = driver.scroller().target();
     let stopped = driver.manipulation().content_transform().unwrap().offset_y;
     assert!(stopped >= before, "{stopped} < {before}");
-    approx(driver.scroller().target(), stopped + notch(), 1e-3);
+    assert!(target >= before + notch(), "{target} < {before} + a notch");
+    assert!(
+        target <= stopped + notch() + 1e-3,
+        "{target} > {stopped} + a notch"
+    );
     run_frames(&mut driver, "wheel animation", |frame| !frame.more);
-    approx(driver.offset(), stopped + notch(), 1e-3);
+    approx(driver.offset(), target, 1e-3);
 }
 
 #[test]

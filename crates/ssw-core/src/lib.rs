@@ -4,6 +4,7 @@ pub mod command;
 pub mod document;
 pub mod edit;
 pub mod folding;
+pub mod format_text;
 pub mod fuzzy;
 pub mod i18n;
 pub mod keymap;

@@ -402,6 +402,24 @@ fn a_plain_text_is_copied_as_it_is_by_markdown_with_attachments_and_its_links_ar
 }
 
 #[test]
+fn a_plain_text_that_cannot_be_written_by_markdown_with_attachments_names_the_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("missing");
+    let target = out.join("notes.md");
+    let mut export = job(
+        ExportFormat::MarkdownWithAttachments,
+        PLAIN_TEXT,
+        None,
+        target.clone(),
+    );
+    export.plain = true;
+    let failure = run(&export).unwrap_err();
+    assert_eq!(written_path(failure), target);
+    assert!(!target.exists());
+    assert!(!out.exists(), "nothing is created");
+}
+
+#[test]
 fn a_plain_text_goes_into_a_textbundle_with_no_assets() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");

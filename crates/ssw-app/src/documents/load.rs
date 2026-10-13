@@ -861,4 +861,25 @@ mod tests {
         );
         assert_eq!(load_file(&fault, &bundle, None).unwrap().text, "# B\n");
     }
+
+    #[test]
+    fn an_unknown_type_whose_first_bytes_cannot_be_read_fails_the_load_with_that_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("blob.dat");
+        std::fs::write(&file, "plain words\n").unwrap();
+        // The prefix read of the sniff is the first read of the load, and it fails.
+        let fault = FaultFs::new();
+        fault.fail(FsOp::Read, FsFailure::AccessDenied, 1);
+        let error = load_file(&fault, &file, None).unwrap_err();
+        assert_eq!(
+            describe(&error),
+            format!("file system: {:?}", FsError::AccessDenied(file.clone()))
+        );
+        assert_eq!(fault.calls(FsOp::Read), 1, "the whole file was not read");
+        // The failure was scripted once: the sniff passes and the text loads.
+        assert_eq!(
+            load_file(&fault, &file, None).unwrap().text,
+            "plain words\n"
+        );
+    }
 }

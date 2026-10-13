@@ -238,8 +238,12 @@ fn text_of_an_untitled_buffer_survives_the_quit_that_closes_its_window() {
     let tmp = tempfile::tempdir().unwrap();
     let services = ScriptedServices::new();
 
+    // Autosave on: a dirty untitled buffer is not asked about when the window closes, which
+    // is how the user meets this (autosave never writes an untitled buffer: it has no path).
+    const AUTOSAVE: &str = r#"{"general":{"autosave":true}}"#;
+
     // A start without files opens one untitled buffer; it gets text nobody saves.
-    let code = start(&[], tmp.path(), |core, _| {
+    let code = start_with(AUTOSAVE, &[], tmp.path(), |core, _| {
         let _ole = OleGuard::initialize().unwrap();
         let app = UiApp::new(core, options(&services, None)).unwrap();
         app.pump();
@@ -270,14 +274,15 @@ fn text_of_an_untitled_buffer_survives_the_quit_that_closes_its_window() {
         // Quitting closes the window, which drops the document: the text has to be stored
         // before that, not when the session is written at the end.
         app.controller().push(Request::Quit);
-        assert_eq!(app.idle(), None, "the loop ends");
+        app.pump();
+        assert!(app.controller().windows().is_empty(), "the window closed");
         app.finish();
         0
     });
     assert_eq!(code, 0);
 
     // The next start finds the buffer again, with its text.
-    let code = start(&[], tmp.path(), |core, _| {
+    let code = start_with(AUTOSAVE, &[], tmp.path(), |core, _| {
         let _ole = OleGuard::initialize().unwrap();
         let app = UiApp::new(core, options(&services, None)).unwrap();
         app.pump();

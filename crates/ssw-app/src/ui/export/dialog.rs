@@ -146,23 +146,17 @@ impl ExportHost {
     }
 }
 
-/// Runs `dialog.event` with a fresh context; a focus request is granted.
+/// Runs `dialog.event` with a fresh context. Its controls are routed through `forward`, which
+/// grants their focus requests, so the dialog never asks for focus itself.
 fn route(dialog: &mut ExportDialog, event: &Event, env: &mut OverlayEnv<'_>) -> EventResult {
-    let id = dialog.id();
-    let result = {
-        let mut cx = EventCx::new(
-            id,
-            env.theme,
-            env.scale,
-            env.text,
-            env.focus,
-            env.capture,
-            env.requests,
-        );
-        dialog.event(&mut cx, event)
-    };
-    if result.request_focus {
-        env.focus.focus(id);
-    }
-    result
+    let mut cx = EventCx::new(
+        dialog.id(),
+        env.theme,
+        env.scale,
+        env.text,
+        env.focus,
+        env.capture,
+        env.requests,
+    );
+    dialog.event(&mut cx, event)
 }

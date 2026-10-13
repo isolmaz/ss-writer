@@ -88,6 +88,7 @@ impl Environment {
 pub struct AppPaths {
     local: PathBuf,
     roaming: PathBuf,
+    exe_dir: PathBuf,
     portable: bool,
 }
 
@@ -102,6 +103,7 @@ impl AppPaths {
             return Ok(Self {
                 local: data.clone(),
                 roaming: data,
+                exe_dir: env.exe_dir.clone(),
                 portable: true,
             });
         }
@@ -116,6 +118,7 @@ impl AppPaths {
         Ok(Self {
             local: local.join(APP_DIR_NAME),
             roaming: roaming.join(APP_DIR_NAME),
+            exe_dir: env.exe_dir.clone(),
             portable: false,
         })
     }
@@ -132,6 +135,12 @@ impl AppPaths {
     #[must_use]
     pub fn is_portable(&self) -> bool {
         self.portable
+    }
+
+    /// The folder the executable runs from (where an update installs the new one).
+    #[must_use]
+    pub fn exe_dir(&self) -> &Path {
+        &self.exe_dir
     }
 
     /// Folder holding machine-local state (`%LOCALAPPDATA%\SS Writer`).

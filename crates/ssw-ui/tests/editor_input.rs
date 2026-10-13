@@ -578,6 +578,21 @@ fn pointing_below_a_document_that_ends_in_a_fold_places_no_caret() {
 }
 
 #[test]
+fn hovering_below_a_document_that_ends_in_a_fold_shows_the_arrow() {
+    let mut h = folded();
+    let below = Point::new(200.0, 190.0);
+    h.pointer(PointerEventKind::Move, below, 0, Modifiers::NONE);
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::Arrow));
+    h.pointer(
+        PointerEventKind::Move,
+        h.first_line_point(1),
+        0,
+        Modifiers::NONE,
+    );
+    assert_eq!(h.requests.take_cursor(), Some(Cursor::IBeam));
+}
+
+#[test]
 fn a_view_that_was_never_laid_out_has_nothing_visible_and_estimates_folds_as_empty() {
     let mut h = Harness::new("# H\n\nbody\n");
     h.view = EditorView::new(h.doc.clone(), h.clock.clone());

@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --package xtask --"
+
+# The machine this is built on has 6 cores / 12 threads and must stay usable while a build
+# runs: four compiler jobs keep the editor and the browser responsive. Raise it only for a
+# one-off build on a bigger machine.
+[build]
+jobs = 4

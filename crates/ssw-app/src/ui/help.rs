@@ -227,6 +227,28 @@ fn run_check(
     )
 }
 
+/// What the download banner says and how far its bar is filled after `done` of `total` bytes.
+/// A `total` of zero means the server announced no size: the bar stays empty and the text only
+/// counts what arrived.
+fn download_progress(i18n: &Localizer, done: u64, total: u64) -> (String, f32) {
+    let megabytes = |bytes: u64| format!("{:.1}", bytes as f64 / (1 << 20) as f64);
+    if total == 0 {
+        let message = i18n.format(
+            "help-update-downloading-unknown",
+            &[("done", Arg::Str(&megabytes(done)))],
+        );
+        return (message, 0.0);
+    }
+    let message = i18n.format(
+        "help-update-downloading-message",
+        &[
+            ("done", Arg::Str(&megabytes(done))),
+            ("total", Arg::Str(&megabytes(total))),
+        ],
+    );
+    (message, done as f32 / total as f32)
+}
+
 impl Controller {
     /// Replaces the network the update check uses (tests answer from a script or a loopback
     /// server instead of GitHub).
@@ -422,28 +444,11 @@ impl Controller {
         let banners = view.banners_mut();
         match &*self.help.download.borrow() {
             Download::Running(progress) => {
-                let done = progress.done.load(Ordering::Relaxed);
-                let total = progress.total.load(Ordering::Relaxed);
-                let megabytes = |bytes: u64| format!("{:.1}", bytes as f64 / (1 << 20) as f64);
-                let message = if total > 0 {
-                    self.i18n.format(
-                        "help-update-downloading-message",
-                        &[
-                            ("done", Arg::Str(&megabytes(done))),
-                            ("total", Arg::Str(&megabytes(total))),
-                        ],
-                    )
-                } else {
-                    self.i18n.format(
-                        "help-update-downloading-unknown",
-                        &[("done", Arg::Str(&megabytes(done)))],
-                    )
-                };
-                let fraction = if total > 0 {
-                    done as f32 / total as f32
-                } else {
-                    0.0
-                };
+                let (message, fraction) = download_progress(
+                    &self.i18n,
+                    progress.done.load(Ordering::Relaxed),
+                    progress.total.load(Ordering::Relaxed),
+                );
                 if !banners.set_update_progress(&message, fraction) {
                     let title = self.i18n.format(
                         "help-update-downloading-title",
@@ -498,7 +503,7 @@ impl Controller {
     /// The Download button of the update banner: downloads the installer on a worker while the
     /// banner shows how far it got. A portable build has no package to install, so it gets the
     /// release page instead.
-    pub(super) fn start_update_download(&self) {
+    pub fn start_update_download(&self) {
         let Some(release) = self.help.offer.borrow().release.clone() else {
             return;
         };
@@ -525,7 +530,8 @@ impl Controller {
             key: UPDATE_DOWNLOAD_JOB_KEY,
             generation,
         };
-        let submitted = core.workers.submit(
+        // No window owns the job, so the submission cannot be refused.
+        let _ = core.workers.submit(
             spec,
             move |_| {
                 // The UI is woken per percent, not per chunk: a 35 MB package arrives in
@@ -563,9 +569,6 @@ impl Controller {
             },
         );
         drop(core);
-        if submitted.is_err() {
-            *self.help.download.borrow_mut() = Download::Idle;
-        }
         self.refresh_all();
     }
 
@@ -599,22 +602,20 @@ impl Controller {
 
     /// The Restart button of the update banner: starts the updater, which waits for this
     /// process to end, installs the package and opens the new build.
-    pub(super) fn install_update(&self) {
+    pub fn install_update(&self) {
         let Download::Ready(installer) = &*self.help.download.borrow() else {
             return;
         };
         let installer = installer.clone();
         let seam = self.help.updater.borrow();
         let fs = Arc::clone(&self.docs().env().fs);
-        let exe = match seam
-            .exe
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(std::env::current_exe)
-        {
-            Ok(exe) => exe,
-            Err(error) => return self.report_update_failure(&error.to_string()),
-        };
+        let exe = seam.exe.clone().unwrap_or_else(|| {
+            self.core()
+                .borrow()
+                .paths
+                .exe_dir()
+                .join(update_apply::APP_FILE_NAME)
+        });
         let temp = seam.temp.clone().unwrap_or_else(std::env::temp_dir);
         let started = update_apply::start(
             &installer,
@@ -671,6 +672,18 @@ mod tests {
         fn chord_text(&self, _chord: KeyChord) -> String {
             "a|b`c".to_owned()
         }
+    }
+
+    #[test]
+    fn the_download_banner_counts_megabytes_and_fills_its_bar() {
+        let i18n = localizer_for("en");
+        let (message, fraction) = download_progress(&i18n, 5 << 20, 20 << 20);
+        assert_eq!(message, "5.0 of 20.0 MB downloaded.");
+        assert!((fraction - 0.25).abs() < f32::EPSILON, "{fraction}");
+        // A server that announces no size: only what arrived is counted, the bar stays empty.
+        let (message, fraction) = download_progress(&i18n, 3 << 19, 0);
+        assert_eq!(message, "1.5 MB downloaded.");
+        assert_eq!(fraction, 0.0);
     }
 
     #[test]

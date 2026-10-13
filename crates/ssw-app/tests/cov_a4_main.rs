@@ -9,6 +9,34 @@ fn executable() -> Command {
 }
 
 #[test]
+fn the_updater_role_leaves_before_anything_is_created_and_installs_nothing_without_a_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A process that already ended: the updater's wait for its parent is over at once. Its own
+    // package is missing, so it stops before `msiexec` and shows nothing.
+    let mut parent = Command::new("cmd")
+        .args(["/c", "exit", "0"])
+        .spawn()
+        .unwrap();
+    let parent_id = parent.id();
+    parent.wait().unwrap();
+    let output = executable()
+        .arg("--apply-update")
+        .arg(tmp.path().join("SSWriter-99.0.0-x64.msi"))
+        .args(["--updater-parent", &parent_id.to_string()])
+        .arg("--updater-target")
+        .arg(tmp.path().join("SSWriter.exe"))
+        .env("LOCALAPPDATA", tmp.path().join("local"))
+        .env("APPDATA", tmp.path().join("roaming"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(11), "the install failed");
+    assert!(
+        !tmp.path().join("local").exists() && !tmp.path().join("roaming").exists(),
+        "the updater creates no profile"
+    );
+}
+
+#[test]
 fn perf_flags_that_cannot_work_together_stop_the_start_with_the_reason() {
     let tmp = tempfile::tempdir().unwrap();
     let output = executable()

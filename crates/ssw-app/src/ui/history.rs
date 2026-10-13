@@ -230,25 +230,19 @@ impl HistoryHost {
     }
 }
 
-/// Runs `panel.event` with a fresh context; a focus request is granted.
+/// Runs `panel.event` with a fresh context. Its controls are routed through `forward`, which
+/// grants their focus requests, so the panel never asks for focus itself.
 fn route(panel: &mut HistoryPanel, event: &Event, env: &mut OverlayEnv<'_>) -> EventResult {
-    let id = panel.id();
-    let result = {
-        let mut cx = EventCx::new(
-            id,
-            env.theme,
-            env.scale,
-            env.text,
-            env.focus,
-            env.capture,
-            env.requests,
-        );
-        panel.event(&mut cx, event)
-    };
-    if result.request_focus {
-        env.focus.focus(id);
-    }
-    result
+    let mut cx = EventCx::new(
+        panel.id(),
+        env.theme,
+        env.scale,
+        env.text,
+        env.focus,
+        env.capture,
+        env.requests,
+    );
+    panel.event(&mut cx, event)
 }
 
 /// The hunks that turn the version `old` into the current text `new`, in the panel's shape:

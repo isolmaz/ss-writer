@@ -60,6 +60,9 @@ pub const PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// The file name of the executable copy the updater runs as.
 pub const UPDATER_FILE_NAME: &str = "SSWriter-updater.exe";
 
+/// The file name of the application itself, in the folder it was installed into.
+pub const APP_FILE_NAME: &str = "SSWriter.exe";
+
 /// Name of the folders below the temp directory that hold an updater copy; the application's
 /// process id and a counter follow.
 const UPDATER_FOLDER_PREFIX: &str = "SSWriter-update";
@@ -239,6 +242,11 @@ pub fn run_updater(
     );
     if !parent_gone {
         return EXIT_UPDATE_PARENT_RUNNING;
+    }
+    // A package that is gone (deleted by hand, or by an updater that already ran) must not
+    // reach `msiexec`, which would answer with a dialog of its own.
+    if !flags.installer.is_file() {
+        return EXIT_UPDATE_INSTALL_FAILED;
     }
     let installed = runner
         .run(&msiexec_path(), &install_arguments(&flags.installer))
@@ -766,12 +774,23 @@ mod tests {
     }
 
     #[test]
-    fn updater_still_succeeds_when_the_msi_is_already_gone() {
+    fn an_updater_whose_package_is_gone_runs_no_installer() {
         let setup = setup();
         let fake = Fake::new(&setup.package);
         std::fs::remove_file(&setup.package).unwrap();
 
-        assert_eq!(run_updater(&setup.flags(), &fake, &fake), EXIT_UPDATED);
+        // `msiexec` would answer a missing package with a dialog of its own.
+        assert_eq!(
+            run_updater(&setup.flags(), &fake, &fake),
+            EXIT_UPDATE_INSTALL_FAILED
+        );
+        assert_eq!(
+            fake.events(),
+            vec![Event::Wait {
+                pid: setup.flags().parent,
+                timeout: PARENT_EXIT_TIMEOUT,
+            }]
+        );
     }
 
     // ---- the real seams ----

@@ -666,6 +666,101 @@ fn a_package_that_does_not_match_its_checksum_is_refused_and_the_button_comes_ba
 }
 
 #[test]
+fn a_download_runs_once_and_a_crashing_one_is_reported() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let sums = format!("{PACKAGE_SHA256}  SSWriter-99.0.0-x64.msi\n");
+        let http = update_network("v99.0.0", &sums);
+        rig.controller
+            .set_update_http(Arc::clone(&http) as Arc<dyn Http>);
+        rig.command(CommandId::HelpCheckForUpdates);
+        rig.settle();
+
+        // Pressing Download twice starts one download: the second press finds one running.
+        rig.press_in(BannerKind::Update, "Download");
+        rig.controller.start_update_download();
+        rig.settle();
+        assert_eq!(
+            http.requests(),
+            [
+                feed_url(),
+                checksums_url("v99.0.0"),
+                installer_url("v99.0.0")
+            ]
+        );
+        // The package is there, so a press after the download is ignored as well.
+        rig.controller.start_update_download();
+        rig.settle();
+        assert_eq!(http.requests().len(), 3);
+    });
+
+    with_rig(NO_AUTOSAVE, |rig| {
+        let http = network_with(&["v99.0.0"]);
+        rig.controller
+            .set_update_http(Arc::clone(&http) as Arc<dyn Http>);
+        rig.command(CommandId::HelpCheckForUpdates);
+        rig.settle();
+        // The download runs on a worker that panics; the editor survives and says why.
+        rig.controller
+            .set_update_http(Arc::new(CrashingNetwork) as Arc<dyn Http>);
+        rig.answer(MessageBoxResult::Ok);
+        rig.press_in(BannerKind::Update, "Download");
+        rig.settle();
+        let shown = rig.services.dialog_log();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].title, "Download failed");
+        assert!(
+            shown[0].message.contains("the network stack crashed"),
+            "{}",
+            shown[0].message
+        );
+        assert!(
+            rig.shows("Download"),
+            "the banner offers the download again"
+        );
+    });
+}
+
+#[test]
+fn an_updater_that_cannot_be_prepared_is_reported_and_the_package_stays() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let sums = format!("{PACKAGE_SHA256}  SSWriter-99.0.0-x64.msi\n");
+        let http = update_network("v99.0.0", &sums);
+        rig.controller
+            .set_update_http(Arc::clone(&http) as Arc<dyn Http>);
+        rig.command(CommandId::HelpCheckForUpdates);
+        rig.settle();
+        rig.press_in(BannerKind::Update, "Download");
+        rig.settle();
+
+        // No seam: the application copies the executable of its own folder, which the test
+        // profile does not have.
+        rig.answer(MessageBoxResult::Ok);
+        rig.press_in(BannerKind::Update, "Restart and install");
+        let shown = rig.services.dialog_log();
+        assert_eq!(shown.len(), 1);
+        assert!(
+            shown[0].message.contains("cannot copy the application"),
+            "{}",
+            shown[0].message
+        );
+        let requests = rig.requests();
+        assert!(
+            !requests.contains(&Request::Quit),
+            "the application stays: {requests:?}"
+        );
+        let package = rig
+            .controller
+            .core()
+            .borrow()
+            .paths
+            .local_dir()
+            .join("updates")
+            .join("SSWriter-99.0.0-x64.msi");
+        assert!(package.is_file(), "the package waits for another attempt");
+    });
+}
+
+#[test]
 fn a_portable_build_opens_the_release_page_instead_of_downloading() {
     with_portable_rig(|rig| {
         let http = network_with(&["v99.0.0"]);

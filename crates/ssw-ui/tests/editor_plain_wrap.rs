@@ -320,16 +320,22 @@ fn without_a_language_or_a_plain_document_nothing_is_coloured() {
     arrange_with(&mut h, &spy);
     assert!(stretches(&spy, "let name = \"ssw\";").is_empty());
 
-    // A language, but the document is shown as Markdown.
+    // A language, but the document is shown as Markdown: its own styles stay, the syntax
+    // colors of the calm palette never appear.
     let spy = Spy::new();
     let mut h = Harness::new("let name = \"ssw\";\n");
     h.config(|config| config.plain_language = Some(Language::Rust));
     arrange_with(&mut h, &spy);
+    let calm = SyntaxColors::calm(&h.theme);
+    let syntax = [
+        calm.color(TokenKind::Keyword),
+        calm.color(TokenKind::String),
+        calm.color(TokenKind::Comment),
+    ];
     assert!(
-        spy.layouts
-            .borrow()
+        stretches(&spy, "let name = \"ssw\";")
             .iter()
-            .all(|(_, ranges)| ranges.is_empty())
+            .all(|(_, color)| color.is_none_or(|color| !syntax.contains(&color)))
     );
 }
 

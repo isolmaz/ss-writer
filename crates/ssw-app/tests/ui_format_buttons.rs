@@ -359,6 +359,40 @@ fn a_pointer_resting_on_an_icon_button_shows_its_name_and_leaving_hides_it() {
 }
 
 #[test]
+fn the_sidebars_buttons_show_their_names_until_the_pane_is_hidden() {
+    with_rig("a.md", "hello world\n", |rig| {
+        // Showing the sidebar loads the folder of the file.
+        rig.controller
+            .run_command(rig.window().id, CommandId::ViewToggleSidebar);
+        rig.layout();
+        let new_button = {
+            let window = rig.window();
+            let view = window.view.borrow();
+            let pane = view.sidebar().expect("the folder pane").bounds();
+            let tree = view.access_tree(&rig.engine, "Window");
+            tree.nodes()
+                .iter()
+                .find(|node| {
+                    node.role == ssw_ui::access::Role::Button
+                        && node.name == "New"
+                        && pane.contains(node.bounds.center())
+                })
+                .expect("the New button of the folder pane")
+                .bounds
+                .center()
+        };
+        assert_eq!(rig.hover(new_button).as_deref(), Some("New"));
+
+        // Hiding it keeps the pane's widget, which is not asked without a rectangle.
+        rig.controller
+            .run_command(rig.window().id, CommandId::ViewToggleSidebar);
+        rig.layout();
+        assert!(!rig.window().view.borrow().layout().sidebar_visible());
+        assert_eq!(rig.hover(new_button), None);
+    });
+}
+
+#[test]
 fn the_selection_toolbar_buttons_show_their_names() {
     with_rig("a.md", "hello world\n", |rig| {
         rig.drag_select();

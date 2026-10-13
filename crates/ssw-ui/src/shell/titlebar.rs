@@ -1342,6 +1342,35 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_pill_paints_its_letters_in_the_disabled_color() {
+        let (mut harness, mut bar, _) = setup();
+        // An active format state must not win over the disabled look.
+        bar.set_format_state(FormatState {
+            bold: true,
+            ..FormatState::default()
+        });
+        bar.set_format_enabled(false);
+        let canvas = harness.paint(&bar);
+        let tokens = harness.theme.tokens;
+        let colors_of = |letter: &str| {
+            canvas
+                .ops()
+                .filter_map(|op| match op {
+                    DrawOp::Text { text, color, .. } if text == letter => Some(*color),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for letter in ["B", "I", "U"] {
+            assert_eq!(
+                colors_of(letter),
+                vec![tokens.text_disabled],
+                "{letter} is not painted disabled"
+            );
+        }
+    }
+
+    #[test]
     fn hover_animates_and_focus_changes_repaint() {
         let (mut harness, mut bar, _) = setup();
         let center = bar.sidebar_toggle_rect().center();

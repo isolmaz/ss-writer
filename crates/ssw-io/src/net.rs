@@ -705,8 +705,10 @@ impl Partial {
     }
 
     fn write(&mut self, chunk: &[u8]) -> Result<(), NetError> {
-        self.file
-            .write_all(chunk)
+        // A write to a scratch file fails on a full or failing disk only: the fault seam is how
+        // that branch is reached.
+        crate::fault::gate_io()
+            .and_then(|()| self.file.write_all(chunk))
             .map_err(|error| io_failure("WriteFile", &error))?;
         self.hasher.update(chunk);
         self.bytes += chunk.len() as u64;

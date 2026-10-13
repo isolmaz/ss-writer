@@ -555,6 +555,17 @@ impl Launcher for RecordingLauncher {
     }
 }
 
+/// A package of several chunks: the progress of a real download is reported per chunk, not
+/// once. `BIG_PACKAGE_SHA256` is the SHA-256 of these bytes.
+fn big_package() -> Vec<u8> {
+    (0..40_000)
+        .map(|index| u8::try_from(index * 31 % 251).unwrap())
+        .collect()
+}
+
+const BIG_PACKAGE_SHA256: &str =
+    "ab721b7d12240623bb53bb5f8a54673b082fd9696292f0a348b5b741e3d95542";
+
 /// Serves the release, its checksum list and its package.
 fn update_network(tag: &str, sums: &str) -> Arc<ScriptedHttp> {
     let http = network_with(&[tag]);
@@ -627,6 +638,70 @@ fn downloading_the_update_fills_the_banner_and_the_restart_starts_the_updater() 
         );
         let requests = rig.requests();
         assert!(requests.contains(&Request::Quit), "{requests:?}");
+    });
+}
+
+/// Downloads `package` from a server whose head is `head` and returns the file it wrote.
+fn download_package(rig: &Rig, head: &str, package: &[u8]) -> PathBuf {
+    let sums = format!("{BIG_PACKAGE_SHA256}  SSWriter-99.0.0-x64.msi\n");
+    let http = network_with(&["v99.0.0"]);
+    http.respond(&checksums_url("v99.0.0"), TEXT_HEAD, sums.as_bytes());
+    http.respond(&installer_url("v99.0.0"), head, package);
+    rig.controller
+        .set_update_http(Arc::clone(&http) as Arc<dyn Http>);
+    rig.command(CommandId::HelpCheckForUpdates);
+    rig.settle();
+
+    rig.press_in(BannerKind::Update, "Download");
+    rig.settle();
+
+    assert!(rig.shows("ready to install"), "the package arrived whole");
+    rig.controller
+        .core()
+        .borrow()
+        .paths
+        .local_dir()
+        .join("updates")
+        .join("SSWriter-99.0.0-x64.msi")
+}
+
+#[test]
+fn a_package_with_an_announced_size_is_counted_in_percent() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let package = big_package();
+        let head = format!("{PACKAGE_HEAD}\r\nContent-Length: {}", package.len());
+
+        let path = download_package(rig, &head, &package);
+
+        assert_eq!(std::fs::read(&path).unwrap(), package);
+    });
+}
+
+#[test]
+fn a_package_without_an_announced_size_is_counted_in_megabytes() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        // Every chunk of this package lands in the same megabyte: the banner is woken once.
+        let package = big_package();
+
+        let path = download_package(rig, PACKAGE_HEAD, &package);
+
+        assert_eq!(std::fs::read(&path).unwrap(), package);
+    });
+}
+
+#[test]
+fn a_restart_without_a_downloaded_package_starts_nothing() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let launcher = Arc::new(RecordingLauncher::default());
+        rig.updater_seam(Arc::clone(&launcher) as Arc<dyn Launcher>);
+
+        // The banner offers the restart only after a download; the guard holds if the state
+        // is lost in between.
+        rig.controller.install_update();
+        rig.settle();
+
+        assert!(launcher.launches().is_empty(), "nothing is started");
+        assert!(!rig.requests().contains(&Request::Quit), "no quit");
     });
 }
 

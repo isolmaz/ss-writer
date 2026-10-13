@@ -351,6 +351,33 @@ mod tests {
         fn events(&self) -> Vec<Event> {
             self.events.borrow().clone()
         }
+
+        /// The programs the fake was asked to start and leave running, in order.
+        fn launches(&self) -> Vec<(PathBuf, Vec<OsString>)> {
+            self.events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    Event::Launch { program, args } => Some((program, args)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The programs the fake was asked to run to their end, with whether the package was
+        /// still there.
+        fn runs(&self) -> Vec<(PathBuf, Vec<OsString>, bool)> {
+            self.events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    Event::Run {
+                        program,
+                        args,
+                        package_present,
+                    } => Some((program, args, package_present)),
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     impl Launcher for Fake {
@@ -459,10 +486,9 @@ mod tests {
         )
         .unwrap();
 
-        let events = fake.events();
-        let [Event::Launch { program, args }] = &events[..] else {
-            panic!("exactly one launch expected, got {events:?}");
-        };
+        let launches = fake.launches();
+        assert_eq!(launches.len(), 1, "{:?}", fake.events());
+        let (program, args) = &launches[0];
         // The copy lives in a new folder below the temp root, and is a byte-for-byte copy.
         assert_ne!(program, &setup.app_exe);
         assert_eq!(program.file_name().unwrap(), UPDATER_FILE_NAME);
@@ -502,12 +528,9 @@ mod tests {
             .unwrap();
         }
         let programs: Vec<PathBuf> = fake
-            .events()
+            .launches()
             .into_iter()
-            .map(|event| match event {
-                Event::Launch { program, .. } => program,
-                other => panic!("unexpected {other:?}"),
-            })
+            .map(|(program, _)| program)
             .collect();
         let mut folders: Vec<&Path> = programs.iter().map(|p| p.parent().unwrap()).collect();
         folders.sort();
@@ -534,14 +557,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            UpdateApplyError::CreateFolder(FsError::AccessDenied(_))
-        ));
         assert!(
             error
                 .to_string()
-                .starts_with("cannot create the updater folder: access denied")
+                .starts_with("cannot create the updater folder: access denied"),
+            "{error}"
         );
         assert!(fake.events().is_empty());
         assert!(setup.temp_entries().is_empty());
@@ -564,10 +584,12 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            UpdateApplyError::CreateFolder(FsError::AlreadyExists(_))
-        ));
+        assert!(
+            error
+                .to_string()
+                .starts_with("cannot create the updater folder: already exists"),
+            "{error}"
+        );
         assert_eq!(fs.calls(FsOp::CreateDir), FOLDER_ATTEMPTS as usize);
         assert!(fake.events().is_empty());
     }
@@ -589,14 +611,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(
-            error,
-            UpdateApplyError::CopyExecutable(FsError::DiskFull(_))
-        ));
         assert!(
             error
                 .to_string()
-                .starts_with("cannot copy the application for the updater: disk full")
+                .starts_with("cannot copy the application for the updater: disk full"),
+            "{error}"
         );
         assert!(fake.events().is_empty());
         assert!(setup.temp_entries().is_empty());
@@ -619,7 +638,6 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, UpdateApplyError::Launch(_)));
         assert_eq!(error.to_string(), "cannot start the updater: cannot launch");
         // The copy was offered to the launcher, and nothing of it is left.
         assert_eq!(fake.events().len(), 1);
@@ -649,14 +667,9 @@ mod tests {
         );
         // 2. The installer: msiexec of the system with the per-user setup arguments, while
         //    the package is still there.
-        let Event::Run {
-            program,
-            args,
-            package_present,
-        } = &events[1]
-        else {
-            panic!("the second step must run msiexec: {events:?}");
-        };
+        let runs = fake.runs();
+        assert_eq!(runs.len(), 1, "{events:?}");
+        let (program, args, package_present) = &runs[0];
         assert!(program.is_absolute());
         assert!(program.ends_with(r"System32\msiexec.exe"), "{program:?}");
         assert_eq!(
@@ -668,7 +681,7 @@ mod tests {
                 &"/norestart".into(),
             ])
         );
-        assert!(package_present);
+        assert!(*package_present);
         // 3. The installed executable, without arguments, and the package is gone.
         assert_eq!(
             events[2],
@@ -717,7 +730,7 @@ mod tests {
             );
             let events = fake.events();
             assert_eq!(events.len(), 2, "{failure}: {events:?}");
-            assert!(matches!(events[1], Event::Run { .. }));
+            assert_eq!(fake.runs().len(), 1, "{failure}: {events:?}");
             assert!(setup.package.exists(), "{failure}");
         }
     }

@@ -486,20 +486,6 @@ impl Controller {
         }
     }
 
-    /// The release page of the offer, for the builds that install themselves by hand.
-    fn open_update_page(&self) {
-        let url = self
-            .help
-            .offer
-            .borrow()
-            .release
-            .as_ref()
-            .map(|release| release.page_url.clone());
-        if let Some(url) = url {
-            let _ = self.shell.borrow_mut().open_url(&url);
-        }
-    }
-
     /// The Download button of the update banner: downloads the installer on a worker while the
     /// banner shows how far it got. A portable build has no package to install, so it gets the
     /// release page instead.
@@ -513,7 +499,8 @@ impl Controller {
         let core = self.core().borrow();
         if core.paths.is_portable() {
             drop(core);
-            return self.open_update_page();
+            let _ = self.shell.borrow_mut().open_url(&release.page_url);
+            return;
         }
         let progress = Arc::new(DownloadProgress::default());
         *self.help.download.borrow_mut() = Download::Running(Arc::clone(&progress));

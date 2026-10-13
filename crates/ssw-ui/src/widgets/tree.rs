@@ -1667,6 +1667,37 @@ mod tests {
     }
 
     #[test]
+    fn kit_tree_asks_for_no_cursor_over_empty_space_below_the_last_row() {
+        let mut harness = Harness::new();
+        let nodes = vec![TreeNode::leaf(1, "only")];
+        let mut tree = TreeView::new("Explorer", nodes).with_motion(Motion::reduced());
+        harness.arrange(&mut tree, Rect::new(0.0, 0.0, 240.0, 128.0));
+        // Inside the tree, but below its single row and clear of the scroll bar.
+        let empty = Point::new(100.0, 100.0);
+        assert!(tree.bounds().contains(empty));
+        assert_eq!(tree.row_at(empty), None);
+        harness.requests.take_cursor();
+        harness.hover(&mut tree, empty);
+        assert_eq!(harness.requests.take_cursor(), None);
+    }
+
+    #[test]
+    fn kit_tree_asks_for_no_cursor_while_resting_on_the_scroll_bar_beside_a_row() {
+        let (mut harness, mut tree) = long_tree(Motion::reduced());
+        let on_bar = tree.bar.bounds().center();
+        assert!(tree.bar.model().is_scrollable());
+        // A row lies under the bar, so only the bar test keeps the hand away.
+        assert!(tree.row_at(on_bar).is_some());
+        // The first move starts the bar's hover and is consumed by it.
+        harness.hover(&mut tree, on_bar);
+        harness.requests.take_cursor();
+        // The second move finds the bar already hovered and falls through to the cursor logic.
+        let result = harness.hover(&mut tree, on_bar);
+        assert!(!result.handled);
+        assert_eq!(harness.requests.take_cursor(), None);
+    }
+
+    #[test]
     fn kit_tree_with_id_names_the_control() {
         let id = WidgetId::allocate();
         let tree = TreeView::new("Explorer", nodes()).with_id(id);

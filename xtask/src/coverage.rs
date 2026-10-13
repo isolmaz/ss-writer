@@ -65,6 +65,9 @@ pub fn run(workspace: &Workspace) -> Result<(), Error> {
         "llvm-cov",
         "report",
         "--summary-only",
+        // The run that fails has to say which lines are missing: the log is all a developer
+        // gets, because this gate runs on CI.
+        "--show-missing-lines",
         "--ignore-filename-regex",
     ])
     .arg(IGNORE_FILENAME_REGEX)

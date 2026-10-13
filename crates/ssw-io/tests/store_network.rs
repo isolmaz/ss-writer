@@ -2270,6 +2270,124 @@ fn a_network_that_only_implements_get_still_streams_to_a_file() {
     assert_eq!((answered.status, calls), (404, 0));
 }
 
+/// A network whose `get` fails; it keeps the default `get_streaming`.
+#[derive(Debug)]
+struct GetFails;
+
+impl Http for GetFails {
+    fn get(&self, _request: &HttpRequest<'_>) -> Result<HttpResponse, NetError> {
+        Err(NetError::Timeout)
+    }
+}
+
+#[test]
+fn the_default_stream_passes_on_a_failed_get_and_a_refused_chunk() {
+    let url = Url::parse(ASSET).unwrap();
+    let ask = request(&url, Accept::Any, LIMIT, FIVE_SECONDS);
+
+    let error = GetFails
+        .get_streaming(&ask, &mut |_, _| Ok(()))
+        .unwrap_err();
+    assert_eq!(error, NetError::Timeout);
+
+    // A sink that refuses stops the stream at its first chunk.
+    let body = payload(70_000);
+    let http = GetOnly {
+        raw_head: octet_head(body.len()),
+        body,
+    };
+    let mut calls = 0;
+    let error = http
+        .get_streaming(&ask, &mut |_, _| {
+            calls += 1;
+            Err(NetError::TooLarge { limit: 1 })
+        })
+        .unwrap_err();
+    assert_eq!((error, calls), (NetError::TooLarge { limit: 1 }, 1));
+}
+
+#[test]
+fn a_download_whose_target_cannot_be_written_fails_and_keeps_nothing() {
+    let body = payload(40_000);
+    let http = ScriptedHttp::new();
+    http.respond(ASSET, &octet_head(body.len()), &body);
+    let dir = tempdir().unwrap();
+
+    // The finished file cannot replace a folder that has something in it.
+    let target = dir.path().join("busy");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("inside"), b"x").unwrap();
+    let error = download(&http, ASSET, &options(Accept::Any), &target, &mut |_, _| {}).unwrap_err();
+    assert!(
+        matches!(error, NetError::Os { call, .. } if call == "MoveFileExW"),
+        "{error:?}"
+    );
+
+    // An empty body reaches no sink, so its file is created at the end; below a file there is
+    // no folder to create it in.
+    let empty = ScriptedHttp::new();
+    empty.respond(ASSET, &octet_head(0), b"");
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, b"x").unwrap();
+    let blocked = file.join("inside.bin");
+    let error =
+        download(&empty, ASSET, &options(Accept::Any), &blocked, &mut |_, _| {}).unwrap_err();
+    assert!(
+        matches!(error, NetError::Os { call, .. } if call == "CreateFileW"),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+}
+
+#[cfg(feature = "fault-injection")]
+#[test]
+fn a_download_reports_a_write_that_the_disk_refuses() {
+    use ssw_io::fault;
+
+    let body = payload(40_000);
+    let http = ScriptedHttp::new();
+    http.respond(ASSET, &octet_head(body.len()), &body);
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("a.bin");
+
+    fault::arm(0);
+    let error = download(&http, ASSET, &options(Accept::Any), &target, &mut |_, _| {}).unwrap_err();
+    assert!(fault::tripped(), "the write was reached");
+    fault::disarm();
+
+    assert!(
+        matches!(error, NetError::Os { call, .. } if call == "WriteFile"),
+        "{error:?}"
+    );
+    assert!(!target.exists(), "nothing is left behind");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_stream_reports_what_the_exchange_could_not_start() {
+    // Nothing listens on port 1: the exchange never starts, and the scripted network passes
+    // on the failure it was told to answer with.
+    let url = Url::parse("http://127.0.0.1:1/update.msi").unwrap();
+    let error = WinHttp
+        .get_streaming(
+            &request(&url, Accept::Any, LIMIT, Duration::from_secs(2)),
+            &mut |_, _| Ok(()),
+        )
+        .unwrap_err();
+    assert!(matches!(error, NetError::Os { .. }), "{error:?}");
+
+    let http = ScriptedHttp::new();
+    http.fail(ASSET, NetError::Timeout);
+    let asset = Url::parse(ASSET).unwrap();
+    let error = http
+        .get_streaming(
+            &request(&asset, Accept::Any, LIMIT, FIVE_SECONDS),
+            &mut |_, _| Ok(()),
+        )
+        .unwrap_err();
+    assert_eq!(error, NetError::Timeout);
+}
+
 #[test]
 fn expected_sha256_picks_the_line_of_the_named_file() {
     let (zip, msi, yaml) = (sha256_of(b"zip"), sha256_of(b"msi"), sha256_of(b"yaml"));
@@ -2451,6 +2569,38 @@ fn the_installer_is_downloaded_and_verified_over_real_http() {
         .map(|entry| entry.target)
         .collect();
     assert_eq!(targets, [SUMS_TARGET, MSI_TARGET, CDN_TARGET]);
+}
+
+#[test]
+fn a_download_folder_that_cannot_be_created_fails_after_the_list_is_read() {
+    let msi = payload(1_000);
+    let server = release_server(format!("{}  {MSI}\n", sha256_of(&msi)), msi);
+    let release = release_with("v0.2.0", &ASSETS);
+    let tmp = tempdir().unwrap();
+    // A file where the folder would go: creating the folder cannot work.
+    let blocker = tmp.path().join("updates");
+    std::fs::write(&blocker, b"not a folder").unwrap();
+    let dir = blocker.join("cache");
+
+    let error = download_installer(
+        &Loopback { port: server.port },
+        &release,
+        &dir,
+        &mut |_, _| {},
+    )
+    .unwrap_err();
+
+    match error {
+        UpdateError::Io { path, .. } => assert_eq!(path, dir),
+        other => panic!("not an io error: {other:?}"),
+    }
+    // The list was read, the installer was never requested.
+    let targets: Vec<String> = server
+        .requests()
+        .into_iter()
+        .map(|entry| entry.target)
+        .collect();
+    assert_eq!(targets, [SUMS_TARGET]);
 }
 
 #[test]

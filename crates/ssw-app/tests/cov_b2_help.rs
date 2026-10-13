@@ -118,6 +118,44 @@ fn a_weekly_check_without_its_state_database_is_logged_and_asks_nobody() {
 }
 
 #[test]
+fn a_download_that_ends_after_the_application_is_gone_finds_nobody_to_tell() {
+    with_controller(NO_AUTOSAVE, |controller| {
+        let http = network_with("v99.0.0");
+        controller.set_update_http(Arc::clone(&http) as Arc<dyn Http>);
+        let workers = Rc::clone(&controller.core().borrow().workers);
+
+        // The offer has to be known before the package can be asked for.
+        controller.start_update_check();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while workers.pending() > 0 {
+            controller.core().borrow_mut().pump();
+            assert!(Instant::now() < deadline, "the check never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(controller.available_update().is_some(), "an update is known");
+
+        // The release carries no package, so the download fails without asking anybody; its
+        // answer is delivered to a controller that is gone by then.
+        controller.start_update_download();
+        assert_eq!(workers.pending(), 1, "the download was handed to a worker");
+        let gone = Rc::downgrade(&controller);
+        drop(controller);
+        assert!(
+            gone.upgrade().is_none(),
+            "nothing else keeps the controller"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while workers.pending() > 0 {
+            workers.poll();
+            assert!(Instant::now() < deadline, "the download never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(http.requests().len(), 1, "only the feed was asked");
+    });
+}
+
+#[test]
 fn an_answer_that_arrives_after_the_application_is_gone_finds_nobody_to_tell() {
     with_controller(NO_AUTOSAVE, |controller| {
         let http = network_with("v99.0.0");

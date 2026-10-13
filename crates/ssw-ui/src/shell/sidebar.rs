@@ -2168,6 +2168,32 @@ mod tests {
     }
 
     #[test]
+    fn moving_over_the_empty_list_area_without_a_press_asks_for_no_cursor() {
+        let mut f = fixture(SidebarOptions::default());
+        // Below the last row and far from the scroll bar: inside the list, but on no row.
+        let empty = Point::new(20.0, 450.0);
+        assert!(f.view.list_rect().contains(empty));
+        assert_eq!(f.view.row_at(empty), None);
+        f.harness.requests.take_cursor();
+        f.harness
+            .pointer(&mut f.view, PointerEventKind::Move, None, empty);
+        assert_eq!(f.harness.requests.take_cursor(), None);
+    }
+
+    #[test]
+    fn the_tooltip_names_the_header_button_under_the_pointer() {
+        let f = fixture(SidebarOptions::default());
+        let strings = strings();
+        let more = f.view.more.bounds();
+        let new = f.view.new.bounds();
+        assert_eq!(f.view.tooltip_at(more.center()), Some((more, strings.more.as_str())));
+        assert_eq!(f.view.tooltip_at(new.center()), Some((new, strings.new.as_str())));
+        // The root name and the rows carry no tooltip.
+        assert_eq!(f.view.tooltip_at(Point::new(20.0, 100.0)), None);
+        assert_eq!(f.view.tooltip_at(f.row_center(0)), None);
+    }
+
+    #[test]
     fn inline_rename_commits_cancels_and_validates() {
         let mut f = fixture(SidebarOptions::default());
         f.click_row(5);

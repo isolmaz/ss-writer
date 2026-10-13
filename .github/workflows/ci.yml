@@ -45,6 +45,9 @@ jobs:
 
   test:
     name: tests (nextest)
+    # The cheap gate first: a run that does not compile cleanly must not spend a runner hour
+    # on the suite and the coverage gate.
+    needs: lint
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

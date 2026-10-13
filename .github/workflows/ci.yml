@@ -42,6 +42,9 @@ jobs:
       # (every feature in docs/features.toml needs a README line).
       - name: Docs sync (spec, keymap, features, README, Fluent ids)
         run: cargo xtask docs-check ${{ hashFiles('README.md') != '' && '--strict' || '' }}
+      # Coverage cannot see this: a widget's own tests cover it while no user path reaches it.
+      - name: Wiring (every UI module is reachable from the application)
+        run: cargo xtask wiring
 
   test:
     name: tests (nextest)

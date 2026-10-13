@@ -30,6 +30,9 @@ Commands:
                            every scenario run hidden in the light and dark theme (offscreen
                            rendering, nothing is shown), PNG files in docs/screenshots;
                            --scale 2 for hi-DPI (default 1)
+  wiring                   every module below ssw-ui/src/widgets and ssw-ui/src/shell has to be
+                           named by production code outside itself: a finished widget nothing
+                           reaches is dead, and coverage does not notice
   help                     this text
 ";
 
@@ -55,6 +58,8 @@ pub enum Command {
     Perf(PerfArgs),
     /// `screenshots`.
     Screenshots(ScreenshotArgs),
+    /// `wiring`.
+    Wiring,
 }
 
 /// Arguments of `screenshots`.
@@ -110,6 +115,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Error> 
         "icons" => no_more_args(args).map(|()| Command::Icons),
         "perf" => parse_perf(args),
         "screenshots" => parse_screenshots(args),
+        "wiring" => no_more_args(args).map(|()| Command::Wiring),
         other => Err(Error::Usage(format!("unknown command `{other}`"))),
     }
 }
@@ -272,6 +278,8 @@ mod tests {
     fn simple_commands() {
         assert_eq!(parse_strs(&["coverage"]).unwrap(), Command::Coverage);
         assert_eq!(parse_strs(&["icons"]).unwrap(), Command::Icons);
+        assert_eq!(parse_strs(&["wiring"]).unwrap(), Command::Wiring);
+        assert!(usage_message(parse_strs(&["wiring", "--all"])).contains("--all"));
         assert_eq!(parse_strs(&["help"]).unwrap(), Command::Help);
         assert_eq!(parse_strs(&["--help"]).unwrap(), Command::Help);
         assert_eq!(

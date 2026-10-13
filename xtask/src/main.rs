@@ -21,6 +21,7 @@ mod perf;
 mod run;
 mod screenshots;
 mod winget;
+mod wiring;
 mod wix;
 mod workspace;
 
@@ -43,6 +44,7 @@ fn execute(args: impl Iterator<Item = String>) -> Result<(), Error> {
         Command::Icons => icons::run(&Workspace::locate()?),
         Command::Perf(args) => perf::run(&Workspace::locate()?, &args),
         Command::Screenshots(args) => screenshots::run(&Workspace::locate()?, &args),
+        Command::Wiring => wiring::run(&Workspace::locate()?),
     }
 }
 

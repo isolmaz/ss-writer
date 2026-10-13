@@ -69,7 +69,7 @@ Dependency direction (no cycles): `core` <- `io`, `convert`, `render`, `ui` <- `
 
 ## The gate
 
-**The gate runs on GitHub, not on the development machine.** Push the change and read the run: `.github/workflows/ci.yml` runs format, clippy with `-D warnings` and `cargo xtask docs-check --strict` first; only when that job is green do the whole suite under `cargo nextest`, the doc tests and the 100 % coverage gate follow on `windows-latest`. Both stages run for every push and pull request, and the coverage job names the lines it is missing. A second push cancels the run in flight (`concurrency: cancel-in-progress`), so push a batch, not a stream of fixes. Mutation testing (`.github/workflows/mutants.yml`) runs there too, by hand or weekly, in eight shards, and the tag-triggered release workflow builds the installer and the portable zip. A change is ready when that run is green.
+**The gate runs on GitHub, not on the development machine.** Push the change and read the run: `.github/workflows/ci.yml` runs format, clippy with `-D warnings`, `cargo xtask docs-check --strict` and `cargo xtask wiring` first; only when that job is green do the whole suite under `cargo nextest`, the doc tests and the 100 % coverage gate follow on `windows-latest`. Both stages run for every push and pull request, and the coverage job names the lines it is missing. A second push cancels the run in flight (`concurrency: cancel-in-progress`), so push a batch, not a stream of fixes. Mutation testing (`.github/workflows/mutants.yml`) runs there too, by hand or weekly, in eight shards, and the tag-triggered release workflow builds the installer and the portable zip. A change is ready when that run is green.
 
 ```powershell
 git push                      # the checks run on GitHub
@@ -153,6 +153,7 @@ Every user-visible string comes from Fluent files in `assets/i18n/en/*.ftl` (Eng
 | `docs-check [--strict]` | Spec, keymap, `features.toml`, README and `.ftl` sync check; `--strict` turns warnings (missing README lines) into failures |
 | `icons` | Rasterizes `assets/icons/*.svg` into the multi-size `assets/icons/*.ico` files that `crates/ssw-app/build.rs` embeds into `SSWriter.exe` |
 | `perf [--runs N] [--write-docs]` | Release build, fixtures in `target/perf`, every performance scenario N times (default 5, off-screen window, fresh profile per run); report in `target/perf/report.md`; `--write-docs` fills `docs/performance.md` too |
+| `wiring` | Every module below `ssw-ui/src/widgets` and `ssw-ui/src/shell` has to be named by production code outside itself: a finished widget nothing reaches is dead and coverage does not notice |
 | `screenshots [--scale N] [--only NAME]... [--no-build]` | Release build, demo documents and scenario scripts in `target/screens`, every scenario run hidden in the light and dark theme; PNG files in `docs/screenshots`; `--scale 2` for hi-DPI (default 1) |
 | `help` | Prints the usage text |
 

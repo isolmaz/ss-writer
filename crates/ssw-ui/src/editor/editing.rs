@@ -398,7 +398,7 @@ impl EditorView {
             doc.set_selections(selection, &[]);
             doc.break_undo_group();
         }
-        if self.config.format_tables_on_exit {
+        if self.config.format_tables_on_exit && self.is_markdown() {
             let tx = {
                 let doc = self.doc.borrow();
                 table::format_after_leaving(doc.ctx(), previous.head)

@@ -38,7 +38,7 @@ use ssw_win::wic::Wic;
 use windows::Win32::Foundation::HWND;
 
 use super::controller::{Controller, Request, WindowCell};
-use crate::documents::{DocEntry, canonical_path};
+use crate::documents::{DocEntry, DocMode, canonical_path};
 use crate::workers::{JobError, JobKey, JobKind, JobSpec, SubmitError, WindowId};
 
 mod dialog;
@@ -397,6 +397,7 @@ impl Controller {
             format,
             options,
             markdown: entry.document().borrow().text(),
+            plain: entry.mode() == DocMode::Plain,
             source_dir: entry
                 .path()
                 .and_then(|path| path.parent().map(Path::to_path_buf)),

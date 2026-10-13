@@ -47,8 +47,8 @@ use super::controller::{Controller, Request, WindowCell};
 use super::inspector::toc_of;
 use super::overlays::list_workspace_files;
 use crate::documents::{
-    DocEntry, DocError, DocMode, FolderWatches, Source, canonical_path, load_file, replace_text,
-    strip_extended_prefix,
+    DocEntry, DocError, DocMode, FolderWatches, LoadError, Source, canonical_path, load_file,
+    replace_text, strip_extended_prefix,
 };
 use crate::workers::{JobKey, JobKind, JobSpec, Waker, WindowId};
 
@@ -323,6 +323,9 @@ struct CompletionKey {
 enum Deferred {
     /// The taskbar button of a window shows this progress.
     Progress(WindowId, Progress),
+    /// A background open of a file the user only browsed to found it is no text: its default
+    /// app starts instead.
+    Launch(PathBuf),
     /// A background open failed.
     Report(Box<DocError>),
 }
@@ -760,6 +763,9 @@ impl Controller {
                 Deferred::Progress(window, progress) => {
                     self.push(Request::TaskbarProgress(window, progress));
                 }
+                Deferred::Launch(path) => {
+                    let _ = self.shell.borrow_mut().open_path(&path);
+                }
                 Deferred::Report(error) => self.report(&error),
             }
         }
@@ -957,7 +963,14 @@ impl Controller {
     /// it, which can take long, so a worker reads it while the taskbar button shows
     /// indeterminate progress, and the tab appears when the file is there. Returns whether the
     /// open is under way; `false` for every other file (the caller opens it directly).
-    pub fn begin_hydration(&self, cell: &Rc<WindowCell>, path: &Path) -> bool {
+    /// `launch_binary` is set for a file the user only browsed to: when it turns out to be no
+    /// text, its default app starts instead of an error showing.
+    pub fn begin_hydration(
+        &self,
+        cell: &Rc<WindowCell>,
+        path: &Path,
+        launch_binary: bool,
+    ) -> bool {
         let env = self.docs().env();
         if !env
             .fs
@@ -997,6 +1010,9 @@ impl Controller {
                     .push(Deferred::Progress(window, Progress::None));
                 let loaded = match outcome {
                     Ok(Ok(loaded)) => loaded,
+                    Ok(Err(LoadError::NotText(_))) if launch_binary => {
+                        return outbox.borrow_mut().push(Deferred::Launch(done_path));
+                    }
                     Ok(Err(error)) => return report_later(&outbox, error),
                     // The read panicked: all that is known is that the file could not be read.
                     Err(_) => {

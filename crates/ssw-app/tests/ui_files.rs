@@ -13,12 +13,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ssw_app::app::{AppCore, ShellHost, run};
-use ssw_app::args::Args;
-use ssw_app::documents::{canonical_path, replace_text};
+use ssw_app::args::{Args, Launch, LaunchItem};
+use ssw_app::documents::{DocMode, canonical_path, replace_text};
 use ssw_app::startup::ProcessEnv;
 use ssw_app::ui::controller::{Controller, Request};
 use ssw_app::ui::files::{Move, absolute, link_updates, moves_for, relative_to};
-use ssw_app::ui::scripted_services::{Answer, DialogKind, ScriptedServices};
+use ssw_app::ui::scripted_services::{Answer, DialogKind, ScriptedServices, ShellRecord};
 use ssw_app::ui::shell_view::ShellAction;
 use ssw_app::ui::tree_source::WorkspaceTree;
 use ssw_core::edit::Selection;
@@ -1540,14 +1540,14 @@ fn a_placeholder_that_cannot_be_read_is_reported_and_a_closed_window_reads_nothi
             .controller
             .create_window(None, Size::new(800.0, 600.0), 1.0);
         rig.controller.close_window(fresh.id);
-        assert!(!rig.controller.begin_hydration(&fresh, &cloud));
-        assert!(!rig.controller.begin_hydration(&fresh, &cloud));
+        assert!(!rig.controller.begin_hydration(&fresh, &cloud, false));
+        assert!(!rig.controller.begin_hydration(&fresh, &cloud, false));
         // Neither a regular file nor a folder is a placeholder.
         assert!(
             !rig.controller
-                .begin_hydration(&window, &rig.work.join("a.md"))
+                .begin_hydration(&window, &rig.work.join("a.md"), false)
         );
-        assert!(!rig.controller.begin_hydration(&window, &rig.work));
+        assert!(!rig.controller.begin_hydration(&window, &rig.work, false));
     });
 }
 
@@ -1639,6 +1639,13 @@ impl FileSystem for PanickingRead {
             "the disk went away"
         );
         RealFs.read(path)
+    }
+    fn read_prefix(&self, path: &Path, max: usize) -> Result<Vec<u8>, ssw_io::fs::FsError> {
+        assert!(
+            !self.0.load(std::sync::atomic::Ordering::SeqCst),
+            "the disk went away"
+        );
+        RealFs.read_prefix(path, max)
     }
     fn metadata(&self, path: &Path) -> Result<ssw_io::fs::FileMeta, ssw_io::fs::FsError> {
         RealFs.metadata(path)
@@ -1994,5 +2001,209 @@ fn an_import_that_finishes_after_its_window_was_merged_away_opens_nothing() {
             "the import was dropped before it was registered"
         );
         assert_eq!(rig.messages(), Vec::<String>::new());
+    });
+}
+
+// ----- files of no known type -------------------------------------------------------------------
+
+/// What the user is told about a binary file.
+const NOT_TEXT: &str = "This file is not a text file.";
+
+/// Text files without a known extension, and what they show.
+const UNKNOWN_TEXT: [(&str, &str); 6] = [
+    ("notes.kt", "fun main() {}\n"),
+    ("Dockerfile", "FROM scratch\n"),
+    ("Dockerfile.prod", "FROM scratch\nENV MODE=prod\n"),
+    (".gitignore", "target/\n*.log\n"),
+    (".env.example", "TOKEN=\n"),
+    ("LICENSE", "MIT\n"),
+];
+
+/// The start of a PNG: its signature and a 1 x 1 header, which carry NUL bytes.
+const PNG_START: &[u8] =
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00";
+
+/// The UTF-16 little-endian bytes of `text`, behind a BOM when `bom`.
+fn utf16le(text: &str, bom: bool) -> Vec<u8> {
+    let bom: &[u8] = if bom { &[0xFF, 0xFE] } else { &[] };
+    let units = text.encode_utf16().flat_map(u16::to_le_bytes);
+    bom.iter().copied().chain(units).collect()
+}
+
+/// The messages of the message boxes shown so far (the open dialog is no message).
+fn message_boxes(rig: &Rig) -> Vec<String> {
+    rig.services
+        .dialog_log()
+        .into_iter()
+        .filter(|record| record.kind == DialogKind::MessageBox)
+        .map(|record| record.message)
+        .collect()
+}
+
+#[test]
+fn a_text_file_of_no_known_type_opens_in_plain_mode_from_the_sidebar() {
+    let mut files = vec![text_file("a.md", "# A\n")];
+    for (name, text) in UNKNOWN_TEXT {
+        files.push(text_file(name, text));
+    }
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        for (index, (name, text)) in UNKNOWN_TEXT.iter().enumerate() {
+            let path = rig.work.join(name);
+            open_in_sidebar(rig, &path);
+            assert_eq!(rig.tab_count(), index + 2, "{name}");
+            assert_eq!(rig.path(), canonical_path(&path), "{name}");
+            assert_eq!(rig.text(), *text, "{name}");
+            assert_eq!(rig.active().mode(), DocMode::Plain, "{name}");
+        }
+        assert_eq!(message_boxes(rig), Vec::<String>::new());
+        assert!(rig.services.shell_log().is_empty(), "no default app");
+    });
+}
+
+#[test]
+fn a_text_file_of_no_known_type_given_on_the_command_line_opens_in_plain_mode() {
+    let files = vec![text_file("notes.kt", "fun main() {}\n")];
+    with_rig(files, "notes.kt", nothing, |rig| {
+        assert_eq!(rig.tab_count(), 1);
+        assert_eq!(rig.path(), canonical_path(&rig.work.join("notes.kt")));
+        assert_eq!(rig.text(), "fun main() {}\n");
+        assert_eq!(rig.active().mode(), DocMode::Plain);
+    });
+}
+
+#[test]
+fn a_utf16_file_with_a_bom_is_text_although_it_holds_nul_bytes() {
+    let text = "héllo\nwörld\n";
+    let with_bom = utf16le(text, true);
+    assert!(with_bom.contains(&0));
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        byte_file("wide.dat", &with_bom),
+        // A known text type is not looked at: its encoding detection finds the UTF-16.
+        byte_file("wide.txt", &utf16le(text, false)),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        for (index, name) in ["wide.dat", "wide.txt"].into_iter().enumerate() {
+            open_in_sidebar(rig, &rig.work.join(name));
+            assert_eq!(rig.tab_count(), index + 2, "{name}");
+            assert_eq!(rig.text(), text, "{name}");
+            assert_eq!(rig.active().mode(), DocMode::Plain, "{name}");
+        }
+        assert_eq!(message_boxes(rig), Vec::<String>::new());
+    });
+}
+
+#[test]
+fn a_binary_file_clicked_in_the_sidebar_starts_its_default_app_with_no_tab_and_no_message() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        byte_file("report.pdf", b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\x00\x00"),
+        byte_file("tool.exe", b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00"),
+        byte_file("blob", b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00"),
+        byte_file("pic.png", PNG_START),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        let names = ["report.pdf", "tool.exe", "blob", "pic.png"];
+        for name in names {
+            open_in_sidebar(rig, &rig.work.join(name));
+        }
+        assert_eq!(rig.tab_count(), 1, "no tab shows a binary file");
+        assert_eq!(message_boxes(rig), Vec::<String>::new());
+        let started: Vec<ShellRecord> = names
+            .iter()
+            .map(|name| ShellRecord::OpenPath(rig.work.join(name)))
+            .collect();
+        assert_eq!(rig.services.shell_log(), started);
+        assert_eq!(rig.controller.docs().all().len(), 1, "no document holds one");
+    });
+}
+
+#[test]
+fn a_binary_file_is_refused_with_a_message_by_every_way_of_asking_the_editor_to_open_it() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        text_file("notes.kt", "fun main() {}\n"),
+        byte_file("tool.exe", b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00"),
+        byte_file("pic.png", PNG_START),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        // File > Open: the binary file is refused, the text file after it opens.
+        rig.services.answer(
+            DialogKind::OpenFile,
+            Answer::Paths(vec![rig.work.join("tool.exe"), rig.work.join("notes.kt")]),
+        );
+        rig.answer(MessageBoxResult::Ok);
+        let _ = rig
+            .controller
+            .run_command(rig.id(), ssw_core::command::CommandId::FileOpen);
+        assert_eq!(message_boxes(rig), [NOT_TEXT]);
+        assert_eq!(rig.tab_count(), 2);
+        assert_eq!(rig.path(), canonical_path(&rig.work.join("notes.kt")));
+        assert_eq!(rig.active().mode(), DocMode::Plain);
+
+        // A launch (Explorer "Open with", the command line, a forwarded second start) and a
+        // dropped file end in the same call: a picture is no more text than a program.
+        for name in ["tool.exe", "pic.png"] {
+            rig.answer(MessageBoxResult::Ok);
+            rig.controller.open_launch(&Launch {
+                items: vec![LaunchItem::File(rig.work.join(name))],
+                new_window: false,
+            });
+        }
+        assert_eq!(message_boxes(rig), [NOT_TEXT; 3]);
+        assert_eq!(rig.tab_count(), 2, "no tab shows a refused file");
+        let mut open: Vec<PathBuf> = rig
+            .controller
+            .docs()
+            .all()
+            .iter()
+            .filter_map(|entry| entry.path())
+            .collect();
+        open.sort();
+        let mut expected = vec![
+            canonical_path(&rig.work.join("a.md")),
+            canonical_path(&rig.work.join("notes.kt")),
+        ];
+        expected.sort();
+        assert_eq!(open, expected, "no document holds a refused file");
+        assert!(
+            rig.services.shell_log().is_empty(),
+            "nothing was started either"
+        );
+    });
+}
+
+#[test]
+fn a_link_never_opens_a_file_of_no_known_type_in_the_app() {
+    let files = vec![
+        text_file("a.md", "[k](notes.kt) [b](blob.dat)\n"),
+        text_file("notes.kt", "fun main() {}\n"),
+        byte_file("blob.dat", b"\x00\x01\x02\x03"),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        let key = rig.window().view.borrow().active_tab().unwrap().key;
+        for target in ["notes.kt", "blob.dat"] {
+            rig.controller.handle_action(
+                rig.id(),
+                ShellAction::Editor(
+                    key,
+                    EditorEvent::LinkActivated(LinkTarget::Url(target.to_owned())),
+                ),
+            );
+        }
+        // Links keep their rules: the default app or nothing, neither a tab nor an error.
+        assert_eq!(rig.tab_count(), 1);
+        assert_eq!(message_boxes(rig), Vec::<String>::new());
+        assert!(
+            rig.services
+                .shell_log()
+                .iter()
+                .all(|record| matches!(record, ShellRecord::OpenPath(_))),
+            "{:?}",
+            rig.services.shell_log()
+        );
     });
 }

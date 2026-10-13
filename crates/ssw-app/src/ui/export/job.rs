@@ -7,6 +7,7 @@
 //! leaves a half-written export behind (a TextBundle *folder* is the one exception: a folder
 //! cannot be replaced in one step).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -56,6 +57,9 @@ pub struct ExportJob {
     pub options: ExportOptions,
     /// The document text.
     pub markdown: String,
+    /// `true` when `markdown` is a plain-text file (`.json`, `.py`, `.txt`…) rather than
+    /// Markdown: its text is exported verbatim, never parsed as Markdown.
+    pub plain: bool,
     /// The document's folder: relative images and attachments are read from below it.
     pub source_dir: Option<PathBuf>,
     /// The document title (file stem or "Untitled").
@@ -287,6 +291,33 @@ fn page_path(target: &Path, index: usize, count: usize) -> PathBuf {
     })
 }
 
+/// Markdown that renders `text` verbatim: a fenced code block (no info string) whose fence is
+/// a run of backticks longer than any run in `text`, and at least three, so nothing in the
+/// text can close it early.
+fn verbatim_markdown(text: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for character in text.chars() {
+        if character == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    let mut markdown = String::with_capacity(text.len() + 2 * fence.len() + 2);
+    markdown.push_str(&fence);
+    markdown.push('\n');
+    markdown.push_str(text);
+    if !text.ends_with('\n') {
+        markdown.push('\n');
+    }
+    markdown.push_str(&fence);
+    markdown.push('\n');
+    markdown
+}
+
 /// Runs the export and returns the files written, the first one being the one to open.
 ///
 /// # Errors
@@ -304,7 +335,13 @@ pub fn run_export(
         dark,
     };
     let diagrams = |source: &str| mermaid_svg(source, dark);
-    let markdown = job.markdown.as_str();
+    let fenced;
+    let markdown = if job.plain {
+        fenced = verbatim_markdown(&job.markdown);
+        fenced.as_str()
+    } else {
+        job.markdown.as_str()
+    };
     let single = |bytes: Vec<u8>| -> Result<Vec<PathBuf>, ExportFailure> {
         write(fs, sleeper, &job.target, &bytes)?;
         Ok(vec![job.target.clone()])
@@ -395,6 +432,7 @@ pub fn run_export(
         ExportFormat::Rtf => {
             single(ssw_convert::rtf::markdown_to_rtf(markdown, &assets).into_bytes())
         }
+        ExportFormat::Txt if job.plain => single(job.markdown.clone().into_bytes()),
         ExportFormat::Txt => single(ssw_convert::txt::markdown_to_text(markdown).into_bytes()),
         ExportFormat::MarkdownWithAttachments => export_markdown(job, fs, sleeper),
         ExportFormat::Textbundle => export_textbundle(job, fs, sleeper),
@@ -407,6 +445,11 @@ fn export_markdown(
     fs: &dyn FileSystem,
     sleeper: &dyn Sleeper,
 ) -> Result<Vec<PathBuf>, ExportFailure> {
+    if job.plain {
+        // A plain file has no Markdown links to rewrite: its text is written as it is.
+        write(fs, sleeper, &job.target, job.markdown.as_bytes())?;
+        return Ok(vec![job.target.clone()]);
+    }
     let dir = job.target.parent().unwrap_or(Path::new(""));
     let source_dir = job.source_dir.as_deref().unwrap_or(dir);
     let plan = markdown_export::plan(&job.markdown, source_dir);
@@ -432,23 +475,30 @@ fn export_textbundle(
 ) -> Result<Vec<PathBuf>, ExportFailure> {
     let dir = job.target.parent().unwrap_or(Path::new(""));
     let source_dir = job.source_dir.as_deref().unwrap_or(dir);
-    let plan = markdown_export::plan_with_folder(&job.markdown, source_dir, "assets");
-    let mut assets = Vec::with_capacity(plan.copies.len());
-    for (from, relative) in &plan.copies {
-        let bytes = fs.read(from).map_err(ExportFailure::convert)?;
-        assets.push(Asset {
-            relative_path: relative.clone(),
-            bytes,
-        });
-    }
+    let mut assets = Vec::new();
+    let text = if job.plain {
+        // A plain file has no Markdown links: its text goes in as it is, with no files.
+        Cow::Borrowed(job.markdown.as_str())
+    } else {
+        let plan = markdown_export::plan_with_folder(&job.markdown, source_dir, "assets");
+        assets.reserve(plan.copies.len());
+        for (from, relative) in &plan.copies {
+            let bytes = fs.read(from).map_err(ExportFailure::convert)?;
+            assets.push(Asset {
+                relative_path: relative.clone(),
+                bytes,
+            });
+        }
+        Cow::Owned(plan.markdown)
+    };
     let folder = job
         .target
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("textbundle"));
     let written = if folder {
-        textbundle::write_dir(&job.target, &plan.markdown, &assets).map_err(ExportFailure::convert)
+        textbundle::write_dir(&job.target, &text, &assets).map_err(ExportFailure::convert)
     } else {
-        textbundle::write_pack(&plan.markdown, &assets)
+        textbundle::write_pack(&text, &assets)
             .map_err(ExportFailure::convert)
             .and_then(|bytes| write(fs, sleeper, &job.target, &bytes))
     };

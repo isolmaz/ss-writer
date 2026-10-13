@@ -2,6 +2,8 @@
 <!--
   Per-user (HKCU) shell registration for SS Writer (spec section 12):
     - file associations through ProgIDs + OpenWithProgids, plus Default Apps capabilities;
+    - the Applications\SSWriter.exe key and the * OpenWithProgids entry, so "Open with" lists the
+      app for any file;
     - the folder verb "Open with SS Writer";
     - the Explorer preview handler (ssw_preview.dll) for .md, .markdown and .mmd.
 
@@ -49,6 +51,30 @@
           <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
         </RegistryKey>
         <RegistryValue Root="HKCU" Key="Software\Classes\.txt\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <!-- Common plain-text formats the editor opens as text. -->
+        <RegistryValue Root="HKCU" Key="Software\Classes\.json\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.csv\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.log\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.xml\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.html\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.css\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.js\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.yml\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <RegistryValue Root="HKCU" Key="Software\Classes\.py\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+        <!-- Universal opener: Microsoft's mechanism for technical text editors, so "Open with" offers
+             SS Writer for any file. It lists an alternate only and never sets a default. -->
+        <RegistryValue Root="HKCU" Key="Software\Classes\*\OpenWithProgids" Name="SSWriter.Text" Type="string" Value="" />
+      </Component>
+
+      <!-- The application itself, so Windows offers SSWriter.exe under "Open with" > "Choose another
+           app" for files no ProgID covers. SupportedTypes and NoOpenWith are left out on purpose:
+           the first restricts which files the app is offered for, the second hides it. -->
+      <Component Id="ApplicationRegistration">
+        <RegistryKey Root="HKCU" Key="Software\Classes\Applications\SSWriter.exe">
+          <RegistryValue Name="FriendlyAppName" Type="string" Value="SS Writer" KeyPath="yes" />
+          <RegistryKey Key="DefaultIcon"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot;,-1" /></RegistryKey>
+          <RegistryKey Key="shell\open\command"><RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]SSWriter.exe&quot; &quot;%1&quot;" /></RegistryKey>
+        </RegistryKey>
       </Component>
 
       <Component Id="ProgIdTextBundle">

@@ -279,6 +279,18 @@ fn lossless_legacy(guess: &'static Encoding, bytes: &[u8]) -> TextEncoding {
     TextEncoding::Legacy(if exact { guess } else { WINDOWS_1252 })
 }
 
+/// Number of leading bytes [`looks_binary`] inspects: what a caller reads when it classifies a
+/// file without reading it whole.
+pub const BINARY_SNIFF_LEN: usize = 8192;
+
+/// Whether `bytes` look like a binary file rather than text. A UTF-8, UTF-16 or UTF-32 BOM
+/// means text (UTF-16/32 text is full of NUL bytes); otherwise a NUL byte among the first 8192
+/// bytes means binary; everything else, an empty file included, is text.
+#[must_use]
+pub fn looks_binary(bytes: &[u8]) -> bool {
+    bom_encoding(bytes).is_none() && bytes[..bytes.len().min(BINARY_SNIFF_LEN)].contains(&0)
+}
+
 /// Detects the encoding and decodes `bytes` (BOM stripped, line endings normalized).
 #[must_use]
 pub fn decode(bytes: &[u8], tld: Option<&str>) -> Decoded {

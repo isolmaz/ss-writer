@@ -15,6 +15,7 @@ app-error-not-found = The file no longer exists.
 app-error-encrypted = The document is password protected and cannot be opened.
 app-error-conversion = The document could not be converted.
 app-error-file = The file could not be read or written.
+app-error-not-text = This file is not a text file.
 app-error-read-only = This file is read-only.
 app-error-in-use = The file is in use by another program.
 app-error-disk-full = The disk is full.

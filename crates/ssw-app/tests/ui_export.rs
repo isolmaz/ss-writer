@@ -29,6 +29,7 @@ fn job(
         format,
         options: ExportOptions::from(&ExportSettings::default()),
         markdown: markdown.to_owned(),
+        plain: false,
         source_dir: source_dir.map(Path::to_path_buf),
         title: "Doc".to_owned(),
         target,

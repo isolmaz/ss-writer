@@ -29,6 +29,7 @@ fn job(
         format,
         options: ExportOptions::from(&ExportSettings::default()),
         markdown: markdown.to_owned(),
+        plain: false,
         source_dir: source_dir.map(Path::to_path_buf),
         title: "Doc".to_owned(),
         target,
@@ -330,6 +331,35 @@ fn a_textbundle_names_what_blocks_it() {
     let _lock = locked(&source.join("a.png"));
     let failure = bundle(tmp.path().join("free.textpack")).unwrap_err();
     assert!(matches!(failure, ExportFailure::Convert(_)), "{failure:?}");
+}
+
+const PLAIN_TEXT: &str = "# not a heading\n**not bold**\n| a | b |";
+
+/// The job of a plain-text document: its text is never read as Markdown.
+fn plain_job(format: ExportFormat, target: PathBuf) -> ExportJob {
+    let mut job = job(format, PLAIN_TEXT, None, target);
+    job.plain = true;
+    job
+}
+
+#[test]
+fn a_plain_text_document_exports_to_html_without_being_read_as_markdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("plain.html");
+    run(&plain_job(ExportFormat::Html, target.clone())).unwrap();
+    let html = std::fs::read_to_string(&target).unwrap();
+    assert!(html.contains("# not a heading"), "{html}");
+    assert!(html.contains("**not bold**"), "{html}");
+    assert!(!html.contains("<h1"), "{html}");
+    assert!(!html.contains("<strong"), "{html}");
+}
+
+#[test]
+fn a_plain_text_document_exports_to_txt_byte_for_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("plain.txt");
+    run(&plain_job(ExportFormat::Txt, target.clone())).unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), PLAIN_TEXT.as_bytes());
 }
 
 #[test]

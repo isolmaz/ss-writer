@@ -478,6 +478,13 @@ fn every_error_has_a_message_id_in_the_app_catalog() {
         DocError::Load(LoadError::Import(
             ssw_convert::import::ImportError::Encrypted,
         )),
+        DocError::Load(LoadError::Import(
+            ssw_convert::import::ImportError::Corrupt("x".to_owned()),
+        )),
+        DocError::Load(LoadError::Bundle(
+            ssw_convert::textbundle::TextBundleError::MissingText,
+        )),
+        DocError::Load(LoadError::NotText(PathBuf::from("a"))),
         DocError::Save(SaveError::SharingViolation(PathBuf::from("a"))),
         DocError::Save(SaveError::DiskFull(PathBuf::from("a"))),
         DocError::Save(SaveError::AccessDenied(PathBuf::from("a"))),

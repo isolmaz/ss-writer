@@ -45,7 +45,7 @@ use super::shell_view::{ShellAction, ShellView, TabView, ViewConfig, sidebar_opt
 use super::tree_source::{TreePaths, WorkspaceTree};
 use crate::app::AppCore;
 use crate::commands::{AppActions, Dispatch};
-use crate::documents::{DocEntry, DocError, DocMode};
+use crate::documents::{DocEntry, DocError, DocMode, LoadError};
 use crate::session::{PlannedDocument, SessionManager, StartupPlan, TabState, WindowState};
 use crate::workers::{JobKey, JobKind, JobSpec, WindowId};
 
@@ -621,8 +621,10 @@ impl Controller {
                         .and_then(|path| path.parent().map(Path::to_path_buf));
                     if let Some(base) = base {
                         let path = base.join(link_path(&url));
-                        if opens_in_app(&path) || may_open_with_default_app(&url) {
-                            self.open_path(cell, &path, false);
+                        if link_opens_in_app(&path) {
+                            self.open_document(cell, &path);
+                        } else if may_open_with_default_app(&url) {
+                            let _ = self.shell.borrow_mut().open_path(&path);
                         }
                     }
                 }
@@ -676,14 +678,33 @@ impl Controller {
 
     /// Opens `path` in window `cell`: an already open tab of the window is activated.
     pub fn open_file(&self, cell: &Rc<WindowCell>, path: &Path) -> Result<(), DocError> {
+        self.open_text_file(cell, path, false)
+    }
+
+    /// [`Self::open_file`]; `launch_binary` is set for a file the user only browsed to: when it
+    /// is no text, its default app starts and the call succeeds, instead of failing with
+    /// `LoadError::NotText`.
+    fn open_text_file(
+        &self,
+        cell: &Rc<WindowCell>,
+        path: &Path,
+        launch_binary: bool,
+    ) -> Result<(), DocError> {
         if self.activate_shown(cell, path) {
             return Ok(());
         }
         // A OneDrive placeholder downloads while it is read: that happens on a worker.
-        if self.begin_hydration(cell, path) {
+        if self.begin_hydration(cell, path, launch_binary) {
             return Ok(());
         }
-        let entry = self.docs.open(path)?;
+        let entry = match self.docs.open(path) {
+            Ok(entry) => entry,
+            Err(DocError::Load(LoadError::NotText(_))) if launch_binary => {
+                let _ = self.shell.borrow_mut().open_path(path);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let workspace = cell
             .view
             .borrow()
@@ -711,11 +732,17 @@ impl Controller {
         }
     }
 
+    /// Opens a file the user browsed to (the sidebar, Quick Open, a search result, a log or
+    /// settings file): word-processor files are imported and text is edited, whatever its
+    /// extension; a picture or any other binary file goes to its default app, with no error.
+    /// `open_document` is the call for a file the user asked the editor to open.
     pub(super) fn open_path(&self, cell: &Rc<WindowCell>, path: &Path, _new_tab: bool) {
-        if opens_in_app(path) {
+        if super::import::is_import(path) {
             self.open_document(cell, path);
-        } else {
+        } else if is_picture(path) {
             let _ = self.shell.borrow_mut().open_path(path);
+        } else if let Err(error) = self.open_text_file(cell, path, true) {
+            self.report(&error);
         }
     }
 
@@ -1284,9 +1311,19 @@ fn tab_view_state(tab: &TabView) -> ViewState {
     }
 }
 
-/// Whether `Controller::open_path` opens `path` in the app (word-processor files are imported,
-/// Markdown and text are edited) instead of handing it to the default app.
-fn opens_in_app(path: &Path) -> bool {
+/// Whether `path` is a picture by its extension: browsing to one hands it to its default app
+/// without reading it.
+fn is_picture(path: &Path) -> bool {
+    use ssw_io::workspace::{FileClass, classify_extension};
+    path.extension()
+        .is_some_and(|ext| classify_extension(&ext.to_string_lossy()) == FileClass::Image)
+}
+
+/// Whether following a Markdown link to `path` opens it in the app (word-processor files are
+/// imported, Markdown and text are edited). Any other file is left to its default app, and only
+/// from the document's folder or below (`may_open_with_default_app`): a link never makes the
+/// app read an arbitrary file to find out whether it is text.
+fn link_opens_in_app(path: &Path) -> bool {
     use ssw_io::workspace::{FileClass, classify_extension};
     let class = path.extension().map_or(FileClass::Text, |ext| {
         classify_extension(&ext.to_string_lossy())
@@ -1470,7 +1507,7 @@ impl AppActions for WindowActions<'_> {
             }
             CommandId::FileOpen => {
                 for path in controller.open_dialog() {
-                    controller.open_path(&cell, &path, true);
+                    controller.open_document(&cell, &path);
                 }
                 true
             }

@@ -9,6 +9,7 @@ use ssw_convert::textbundle::{self, TextBundleError};
 use ssw_io::encoding::{self, TextEncoding, TextFormat};
 use ssw_io::fs::{FileSystem, FsError};
 use ssw_io::save::{SaveStamp, WriteAccess, write_access};
+use ssw_io::workspace::{FileClass, classify_extension};
 
 /// Word-processor formats opened by conversion to Markdown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +161,9 @@ pub enum LoadError {
     /// A TextBundle or TextPack is unreadable.
     #[error(transparent)]
     Bundle(#[from] TextBundleError),
+    /// A file of no known text type whose content looks binary.
+    #[error("{} is not a text file", .0.display())]
+    NotText(PathBuf),
 }
 
 /// Names tried, in order, for the text file of a `.textbundle` folder.
@@ -176,6 +180,25 @@ fn extension_of(path: &Path) -> String {
     path.extension()
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default()
+}
+
+/// Whether files with `extension` (lowercase, no dot) open as text without a look at their
+/// content: Markdown and the known text formats. A file of any other type, or without one, is
+/// text only when [`encoding::looks_binary`] says it is not binary.
+fn is_known_text(extension: &str) -> bool {
+    matches!(
+        classify_extension(extension),
+        FileClass::Markdown | FileClass::Text
+    )
+}
+
+/// Whether files with `extension` are read by a converter, which decides itself what it accepts
+/// (a DOCX or TextPack is a ZIP, a DOC a compound file: binary by content, text once imported).
+fn is_converted(extension: &str) -> bool {
+    matches!(
+        extension,
+        "docx" | "odt" | "rtf" | "doc" | "textbundle" | "textpack"
+    )
 }
 
 fn stem_of(path: &Path) -> String {
@@ -260,11 +283,12 @@ fn bundle_text_file(fs: &dyn FileSystem, dir: &Path) -> Result<String, FsError> 
 
 /// Reads and decodes `path`: text files with encoding detection (`tld` biases the legacy code
 /// page guess), word-processor files through their importer, bundles and packs through the
-/// TextBundle reader.
+/// TextBundle reader. A file whose extension is no known Markdown or text type (or that has
+/// none) is text when its content does not look binary, see [`encoding::looks_binary`].
 ///
 /// # Errors
-/// [`LoadError`] when the file cannot be read, is refused by an importer, or is a broken
-/// bundle.
+/// [`LoadError`] when the file cannot be read, is refused by an importer, is a broken
+/// bundle, or is a binary file of no known text type ([`LoadError::NotText`]).
 pub fn load_file(fs: &dyn FileSystem, path: &Path, tld: Option<&str>) -> Result<Loaded, LoadError> {
     load_file_as(fs, path, tld, None)
 }
@@ -297,6 +321,14 @@ pub fn load_file_as(
             access,
             lossy: false,
         });
+    }
+    if !is_known_text(&extension) && !is_converted(&extension) {
+        // A file of unknown type is classified by its first bytes, so a picture, an archive or
+        // a disk image is refused without reading it whole.
+        let head = fs.read_prefix(path, encoding::BINARY_SNIFF_LEN)?;
+        if encoding::looks_binary(&head) {
+            return Err(LoadError::NotText(path.to_path_buf()));
+        }
     }
     let bytes = fs.read(path)?;
     ssw_win::perf::mark_latest(crate::perf::DOC_READ);
@@ -419,6 +451,7 @@ mod tests {
             LoadError::Fs(error) => format!("file system: {error:?}"),
             LoadError::Import(error) => format!("import: {error:?}"),
             LoadError::Bundle(error) => format!("bundle: {error:?}"),
+            LoadError::NotText(path) => format!("not text: {}", path.display()),
         }
     }
 
@@ -476,6 +509,46 @@ mod tests {
         // 3 BOM bytes + "one\r\ntwo\r\n" (10 bytes).
         assert_eq!(loaded.stamp.size, 13);
         assert!(loaded.stamp.matches_content(&std::fs::read(&path).unwrap()));
+    }
+
+    #[test]
+    fn a_file_of_no_known_text_type_is_text_unless_it_looks_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let text = [
+            ("notes.kt", &b"fun main() {}\r\n"[..], "fun main() {}\n"),
+            ("Dockerfile", b"FROM scratch\n", "FROM scratch\n"),
+            (".gitignore", b"target/\n", "target/\n"),
+            ("LICENSE", b"MIT\n", "MIT\n"),
+            ("wide.dat", b"\xFF\xFEh\0i\0\n\0", "hi\n"),
+        ];
+        for (name, bytes, expected) in text {
+            let loaded = load_file(&RealFs, &write(name, bytes), None).unwrap();
+            assert_eq!(loaded.text, expected, "{name}");
+            assert_eq!(loaded.source, Source::Text, "{name}");
+        }
+        let binary = [
+            ("pic.png", &b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"[..]),
+            ("tool.exe", b"MZ\x90\0\x03\0\0\0"),
+            ("blob", b"\x7fELF\x02\x01\x01\0"),
+            ("wide-without-bom.dat", b"h\0i\0\n\0"),
+        ];
+        for (name, bytes) in binary {
+            let path = write(name, bytes);
+            let error = load_file(&RealFs, &path, None).unwrap_err();
+            assert_eq!(describe(&error), format!("not text: {}", path.display()));
+            assert_eq!(
+                error.to_string(),
+                format!("{} is not a text file", path.display())
+            );
+        }
+        // A known text type is opened without a look at its content.
+        let wide = write("wide.txt", b"h\0i\0\n\0");
+        assert_eq!(load_file(&RealFs, &wide, None).unwrap().text, "hi\n");
     }
 
     #[test]

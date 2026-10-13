@@ -975,33 +975,57 @@ fn a_click_on_a_drop_down_row_over_other_controls_chooses_the_row_and_nothing_el
     let combo = host.control(&window, &name);
     host.click(&mut window, combo.bounds.center());
     let tree = host.tree(&window);
-    let option = tree
-        .nodes()
+    // What lies under a point of the page besides the open drop-down itself and its own pop-up:
+    // the other controls the pop-up hangs over (a drop-down, a slider, a switch, ...).
+    let under = |at: Point| -> Vec<String> {
+        tree.nodes()
+            .iter()
+            .filter(|node| {
+                node.bounds.contains(at)
+                    && !node.state.offscreen
+                    && node.name != name
+                    && !matches!(
+                        node.role,
+                        Role::ListItem | Role::List | Role::Group | Role::Window
+                    )
+            })
+            .map(|node| node.name.clone())
+            .collect()
+    };
+    // Which controls the rows of the pop-up cover depends on how tall the rows above and below
+    // are, so look for them instead of assuming one: the first option other than the current
+    // one with a point that lies over another control.
+    let options = [
+        (ListIndent::Align, "settings-opt-indent-align"),
+        (ListIndent::Two, "settings-opt-indent-2"),
+        (ListIndent::Four, "settings-opt-indent-4"),
+        (ListIndent::Tab, "settings-opt-indent-tab"),
+    ];
+    let (chosen, at, covered) = options
         .iter()
-        .find(|node| node.role == Role::ListItem && node.name == "4 spaces")
-        .cloned()
-        .expect("the third option");
-    let at = option.bounds.center();
-    // The row of the pop-up is over another control of the page.
-    let covered: Vec<&str> = tree
-        .nodes()
-        .iter()
-        .filter(|node| {
-            node.bounds.contains(at)
-                && !matches!(
-                    node.role,
-                    Role::ListItem | Role::List | Role::ComboBox | Role::Group | Role::Window
-                )
+        .filter(|(value, _)| *value != before.editor.list_indent)
+        .find_map(|&(value, id)| {
+            let text = localizer().text(id);
+            let row = tree.nodes().iter().find(|node| {
+                node.role == Role::ListItem && node.name == text && node.bounds.y > combo.bounds.y
+            })?;
+            let bounds = row.bounds;
+            [bounds.y + 2.0, bounds.center().y, bounds.bottom() - 2.0]
+                .into_iter()
+                .find_map(|y| {
+                    let at = Point::new(bounds.center().x, y);
+                    let covered = under(at);
+                    (!covered.is_empty()).then_some((value, at, covered))
+                })
         })
-        .map(|node| node.name.as_str())
-        .collect();
-    assert!(!covered.is_empty(), "nothing lies under {at:?}");
+        .expect("a row of the pop-up lies over another control of the page");
 
     host.click(&mut window, at);
     let mut expected = before;
-    expected.editor.list_indent = ListIndent::Four;
+    expected.editor.list_indent = chosen;
     assert_eq!(window.settings(), &expected, "covered: {covered:?}");
     assert_eq!(window.take_events(), changed(FieldId::ListIndent));
+    assert_eq!(host.control(&window, &name).state.expanded, Some(false));
 }
 
 #[test]

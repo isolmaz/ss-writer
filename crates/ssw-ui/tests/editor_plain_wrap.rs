@@ -19,6 +19,7 @@ use ssw_ui::text::{
     InlineObject, MonoTextEngine, StyledRange, TextLayout, TextLayoutEngine, TextStyle,
 };
 use ssw_ui::widget::{LayoutCx, Widget};
+use ssw_ui::widgets::Control;
 
 /// Characters of a long line: 800 DIPs at 8 DIPs each, far wider than the 352 DIP column.
 const LONG: usize = 100;
@@ -305,7 +306,7 @@ fn a_plain_document_with_a_language_colours_the_tokens_of_its_lines() {
         stretches(&spy, "let name = \"ssw\";"),
         [
             ("let".to_owned(), Some(calm.color(TokenKind::Keyword))),
-            ("\"ssw\"".to_owned(), Some(calm.color(TokenKind::String))),
+            ("\"ssw\"".to_owned(), Some(calm.color(TokenKind::String)))
         ]
     );
     assert!(stretches(&spy, "plain words").is_empty());
@@ -359,7 +360,7 @@ fn the_whole_document_is_tokenized_so_a_comment_runs_over_the_lines_after_it() {
         stretches(&spy, "let b = 2;"),
         [
             ("let".to_owned(), Some(calm.color(TokenKind::Keyword))),
-            ("2".to_owned(), Some(calm.color(TokenKind::Number))),
+            ("2".to_owned(), Some(calm.color(TokenKind::Number)))
         ]
     );
 
@@ -422,7 +423,7 @@ fn an_ime_composition_inside_a_token_splits_it_and_stays_uncoloured() {
         [
             ("let".to_owned(), Some(calm.color(TokenKind::Keyword))),
             ("\"ab".to_owned(), string),
-            ("c\"".to_owned(), string),
+            ("c\"".to_owned(), string)
         ]
     );
     assert_eq!(

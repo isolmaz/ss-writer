@@ -927,6 +927,179 @@ fn html_open_tags_may_span_lines_before_the_body_starts() {
 }
 
 #[test]
+fn html_javascript_types_in_any_case_and_spacing_are_javascript() {
+    for mime in [
+        "text/javascript",
+        "application/javascript",
+        "application/ecmascript",
+        "application/x-javascript",
+        "text/javascript1.5",
+        "text/jscript",
+        "text/x-ecmascript",
+        "TEXT/JavaScript",
+        "  text/javascript\t",
+    ] {
+        let text = format!("<script type=\"{mime}\">let a</script>");
+        let quoted = format!("\"{mime}\"");
+        assert_eq!(
+            toks(Language::Html, &text),
+            [
+                ("<script", Tag),
+                ("type", Attribute),
+                (quoted.as_str(), Str),
+                ("let", Keyword),
+                ("</script", Tag)
+            ],
+            "{mime:?}"
+        );
+    }
+}
+
+#[test]
+fn html_an_empty_or_blank_type_is_no_type() {
+    assert_eq!(
+        toks(Language::Html, "<script type=\"\">let a</script>"),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("\"\"", Str),
+            ("let", Keyword),
+            ("</script", Tag)
+        ],
+        "an empty type leaves a script JavaScript"
+    );
+    assert_eq!(
+        toks(Language::Html, "<style type=\" \">a{margin:0}</style>"),
+        [
+            ("<style", Tag),
+            ("type", Attribute),
+            ("\" \"", Str),
+            ("a", Tag),
+            ("margin", Property),
+            ("0", Number),
+            ("</style", Tag)
+        ],
+        "a blank type leaves a style CSS"
+    );
+}
+
+#[test]
+fn html_unquoted_and_spaced_type_values_are_read_too() {
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type=application/json defer>{\"a\": 1}</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("application", Attribute),
+            ("json", Attribute),
+            ("defer", Attribute),
+            ("\"a\"", Property),
+            ("1", Number),
+            ("</script", Tag)
+        ],
+        "an unquoted value ends at white space"
+    );
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type=application/json\n>\n{\"a\": 1}\n</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("application", Attribute),
+            ("json", Attribute),
+            ("\"a\"", Property),
+            ("1", Number),
+            ("</script", Tag)
+        ],
+        "an unquoted value ends at the end of the line"
+    );
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type = 'application/json'>{\"a\": 1}</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("'application/json'", Str),
+            ("\"a\"", Property),
+            ("1", Number),
+            ("</script", Tag)
+        ],
+        "white space around the equals sign does not matter"
+    );
+}
+
+#[test]
+fn html_a_type_that_cannot_be_read_leaves_the_default_language() {
+    // The value starts on the next line: it is not read, the script stays JavaScript.
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type=\n\"application/json\">{\"a\": 1}</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("\"application/json\"", Str),
+            ("\"a\"", Str),
+            ("1", Number),
+            ("</script", Tag)
+        ]
+    );
+    // A quoted value that does not end on the line is not read either.
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type=\"application/json\n\">{\"a\": 1}</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("\"application/json", Str),
+            ("\"", Str),
+            ("\"a\"", Str),
+            ("1", Number),
+            ("</script", Tag)
+        ]
+    );
+    // The first `type` counts, as in a browser.
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<script type=\"text/x\" type=\"module\">let a</script>"
+        ),
+        [
+            ("<script", Tag),
+            ("type", Attribute),
+            ("\"text/x\"", Str),
+            ("type", Attribute),
+            ("\"module\"", Str),
+            ("</script", Tag)
+        ]
+    );
+    // Only a script or a style has a body of another language.
+    assert_eq!(
+        toks(
+            Language::Html,
+            "<input type=\"application/json\"><p>{\"a\": 1}</p>"
+        ),
+        [
+            ("<input", Tag),
+            ("type", Attribute),
+            ("\"application/json\"", Str),
+            ("<p", Tag),
+            ("</p", Tag)
+        ]
+    );
+}
+
+#[test]
 fn an_end_tag_inside_a_guest_string_or_comment_still_ends_the_element() {
     assert_eq!(
         toks(Language::Html, "<script>var s = \"</script><b>x</b>"),

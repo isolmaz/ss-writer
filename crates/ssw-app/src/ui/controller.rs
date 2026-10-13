@@ -123,6 +123,16 @@ pub enum CloseOutcome {
     Cancelled,
 }
 
+/// What became of a file the user browsed to (see [`Controller::open_path`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Browsed {
+    /// The file went to its default app: no tab shows it, nothing is pending and no error was
+    /// reported.
+    Launched,
+    /// A tab shows the file or a worker is loading it, or the failure was reported.
+    Handled,
+}
+
 /// The windows, tabs and commands of the process (UI thread only).
 pub struct Controller {
     /// This controller, for worker callbacks that outlive a borrow (see [`super::import`]).
@@ -678,30 +688,30 @@ impl Controller {
 
     /// Opens `path` in window `cell`: an already open tab of the window is activated.
     pub fn open_file(&self, cell: &Rc<WindowCell>, path: &Path) -> Result<(), DocError> {
-        self.open_text_file(cell, path, false)
+        self.open_text_file(cell, path, false).map(|_| ())
     }
 
     /// [`Self::open_file`]; `launch_binary` is set for a file the user only browsed to: when it
-    /// is no text, its default app starts and the call succeeds, instead of failing with
-    /// `LoadError::NotText`.
+    /// is no text, its default app starts and the call succeeds with [`Browsed::Launched`],
+    /// instead of failing with `LoadError::NotText`.
     fn open_text_file(
         &self,
         cell: &Rc<WindowCell>,
         path: &Path,
         launch_binary: bool,
-    ) -> Result<(), DocError> {
+    ) -> Result<Browsed, DocError> {
         if self.activate_shown(cell, path) {
-            return Ok(());
+            return Ok(Browsed::Handled);
         }
         // A OneDrive placeholder downloads while it is read: that happens on a worker.
         if self.begin_hydration(cell, path, launch_binary) {
-            return Ok(());
+            return Ok(Browsed::Handled);
         }
         let entry = match self.docs.open(path) {
             Ok(entry) => entry,
             Err(DocError::Load(LoadError::NotText(_))) if launch_binary => {
                 let _ = self.shell.borrow_mut().open_path(path);
-                return Ok(());
+                return Ok(Browsed::Launched);
             }
             Err(error) => return Err(error),
         };
@@ -713,7 +723,7 @@ impl Controller {
         cell.view
             .borrow_mut()
             .open_tab(entry, workspace, &self.docs);
-        Ok(())
+        Ok(Browsed::Handled)
     }
 
     /// A weak reference to this controller (for worker callbacks).
@@ -736,13 +746,21 @@ impl Controller {
     /// settings file): word-processor files are imported and text is edited, whatever its
     /// extension; a picture or any other binary file goes to its default app, with no error.
     /// `open_document` is the call for a file the user asked the editor to open.
-    pub(super) fn open_path(&self, cell: &Rc<WindowCell>, path: &Path, _new_tab: bool) {
+    ///
+    /// Returns [`Browsed::Launched`] when the file went to its default app.
+    pub(super) fn open_path(&self, cell: &Rc<WindowCell>, path: &Path, _new_tab: bool) -> Browsed {
         if super::import::is_import(path) {
             self.open_document(cell, path);
+            Browsed::Handled
         } else if is_picture(path) {
             let _ = self.shell.borrow_mut().open_path(path);
-        } else if let Err(error) = self.open_text_file(cell, path, true) {
-            self.report(&error);
+            Browsed::Launched
+        } else {
+            self.open_text_file(cell, path, true)
+                .unwrap_or_else(|error| {
+                    self.report(&error);
+                    Browsed::Handled
+                })
         }
     }
 

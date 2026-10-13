@@ -18,15 +18,17 @@ use ssw_app::documents::{DocMode, canonical_path, replace_text};
 use ssw_app::startup::ProcessEnv;
 use ssw_app::ui::controller::{Controller, Request};
 use ssw_app::ui::files::{Move, absolute, link_updates, moves_for, relative_to};
+use ssw_app::ui::menus::menu_id;
 use ssw_app::ui::scripted_services::{Answer, DialogKind, ScriptedServices, ShellRecord};
 use ssw_app::ui::shell_view::ShellAction;
 use ssw_app::ui::tree_source::WorkspaceTree;
+use ssw_core::command::CommandId;
 use ssw_core::edit::Selection;
 use ssw_core::links::RelPath;
 use ssw_io::fs::{Attributes, FileSystem, RealFs};
 use ssw_io::watch::{FsEvent, FsEventKind};
 use ssw_ui::editor::{EditorEvent, LinkTarget};
-use ssw_ui::geometry::{Rect, Size};
+use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::services::{
     Clock, Dialogs, FakeClock, MemoryClipboard, MessageBoxOptions, MessageBoxResult,
     OpenFileOptions, PickFolderOptions, SaveFileOptions, ServiceError,
@@ -2073,19 +2075,29 @@ fn a_text_file_of_no_known_type_given_on_the_command_line_opens_in_plain_mode() 
 }
 
 #[test]
-fn a_utf16_file_with_a_bom_is_text_although_it_holds_nul_bytes() {
+fn a_utf16_file_is_text_with_or_without_a_bom_whatever_it_is_called() {
     let text = "héllo\nwörld\n";
     let with_bom = utf16le(text, true);
-    assert!(with_bom.contains(&0));
+    let without_bom = utf16le(text, false);
+    assert!(with_bom.contains(&0) && without_bom.contains(&0));
     let files = vec![
         text_file("a.md", "# A\n"),
         byte_file("wide.dat", &with_bom),
-        // A known text type is not looked at: its encoding detection finds the UTF-16.
-        byte_file("wide.txt", &utf16le(text, false)),
+        // Without a BOM the same bytes are text under every name: the encoding detection that
+        // opens `wide.txt` is the one that tells the sidebar this is no binary file.
+        byte_file("wide-without-bom.dat", &without_bom),
+        byte_file("wide-without-bom", &without_bom),
+        byte_file("wide.txt", &without_bom),
     ];
     with_rig(files, "a.md", nothing, |rig| {
         rig.show();
-        for (index, name) in ["wide.dat", "wide.txt"].into_iter().enumerate() {
+        let names = [
+            "wide.dat",
+            "wide-without-bom.dat",
+            "wide-without-bom",
+            "wide.txt",
+        ];
+        for (index, name) in names.into_iter().enumerate() {
             open_in_sidebar(rig, &rig.work.join(name));
             assert_eq!(rig.tab_count(), index + 2, "{name}");
             assert_eq!(rig.text(), text, "{name}");
@@ -2164,6 +2176,96 @@ fn a_binary_placeholder_clicked_in_the_sidebar_starts_its_default_app_once_it_is
     });
 }
 
+/// Right click on the sidebar entry `path` and choose "Open in new window".
+fn open_in_new_window(rig: &Rig, path: &Path) {
+    let menu = ShellAction::Sidebar(SidebarEvent::ContextMenu {
+        key: Some(rig.key(path)),
+        at: Point::new(30.0, 90.0),
+    });
+    let popup = rig
+        .controller
+        .popup_for(rig.id(), &menu)
+        .expect("the sidebar menu");
+    let item = menu_id(CommandId::SidebarOpenInNewWindow);
+    rig.controller.run_popup_choice(rig.id(), &popup, item);
+}
+
+#[test]
+fn a_binary_file_opened_in_a_new_window_starts_its_default_app_and_no_window_stays() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        byte_file(
+            "report.pdf",
+            b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\x00\x00",
+        ),
+        byte_file("pack.zip", b"PK\x03\x04\x14\x00\x00\x00\x08\x00\x00\x00"),
+        byte_file("pic.png", PNG_START),
+        text_file("notes.kt", "fun main() {}\n"),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        let names = ["report.pdf", "pack.zip", "pic.png"];
+        for name in names {
+            open_in_new_window(rig, &rig.work.join(name));
+        }
+        // The same as clicking the file: its default app, with no tab, no message and no
+        // empty window left behind.
+        assert_eq!(rig.controller.windows().len(), 1);
+        assert_eq!(rig.tab_count(), 1);
+        assert_eq!(rig.controller.active_window().unwrap().id, rig.id());
+        assert_eq!(message_boxes(rig), Vec::<String>::new());
+        let started: Vec<ShellRecord> = names
+            .iter()
+            .map(|name| ShellRecord::OpenPath(rig.work.join(name)))
+            .collect();
+        assert_eq!(rig.services.shell_log(), started);
+        assert_eq!(
+            rig.controller.docs().all().len(),
+            1,
+            "no document holds one"
+        );
+
+        // A text file of no known type gets its window, with the file in plain mode.
+        open_in_new_window(rig, &rig.work.join("notes.kt"));
+        let windows = rig.controller.windows();
+        assert_eq!(windows.len(), 2);
+        let fresh = windows[1].view.borrow();
+        let tab = fresh.active_tab().expect("the file opened in the window");
+        assert_eq!(
+            tab.entry.path(),
+            Some(canonical_path(&rig.work.join("notes.kt")))
+        );
+        assert_eq!(tab.entry.mode(), DocMode::Plain);
+        assert_eq!(rig.controller.active_window().unwrap().id, windows[1].id);
+        assert_eq!(rig.services.shell_log(), started, "nothing else started");
+    });
+}
+
+#[test]
+fn a_word_processor_file_opened_in_a_new_window_keeps_the_window_while_it_is_imported() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        byte_file("doc.rtf", &rtf_fixture()),
+    ];
+    with_rig(files, "a.md", nothing, |rig| {
+        rig.show();
+        let doc = rig.work.join("doc.rtf");
+        open_in_new_window(rig, &doc);
+        assert_eq!(rig.controller.windows().len(), 2, "the import is under way");
+        rig.wait_for("the import", || {
+            rig.controller.windows()[1].view.borrow().tabs().len() == 1
+        });
+        let windows = rig.controller.windows();
+        let fresh = windows[1].view.borrow();
+        assert_eq!(
+            fresh.active_tab().unwrap().entry.path(),
+            Some(canonical_path(&doc))
+        );
+        assert_eq!(message_boxes(rig), Vec::<String>::new());
+        assert!(rig.services.shell_log().is_empty(), "no default app");
+    });
+}
+
 #[test]
 fn a_binary_file_is_refused_with_a_message_by_every_way_of_asking_the_editor_to_open_it() {
     let files = vec![
@@ -2237,16 +2339,16 @@ fn a_link_never_opens_a_file_of_no_known_type_in_the_app() {
                 ),
             );
         }
-        // Links keep their rules: the default app or nothing, neither a tab nor an error.
+        // Links keep their rules: both files go to their default app, in the order of the
+        // links, with neither a tab nor an error.
         assert_eq!(rig.tab_count(), 1);
         assert_eq!(message_boxes(rig), Vec::<String>::new());
-        assert!(
-            rig.services
-                .shell_log()
-                .iter()
-                .all(|record| matches!(record, ShellRecord::OpenPath(_))),
-            "{:?}",
-            rig.services.shell_log()
+        assert_eq!(
+            rig.services.shell_log(),
+            [
+                ShellRecord::OpenPath(rig.work.join("notes.kt")),
+                ShellRecord::OpenPath(rig.work.join("blob.dat")),
+            ]
         );
     });
 }

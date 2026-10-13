@@ -8,12 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Every file whose content is text opens, whatever it is called: `Dockerfile`, `.gitignore`, `.kt`, a file without an extension. A file is text when it starts with a byte order mark or holds no `0x00` byte in its first 8192 bytes; a binary file is refused with "This file is not a text file" instead of being shown as mojibake. Clicking such a file in the sidebar, Quick Open or a folder search still hands it to its default app.
+- Every file whose content is text opens, whatever it is called: `Dockerfile`, `.gitignore`, `.kt`, a file without an extension. A file is text when it starts with a byte order mark, holds no `0x00` byte in its first 8192 bytes, or is UTF-16 or UTF-32 without a mark; a binary file is refused with "This file is not a text file" instead of being shown as mojibake. Clicking such a file in the sidebar, Quick Open, a folder search or "Open in new window" still hands it to its default app, and no empty window is left behind.
 - The installer registers SS Writer as an application (`Applications\SSWriter.exe`) and lists it under `*\OpenWithProgids`, so Windows offers it in "Open with" for any file, with `.json`, `.csv`, `.log`, `.xml`, `.html`, `.css`, `.js`, `.yml` and `.py` naming it directly. No default association is taken.
 
 ### Fixed
 
-- Exporting a plain-text document read its text as Markdown, so a `.json` or `.html` file lost its `#`, `*` and `|` characters to headings, emphasis and tables in PDF, HTML, DOCX, ODT, RTF and ePub. A plain document is now exported verbatim: as its own text for TXT, Markdown with attachments and TextBundle, inside a code block for every other format.
+- Exporting a plain-text document read its text as Markdown, so a `.json` or `.html` file lost its `#`, `*` and `|` characters to headings, emphasis and tables in PDF, HTML, DOCX, ODT, RTF and ePub. A plain document is now exported verbatim: as its own text for TXT, Markdown with attachments and TextBundle, inside a code block for every other format. Printing takes the same path, so a printout matches the PDF export.
 - The table formatter re-aligned pipe characters in plain-text and Mermaid documents when the caret left the line. It now runs only in Markdown documents.
 
 ## [0.1.5] - 2026-10-13

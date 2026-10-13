@@ -632,6 +632,8 @@ impl Controller {
             return;
         }
         let markdown = entry.document().borrow().text();
+        // A plain-text file prints as it is, exactly as it exports to PDF.
+        let plain = entry.mode() == DocMode::Plain;
         let source_dir = entry
             .path()
             .and_then(|path| path.parent().map(Path::to_path_buf));
@@ -645,7 +647,7 @@ impl Controller {
         let submitted = self.submit_export(
             cell,
             JobKind::Render,
-            move || layout_pages(&markdown, source_dir.as_deref(), &options, &title),
+            move || layout_pages(&markdown, plain, source_dir.as_deref(), &options, &title),
             move |controller, outcome| controller.finish_print(owner, &stem, outcome),
         );
         if let Err(error) = submitted {

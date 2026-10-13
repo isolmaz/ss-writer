@@ -192,13 +192,15 @@ fn is_known_text(extension: &str) -> bool {
     )
 }
 
+/// The extensions of the TextBundle formats, which have their own reader.
+const BUNDLE_EXTENSIONS: [&str; 2] = ["textbundle", "textpack"];
+
 /// Whether files with `extension` are read by a converter, which decides itself what it accepts
 /// (a DOCX or TextPack is a ZIP, a DOC a compound file: binary by content, text once imported).
+/// The word-processor formats are those of [`ConvertedFormat`], so a converter added there is
+/// never sniffed as binary and refused before its importer runs.
 fn is_converted(extension: &str) -> bool {
-    matches!(
-        extension,
-        "docx" | "odt" | "rtf" | "doc" | "textbundle" | "textpack"
-    )
+    ConvertedFormat::from_extension(extension).is_some() || BUNDLE_EXTENSIONS.contains(&extension)
 }
 
 fn stem_of(path: &Path) -> String {
@@ -525,6 +527,10 @@ mod tests {
             (".gitignore", b"target/\n", "target/\n"),
             ("LICENSE", b"MIT\n", "MIT\n"),
             ("wide.dat", b"\xFF\xFEh\0i\0\n\0", "hi\n"),
+            // Wide text without a BOM is text, as it is under a known text type.
+            ("wide-without-bom.dat", b"h\0i\0\n\0", "hi\n"),
+            ("wide-without-bom", b"\0h\0i\0\n", "hi\n"),
+            ("wide32.dat", b"h\0\0\0i\0\0\0\n\0\0\0", "hi\n"),
         ];
         for (name, bytes, expected) in text {
             let loaded = load_file(&RealFs, &write(name, bytes), None).unwrap();
@@ -534,8 +540,9 @@ mod tests {
         let binary = [
             ("pic.png", &b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"[..]),
             ("tool.exe", b"MZ\x90\0\x03\0\0\0"),
-            ("blob", b"\x7fELF\x02\x01\x01\0"),
-            ("wide-without-bom.dat", b"h\0i\0\n\0"),
+            ("blob", b"\x7fELF\x02\x01\x01\0\0\0\0\0"),
+            // The zero-filled start of a disk image is no UTF-32 text.
+            ("disk.img", &[0; 8192]),
         ];
         for (name, bytes) in binary {
             let path = write(name, bytes);
@@ -546,9 +553,39 @@ mod tests {
                 format!("{} is not a text file", path.display())
             );
         }
-        // A known text type is opened without a look at its content.
+        // A known text type is opened without a look at its content: the same bytes as the
+        // file without a BOM above.
         let wide = write("wide.txt", b"h\0i\0\n\0");
         assert_eq!(load_file(&RealFs, &wide, None).unwrap().text, "hi\n");
+    }
+
+    #[test]
+    fn a_converter_extension_is_never_sniffed_for_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Bytes with NULs that no importer takes: the importer answers, not the sniff.
+        let junk = b"\x00\x01\x02\x03junk\x00";
+        let mut extensions: Vec<&str> = [
+            ConvertedFormat::Docx,
+            ConvertedFormat::Odt,
+            ConvertedFormat::Rtf,
+            ConvertedFormat::Doc,
+        ]
+        .into_iter()
+        .map(ConvertedFormat::extension)
+        .collect();
+        extensions.extend(BUNDLE_EXTENSIONS);
+        for extension in extensions {
+            assert!(is_converted(extension), "{extension}");
+            let path = tmp.path().join(format!("junk.{extension}"));
+            std::fs::write(&path, junk).unwrap();
+            let outcome = load_file(&RealFs, &path, None);
+            assert!(
+                !matches!(outcome, Err(LoadError::NotText(_))),
+                "{extension}: refused as binary"
+            );
+        }
+        assert!(!is_converted("md"));
+        assert!(!is_converted("dat"));
     }
 
     #[test]

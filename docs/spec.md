@@ -141,7 +141,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 | `.odt` | ✓ | ✓ | same model as docx |
 | `.rtf` | ✓ | ✓ | same model |
 | `.doc` (Word 97–2003) | ✓ | — | import only; save as `.docx` or `.md`. Encrypted files and Word 6/95 files are rejected with a message |
-| every other file | ✓ | ✓ | Opened as plain text when its content is text: a BOM means text, a `0x00` byte in the first 8192 bytes means binary. A binary file is refused with "This file is not a text file"; from the sidebar, Quick Open and folder search it keeps going to its default app instead |
+| every other file | ✓ | ✓ | Opened as plain text when its content is text: a BOM, or UTF-16/32 without one, means text; a `0x00` byte in the first 8192 bytes of anything else means binary. A binary file is refused with "This file is not a text file"; from the sidebar, Quick Open and folder search it keeps going to its default app instead |
 
 - Import reports what could not be represented (merged cells, headers/footers, columns, text boxes, comments, tracked changes, VML shapes, unsupported equations) in a banner with a details list. OMML equations convert to LaTeX for fractions, scripts, radicals, n-ary operators, delimiters, matrices; others become `[equation]` placeholders and are reported.
 

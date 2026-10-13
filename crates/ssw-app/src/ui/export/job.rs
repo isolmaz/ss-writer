@@ -191,22 +191,24 @@ fn mermaid_svg(source: &str, dark: bool) -> Option<String> {
 }
 
 /// The pages of the document laid out by Typst, one scene per page (white paper included).
+/// `plain` marks a plain-text file, whose text is laid out as it is (see [`ExportJob::plain`]),
+/// exactly as [`run_export`] does for the page formats.
 ///
 /// # Errors
 /// [`ExportFailure::Convert`] when Typst cannot lay the document out.
 pub fn layout_pages(
     markdown: &str,
+    plain: bool,
     source_dir: Option<&Path>,
     options: &ExportOptions,
     title: &str,
 ) -> Result<Vec<Scene>, ExportFailure> {
     let dark = dark(options);
+    let text = markdown_source(markdown, plain);
     Exporter::new(source_dir)
-        .layout_pages(
-            markdown,
-            &render_options(options, title),
-            &|source: &str| mermaid_svg(source, dark),
-        )
+        .layout_pages(&text, &render_options(options, title), &|source: &str| {
+            mermaid_svg(source, dark)
+        })
         .map_err(ExportFailure::convert)
 }
 
@@ -291,6 +293,16 @@ fn page_path(target: &Path, index: usize, count: usize) -> PathBuf {
     })
 }
 
+/// What the Markdown pipelines read for a document: its text, or for a plain-text file (`plain`)
+/// a code block holding it, so that nothing in it is taken for Markdown.
+fn markdown_source(text: &str, plain: bool) -> Cow<'_, str> {
+    if plain {
+        Cow::Owned(verbatim_markdown(text))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 /// Markdown that renders `text` verbatim: a fenced code block (no info string) whose fence is
 /// a run of backticks longer than any run in `text`, and at least three, so nothing in the
 /// text can close it early.
@@ -335,13 +347,8 @@ pub fn run_export(
         dark,
     };
     let diagrams = |source: &str| mermaid_svg(source, dark);
-    let fenced;
-    let markdown = if job.plain {
-        fenced = verbatim_markdown(&job.markdown);
-        fenced.as_str()
-    } else {
-        job.markdown.as_str()
-    };
+    let source = markdown_source(&job.markdown, job.plain);
+    let markdown: &str = &source;
     let single = |bytes: Vec<u8>| -> Result<Vec<PathBuf>, ExportFailure> {
         write(fs, sleeper, &job.target, &bytes)?;
         Ok(vec![job.target.clone()])

@@ -105,7 +105,7 @@ fn a_picture_typst_cannot_decode_fails_the_page_formats_with_the_layout_message(
     }
     // Printing lays the same document out and fails the same way.
     let options = ExportOptions::from(&ExportSettings::default());
-    let failure = layout_pages(markdown, Some(tmp.path()), &options, "Doc").unwrap_err();
+    let failure = layout_pages(markdown, false, Some(tmp.path()), &options, "Doc").unwrap_err();
     assert!(matches!(failure, ExportFailure::Convert(_)), "{failure:?}");
 }
 
@@ -135,7 +135,7 @@ fn diagrams_are_drawn_for_the_paper_the_document_goes_on() {
     assert_ne!(std::fs::read(drawn).unwrap(), std::fs::read(code).unwrap());
 
     let options = ExportOptions::from(&ExportSettings::default());
-    let pages = layout_pages(DIAGRAM, None, &options, "Doc").unwrap();
+    let pages = layout_pages(DIAGRAM, false, None, &options, "Doc").unwrap();
     assert_eq!(pages.len(), 1);
 }
 

@@ -139,7 +139,15 @@ mod tests {
         for known in PICTURE_EXTENSIONS {
             assert_eq!(picture_extension(known), known);
         }
-        for other in ["exe", "", "dat", "png/../x", "toolongextension", "p-g", "PNG"] {
+        for other in [
+            "exe",
+            "",
+            "dat",
+            "png/../x",
+            "toolongextension",
+            "p-g",
+            "PNG",
+        ] {
             assert_eq!(picture_extension(other), "bin", "{other:?}");
         }
     }

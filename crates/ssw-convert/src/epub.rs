@@ -665,7 +665,10 @@ mod tests {
         let epub = export_epub(md, "t.md", &NoAssets, &EpubOptions::default()).unwrap();
         let chapter = read(&epub, "OEBPS/chapter_1.xhtml");
         assert!(chapter.contains("<h1 id=\"title\">Title</h1>"), "{chapter}");
-        assert!(chapter.contains("bodytext <code>code</code> end"), "{chapter}");
+        assert!(
+            chapter.contains("bodytext <code>code</code> end"),
+            "{chapter}"
+        );
         for name in [
             "OEBPS/content.opf",
             "OEBPS/toc.ncx",

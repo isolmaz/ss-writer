@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-10-25
+
 ### Changed
 
 - The files one action could not open (the startup session, a launch from Explorer or the Jump List, File → Open, a drop, the sidebar) are named in one message with the reason for each, instead of one nameless "The file no longer exists." box per file. A word-processor import or a OneDrive download that fails is named the same way (together with the others that fail in the same turn).
@@ -212,7 +214,8 @@ First release.
 
 - Scrolling very large documents (60 000 lines) at high speed does not yet keep up with a 144 Hz display: in the stress test a frame takes about 16 ms instead of 7 ms. See [docs/performance.md](docs/performance.md#known-issues).
 
-[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/isolmaz/ss-writer/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/isolmaz/ss-writer/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/isolmaz/ss-writer/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/isolmaz/ss-writer/compare/v0.1.3...v0.1.4

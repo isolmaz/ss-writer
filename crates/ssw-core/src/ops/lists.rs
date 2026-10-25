@@ -195,9 +195,10 @@ pub fn renumber_lists(ctx: Ctx<'_>) -> Option<Transaction> {
     (!edits.is_empty()).then(|| ctx.transaction_mapped(edits))
 }
 
-/// The smallest range covering `edits`, the top-level blocks they touch and the ordered-list
-/// blocks next to those, when one of them holds an ordered list. Removing what separates two
-/// ordered lists merges them, so a list next to the edit is renumbered with it.
+/// The smallest range covering `edits`, the top-level blocks they touch and, for an edit that
+/// removes text, the ordered-list blocks next to those, when one of them holds an ordered list.
+/// Removing what separates two ordered lists merges them, so a list next to the edit is
+/// renumbered with it.
 fn renumber_window(ctx: Ctx<'_>, edits: &[Edit]) -> Option<TextRange> {
     let blocks = &ctx.ast.blocks;
     let mut window: Option<TextRange> = None;
@@ -210,11 +211,18 @@ fn renumber_window(ctx: Ctx<'_>, edits: &[Edit]) -> Option<TextRange> {
             range = range.cover(block.range);
             has_ordered |= holds_ordered_list(block);
         }
-        let neighbours = first
-            .checked_sub(1)
-            .map(|i| &blocks[i])
+        // Only a removal can merge the lists on both sides of the edit; typing next to a long
+        // list must not re-parse it on every keystroke.
+        let neighbours = (!edit.range.is_empty())
+            .then(|| {
+                first
+                    .checked_sub(1)
+                    .map(|i| &blocks[i])
+                    .into_iter()
+                    .chain(blocks.get(end))
+            })
             .into_iter()
-            .chain(blocks.get(end))
+            .flatten()
             .filter(|b| holds_ordered_list(b));
         for block in neighbours {
             range = range.cover(block.range);

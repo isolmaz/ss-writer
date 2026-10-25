@@ -74,7 +74,9 @@ impl<'a> Ctx<'a> {
     /// (`2. ` on a paragraph continuation line) is content.
     pub fn content_start(&self, line: usize) -> usize {
         let range = self.line_range(line);
-        let prefix = prefix_len(&self.slice(range), |at| self.item_starts_at(range.start + at));
+        let prefix = prefix_len(&self.slice(range), |at| {
+            self.item_starts_at(range.start + at)
+        });
         range.start + prefix
     }
 

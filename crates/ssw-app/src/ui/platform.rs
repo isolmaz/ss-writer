@@ -1069,7 +1069,9 @@ impl Platform {
                     selection,
                 });
                 drop(shadow);
-                services.store().layout_changed();
+                // Another document: what the text store cached and what TSF knows of the old
+                // text no longer holds.
+                services.document_replaced();
             }
         }
     }

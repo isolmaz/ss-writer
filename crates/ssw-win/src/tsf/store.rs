@@ -444,6 +444,36 @@ impl Store {
         self.flush_notifications();
     }
 
+    /// The host shows another document (a tab switch): neither the cache nor what TSF learned
+    /// of the old text holds. A composition is dropped without being committed, the cache is
+    /// rebuilt from the new text on the next access, and TSF is told that the whole text, the
+    /// selection and the layout changed.
+    pub(super) fn document_replaced(&self) {
+        let (was_valid, old_len, composing) = {
+            let mut view = self.view.borrow_mut();
+            let known = (view.is_valid(), view.len(), view.composition().is_some());
+            *view = View::new();
+            known
+        };
+        if composing {
+            self.echoing(|| self.host.ime(ImeEvent::End));
+        }
+        if !self.has_sink() {
+            return;
+        }
+        // A cache TSF never read from has no text TSF could know.
+        if was_valid {
+            let new_len = self.with_view(|view| view.len());
+            self.queue_text_change(TextChange {
+                start: 0,
+                old_end: old_len,
+                new_end: new_len,
+            });
+        }
+        self.pending.borrow_mut().selection = true;
+        self.layout_changed();
+    }
+
     // ---- ITextStoreACP2 --------------------------------------------------------------------
 
     pub(super) fn status(&self) -> TS_STATUS {

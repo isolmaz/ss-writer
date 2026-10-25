@@ -52,6 +52,7 @@ use windows::Win32::System::Threading::{
     CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{TBPF_NOPROGRESS, TBPF_NORMAL, TBPFLAG};
+use windows::Win32::UI::TextServices::{TF_ANCHOR_END, TF_ES_READ, TF_ES_SYNC};
 use windows::Win32::UI::WindowsAndMessaging::{
     DM_POINTERHITTEST, HMENU, WM_CHAR, WM_GETOBJECT, WM_PAINT, WM_POINTERDOWN, WM_SETTINGCHANGE,
 };
@@ -957,6 +958,49 @@ fn text_services_are_told_only_what_changed_while_the_view_is_free() {
         close_active_tab(platform);
         platform.notify_text_services();
         assert!(platform.shadow.borrow().is_none());
+    });
+}
+
+/// The whole text as the text services read it through an edit session of the real thread
+/// manager.
+fn tsf_text(platform: &Platform) -> String {
+    let slot = platform.tsf.borrow();
+    let services = slot.as_ref().expect("text services are running");
+    services.set_focus();
+    let context = services.context().clone();
+    let text = Rc::new(RefCell::new(String::new()));
+    let read = Rc::clone(&text);
+    let session = services
+        .edit_session(TF_ES_READ | TF_ES_SYNC, move |ec| {
+            // SAFETY: plain calls on the live context of the window and the ranges it hands out;
+            // the buffer outlives the call.
+            unsafe {
+                let range = context.GetStart(ec)?;
+                let end = context.GetEnd(ec)?;
+                range.ShiftEndToRange(ec, &end, TF_ANCHOR_END)?;
+                let mut buffer = vec![0u16; 256];
+                let mut got = 0u32;
+                range.GetText(ec, 0, &mut buffer, &mut got)?;
+                *read.borrow_mut() = String::from_utf16_lossy(&buffer[..got as usize]);
+            }
+            Ok(())
+        })
+        .expect("the edit session is requested");
+    assert!(session.is_ok(), "read session: {session:?}");
+    text.take()
+}
+
+#[test]
+fn a_tab_switch_gives_text_services_the_text_of_the_new_document() {
+    with_app("first\n", |_app, platform, _| {
+        platform.notify_text_services();
+        // The text services read the first document: the store caches its text.
+        assert_eq!(tsf_text(platform), "first\n");
+
+        platform.env.controller.new_untitled(&platform.cell);
+        assert!(text_host(platform).replace(0..0, "second\n"));
+        platform.notify_text_services();
+        assert_eq!(tsf_text(platform), "second\n");
     });
 }
 

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::Args;
-use ssw_app::commands::Dispatch;
+use ssw_app::commands::{CommandDispatcher, Dispatch};
 use ssw_app::documents::{
     DocEntry, DocEnv, DocError, Documents, ExternalState, canonical_path, load_file,
     loss_message_id, replace_text,
@@ -673,7 +673,11 @@ fn a_save_that_loses_the_file_tells_the_user_where_the_new_text_is() {
     with_rig(
         NO_AUTOSAVE,
         &[("notes.md", "old\n")],
-        |core, _| install(core, Arc::new(LosingFs)),
+        |core, _| {
+            install(core, Arc::new(LosingFs));
+            // File → Save runs through the dispatcher: it saves through the same documents.
+            core.commands = Rc::new(CommandDispatcher::new(Rc::clone(&core.docs)));
+        },
         |rig| {
             rig.set_text("new\n");
             rig.answer(MessageBoxResult::Ok);

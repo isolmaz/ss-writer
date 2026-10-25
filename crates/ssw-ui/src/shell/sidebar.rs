@@ -2786,8 +2786,10 @@ mod tests {
             tree.nodes()
                 .iter()
                 .filter(|node| {
-                    ["docs", "deep", "c.md", "a.md", "b.txt", "empty", "cloud.md", "data.bin"]
-                        .contains(&node.name.as_str())
+                    [
+                        "docs", "deep", "c.md", "a.md", "b.txt", "empty", "cloud.md", "data.bin",
+                    ]
+                    .contains(&node.name.as_str())
                 })
                 .map(|node| (node.name.clone(), node.id))
                 .collect()

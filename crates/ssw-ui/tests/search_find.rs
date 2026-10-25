@@ -519,7 +519,11 @@ fn a_hidden_bar_searches_another_document_only_when_it_is_shown() {
     let searches = bar.generation();
     let other: SharedDocument = Rc::new(RefCell::new(Document::new("one two one one")));
     bar.set_document(other);
-    assert_eq!(bar.generation(), searches, "the hidden bar searched nothing");
+    assert_eq!(
+        bar.generation(),
+        searches,
+        "the hidden bar searched nothing"
+    );
     bar.open(false);
     assert_eq!(bar.generation(), searches + 1);
     assert_eq!(bar.matches().len(), 3);

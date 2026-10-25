@@ -877,10 +877,12 @@ fn find_highlights_follow_the_bar_and_vanish_when_it_closes() {
 
 #[test]
 fn find_highlights_follow_the_current_match_and_edits() {
-    let mut rig = Rig::new("ab
+    let mut rig = Rig::new(
+        "ab
 
 ab
-");
+",
+    );
     let palette = &rig.theme.tokens.highlight;
     let (current, other) = (palette.orange.background, palette.yellow.background);
     rig.overlays.open_find(false);
@@ -906,13 +908,17 @@ ab
 
 #[test]
 fn closing_find_after_a_tab_switch_leaves_no_highlights_in_the_tab_left_behind() {
-    let mut rig = Rig::new("ab
+    let mut rig = Rig::new(
+        "ab
 
 ab
-");
+",
+    );
     let doc_a = Rc::clone(&rig.doc);
-    let doc_b = Rc::new(RefCell::new(Document::new("xx ab
-")));
+    let doc_b = Rc::new(RefCell::new(Document::new(
+        "xx ab
+",
+    )));
     let clock: Rc<dyn Clock> = Rc::new(FakeClock::default());
     let mut tab_b = EditorView::new(Rc::clone(&doc_b), clock);
     rig.overlays.open_find(false);

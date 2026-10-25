@@ -347,10 +347,12 @@ fn ime_composition_is_displayed_with_an_underline_and_not_written() {
 
 #[test]
 fn ime_composition_on_a_blank_line_is_displayed_with_the_caret_inside_it() {
-    let mut h = Harness::new("a
+    let mut h = Harness::new(
+        "a
 
 b
-");
+",
+    );
     h.set_caret(2);
     h.ime(ImeEvent::Start);
     h.ime(ImeEvent::Update {
@@ -360,10 +362,14 @@ b
     });
     let canvas = h.paint();
     assert_eq!(canvas.texts(), ["a", "か", "b"]);
-    assert_eq!(h.text(), "a
+    assert_eq!(
+        h.text(),
+        "a
 
 b
-", "nothing is written before the commit");
+",
+        "nothing is written before the commit"
+    );
     let shown = canvas
         .recorded()
         .iter()
@@ -379,7 +385,11 @@ b
         "caret {caret:?} inside {shown:?}"
     );
     h.ime(ImeEvent::End);
-    assert_eq!(h.painted_texts(), ["a", "b"], "the blank line is blank again");
+    assert_eq!(
+        h.painted_texts(),
+        ["a", "b"],
+        "the blank line is blank again"
+    );
 }
 
 #[test]

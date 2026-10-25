@@ -831,10 +831,12 @@ fn pointer_events_the_view_does_not_own_are_ignored() {
 
 #[test]
 fn a_hover_move_within_one_item_neither_repaints_the_editor_nor_restarts_the_blink() {
-    let mut h = Harness::new("a
+    let mut h = Harness::new(
+        "a
 
 b
-");
+",
+    );
     let caret_color = h.theme.tokens.caret;
     let carets = |h: &Harness| {
         h.paint()

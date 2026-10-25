@@ -148,9 +148,14 @@ fn zooming_keeps_the_same_text_at_the_top_of_the_view() {
     // Every paragraph wraps into three lines but is estimated as one, so rebuilding the heights
     // after a zoom would put a much later paragraph under the scroll offset.
     let text: String = (0..300)
-        .map(|i| format!("p{i:03} {}
+        .map(|i| {
+            format!(
+                "p{i:03} {}
 
-", "y".repeat(100)))
+",
+                "y".repeat(100)
+            )
+        })
         .collect();
     let mut h = Harness::new(&text);
     h.view.set_scroll_y(4_000.0);

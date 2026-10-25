@@ -571,14 +571,12 @@ struct Prepared {
 }
 
 fn prepare(found: Found, placeholder: bool) -> Prepared {
-    let analysis = if is_markdown_path(&found.rel)
-        && !placeholder
-        && (found.size as u64) <= MAX_PARSE_BYTES
-    {
-        read_markdown(&found.path).map(|text| analyze(&text, &found.rel))
-    } else {
-        None
-    };
+    let analysis =
+        if is_markdown_path(&found.rel) && !placeholder && (found.size as u64) <= MAX_PARSE_BYTES {
+            read_markdown(&found.path).map(|text| analyze(&text, &found.rel))
+        } else {
+            None
+        };
     Prepared {
         found,
         placeholder,

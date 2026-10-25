@@ -36,7 +36,11 @@ fn a_folder_that_cannot_be_watched_is_left_alone_until_the_back_off_is_over() {
 
     // The folder exists from now on: an attempt would succeed, so none is made before the time.
     std::fs::create_dir(&folder).unwrap();
-    assert!(watches.sync(&wanted, start + BACK_OFF - A_MOMENT).is_empty());
+    assert!(
+        watches
+            .sync(&wanted, start + BACK_OFF - A_MOMENT)
+            .is_empty()
+    );
     assert!(watches.folders().is_empty());
 
     assert!(watches.sync(&wanted, start + BACK_OFF).is_empty());
@@ -107,8 +111,16 @@ fn a_flat_set_of_watches_ignores_the_folders_below_and_a_recursive_one_sees_them
     }
     let mut flat_watches = folder_watches(false);
     let mut deep_watches = folder_watches(true);
-    assert!(flat_watches.sync(&[flat.clone()], Duration::ZERO).is_empty());
-    assert!(deep_watches.sync(&[deep.clone()], Duration::ZERO).is_empty());
+    assert!(
+        flat_watches
+            .sync(&[flat.clone()], Duration::ZERO)
+            .is_empty()
+    );
+    assert!(
+        deep_watches
+            .sync(&[deep.clone()], Duration::ZERO)
+            .is_empty()
+    );
 
     // The file below comes first: the events of one watcher arrive in the order of the changes.
     for root in [&flat, &deep] {

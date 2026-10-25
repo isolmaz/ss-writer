@@ -966,28 +966,46 @@ impl Controller {
         }
     }
 
-    fn write_settings(&self) {
-        self.settings_hub.due.set(None);
-        let settings = self.settings.borrow().clone();
-        let path = self.core().borrow().paths.settings_file();
-        match save_settings(&path, &settings) {
-            Ok(()) => {
-                self.settings_hub.failed.set(false);
-                if self.settings_hub.watching.get() {
-                    self.settings_hub.stamp.set(stamp_of(&path));
-                }
-            }
-            Err(error) => self.settings_write_failed(&error),
+    /// [`Self::flush_settings`] for the end of the session, when no message box can be
+    /// answered or opened: a failure is logged and not shown.
+    pub(super) fn flush_settings_quietly(&self) {
+        if self.settings_hub.due.get().is_some()
+            && let Err(error) = self.save_settings_now()
+        {
+            self.log_settings_failure(&error);
         }
     }
 
-    fn settings_write_failed(&self, error: &SettingsFileError) {
+    fn write_settings(&self) {
+        if let Err(error) = self.save_settings_now() {
+            self.settings_write_failed(&error);
+        }
+    }
+
+    fn save_settings_now(&self) -> Result<(), SettingsFileError> {
+        self.settings_hub.due.set(None);
+        let settings = self.settings.borrow().clone();
+        let path = self.core().borrow().paths.settings_file();
+        save_settings(&path, &settings)?;
+        self.settings_hub.failed.set(false);
+        if self.settings_hub.watching.get() {
+            self.settings_hub.stamp.set(stamp_of(&path));
+        }
+        Ok(())
+    }
+
+    /// Logs the failure and schedules the next attempt.
+    fn log_settings_failure(&self, error: &SettingsFileError) {
         self.core().borrow().logger.log(
             Level::Error,
             "settings",
             &format!("settings.json was not written: {error}"),
         );
         self.settings_hub.due.set(Some(self.clock.now() + RETRY));
+    }
+
+    fn settings_write_failed(&self, error: &SettingsFileError) {
+        self.log_settings_failure(error);
         if self.settings_hub.failed.replace(true) {
             return;
         }

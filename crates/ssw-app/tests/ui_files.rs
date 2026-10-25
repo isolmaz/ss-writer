@@ -2084,8 +2084,18 @@ fn background_opens_that_fail_in_the_same_turn_share_one_box() {
         fs.vanish(true);
         rig.controller.open_file(&rig.window(), &cloud).unwrap();
         open_in_sidebar(rig, &doc);
-        // Both jobs fail within microseconds; their results are collected in one turn.
-        std::thread::sleep(Duration::from_millis(500));
+        // The results of both jobs are delivered before the turn that reports failures runs,
+        // so that it finds both.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while rig.controller.core().borrow().workers.pending() > 0 {
+            assert!(Instant::now() < deadline, "the jobs did not finish");
+            rig.controller.core().borrow_mut().pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            rig.messages().is_empty(),
+            "nothing is reported before the turn"
+        );
         rig.pump();
         fs.vanish(false);
         let messages = rig.messages();

@@ -281,6 +281,12 @@ impl WindowHandler for WindowGlue {
         false
     }
 
+    fn on_query_end_session(&mut self, _info: &WindowInfo) {
+        // Every window is asked before any is told: a new question starts a new end of the
+        // session, which the first window told then handles.
+        self.env.controller.session_ended.set(false);
+    }
+
     fn on_end_session(&mut self, _info: &WindowInfo) {
         // The one job that cannot wait for the loop owner: the process ends with this message.
         end_session(&self.env.controller);

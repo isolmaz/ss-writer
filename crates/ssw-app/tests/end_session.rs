@@ -1,10 +1,12 @@
 //! The system ending the session (`WM_QUERYENDSESSION` / `WM_ENDSESSION`) as the application's
 //! windows receive it: no shutdown is held up, and the state a quit saves is saved without a
-//! question (the files autosave covers, the session, the untitled buffers), while the text of
-//! files with unsaved changes is kept in the recovery folder, and that of the untitled buffers
-//! when the next start does not get it from the session. The session also ends inside dialogs
-//! and with the core borrowed. Windows are hidden and never shown, raised or activated; the
-//! messages go to the application's own windows only.
+//! question (the files autosave covers, the session, the untitled buffers, a settings change
+//! still waiting for its write), while the text of files with unsaved changes is kept in the
+//! recovery folder, and that of the untitled buffers when the next start does not get it from
+//! the session. The session also ends inside dialogs and with the core borrowed, and a session
+//! that goes on after it ended ends again later. A quit whose session cannot be stored keeps
+//! the untitled text for recovery the same way. Windows are hidden and never shown, raised or
+//! activated; the messages go to the application's own windows only.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::Args;
 use ssw_app::documents::{DocEntry, replace_text};
 use ssw_app::startup::ProcessEnv;
+use ssw_app::ui::controller::Request;
 use ssw_app::ui::host::{UiApp, UiOptions, UiServices};
 use ssw_app::ui::scripted_services::{Answer, DialogKind, ScriptedServices};
 use ssw_core::command::CommandId;
@@ -23,6 +26,7 @@ use ssw_core::edit::{Edit, Selection, Transaction};
 use ssw_io::encoding::TextFormat;
 use ssw_io::recovery::{RecoveryDoc, RecoveryKind, RecoveryStore};
 use ssw_io::session::TabDocument;
+use ssw_io::settings_file::load_settings;
 use ssw_ui::services::{
     Dialogs, MemoryClipboard, MessageBoxOptions, MessageBoxResult, OpenFileOptions,
     PickFolderOptions, SaveFileOptions, ServiceError,
@@ -228,8 +232,8 @@ fn send(app: &UiApp, msg: u32, wparam: usize) -> isize {
     deliver(window_of(app, 0), msg, wparam)
 }
 
-/// A new untitled buffer with text and the open `file` with an appended line, none of it saved.
-fn unsaved_work(app: &UiApp, file: &Path) -> (Rc<DocEntry>, Rc<DocEntry>) {
+/// A new untitled buffer with text, not saved.
+fn scratch_buffer(app: &UiApp) -> Rc<DocEntry> {
     let cell = Rc::clone(&app.controller().windows()[0]);
     app.controller().new_untitled(&cell);
     app.pump();
@@ -240,9 +244,15 @@ fn unsaved_work(app: &UiApp, file: &Path) -> (Rc<DocEntry>, Rc<DocEntry>) {
         .expect("a tab")
         .entry
         .clone();
+    append(&scratch, "scratch");
+    scratch
+}
+
+/// A new untitled buffer with text and the open `file` with an appended line, none of it saved.
+fn unsaved_work(app: &UiApp, file: &Path) -> (Rc<DocEntry>, Rc<DocEntry>) {
+    let scratch = scratch_buffer(app);
     let opened = app.controller().docs().find(file).expect("file is open");
     append(&opened, "two");
-    append(&scratch, "scratch");
     (opened, scratch)
 }
 
@@ -255,6 +265,30 @@ fn stored_tabs(app: &UiApp) -> Vec<TabDocument> {
     let session = app.controller().core().borrow().session.load().unwrap();
     let tabs = &session.windows[0].tabs;
     tabs.iter().map(|tab| tab.document.clone()).collect()
+}
+
+/// The text the recovery folder keeps for the one file with unsaved changes.
+fn kept_file_text(app: &UiApp) -> String {
+    let recovery = recovery_of(app);
+    let kept = recovery.list().unwrap();
+    let files: Vec<_> = kept
+        .iter()
+        .filter(|entry| entry.kind == RecoveryKind::Dirty)
+        .collect();
+    assert_eq!(files.len(), 1, "{kept:?}");
+    recovery.restore(&files[0].id).unwrap().text
+}
+
+fn settings_file(tmp: &Path) -> PathBuf {
+    tmp.join("profile")
+        .join("roaming")
+        .join("SS Writer")
+        .join("settings.json")
+}
+
+fn stored_zoom(tmp: &Path) -> u32 {
+    let loaded = load_settings(&settings_file(tmp)).unwrap();
+    loaded.settings.appearance.zoom_percent
 }
 
 fn stored_text(app: &UiApp, id: &str) -> Option<String> {
@@ -494,6 +528,8 @@ fn ends_with_the_core_held(writing: bool) {
         let id = scratch.untitled_id().expect("an untitled id");
         // The tick copies the unsaved text for the crash handler.
         app.pump();
+        // A change of the settings that waits for its write.
+        app.controller().set_zoom(150);
 
         let core = app.controller().core();
         if writing {
@@ -505,6 +541,10 @@ fn ends_with_the_core_held(writing: bool) {
         }
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+        // The path of the settings file is the core's: while the core is written it cannot be
+        // asked, so the change stays unwritten.
+        let zoom = if writing { 100 } else { 150 };
+        assert_eq!(stored_zoom(tmp.path()), zoom);
         let recovery = recovery_of(app);
         let kept = recovery.list().unwrap();
         assert_eq!(kept.len(), 2, "{kept:?}");
@@ -573,8 +613,7 @@ fn the_session_can_end_while_a_worker_result_shows_a_message_box() {
     let tmp = tempfile::tempdir().unwrap();
     let file = note(tmp.path(), "a.md", "one\n");
     let launch = std::slice::from_ref(&file);
-    let refused = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/doc/PasswordProtected.doc");
+    let exported = tmp.path().join("exported.txt");
     let trigger = Trigger::default();
     run_app_with(
         AUTOSAVE_OFF,
@@ -584,20 +623,22 @@ fn the_session_can_end_while_a_worker_result_shows_a_message_box() {
         |app, services| {
             let (_, scratch) = unsaved_work(app, &file);
             let id = scratch.untitled_id().expect("an untitled id");
-            // The importer refuses the file on a worker; the refusal is reported when the loop
+            // The export runs on a worker; the box that says where it went opens while the loop
             // delivers the result.
-            services.answer(DialogKind::OpenFile, Answer::Paths(vec![refused]));
+            services.answer(DialogKind::SaveFile, Answer::Paths(vec![exported.clone()]));
             let window = app.controller().windows()[0].id;
-            app.controller().run_command(window, CommandId::FileOpen);
+            app.controller().run_command(window, CommandId::ExportTxt);
             trigger.set(Some((DialogKind::MessageBox, window_of(app, 0))));
 
             let deadline = Instant::now() + Duration::from_secs(30);
             while trigger.get().is_some() {
-                assert!(Instant::now() < deadline, "the refusal was not reported");
+                assert!(Instant::now() < deadline, "the export was not reported");
                 app.pump();
                 std::thread::sleep(Duration::from_millis(5));
             }
 
+            let text = std::fs::read_to_string(&exported).unwrap();
+            assert!(text.contains("scratch"), "{text}");
             assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
             assert_ended_like_a_quit(app, &id);
         },
@@ -617,6 +658,9 @@ fn the_end_of_the_session_is_handled_once_however_many_windows_hear_it() {
         app.pump();
         assert_eq!(app.controller().windows().len(), 2);
 
+        // Every window is asked before any is told.
+        deliver(window_of(app, 0), WM_QUERYENDSESSION, 0);
+        deliver(window_of(app, 1), WM_QUERYENDSESSION, 0);
         deliver(window_of(app, 0), WM_ENDSESSION, 1);
         // A second round would delete what this run wrote, the copies of the first included.
         let marker = RecoveryDoc {
@@ -637,7 +681,147 @@ fn the_end_of_the_session_is_handled_once_however_many_windows_hear_it() {
             kept.iter().any(|entry| entry.kind == RecoveryKind::Dirty),
             "{kept:?}"
         );
+        let log = log_of(tmp.path());
+        assert_eq!(log.matches("SS Writer exiting").count(), 1, "{log}");
+
+        // The next end of the session is handled once as well.
+        for window in 0..2 {
+            deliver(window_of(app, window), WM_QUERYENDSESSION, 0);
+        }
+        for window in 0..2 {
+            deliver(window_of(app, window), WM_ENDSESSION, 1);
+        }
     });
     let log = log_of(tmp.path());
-    assert_eq!(log.matches("SS Writer exiting").count(), 1, "{log}");
+    assert_eq!(log.matches("SS Writer exiting").count(), 2, "{log}");
+}
+
+#[test]
+fn a_session_that_goes_on_after_it_ended_is_handled_again_when_it_ends_for_good() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "one\n");
+    let launch = std::slice::from_ref(&file);
+    run_app(AUTOSAVE_OFF, tmp.path(), launch, |app, _| {
+        let (opened, _) = unsaved_work(app, &file);
+
+        // An installer asks the application to close; it is still there afterwards.
+        assert_eq!(send(app, WM_QUERYENDSESSION, 0), 1);
+        send(app, WM_ENDSESSION, 1);
+        assert_eq!(kept_file_text(app), "one\ntwo");
+
+        append(&opened, "three");
+        assert_eq!(send(app, WM_QUERYENDSESSION, 0), 1);
+        send(app, WM_ENDSESSION, 1);
+
+        assert_eq!(kept_file_text(app), "one\ntwothree");
+    });
+    let log = log_of(tmp.path());
+    assert_eq!(log.matches("SS Writer exiting").count(), 2, "{log}");
+}
+
+#[test]
+fn a_settings_change_waiting_for_its_write_is_written_when_the_session_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "one\n");
+    let launch = std::slice::from_ref(&file);
+    run_app(AUTOSAVE_OFF, tmp.path(), launch, |app, _| {
+        app.controller().set_zoom(150);
+        assert_eq!(
+            stored_zoom(tmp.path()),
+            100,
+            "the write waits for its delay"
+        );
+
+        send(app, WM_ENDSESSION, 1);
+
+        assert_eq!(stored_zoom(tmp.path()), 150);
+    });
+}
+
+fn ends_with_a_settings_file_that_cannot_be_written(in_dialog: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "one\n");
+    let launch = std::slice::from_ref(&file);
+    let trigger = Trigger::default();
+    run_app_with(
+        AUTOSAVE_OFF,
+        tmp.path(),
+        launch,
+        &trigger,
+        |app, services| {
+            let (_, scratch) = unsaved_work(app, &file);
+            let id = scratch.untitled_id().expect("an untitled id");
+            app.controller().set_zoom(150);
+            // A folder where the file belongs: the write cannot succeed.
+            let settings = settings_file(tmp.path());
+            std::fs::remove_file(&settings).unwrap();
+            std::fs::create_dir(&settings).unwrap();
+
+            if in_dialog {
+                trigger.set(Some((DialogKind::OpenFile, window_of(app, 0))));
+                let window = app.controller().windows()[0].id;
+                app.controller().run_command(window, CommandId::FileOpen);
+                assert!(trigger.get().is_none(), "the dialog was up");
+            } else {
+                send(app, WM_ENDSESSION, 1);
+            }
+
+            assert_ended_like_a_quit(app, &id);
+            let boxes = services
+                .dialog_log()
+                .into_iter()
+                .filter(|dialog| dialog.kind == DialogKind::MessageBox)
+                .count();
+            assert_eq!(boxes, 0, "nobody is there to answer a message box");
+        },
+    );
+    let log = log_of(tmp.path());
+    let exiting = log.find("SS Writer exiting").expect("the session ended");
+    let failed = log
+        .find("settings.json was not written")
+        .unwrap_or_else(|| panic!("the failure is in the log: {log}"));
+    assert!(exiting < failed, "the session is stored first: {log}");
+}
+
+#[test]
+fn settings_that_cannot_be_written_when_the_session_ends_are_logged_not_shown() {
+    ends_with_a_settings_file_that_cannot_be_written(false);
+}
+
+#[test]
+fn settings_that_cannot_be_written_when_the_session_ends_in_a_dialog_are_logged_not_shown() {
+    ends_with_a_settings_file_that_cannot_be_written(true);
+}
+
+#[test]
+fn a_quit_that_cannot_store_the_session_keeps_the_untitled_text_for_recovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "one\n");
+    let launch = std::slice::from_ref(&file);
+    run_app(AUTOSAVE_ON, tmp.path(), launch, |app, services| {
+        let id = scratch_buffer(app).untitled_id().expect("an untitled id");
+        // Another connection takes the session table away.
+        let database = app.controller().core().borrow().paths.state_db();
+        rusqlite::Connection::open(database)
+            .unwrap()
+            .execute_batch("DROP TABLE session_windows")
+            .unwrap();
+
+        // File → Exit: the session keeps the untitled buffer, so it is not asked about.
+        app.controller().push(Request::Quit);
+        app.pump();
+        assert_eq!(app.exit_code(), Some(0));
+        app.finish();
+
+        let recovery = recovery_of(app);
+        let kept = recovery.list().unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].id, id);
+        assert_eq!(kept[0].kind, RecoveryKind::Untitled);
+        assert_eq!(kept[0].display_name, "Untitled");
+        assert_eq!(recovery.restore(&id).unwrap().text, "scratch");
+        assert!(services.dialog_log().is_empty(), "nothing is asked");
+    });
+    let log = log_of(tmp.path());
+    assert!(log.contains("session not saved"), "{log}");
 }

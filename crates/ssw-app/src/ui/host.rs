@@ -62,6 +62,7 @@ use super::shell_view::ShellAction;
 use super::window::{WindowEnv, WindowGlue, WindowLink};
 use crate::app::{AppCore, EXIT_NO_DEVICE, EXIT_NO_SHELL, ShellHost};
 use crate::args::{Args, Launch};
+use crate::documents::DocEntry;
 use crate::emergency::{CachedDoc, EmergencyCache};
 use crate::startup::{InstanceError, InstanceHook, InstanceRole};
 use crate::workers::{Waker, WindowId};
@@ -345,6 +346,9 @@ pub struct UiApp {
     /// When a window last asked for a repaint (the spelling checks wait for a quiet moment).
     last_repaint: Cell<Instant>,
     final_session: RefCell<Option<Session>>,
+    /// The untitled buffers of the final session: their windows are gone by the time
+    /// [`UiApp::finish`] stores the session.
+    final_untitled: RefCell<Vec<Rc<DocEntry>>>,
     exit: Cell<Option<i32>>,
     // Declared last: every native window is gone before the message window.
     message_window: MessageWindow,
@@ -483,6 +487,7 @@ impl UiApp {
             frame_interval: ssw_win::services::timers::refresh_interval(),
             last_repaint: Cell::new(Instant::now()),
             final_session: RefCell::new(None),
+            final_untitled: RefCell::new(Vec::new()),
             exit: Cell::new(None),
             message_window,
         };
@@ -788,6 +793,13 @@ impl UiApp {
             .borrow()
             .session
             .untitled_texts(&session);
+        *self.final_untitled.borrow_mut() = self
+            .controller
+            .docs()
+            .all()
+            .into_iter()
+            .filter(|entry| entry.is_untitled())
+            .collect();
         *self.final_session.borrow_mut() = Some(session);
         for cell in self.controller.windows() {
             self.controller.close_window(cell.id);
@@ -1052,7 +1064,9 @@ impl UiApp {
     }
 
     /// Leaves the application cleanly: stores the session of the moment the user quit (or of
-    /// the windows that are left) and flushes autosave.
+    /// the windows that are left) and flushes autosave. The untitled buffers, which the quit
+    /// left to the session without asking, go to the recovery folder when the session cannot be
+    /// stored.
     pub fn finish(&self) {
         let session = self
             .final_session
@@ -1060,7 +1074,12 @@ impl UiApp {
             .clone()
             .unwrap_or_else(|| self.controller.session());
         self.controller.flush_settings();
-        self.controller.core().borrow_mut().shutdown(&session);
+        let mut core = self.controller.core().borrow_mut();
+        if !core.shutdown(&session)
+            && self.controller.settings().general.on_startup == StartupBehavior::RestoreSession
+        {
+            keep_text_of(&core, &self.final_untitled.borrow(), true);
+        }
     }
 }
 
@@ -1287,10 +1306,13 @@ pub fn end_session(controller: &Controller) {
         return;
     }
     let cell = controller.core();
-    if cell.try_borrow().is_ok() {
-        controller.flush_settings();
-    }
-    let Ok(mut core) = cell.try_borrow_mut() else {
+    if let Ok(mut core) = cell.try_borrow_mut() {
+        let session = controller.session();
+        let stored = core.shutdown(&session);
+        let restored =
+            stored && controller.settings().general.on_startup == StartupBehavior::RestoreSession;
+        keep_unsaved_text(&core, !restored);
+    } else {
         controller.logger.log(
             Level::Warn,
             "shutdown",
@@ -1301,20 +1323,24 @@ pub fn end_session(controller: &Controller) {
             &controller.docs().env().recovery,
             &controller.logger,
         );
-        return;
-    };
-    let session = controller.session();
-    let stored = core.shutdown(&session);
-    let restored =
-        stored && controller.settings().general.on_startup == StartupBehavior::RestoreSession;
-    keep_unsaved_text(&core, !restored);
+    }
+    // Last, so that nothing waits for the settings file before the session is stored; a change
+    // that cannot be written is logged, because nobody is there to read a message box.
+    if cell.try_borrow().is_ok() {
+        controller.flush_settings_quietly();
+    }
 }
 
 /// Writes the text of the files with unsaved changes to the recovery folder, and that of the
 /// untitled buffers when `untitled` is set: otherwise the session stores them.
 fn keep_unsaved_text(core: &AppCore, untitled: bool) {
+    keep_text_of(core, &core.docs.all(), untitled);
+}
+
+/// [`keep_unsaved_text`] for the documents `entries`.
+fn keep_text_of(core: &AppCore, entries: &[Rc<DocEntry>], untitled: bool) {
     let unsaved = EmergencyCache::new();
-    for entry in core.docs.all().iter().filter(|entry| entry.is_dirty()) {
+    for entry in entries.iter().filter(|entry| entry.is_dirty()) {
         let text = entry.document().borrow().text();
         let (kind, original_path, display_name) = match entry.path() {
             Some(path) => {

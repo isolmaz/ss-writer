@@ -282,6 +282,11 @@ pub trait WindowHandler {
     fn on_close_requested(&mut self, _info: &WindowInfo) -> bool {
         true
     }
+    /// The system starts asking whether the session may end (`WM_QUERYENDSESSION`; the answer
+    /// is always yes). Every window is asked before any of them is told the outcome with
+    /// [`Self::on_end_session`], and a process that is still running after being told (an
+    /// installer asking applications to close) is asked again before it is told again.
+    fn on_query_end_session(&mut self, _info: &WindowInfo) {}
     /// The system is ending the session (shutdown, restart or sign-out) and does not ask the
     /// window again: the process can be killed once this returns, so whatever must survive is
     /// written here, without asking the user anything.
@@ -1302,7 +1307,11 @@ impl WindowState {
                 }
             }
             // Agrees to every shutdown: the application keeps nothing that has to be asked.
-            WM_QUERYENDSESSION => (Some(LRESULT(1)), After::None),
+            WM_QUERYENDSESSION => {
+                let info = self.info();
+                self.handler.on_query_end_session(&info);
+                (Some(LRESULT(1)), After::None)
+            }
             WM_ENDSESSION => {
                 // A zero `wparam` says the session goes on after all.
                 if wparam.0 != 0 {
@@ -1894,6 +1903,7 @@ mod tests {
         activations: Vec<bool>,
         themes: u32,
         paints: u32,
+        end_session_queries: u32,
         end_sessions: u32,
     }
 
@@ -1937,6 +1947,9 @@ mod tests {
         fn on_close_requested(&mut self, _info: &WindowInfo) -> bool {
             self.log.borrow_mut().closes += 1;
             self.allow_close
+        }
+        fn on_query_end_session(&mut self, _info: &WindowInfo) {
+            self.log.borrow_mut().end_session_queries += 1;
         }
         fn on_end_session(&mut self, _info: &WindowInfo) {
             self.log.borrow_mut().end_sessions += 1;
@@ -2923,6 +2936,7 @@ mod tests {
             handler.on_close_requested(&info),
             "closing is allowed by default"
         );
+        handler.on_query_end_session(&info);
         handler.on_end_session(&info);
         handler.on_destroy(&info);
         assert_eq!(
@@ -2940,6 +2954,7 @@ mod tests {
             (Some(1), After::None),
             "no shutdown is held up"
         );
+        assert_eq!(log.borrow().end_session_queries, 1, "the handler is asked");
         assert_eq!(log.borrow().end_sessions, 0, "being asked changes nothing");
         // `wparam == 0`: another program refused, the session goes on.
         assert_eq!(feed(&host, WM_ENDSESSION, 0, 0), (Some(0), After::None));
@@ -2949,6 +2964,7 @@ mod tests {
         // The window procedure takes the same way and answers without default processing.
         assert_eq!(send(&host, WM_QUERYENDSESSION, 0, 0), 1);
         assert_eq!(send(&host, WM_ENDSESSION, 1, 0), 0);
+        assert_eq!(log.borrow().end_session_queries, 2);
         assert_eq!(log.borrow().end_sessions, 2);
     }
 

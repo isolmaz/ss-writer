@@ -2270,3 +2270,24 @@ fn uia_a_bridge_without_a_window_works_in_unscaled_client_pixels() {
     let found = uia!(screen.ElementProviderFromPoint(50.0, 20.0)).expect("over Save");
     assert_eq!(name_of_provider(&found.cast().expect("simple")), "Save");
 }
+
+#[test]
+fn a_snapshot_nobody_listens_to_is_stored_without_being_compared() {
+    let root = WidgetId::new(1);
+    let bridge = UiaBridge::new(HWND::default(), Arc::new(Recorder::default()), root);
+    let named = |name: &str| {
+        let mut tree = AccessTree::new(root);
+        tree.insert(AccessNode::new(
+            root,
+            Role::Window,
+            name,
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+        ));
+        tree
+    };
+    let current = || bridge.tree().node(root).map(|node| node.name.clone());
+    assert!(bridge.publish(named("one"), false).unwrap().is_empty());
+    assert_eq!(current().as_deref(), Some("one"));
+    assert!(bridge.publish(named("two"), false).unwrap().is_empty());
+    assert_eq!(current().as_deref(), Some("two"));
+}

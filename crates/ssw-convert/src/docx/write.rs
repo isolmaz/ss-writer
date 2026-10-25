@@ -1406,7 +1406,7 @@ mod tests {
         let bytes = export("x[^a]\n\n[^a]: see [^a]\n");
         let texts = note_texts(&bytes);
         assert_eq!(texts.len(), 1);
-        assert!(texts[0].contains("see [^a]"), "{}", texts[0]);
+        assert!(texts[0].contains("see [^a]"), "{texts:?}");
         let document = part(&bytes, "word/document.xml");
         assert_eq!(document.descendants(Ns::W, "footnoteReference").len(), 1);
     }
@@ -1416,8 +1416,8 @@ mod tests {
         let bytes = export("x[^a] y[^b]\n\n[^a]: A [^b]\n\n[^b]: B [^a]\n");
         let texts = note_texts(&bytes);
         assert_eq!(texts.len(), 2);
-        assert!(texts[0].contains("A [^b]"), "{}", texts[0]);
-        assert!(texts[1].contains("B [^a]"), "{}", texts[1]);
+        assert!(texts[0].contains("A [^b]"), "{texts:?}");
+        assert!(texts[1].contains("B [^a]"), "{texts:?}");
     }
 
     #[test]

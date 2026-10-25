@@ -975,12 +975,16 @@ fn tsf_text(platform: &Platform) -> String {
             // SAFETY: plain calls on the live context of the window and the ranges it hands out;
             // the buffer outlives the call.
             unsafe {
-                let range = context.GetStart(ec)?;
-                let end = context.GetEnd(ec)?;
-                range.ShiftEndToRange(ec, &end, TF_ANCHOR_END)?;
+                let range = context.GetStart(ec).expect("the start of the text");
+                let end = context.GetEnd(ec).expect("the end of the text");
+                range
+                    .ShiftEndToRange(ec, &end, TF_ANCHOR_END)
+                    .expect("the range spans the text");
                 let mut buffer = vec![0u16; 256];
                 let mut got = 0u32;
-                range.GetText(ec, 0, &mut buffer, &mut got)?;
+                range
+                    .GetText(ec, 0, &mut buffer, &mut got)
+                    .expect("the text is read");
                 *read.borrow_mut() = String::from_utf16_lossy(&buffer[..got as usize]);
             }
             Ok(())

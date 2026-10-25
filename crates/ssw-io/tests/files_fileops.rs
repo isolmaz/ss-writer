@@ -474,6 +474,14 @@ fn tree_operations_stop_at_the_first_failing_call() {
     );
     fault.clear();
 
+    fault.fail(FsOp::ListDir, FsFailure::AccessDenied, 1);
+    assert!(matches!(
+        fileops::remove_tree(&fault, &source),
+        Err(FsError::AccessDenied(_))
+    ));
+    assert!(source.exists(), "a folder that cannot be listed stays");
+    fault.clear();
+
     fault.fail(FsOp::RemoveDir, FsFailure::SharingViolation, 1);
     assert!(matches!(
         fileops::remove_tree(&fault, &source),

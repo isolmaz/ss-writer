@@ -336,7 +336,11 @@ impl UiaBridge {
         self.publish(tree, events::clients_listening())
     }
 
-    fn publish(
+    /// [`UiaBridge::update`] for a caller that knows whether a UIA client is `listening`.
+    ///
+    /// # Errors
+    /// Fails when raising an event fails.
+    pub fn publish(
         &self,
         tree: AccessTree,
         listening: bool,

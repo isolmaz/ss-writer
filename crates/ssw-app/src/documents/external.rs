@@ -204,14 +204,12 @@ impl Documents {
         let decisions = self.tracker.borrow().classify(events);
         let mut outcomes = Vec::new();
         for (path, change) in decisions {
-            let Some(entry) = self.find_by_key(&path_key(&path)) else {
-                continue;
-            };
-            // `classify` never reports an unchanged document, so every decision has an action.
-            outcomes.extend(
+            // `classify` decides only for tracked paths and never reports an unchanged
+            // document, so every decision has a document and an action.
+            outcomes.extend(self.find_by_key(&path_key(&path)).and_then(|entry| {
                 self.apply_change(&entry, &path, change)
-                    .map(|action| ExternalOutcome { entry, action }),
-            );
+                    .map(|action| ExternalOutcome { entry, action })
+            }));
         }
         outcomes
     }

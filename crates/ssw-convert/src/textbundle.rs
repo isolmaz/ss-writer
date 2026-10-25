@@ -432,6 +432,17 @@ mod tests {
     }
 
     #[test]
+    fn a_pack_with_too_many_entries_is_refused() {
+        let names: Vec<String> = (0..=MAX_ENTRIES).map(|i| format!("f{i}")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b""[..])).collect();
+        let error = read_pack(&zip_of(&entries)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("the bundle is too large: 10001 entries (limit {MAX_ENTRIES})")
+        );
+    }
+
+    #[test]
     fn bundle_without_assets_folder_reads_empty_assets() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("text.txt"), "t").unwrap();

@@ -1452,9 +1452,9 @@ fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
-            if let Ok(mut state) = cell.try_borrow_mut() {
-                state.apply_dpi();
-            }
+            // This call borrowed the state above, so no outer call holds it, and the messages
+            // `SetWindowPos` sent are done.
+            cell.borrow_mut().apply_dpi();
         }
         After::Close => {
             // SAFETY: posts WM_CLOSE to our own window.

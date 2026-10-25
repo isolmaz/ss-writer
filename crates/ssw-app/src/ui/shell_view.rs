@@ -9,6 +9,7 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use ssw_core::command::CommandId;
 use ssw_core::edit::Selection;
@@ -25,7 +26,7 @@ use ssw_ui::editor::highlight::{Language, detect_language};
 use ssw_ui::editor::{DocumentKind, EditorConfig, EditorEvent, EditorStrings, EditorView};
 use ssw_ui::geometry::{Point, Rect, Size};
 use ssw_ui::input::{Cursor, Event, FocusEvent, PointerButton, PointerEvent, PointerEventKind};
-use ssw_ui::services::Clock;
+use ssw_ui::services::{Clock, TimerId};
 use ssw_ui::shell::banners::{BannerHost, BannerStrings, HostEvent};
 use ssw_ui::shell::inspector::{Inspector, InspectorEvent, InspectorStrings};
 use ssw_ui::shell::layout::{Backdrop, ChromeHit, Pane, ShellLayout, ShellMode};
@@ -149,6 +150,15 @@ enum Target {
     Status,
 }
 
+/// The word count of the whole document a tab shows, and when it was counted.
+#[derive(Debug, Clone, Copy)]
+struct WordCount {
+    tab: u64,
+    version: u64,
+    words: usize,
+    at: Duration,
+}
+
 /// What the status bar was last computed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StatusKey {
@@ -205,7 +215,9 @@ pub struct ShellView {
     /// The one tooltip of the window: its target and text follow the control under the pointer.
     tooltip: Tooltip,
     status_key: Option<StatusKey>,
-    words: Option<(u64, u64, usize)>,
+    words: Option<WordCount>,
+    /// Brings the word count up to date once typing pauses.
+    words_timer: TimerId,
 }
 
 impl fmt::Debug for ShellView {
@@ -221,6 +233,10 @@ impl fmt::Debug for ShellView {
 /// How much of the first line of a document the language detection reads: more than any shebang
 /// or markup declaration needs, and little enough for a minified file that is one huge line.
 const DETECT_HEAD_BYTES: usize = 256;
+
+/// The word count of the whole document reads all of it, so while the text keeps changing it is
+/// counted at most this often; the status bar shows the previous count meanwhile.
+const WORD_COUNT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The language a plain-text file is coloured as: the one its name, extension, shebang or
 /// markup declaration names ([`detect_language`]); none for an untitled document or when
@@ -328,6 +344,7 @@ impl ShellView {
             tooltip: Tooltip::new("", Rect::ZERO),
             status_key: None,
             words: None,
+            words_timer: TimerId::allocate(),
             localizer,
         }
     }
@@ -1677,7 +1694,12 @@ impl ShellView {
         // Formatting writes Markdown: a plain-text or diagram document refuses it (spec §4.1).
         self.titlebar
             .set_format_enabled(tab.editor.config().document_kind == DocumentKind::Markdown);
-        if self.status_key == Some(key) {
+        let now = self.clock.now();
+        let counted = self.words.filter(|count| count.tab == key.tab);
+        let recount = counted.is_none_or(|count| {
+            count.version != key.version && now >= count.at + WORD_COUNT_INTERVAL
+        });
+        if self.status_key == Some(key) && !recount {
             return;
         }
         self.status_key = Some(key);
@@ -1692,21 +1714,32 @@ impl ShellView {
             .chars()
             .count();
         let markdown = tab.entry.mode() != DocMode::Plain;
-        let words = match self.words {
-            Some((cached_tab, version, words))
-                if cached_tab == tab.key && version == key.version =>
-            {
-                words
+        let words = match counted {
+            Some(count) if !recount => {
+                if count.version != key.version {
+                    let wait = count.at + WORD_COUNT_INTERVAL - now;
+                    self.requests.set_timer(self.words_timer, wait, false);
+                }
+                count.words
             }
             _ => {
                 let source = document.text();
-                let counted = if markdown {
+                let words = if markdown {
                     stats::compute(&source, document.ast()).words
                 } else {
                     stats::compute_plain(&source).words
                 };
-                self.words = Some((tab.key, key.version, counted));
-                counted
+                // A recount the timer started has no other repaint behind it.
+                if counted.is_some_and(|count| count.words != words) {
+                    self.requests.invalidate(self.statusbar.bounds());
+                }
+                self.words = Some(WordCount {
+                    tab: tab.key,
+                    version: key.version,
+                    words,
+                    at: now,
+                });
+                words
             }
         };
         let selected_words = (!selection.range().is_empty()).then(|| {

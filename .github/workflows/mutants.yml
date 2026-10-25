@@ -1,9 +1,17 @@
 name: Mutants
 
-# Mutation testing runs on GitHub, never on a developer machine: started by hand (a shard of the
-# workspace per job) and weekly. The report of every shard is kept as an artifact.
+# Mutation testing runs on GitHub, never on a developer machine. The weekly run tests the mutants
+# of the code that changed in the last seven days; a run started by hand tests the code that
+# changed since the commit it names, or the whole workspace. The mutants are split into shards
+# of about 400 (a mutant takes about 20 s, a job may run six hours), at most 64; the report of
+# every shard is kept as an artifact.
 on:
   workflow_dispatch:
+    inputs:
+      base:
+        description: "Test only the code changed since this commit or tag (empty: the whole workspace)"
+        required: false
+        default: ""
   schedule:
     - cron: "0 3 * * 0"
 
@@ -19,16 +27,61 @@ defaults:
     shell: bash
 
 jobs:
+  scope:
+    name: scope
+    runs-on: windows-latest
+    outputs:
+      base: ${{ steps.scope.outputs.base }}
+      shards: ${{ steps.scope.outputs.shards }}
+      total: ${{ steps.scope.outputs.total }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install the toolchain pinned in rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Mutants to test and shards
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ inputs.base }}
+        run: |
+          if [ "$EVENT" = schedule ]; then
+            BASE=$(git rev-list -1 --before="7 days ago" HEAD)
+          fi
+          scope=()
+          if [ -n "$BASE" ]; then
+            BASE=$(git rev-parse --verify "$BASE^{commit}")
+            git diff "$BASE" HEAD -- crates > mutants.diff
+            scope=(--in-diff mutants.diff)
+          fi
+          count=$(cargo mutants --list --workspace --exclude 'xtask/**' "${scope[@]}" | wc -l)
+          total=$(( (count + 399) / 400 ))
+          if [ "$total" -gt 64 ]; then total=64; fi
+          echo "$count mutants since ${BASE:-the first commit}, $total shards"
+          {
+            echo "base=$BASE"
+            echo "total=$total"
+            echo "shards=[$(seq -s, 0 $((total - 1)))]"
+          } >> "$GITHUB_OUTPUT"
+
   mutants:
-    name: mutants (shard ${{ matrix.shard }}/8)
+    name: mutants (shard ${{ matrix.shard }}/${{ needs.scope.outputs.total }})
+    needs: scope
+    if: needs.scope.outputs.total != '0'
     runs-on: windows-latest
     timeout-minutes: 350
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: ${{ fromJSON(needs.scope.outputs.shards) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install the toolchain pinned in rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -39,7 +92,16 @@ jobs:
         shell: pwsh
         run: .github/scripts/desktop.ps1
       - name: Mutants
-        run: cargo xtask mutants -j 2 -- --shard ${{ matrix.shard }}/8 --all-features --timeout 600
+        env:
+          BASE: ${{ needs.scope.outputs.base }}
+          SHARD: ${{ matrix.shard }}/${{ needs.scope.outputs.total }}
+        run: |
+          scope=()
+          if [ -n "$BASE" ]; then
+            git diff "$BASE" HEAD -- crates > mutants.diff
+            scope=(--in-diff mutants.diff)
+          fi
+          cargo xtask mutants -j 2 -- --shard "$SHARD" --all-features --timeout 600 "${scope[@]}"
       - name: Keep the report
         if: always()
         uses: actions/upload-artifact@v4

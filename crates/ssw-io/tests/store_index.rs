@@ -783,6 +783,35 @@ fn a_pending_update_near_the_limit_leaves_room_for_a_new_file() {
 }
 
 #[test]
+fn a_file_renamed_in_a_full_index_keeps_its_place() {
+    let mut fx = standard();
+    let opts = IndexOptions {
+        show_hidden: false,
+        max_files: 4,
+    };
+    run(&mut fx.store, &fx.root, &opts);
+    std::fs::rename(
+        path_of(&fx.root, "readme.md"),
+        path_of(&fx.root, "intro.md"),
+    )
+    .unwrap();
+    // The removal of the old name frees the room the new name takes.
+    let changes = [
+        IndexChange::Removed(path_of(&fx.root, "readme.md")),
+        IndexChange::Changed(path_of(&fx.root, "intro.md")),
+    ];
+    let stats = fx
+        .store
+        .index_apply_changes(&fx.root, &changes, &opts, &no_placeholders)
+        .unwrap();
+    assert!(!stats.truncated);
+    assert_eq!((stats.files, stats.removed, stats.parsed), (4, 1, 1));
+    let rels = rels(&fx.store, &fx.root);
+    assert!(rels.contains(&"intro.md".to_owned()));
+    assert!(!rels.contains(&"readme.md".to_owned()));
+}
+
+#[test]
 fn placeholders_are_listed_but_never_read() {
     let mut fx = standard();
     let opts = IndexOptions::default();

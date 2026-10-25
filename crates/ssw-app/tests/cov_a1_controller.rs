@@ -281,8 +281,8 @@ fn dots(cell: &WindowCell) -> Vec<bool> {
 
 /// A small Word document of the shared fixtures.
 fn word_document() -> Vec<u8> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/docx/mammoth_empty.docx");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/docx/mammoth_empty.docx");
     std::fs::read(path).unwrap()
 }
 

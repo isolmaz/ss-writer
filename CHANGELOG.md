@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- The files one action could not open (the startup session, a launch from Explorer or the Jump List, File → Open, a drop, the sidebar) are named in one message with the reason for each, instead of one nameless "The file no longer exists." box per file.
+- The folder of an open document is watched without its subfolders, and a folder that cannot be watched (an offline share) is tried again after 30 s instead of several times a second. An unreachable network share counts as a changed file, not a deleted one.
+- With autosave on, a document autosave cannot write (untitled, imported from Word, ODT, RTF or DOC, read-only, changed or deleted on disk, decoded with losses) shows the dirty dot.
+- The encoding menus list Turkish once; ISO-8859-9 was a second name for Windows-1254.
+- The "Syntax highlighting" setting is labeled "Color code blocks and plain-text files", which is what it switches.
+- README and the website no longer offer `winget install isolmaz.SSWriter`: the package is not in the winget community repository. The winget manifests attached to every release install it from a local folder.
+
+### Fixed
+
+- Opening a file that a restored session already showed added a second tab for it, and every later start from Explorer added another; once the file moved or was deleted, each copy reported "The file no longer exists." at startup. A launched file the window shows already now activates its tab, and duplicate tabs stored by earlier versions are restored once.
+- A deleted file stayed on the recent list and in the Jump List, and opening it from there failed every time. A file that no longer exists is taken off both.
+- A document that could not be read again after an external change (locked by a sync client, share offline) was reported again every time the window was activated, including when the error box itself closed; the same failure from the file watcher was not reported at all. Each is reported once until the file reads again.
+- A recent-list entry that could not be written made an open fail although the file had been read.
+- Typing paused for up to 1.5 s at every autosave while another program (antivirus, OneDrive, the indexer) held the file: the save slept between its retries on the interface thread. Autosave now retries on its clock without blocking and reports once.
+- The editor waited up to 5 s for the database while a workspace was indexed: indexing held the write lock while it read and parsed every file. Files are read and parsed first and written in short transactions.
+- A burst of file events (a branch switch, an unzip, a package install) was classified in quadratic time on the interface thread.
+- Inserting or deleting a line break in a large plain-text or source file rescanned the syntax colors of every line below it.
+- Every mouse move over the editor repainted it and restarted the caret blink; the find bar searched the whole document on tab switches while hidden and copied its matches at every repaint; relisting a large sidebar folder was quadratic.
+- Zooming or changing an editor setting in a long document jumped to different text; it now keeps the text at the top of the view.
+- Text composed with an IME on a blank Markdown line was invisible until committed.
+- Find highlights stayed on a tab that was left while the find bar was open.
+- With autosave on, closing an untitled tab with text, an edited imported document or a document whose file was deleted discarded the changes without asking. Such documents are asked about (Save, Don't save, Cancel); untitled buffers the restored session keeps are not asked about when the app quits.
+- With autosave off, Exit did not ask about unsaved changes of a document shown in more than one tab or window, and discarded them.
+- A failed autosave was reported again at every pause and on every tab switch, and kept the tab and the app from closing until its cause was fixed. It is reported once, and closing asks what to do with the changes.
+- A clean exit deleted the crash-recovery offer of the previous run when it had not been answered yet; a document closed without saving could come back as a recovered document after a later crash; the recovery copies of two crashed runs could overwrite each other.
+- Deactivating a window did not save its documents (spec §4.3).
+- Moving a folder that contains a directory junction or symbolic link to another drive deleted the files the link pointed to, and copying such a folder copied them; a link that points to its own folder recursed until the path was too long. Links are removed or left out, never followed.
+- When a replace failed after losing the original file and the fallback move failed too, the temp file with the new content was deleted. It is kept and named in the error.
+- Exporting a document whose footnote refers to itself (or two footnotes that refer to each other) to DOCX overflowed the stack and closed the app. A reference inside a footnote is written as text, as ODT does; DOCX and ODT also use the first of two definitions of a label, like the editor.
+- Imported tables of DOCX, RTF, DOC and pasted HTML had no size limit, so a small file could exhaust memory; they are cut to 4096 columns and one million cells per document, as ODT tables are, and the loss is reported. A DOC with an unbounded number of formatting runs and a `.textpack` with more than 10 000 entries are refused, and reading a textpack no longer takes quadratic time.
+- A Mermaid `click` link with a `javascript:`, `data:` or other scripting scheme stayed live in exported HTML, ePub and SVG files; only http, https, mailto and relative links are kept.
+- Control characters and U+FFFE/U+FFFF made exported ePub chapters invalid XML; they are left out of HTML and ePub text.
+- Pictures imported from DOCX and ODT kept the extension of their archive part name, so a part named `x.exe` was written next to the document as an `.exe`. Only image extensions are kept; others become `.bin`.
+- Deleting the paragraph between two ordered lists merged them without renumbering the second one.
+- Heading and other block commands treated `2. ` at the start of a paragraph continuation line as a list marker.
+- Find next, Find previous and Replace collected every match of the document to pick one; they now search from the caret.
+
 ## [0.1.6] - 2026-10-13
 
 ### Added

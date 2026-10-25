@@ -153,11 +153,11 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Line endings: stored as `\n` internally; original style restored on save. Mixed files are normalized to the majority style and the user is notified once. Status bar line-ending menu (click the EOL): LF, CRLF or CR for the next save, current style marked; disabled for documents that a converter writes.
 
 ### 4.3 Saving
-- Autosave default on: 1 s after typing stops, on tab switch, window deactivate and close. Off → classic `Ctrl+S`, dirty dot on the tab, close prompt **Save / Don't save / Cancel**.
-- Atomic write: temp file in the same folder → `ReplaceFileW` (keeps attributes/ACLs). Network share failure → temp + `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`. `ERROR_SHARING_VIOLATION` → retry with backoff (50, 100, 200, 400, 800 ms) then banner.
+- Autosave default on: 1 s after typing stops, on tab switch, window deactivate and close. The 1 s write never blocks the editor: a file another program holds is tried again on the backoff below and reported only when that runs out. A failed autosave is shown once per document until a save of it succeeds, and never keeps a tab or the app from closing. Off → classic `Ctrl+S`, dirty dot on the tab, close prompt **Save / Don't save / Cancel**. With autosave on, a document autosave cannot write (untitled, imported from Word/ODT/RTF/DOC, read-only, changed or deleted on disk, lossy decode) gets the dirty dot and the same prompt; untitled buffers are not asked about when the app quits and the session restores them (§4.4). A document another tab still shows is never asked about, and one shown in several tabs that all close is asked about once.
+- Atomic write: temp file in the same folder → `ReplaceFileW` (keeps attributes/ACLs). Network share failure → temp + `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`. `ERROR_SHARING_VIOLATION` → retry with backoff (50, 100, 200, 400, 800 ms) then an error. When a failed replace has lost the original file, the new content stays in the temp file and the error names it.
 - Own writes are recognized (expected size, mtime, content hash) and never trigger the external-change path.
 - Read-only files (attribute or ACL): banner "This file is read-only" + "Allow editing" (clears the attribute when permitted).
-- External change: no local unsaved edits → reload preserving caret/scroll (diff-based); otherwise conflict banner: Keep mine / Load theirs / Compare.
+- External change: no local unsaved edits → reload preserving caret/scroll (diff-based); otherwise conflict banner: Keep mine / Load theirs / Compare. A file that cannot be read again (locked by another program, share offline) is reported once until it reads again; an unreachable network share counts as a change, not a deletion. The folder of each open document is watched without its subfolders; a folder that cannot be watched is tried again after 30 s.
 - OneDrive placeholders (`RECALL_ON_DATA_ACCESS`/`RECALL_ON_OPEN`): never hydrated by indexing/search; cloud icon in the tree; opening hydrates with progress.
 
 ### 4.4 New & untitled
@@ -188,10 +188,11 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Index (background, SQLite): file list, headings, links for Quick Open, wikilinks, backlinks, rename updates. Respects `.gitignore` and hidden-item settings. Case-insensitive ordinal file matching (`CompareStringOrdinal`).
 
 ## 6. Tabs, windows, session
-- Tabs: title (file stem; extension shown for non-Markdown), dirty dot (autosave off), close on hover, middle-click close, drag reorder, drag out → new window, drop onto another window's tab row → move. Context: Close, Close others, Close to the right, Copy path, Reveal in Explorer.
+- Tabs: title (file stem; extension shown for non-Markdown), dirty dot (autosave off, or a document autosave cannot write), close on hover, middle-click close, drag reorder, drag out → new window, drop onto another window's tab row → move. Context: Close, Close others, Close to the right, Copy path, Reveal in Explorer.
 - `Ctrl+T` new tab, `Ctrl+W` close, `Ctrl+Tab`/`Ctrl+Shift+Tab`, `Ctrl+PgDn`/`Ctrl+PgUp`, `Ctrl+Shift+T` reopen closed. Window → Merge all windows.
 - Same file in several tabs/windows shares one document (instant sync).
-- Single instance (named mutex + `WM_COPYDATA`); new launches open tabs in the last active window (or a new window for folders).
+- Single instance (named mutex + `WM_COPYDATA`); new launches open tabs in the last active window (or a new window for folders). A launched file the window shows already activates its tab instead of opening a second one, also when it starts the app and the restored session has it.
+- The files one action cannot open (startup, launch, File → Open, drop, sidebar) are named with their reason in one message. A file that no longer exists leaves the recent list and the Jump List.
 - Session restore: windows (placement), tabs, workspaces, caret, scroll, folds. Per-file caret/scroll remembered for reopened files.
 
 ## 7. Search

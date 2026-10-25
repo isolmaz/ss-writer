@@ -715,6 +715,19 @@ struct Graphics {
     resources: TargetResources,
 }
 
+/// How many rebuilds of lost graphics may fail before the window stops trying.
+const GRAPHICS_RETRIES: u32 = 5;
+/// How long the window waits after the first failed rebuild; each failure doubles the wait.
+const GRAPHICS_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// The devices of a failed rebuild: a later paint tries again from them.
+struct LostGraphics {
+    devices: GfxDevices,
+    /// The rebuilds that failed so far.
+    failures: u32,
+    retry_at: Instant,
+}
+
 struct WindowState {
     hwnd: HWND,
     handler: Box<dyn WindowHandler>,
@@ -728,6 +741,8 @@ struct WindowState {
     /// registrations survive until (and across) the graphics devices.
     assets: Option<CanvasAssets>,
     graphics: Option<Graphics>,
+    /// Set while `graphics` is `None` because a rebuild failed and may still be retried.
+    lost: Option<LostGraphics>,
     pending_high_surrogate: Option<u16>,
     clicks: ClickTracker,
     started: Instant,
@@ -886,6 +901,7 @@ impl WindowState {
             return;
         }
         self.painting = true;
+        self.retry_graphics();
         let outcome = self.paint_once();
         if matches!(&outcome, Err(error) if error.is_device_lost()) {
             self.recover_graphics();
@@ -918,7 +934,8 @@ impl WindowState {
         })
     }
 
-    /// Rebuilds every device resource after a device loss; the next paint redraws.
+    /// Rebuilds every device resource after a device loss; the next paint redraws. A rebuild
+    /// that fails is tried again by later paints ([`WindowState::retry_graphics`]).
     fn recover_graphics(&mut self) {
         let Some(old) = self.graphics.take() else {
             return;
@@ -931,20 +948,44 @@ impl WindowState {
         // The composition target must be released before a new one is made for this HWND.
         drop(surface);
         drop(resources);
-        let Ok(devices) = devices.recreate() else {
-            return;
-        };
+        self.rebuild_graphics(devices, 0);
+    }
+
+    /// Makes the devices after `lost` and a surface on them. When that fails, the window keeps
+    /// `lost` for a later try, which waits twice as long after every failure; after
+    /// [`GRAPHICS_RETRIES`] failures it stays without graphics.
+    fn rebuild_graphics(&mut self, lost: GfxDevices, failures: u32) {
         let (width, height) = (self.size_px.0.max(1) as u32, self.size_px.1.max(1) as u32);
-        let Ok(surface) = WindowSurface::new(&devices, self.hwnd, width, height, self.dpi as f32)
-        else {
-            return;
-        };
-        let resources = TargetResources::new(devices.d2d_factory().clone(), devices.generation());
-        self.graphics = Some(Graphics {
-            devices,
-            surface,
-            resources,
+        let built = lost.recreate().and_then(|devices| {
+            let surface = WindowSurface::new(&devices, self.hwnd, width, height, self.dpi as f32)?;
+            Ok((devices, surface))
         });
+        match built {
+            Ok((devices, surface)) => {
+                let resources =
+                    TargetResources::new(devices.d2d_factory().clone(), devices.generation());
+                self.graphics = Some(Graphics {
+                    devices,
+                    surface,
+                    resources,
+                });
+            }
+            Err(_) => {
+                let failures = failures + 1;
+                self.lost = (failures < GRAPHICS_RETRIES).then(|| LostGraphics {
+                    devices: lost,
+                    failures,
+                    retry_at: Instant::now() + GRAPHICS_RETRY_WAIT * 2u32.pow(failures - 1),
+                });
+            }
+        }
+    }
+
+    /// Tries again to rebuild graphics a failed rebuild left behind, once its wait is over.
+    fn retry_graphics(&mut self) {
+        if let Some(lost) = self.lost.take_if(|lost| Instant::now() >= lost.retry_at) {
+            self.rebuild_graphics(lost.devices, lost.failures);
+        }
     }
 
     fn handle(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> (Option<LRESULT>, After) {
@@ -1274,6 +1315,7 @@ impl WindowState {
                 let info = self.info();
                 self.handler.on_destroy(&info);
                 self.graphics = None;
+                self.lost = None;
                 self.assets = None;
                 (Some(LRESULT(0)), After::None)
             }
@@ -1474,6 +1516,7 @@ impl WindowHost {
             theme,
             assets: None,
             graphics: None,
+            lost: None,
             pending_high_surrogate: None,
             clicks: ClickTracker::new(
                 // SAFETY: pure query.
@@ -1586,6 +1629,7 @@ impl WindowHost {
             surface,
             resources,
         });
+        state.lost = None;
         Ok(())
     }
 
@@ -3289,6 +3333,109 @@ mod tests {
         let mut expected = vec![Some(2); 5];
         expected.extend([None; 10]);
         assert_eq!(generations, expected);
+    }
+
+    /// How many rebuilds of its lost graphics have failed while `host` waits to try again.
+    #[cfg(feature = "fault-injection")]
+    fn failed_rebuilds(host: &WindowHost) -> Option<u32> {
+        host.state.borrow().lost.as_ref().map(|lost| lost.failures)
+    }
+
+    /// Lets the wait before the next try at the lost graphics of `host` end now.
+    #[cfg(feature = "fault-injection")]
+    fn end_graphics_wait(host: &WindowHost) {
+        let mut state = host.state.borrow_mut();
+        let lost = state.lost.as_mut().expect("a rebuild is waiting");
+        lost.retry_at = Instant::now();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn graphics_that_could_not_be_rebuilt_are_tried_again_by_later_paints_after_a_growing_wait() {
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, log) = host(true, false);
+        attach(&host);
+
+        let before = Instant::now();
+        crate::fault::arm_from(0);
+        host.state.borrow_mut().recover_graphics();
+        crate::fault::disarm();
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(failed_rebuilds(&host), Some(1));
+        let retry_at = host.state.borrow().lost.as_ref().map(|lost| lost.retry_at);
+        assert!(retry_at >= Some(before + GRAPHICS_RETRY_WAIT));
+
+        // Within the wait a paint neither tries nor draws.
+        let paints = log.borrow().paints;
+        host.state.borrow_mut().paint();
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(log.borrow().paints, paints);
+        assert_eq!(failed_rebuilds(&host), Some(1));
+
+        // After it a try that fails again waits twice as long.
+        end_graphics_wait(&host);
+        let before = Instant::now();
+        crate::fault::arm_from(0);
+        host.state.borrow_mut().paint();
+        crate::fault::disarm();
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(failed_rebuilds(&host), Some(2));
+        let retry_at = host.state.borrow().lost.as_ref().map(|lost| lost.retry_at);
+        assert!(retry_at >= Some(before + GRAPHICS_RETRY_WAIT * 2));
+
+        // After that wait a try gets through: new devices, and the frame is drawn on them.
+        end_graphics_wait(&host);
+        host.state.borrow_mut().paint();
+        assert_eq!(host.graphics_generation(), Some(2));
+        assert_eq!(log.borrow().paints, paints + 1);
+        assert!(host.state.borrow().lost.is_none());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn the_window_stops_trying_after_a_bounded_number_of_failed_rebuilds() {
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, log) = host(true, false);
+        attach(&host);
+
+        crate::fault::arm_from(0);
+        host.state.borrow_mut().recover_graphics();
+        let mut seen = vec![failed_rebuilds(&host)];
+        for _ in 1..GRAPHICS_RETRIES {
+            end_graphics_wait(&host);
+            host.state.borrow_mut().paint();
+            seen.push(failed_rebuilds(&host));
+        }
+        crate::fault::disarm();
+        // The last failure is the one that ends the tries.
+        assert_eq!(seen, [Some(1), Some(2), Some(3), Some(4), None]);
+        assert_eq!(host.graphics_generation(), None);
+
+        // Nothing is left to try: later paints do not rebuild and draw nothing.
+        let paints = log.borrow().paints;
+        host.state.borrow_mut().paint();
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(log.borrow().paints, paints);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn graphics_attached_while_a_rebuild_waits_replace_it() {
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, log) = host(true, false);
+        attach(&host);
+        crate::fault::arm_from(0);
+        host.state.borrow_mut().recover_graphics();
+        crate::fault::disarm();
+        assert!(host.state.borrow().lost.is_some());
+
+        attach(&host);
+        assert!(host.state.borrow().lost.is_none());
+        assert_eq!(host.graphics_generation(), Some(1));
+        let paints = log.borrow().paints;
+        host.state.borrow_mut().paint();
+        assert_eq!(host.graphics_generation(), Some(1));
+        assert_eq!(log.borrow().paints, paints + 1);
     }
 
     #[test]

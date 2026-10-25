@@ -1,12 +1,14 @@
 //! The autosave scheduler (spec §4.3, §4.4, §4.5).
 //!
-//! The UI calls [`Autosave::tick`] from a timer (a few times a second) and [`Autosave::flush`]
-//! on tab switch, window deactivation and close. The scheduler decides, from a fake-able clock:
+//! The UI calls [`Autosave::tick`] from a timer (a few times a second), [`Autosave::flush`] on
+//! tab switch and close and [`Autosave::flush_without_waiting`] on window deactivation. The
+//! scheduler decides, from a fake-able clock:
 //!
 //! - save a changed file document once typing stopped for the configured delay (autosave on);
 //!   the tick never sleeps: a file another program holds is tried again after the backoff of an
 //!   explicit save (50, 100, 200, 400, 800 ms) and only then reported,
-//! - save immediately on those triggers (autosave on),
+//! - save immediately on those triggers (autosave on); only the deactivation trigger never
+//!   waits for a file another program holds and leaves it to the tick,
 //! - back up dirty untitled buffers every 30 s (recovery folder and session store),
 //! - snapshot edited files in the version history every 5 minutes,
 //! - delete the history older than the retention every hour (startup purges once as well),
@@ -408,15 +410,35 @@ impl Autosave {
         self.state.borrow_mut().reported.remove(&entry.id());
     }
 
-    /// Saves `entry` now when autosave is on and it has unsaved changes: the tab switch, window
-    /// deactivation and close triggers. `None` when there is nothing to do (autosave off,
-    /// clean, not autosavable). A failure is returned as it is; whether it is news is
-    /// [`Autosave::is_new_failure`].
+    /// Saves `entry` now when autosave is on and it has unsaved changes: the tab switch and
+    /// close triggers; a file another program holds is tried again after 50 to 800 ms. `None`
+    /// when there is nothing to do (autosave off, clean, not autosavable). A failure is returned
+    /// as it is; whether it is news is [`Autosave::is_new_failure`].
     pub fn flush(&self, entry: &DocEntry) -> Option<Result<Saved, DocError>> {
+        self.flush_by(entry, Documents::save)
+    }
+
+    /// [`Autosave::flush`] for the trigger that must not stall the UI (window deactivation: a
+    /// message box or an Alt+Tab deactivates the window while a spreadsheet may hold the file).
+    /// It never sleeps. A file another program holds is not a failure here: the document stays
+    /// unsaved and `None` is returned, and the tick tries again after its backoff and reports
+    /// the file if it stays held.
+    pub fn flush_without_waiting(&self, entry: &DocEntry) -> Option<Result<Saved, DocError>> {
+        match self.flush_by(entry, Documents::save_without_waiting) {
+            Some(Err(DocError::Save(SaveError::SharingViolation(_)))) => None,
+            outcome => outcome,
+        }
+    }
+
+    fn flush_by(
+        &self,
+        entry: &DocEntry,
+        save: fn(&Documents, &DocEntry) -> Result<Saved, DocError>,
+    ) -> Option<Result<Saved, DocError>> {
         if !self.policy().enabled || !entry.is_dirty() || !Self::autosavable(entry) {
             return None;
         }
-        let result = self.docs.save(entry);
+        let result = save(&self.docs, entry);
         if result.is_ok() {
             self.written(entry);
         }
@@ -1057,6 +1079,62 @@ mod tests {
         assert!(report.failed.is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
         assert!(!entry.is_dirty());
+        assert!(rig.emergency.is_empty());
+        assert!(sleeper.slept().is_empty());
+    }
+
+    #[test]
+    fn a_flush_without_waiting_leaves_a_held_file_to_the_tick() {
+        let fault = Arc::new(FaultFs::new());
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let rig = rig_on(fault.clone(), sleeper.clone(), true);
+        let (path, entry) = rig.file("a\n");
+        rig.autosave.tick(&rig.i18n);
+        assert!(
+            rig.autosave.flush_without_waiting(&entry).is_none(),
+            "nothing to write"
+        );
+        type_text(&entry, "b\n");
+        rig.autosave.tick(&rig.i18n);
+
+        // The file is held: one try, no sleep, no failure, and the text stays unsaved.
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::SharingViolation);
+        assert!(rig.autosave.flush_without_waiting(&entry).is_none());
+        assert_eq!(attempts(&fault), 1);
+        assert!(sleeper.slept().is_empty());
+        assert!(entry.is_dirty());
+        assert_eq!(rig.emergency.len(), 1, "the crash copy stays");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+
+        // Any other failure is returned for the caller to report.
+        fault.clear();
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::AccessDenied);
+        let error = rig
+            .autosave
+            .flush_without_waiting(&entry)
+            .expect("dirty and autosavable")
+            .unwrap_err();
+        assert_eq!(error.message_id(), "app-error-access-denied");
+        assert_eq!(attempts(&fault), 2);
+
+        // Released, the tick writes it after the delay, as it would have without the flush.
+        fault.clear();
+        rig.advance(1000);
+        let report = rig.autosave.tick(&rig.i18n);
+        assert_eq!(report.saved, [entry.id()]);
+        assert!(report.failed.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
+
+        // A flush that finds the file free writes it.
+        type_text(&entry, "c\n");
+        rig.autosave.tick(&rig.i18n);
+        assert!(
+            rig.autosave
+                .flush_without_waiting(&entry)
+                .expect("dirty and autosavable")
+                .is_ok()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc\n");
         assert!(rig.emergency.is_empty());
         assert!(sleeper.slept().is_empty());
     }

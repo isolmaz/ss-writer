@@ -5,6 +5,7 @@
 //! shown.
 
 use std::cell::RefCell;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -1310,6 +1311,35 @@ fn a_deactivated_window_writes_its_own_documents_at_once() {
 
         rig.controller.window_deactivated(first.id);
         assert_eq!(disk("a.md"), "a edited\n");
+    });
+}
+
+#[test]
+fn a_deactivated_window_neither_waits_for_nor_reports_a_file_another_program_holds() {
+    with_rig("{}", |rig| {
+        let window = rig.window();
+        rig.open("a.md");
+        let entry = entry_of(&window);
+        edit(&entry, "a edited\n");
+        let path = rig.work.join("a.md");
+        // Another program has the file open without sharing it; an unexpected box would fail
+        // the rig, so the lock goes unreported.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        rig.controller.window_deactivated(window.id);
+        assert!(entry.is_dirty(), "left to the autosave timer");
+        drop(lock);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# A\nfind the needle\n"
+        );
+
+        rig.controller.window_deactivated(window.id);
+        assert!(!entry.is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a edited\n");
     });
 }
 

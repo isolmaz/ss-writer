@@ -141,7 +141,7 @@ impl Autosave {
     /// The id of `entry` in the crash copy and the recovery folder. An untitled buffer has its
     /// own id; a file's holds the start of this run, because document numbers begin at 1 in
     /// every run while the recovery folder keeps what earlier runs left unrecovered.
-    fn recovery_id(&self, entry: &DocEntry) -> String {
+    pub fn recovery_id(&self, entry: &DocEntry) -> String {
         entry
             .untitled_id()
             .unwrap_or_else(|| format!("doc-{}-{}", self.run, entry.id().0))

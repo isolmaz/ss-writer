@@ -265,7 +265,12 @@ fn a_file_whose_text_cannot_be_kept_does_not_stop_the_others() {
         // The recovery file of the first document cannot be replaced.
         let folder = app.controller().core().borrow().paths.recovery_dir();
         std::fs::create_dir_all(&folder).unwrap();
-        blocked = format!("doc-{}", first.id().0);
+        blocked = app
+            .controller()
+            .core()
+            .borrow()
+            .autosave
+            .recovery_id(&first);
         let data = folder.join(format!("{blocked}.txt"));
         std::fs::write(&data, "old").unwrap();
         let mut permissions = std::fs::metadata(&data).unwrap().permissions();

@@ -1288,7 +1288,7 @@ fn keep_unsaved_text(core: &AppCore) {
             .file_name()
             .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
         unsaved.put(
-            &format!("doc-{}", entry.id().0),
+            &core.autosave.recovery_id(entry),
             CachedDoc {
                 kind: RecoveryKind::Dirty,
                 original_path: Some(path),

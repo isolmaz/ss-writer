@@ -759,6 +759,30 @@ fn a_new_file_pending_at_the_limit_is_stored_again_by_its_next_event() {
 }
 
 #[test]
+fn a_pending_update_near_the_limit_leaves_room_for_a_new_file() {
+    let mut fx = standard();
+    let opts = IndexOptions {
+        show_hidden: false,
+        max_files: 5,
+    };
+    run(&mut fx.store, &fx.root, &opts);
+    write(&fx.root, "readme.md", "# Readme again\n");
+    write(&fx.root, "one.md", "# One\n");
+    // The pending update of a file the index has is written first and takes no room.
+    let changes = [
+        IndexChange::Changed(path_of(&fx.root, "readme.md")),
+        IndexChange::Changed(path_of(&fx.root, "one.md")),
+    ];
+    let stats = fx
+        .store
+        .index_apply_changes(&fx.root, &changes, &opts, &no_placeholders)
+        .unwrap();
+    assert!(!stats.truncated);
+    assert_eq!(stats.files, 5);
+    assert!(rels(&fx.store, &fx.root).contains(&"one.md".to_owned()));
+}
+
+#[test]
 fn placeholders_are_listed_but_never_read() {
     let mut fx = standard();
     let opts = IndexOptions::default();

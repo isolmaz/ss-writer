@@ -389,6 +389,7 @@ fn create_event(path: &Path) -> Result<Owned<HANDLE>, FsError> {
 /// Overlapped `ReadDirectoryChangesW` on one directory handle.
 struct RdcwSource {
     root: PathBuf,
+    recursive: bool,
     dir: Owned<HANDLE>,
     io_event: Owned<HANDLE>,
     stop: Arc<StopEvent>,
@@ -398,8 +399,9 @@ struct RdcwSource {
 }
 
 impl RdcwSource {
-    /// Opens `root` for overlapped change notification; no request is pending yet.
-    fn open(root: &Path, stop: Arc<StopEvent>) -> Result<Self, FsError> {
+    /// Opens `root` for overlapped change notification, of the whole tree below it when
+    /// `recursive`; no request is pending yet.
+    fn open(root: &Path, recursive: bool, stop: Arc<StopEvent>) -> Result<Self, FsError> {
         let name = wide(root);
         // SAFETY: `name` is NUL-terminated and outlives the call; the handle is opened for
         // overlapped directory listing with full sharing so the folder can still be renamed.
@@ -421,6 +423,7 @@ impl RdcwSource {
         let dir = unsafe { Owned::new(dir) };
         let mut source = Self {
             root: root.to_path_buf(),
+            recursive,
             dir,
             io_event: create_event(root)?,
             stop,
@@ -447,7 +450,7 @@ impl RdcwSource {
                 *self.dir,
                 self.buffer.as_mut_ptr().cast(),
                 BUFFER_BYTES as u32,
-                true,
+                self.recursive,
                 filter,
                 None,
                 Some(&raw mut *self.overlapped),
@@ -529,7 +532,7 @@ impl Drop for RdcwSource {
     }
 }
 
-/// Watches a folder tree recursively. Dropping the watcher stops the reader thread.
+/// Watches a folder, or the whole tree below it. Dropping the watcher stops the reader thread.
 #[derive(Debug)]
 pub struct Watcher {
     root: PathBuf,
@@ -538,18 +541,20 @@ pub struct Watcher {
 }
 
 impl Watcher {
-    /// Starts watching `root` recursively. Coalesced events arrive on the returned channel;
-    /// `wake` runs after each delivered batch (e.g. to post a window message). When the watch
-    /// breaks the channel receives [`FsEventKind::Rescan`] and then disconnects.
+    /// Starts watching `root`, and every folder below it when `recursive`. Coalesced events
+    /// arrive on the returned channel; `wake` runs after each delivered batch (e.g. to post a
+    /// window message). When the watch breaks the channel receives [`FsEventKind::Rescan`] and
+    /// then disconnects.
     ///
     /// # Errors
     /// [`FsError::NotFound`] when `root` is not a folder, other [`FsError`]s from the OS.
     pub fn start(
         root: &Path,
+        recursive: bool,
         wake: impl Fn() + Send + 'static,
     ) -> Result<(Self, Receiver<FsEvent>), FsError> {
         let stop = Arc::new(StopEvent(create_event(root)?));
-        let source = RdcwSource::open(root, Arc::clone(&stop))?;
+        let source = RdcwSource::open(root, recursive, Arc::clone(&stop))?;
         let (sender, receiver) = channel();
         let (armed_sender, armed) = channel::<()>();
         let owned_root = root.to_path_buf();
@@ -680,14 +685,17 @@ impl ExternalChanges {
     }
 
     /// Classifies watcher events for the tracked documents. The result holds one entry per
-    /// document (the last decision wins) and never contains [`DocChange::Unchanged`].
+    /// document (the last decision wins, in the order of the decisions) and never contains
+    /// [`DocChange::Unchanged`]. Events about paths that are not tracked cost no more than a
+    /// lookup, however many arrive at once.
     #[must_use]
     pub fn classify(&self, events: &[FsEvent]) -> Vec<(PathBuf, DocChange)> {
-        let mut decisions: Vec<(String, PathBuf, DocChange)> = Vec::new();
+        // Path key → (order of the decision, path, decision).
+        let mut decisions: HashMap<String, (usize, PathBuf, DocChange)> = HashMap::new();
+        let mut order = 0;
         let mut decide = |path: &Path, change: DocChange| {
-            let key = path_key(path);
-            decisions.retain(|(existing, _, _)| *existing != key);
-            decisions.push((key, path.to_path_buf(), change));
+            decisions.insert(path_key(path), (order, path.to_path_buf(), change));
+            order += 1;
         };
         for event in events {
             match &event.kind {
@@ -704,12 +712,19 @@ impl ExternalChanges {
                         },
                     );
                 }
-                _ => decide(&event.path, self.check(&event.path)),
+                _ if self.docs.contains_key(&path_key(&event.path)) => {
+                    decide(&event.path, self.check(&event.path));
+                }
+                _ => {}
             }
         }
-        decisions
-            .into_iter()
+        let mut decided: Vec<(usize, PathBuf, DocChange)> = decisions
+            .into_values()
             .filter(|(_, _, change)| *change != DocChange::Unchanged)
+            .collect();
+        decided.sort_by_key(|(order, _, _)| *order);
+        decided
+            .into_iter()
             .map(|(_, path, change)| (path, change))
             .collect()
     }
@@ -725,7 +740,7 @@ mod tests {
     fn a_failing_completion_ends_the_watch_instead_of_reporting_changes() {
         let dir = tempfile::tempdir().unwrap();
         let stop = Arc::new(StopEvent(create_event(dir.path()).unwrap()));
-        let mut source = RdcwSource::open(dir.path(), stop).unwrap();
+        let mut source = RdcwSource::open(dir.path(), true, stop).unwrap();
         source.issue().unwrap();
         std::fs::write(dir.path().join("changed.md"), "x").unwrap();
         crate::fault::arm(0);

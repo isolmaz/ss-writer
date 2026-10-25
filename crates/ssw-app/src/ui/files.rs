@@ -776,11 +776,12 @@ impl Controller {
         let mut slot = self.files.watches.borrow_mut();
         let watches = slot.get_or_insert_with(|| {
             let waker: Arc<dyn Waker> = self.core().borrow().waker.clone();
-            FolderWatches::new(waker)
+            FolderWatches::new(waker, true)
         });
         let mut watched = self.files.watched.borrow_mut();
         if watched.as_slice() != roots {
-            for (folder, error) in watches.sync(roots) {
+            let now = self.core().borrow().docs.env().clock.monotonic();
+            for (folder, error) in watches.sync(roots, now) {
                 self.core().borrow().logger.log(
                     Level::Warn,
                     "watch",

@@ -108,7 +108,7 @@ impl AppCore {
             session: SessionManager::new(Rc::clone(&docs)),
             commands: CommandDispatcher::new(Rc::clone(&docs)),
             workers: Rc::new(Workers::new(Workers::default_thread_count(), waker.clone())),
-            watches: FolderWatches::new(waker.clone()),
+            watches: FolderWatches::new(waker.clone(), false),
             docs,
             waker,
             plan,
@@ -146,7 +146,8 @@ impl AppCore {
     /// tick.
     pub fn pump(&mut self) -> PumpReport {
         let jobs = self.workers.poll();
-        let failed = self.watches.sync(&self.docs.watch_folders());
+        let now = self.docs.env().clock.monotonic();
+        let failed = self.watches.sync(&self.docs.watch_folders(), now);
         for (folder, error) in failed {
             self.logger.log(
                 Level::Warn,

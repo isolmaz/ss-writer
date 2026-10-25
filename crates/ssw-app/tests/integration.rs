@@ -65,8 +65,8 @@ fn a_real_watcher_reports_an_external_edit_and_the_document_reloads() {
         tld: None,
     });
     let entry = docs.open(&path).unwrap();
-    let mut watches = FolderWatches::new(Arc::new(NoWaker));
-    assert!(watches.sync(&docs.watch_folders()).is_empty());
+    let mut watches = FolderWatches::new(Arc::new(NoWaker), false);
+    assert!(watches.sync(&docs.watch_folders(), Duration::ZERO).is_empty());
     assert_eq!(watches.folders().len(), 1);
 
     std::fs::write(&path, "one\ntwo\nthree, written by another program\n").unwrap();
@@ -88,6 +88,6 @@ fn a_real_watcher_reports_an_external_edit_and_the_document_reloads() {
 
     // Closing the last document stops the watcher.
     assert!(docs.release(&entry));
-    assert!(watches.sync(&docs.watch_folders()).is_empty());
+    assert!(watches.sync(&docs.watch_folders(), Duration::ZERO).is_empty());
     assert!(watches.folders().is_empty());
 }

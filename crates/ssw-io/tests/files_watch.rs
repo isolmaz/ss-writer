@@ -734,6 +734,50 @@ fn events_are_classified_per_document() {
 }
 
 #[test]
+fn a_huge_batch_of_events_for_untracked_paths_decides_only_about_the_tracked_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = |name: &str, content: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    };
+    let edited = file("edited.md", "edited");
+    let deleted = file("deleted.md", "deleted");
+    let untouched = file("untouched.md", "untouched");
+    let disk = Arc::new(FaultFs::new());
+    let mut tracker = ExternalChanges::new(disk.clone());
+    for path in [&edited, &deleted, &untouched] {
+        tracker.track(path, stamp_of(path));
+    }
+    std::fs::write(&edited, "edited by someone").unwrap();
+    std::fs::remove_file(&deleted).unwrap();
+
+    // What a checkout or an unpacked archive delivers in one batch, with the two documents
+    // that really changed somewhere in it.
+    let event = |path: PathBuf, kind| FsEvent { path, kind };
+    let mut events: Vec<FsEvent> = (0..50_000)
+        .map(|i| event(at(&format!("other-{i}.md")), FsEventKind::Modified))
+        .collect();
+    events.insert(10_000, event(edited.clone(), FsEventKind::Modified));
+    events.insert(20_000, event(deleted.clone(), FsEventKind::Removed));
+    events.push(event(at("new.md"), renamed("old.md")));
+
+    let looked_at = disk.calls(FsOp::Metadata);
+    assert_eq!(
+        tracker.classify(&events),
+        [
+            (edited.clone(), DocChange::Changed),
+            (deleted.clone(), DocChange::Deleted)
+        ]
+    );
+    assert_eq!(
+        disk.calls(FsOp::Metadata) - looked_at,
+        2,
+        "only the two tracked documents in the batch are looked at"
+    );
+}
+
+#[test]
 fn a_rescan_rechecks_every_tracked_document() {
     let dir = tempfile::tempdir().unwrap();
     let mut paths = Vec::new();
@@ -771,8 +815,13 @@ const WAIT: Duration = Duration::from_secs(15);
 /// Starts a watcher whose wake-up callback does nothing. Every test that does not look at the
 /// callback goes through here, so that one instantiation of the generic `Watcher::start` sees
 /// all of its outcomes: a running watch, the missing folder and every failing OS step.
+fn start_with(root: &Path, recursive: bool) -> Result<(Watcher, Receiver<FsEvent>), FsError> {
+    Watcher::start(root, recursive, || {})
+}
+
+/// A watcher of the whole tree below `root`.
 fn start(root: &Path) -> Result<(Watcher, Receiver<FsEvent>), FsError> {
-    Watcher::start(root, || {})
+    start_with(root, true)
 }
 
 fn same(a: &Path, b: &Path) -> bool {
@@ -810,7 +859,7 @@ fn the_watcher_reports_create_modify_rename_and_delete() {
     let dir = tempfile::tempdir().unwrap();
     let woken = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&woken);
-    let (watcher, receiver) = Watcher::start(dir.path(), move || {
+    let (watcher, receiver) = Watcher::start(dir.path(), true, move || {
         counter.fetch_add(1, Ordering::SeqCst);
     })
     .unwrap();
@@ -864,6 +913,31 @@ fn the_watcher_sees_the_whole_tree() {
     std::fs::rename(&sub, &moved).unwrap();
     let renamed = wait_for(&receiver, "folder rename", |e| same(&e.path, &moved));
     assert_eq!(renamed.kind, FsEventKind::Renamed { from: sub.clone() });
+}
+
+/// Whether `seen` holds an event of `kind` for `path`.
+fn saw(seen: &[FsEvent], path: &Path, kind: FsEventKind) -> bool {
+    seen.iter().any(|e| same(&e.path, path) && e.kind == kind)
+}
+
+#[test]
+fn a_flat_watcher_reports_its_folder_and_not_the_folders_below_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let (_watcher, receiver) = start_with(dir.path(), false).unwrap();
+
+    // The file below comes first: the events of one watcher arrive in the order of the changes.
+    let inner = sub.join("inner.md");
+    std::fs::write(&inner, "x").unwrap();
+    let top = dir.path().join("top.md");
+    std::fs::write(&top, "x").unwrap();
+    let mut events = Vec::new();
+    while !saw(&events, &top, FsEventKind::Created) {
+        events.push(receiver.recv_timeout(WAIT).expect("an event"));
+    }
+    events.extend(drain_until_quiet(&receiver, Duration::from_millis(300)));
+    assert!(events.iter().all(|e| !same(&e.path, &inner)), "{events:?}");
 }
 
 #[test]

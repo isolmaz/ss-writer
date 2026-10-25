@@ -753,7 +753,7 @@ fn mixed_line_endings_are_announced_once_and_debug_output_names_its_parts() {
     let env = format!("{:?}", f.docs.env());
     assert!(env.starts_with("DocEnv {"), "{env}");
     assert!(env.contains("tld: None"), "{env}");
-    let watches = FolderWatches::new(Arc::new(crate::workers::DeferredWaker::new()));
+    let watches = FolderWatches::new(Arc::new(crate::workers::DeferredWaker::new()), false);
     assert_eq!(format!("{watches:?}"), "FolderWatches { folders: [], .. }");
 }
 

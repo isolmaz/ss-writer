@@ -164,17 +164,32 @@ fn file_key(path: &Path) -> String {
     ssw_io::watch::path_key(&canonical_path(path))
 }
 
+/// The [`file_key`] of each tab of `window`, in tab order; `None` for a tab without a file. The
+/// keys cost a disk access each, so they are computed once and kept up to date by [`tab_for`].
+fn tab_keys(window: &PlannedWindow) -> Vec<Option<String>> {
+    window
+        .tabs
+        .iter()
+        .map(|tab| match &tab.document {
+            PlannedDocument::File(path) => Some(file_key(path)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The index of the tab of `window` that shows the file `path`; a tab for it is appended when
-/// none does.
-fn tab_for(window: &mut PlannedWindow, path: &Path) -> usize {
+/// none does. `keys` are the [`tab_keys`] of `window`.
+fn tab_for(window: &mut PlannedWindow, keys: &mut Vec<Option<String>>, path: &Path) -> usize {
     let wanted = file_key(path);
-    let shown = window.tabs.iter().position(
-        |tab| matches!(&tab.document, PlannedDocument::File(open) if file_key(open) == wanted),
-    );
-    shown.unwrap_or_else(|| {
-        window.tabs.push(file_tab(path));
-        window.tabs.len() - 1
-    })
+    if let Some(shown) = keys
+        .iter()
+        .position(|key| key.as_deref() == Some(wanted.as_str()))
+    {
+        return shown;
+    }
+    window.tabs.push(file_tab(path));
+    keys.push(Some(wanted));
+    window.tabs.len() - 1
 }
 
 /// Decides which windows and tabs to create (spec §5, §6, §10 "On startup").
@@ -225,7 +240,11 @@ pub fn plan_startup(
         match restored_active {
             Some(active) if !launch.new_window => {
                 let window = &mut plan.windows[active];
-                let shown: Vec<usize> = files.iter().map(|path| tab_for(window, path)).collect();
+                let mut keys = tab_keys(window);
+                let shown: Vec<usize> = files
+                    .iter()
+                    .map(|path| tab_for(window, &mut keys, path))
+                    .collect();
                 window.active_tab = shown.first().copied();
             }
             _ => {
@@ -708,6 +727,55 @@ mod tests {
         let plan = plan_for(&[r"C:\new.md", r"C:\NEW.md"]);
         assert_eq!(documents(&plan), with_new());
         assert_eq!(plan.windows[0].active_tab, Some(3));
+    }
+
+    #[test]
+    fn launch_files_match_restored_tabs_under_any_spelling_of_their_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(tmp.path().join(name), name).unwrap();
+        }
+        let tab = |name: &str| SessionTab {
+            // Spelled through a sub folder, as a link or a recent entry could be.
+            document: TabDocument::File(tmp.path().join("sub").join("..").join(name)),
+            workspace: None,
+        };
+        let session = Session {
+            windows: vec![SessionWindow {
+                placement: placement(1),
+                tabs: vec![tab("a.md"), tab("b.md")],
+                active_tab: Some(0),
+            }],
+            active_window: Some(0),
+        };
+        let plan = plan_startup(
+            StartupBehavior::RestoreSession,
+            None,
+            &session,
+            &launch(
+                &[
+                    tmp.path().join("b.md").to_str().unwrap(),
+                    tmp.path().join("c.md").to_str().unwrap(),
+                    tmp.path()
+                        .join("sub")
+                        .join("..")
+                        .join("c.md")
+                        .to_str()
+                        .unwrap(),
+                    tmp.path().join("a.md").to_str().unwrap(),
+                ],
+                &[],
+                false,
+            ),
+        );
+        let window = &plan.windows[0];
+        assert_eq!(window.tabs.len(), 3, "only c.md is new, and only once");
+        assert_eq!(
+            window.tabs[2].document,
+            PlannedDocument::File(tmp.path().join("c.md"))
+        );
+        assert_eq!(window.active_tab, Some(1), "b.md leads the launch");
     }
 
     #[test]

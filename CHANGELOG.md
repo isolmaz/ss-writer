@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Opening a file that a restored session already showed added a second tab for it, and every later start from Explorer added another; once the file moved or was deleted, each copy reported "The file no longer exists." at startup. A launched file the window shows already now activates its tab, and duplicate tabs stored by earlier versions are restored once.
+- Opening a file that a restored session already showed added a second tab for it, and every later start from Explorer added another; once the file moved or was deleted, each copy reported "The file no longer exists." at startup. A launched file the window shows already now activates its tab, and duplicate tabs stored by earlier versions are restored once. The files of the restored tabs are resolved on disk once per start, not once per launched file (an offline share costs a timeout per access).
 - A deleted file stayed on the recent list and in the Jump List, and opening it from there failed every time. A file that no longer exists is taken off both, also when it was opened as an import or a OneDrive placeholder.
 - A document that could not be read again after an external change (locked by a sync client, share offline) was reported again every time the window was activated, including when the error box itself closed; the same failure from the file watcher was not reported at all. Each is reported once until the file reads again.
 - A recent-list entry that could not be written made an open fail although the file had been read.

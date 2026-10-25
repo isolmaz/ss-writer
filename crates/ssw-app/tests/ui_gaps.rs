@@ -530,6 +530,17 @@ fn the_word_count_follows_the_text_once_typing_pauses() {
 }
 
 #[test]
+fn markdown_counts_its_visible_words_and_plain_text_every_word() {
+    let link: &[u8] = b"[docs](guide)\n";
+    with_rig(&[("a.md", link), ("b.txt", link)], |rig| {
+        // The destination of a Markdown link is not visible text.
+        assert_eq!(rig.status(StatusSegment::Words), "1 word");
+        rig.open("b.txt");
+        assert_eq!(rig.status(StatusSegment::Words), "2 words");
+    });
+}
+
+#[test]
 fn the_other_status_segments_are_not_clickable() {
     with_rig(&[("a.md", b"one two\n")], |rig| {
         for segment in [

@@ -10,10 +10,14 @@ use std::time::Duration;
 use ssw_app::app::AppCore;
 use ssw_app::args::Args;
 use ssw_app::clock::{AppClock, ManualClock};
+use ssw_app::documents::replace_text;
 use ssw_app::startup::{Boot, ProcessEnv, boot};
 use ssw_app::ui::scripted_services::ScriptedServices;
 use ssw_app::workers::DeferredWaker;
+use ssw_io::encoding::TextFormat;
+use ssw_io::fs::RealFs;
 use ssw_io::paths::Environment;
+use ssw_io::recovery::{RecoveryDoc, RecoveryKind, RecoveryStore};
 use ssw_io::session::Session;
 use ssw_win::gfx::Driver;
 use ssw_win::window::OsVersion;
@@ -106,4 +110,39 @@ fn a_session_the_database_refuses_is_logged_and_the_exit_still_completes() {
     let log = log_of(&core);
     assert!(log.contains("session not saved"), "{log}");
     assert!(log.contains("SS Writer exiting"), "{log}");
+}
+
+#[test]
+fn a_clean_exit_keeps_the_crash_recovery_nobody_answered_and_drops_its_own_backups() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A crashed run left a document behind.
+    let folder = tmp.path().join("local").join("SS Writer").join("recovery");
+    let store = RecoveryStore::new(Arc::new(RealFs), folder);
+    let lost = RecoveryDoc {
+        id: "untitled-1",
+        kind: RecoveryKind::Untitled,
+        original_path: None,
+        display_name: "Untitled",
+        text: "lost words",
+        format: TextFormat::default(),
+    };
+    store.backup(&lost, 5).unwrap();
+    let (mut core, _) = core_in(tmp.path());
+    // Showing the offer takes the entries out of the core; nobody answers it.
+    let offered = std::mem::take(&mut core.recoverable);
+    assert_eq!(offered.len(), 1);
+
+    // This run backs up an untitled buffer of its own.
+    let scratch = core.docs.new_untitled();
+    let changed = replace_text(&mut scratch.document().borrow_mut(), "new words");
+    assert!(changed);
+    core.pump();
+    assert_eq!(store.list().unwrap().len(), 2);
+
+    core.shutdown(&Session::default());
+
+    let left = store.list().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0], offered[0]);
+    assert_eq!(store.restore("untitled-1").unwrap().text, "lost words");
 }

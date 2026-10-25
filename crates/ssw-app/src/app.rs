@@ -74,6 +74,9 @@ pub struct AppCore {
     pub recoverable: Vec<RecoveryEntry>,
     /// Crash-recovery folder.
     pub recovery: Arc<RecoveryStore>,
+    /// What `recoverable` held at startup. The offer takes `recoverable` away, so this is what
+    /// tells a clean exit which entries an earlier run left and the user has not answered yet.
+    inherited: Vec<RecoveryEntry>,
     devices: Option<DeviceStartup>,
 }
 
@@ -116,6 +119,7 @@ impl AppCore {
             settings: started.settings,
             i18n: started.i18n,
             logger: started.logger,
+            inherited: started.recoverable.clone(),
             recoverable: started.recoverable,
             recovery: started.recovery,
             devices: Some(started.devices),
@@ -171,8 +175,9 @@ impl AppCore {
         }
     }
 
-    /// Clean exit: flushes autosave, stores `session` and removes the recovery entries (a clean
-    /// exit has nothing to recover).
+    /// Clean exit: flushes autosave, stores `session` and removes the recovery entries this run
+    /// wrote (a clean exit has nothing to recover from it). What an earlier, crashed run left
+    /// and the user has not answered stays for the next start to offer again.
     pub fn shutdown(&mut self, session: &Session) {
         let _ = self.autosave.flush_all();
         if let Err(error) = self.session.save(session) {
@@ -182,7 +187,11 @@ impl AppCore {
                 &format!("session not saved: {error}"),
             );
         }
-        let _ = self.recovery.discard_all();
+        for entry in self.recovery.list().unwrap_or_default() {
+            if !self.inherited.contains(&entry) {
+                let _ = self.recovery.discard(&entry.id);
+            }
+        }
         self.logger
             .log(Level::Info, "shutdown", "SS Writer exiting");
     }

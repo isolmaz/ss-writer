@@ -57,6 +57,11 @@ impl EmergencyCache {
         self.lock().remove(id);
     }
 
+    /// Forgets every document whose id is not in `ids`.
+    pub fn keep_only(&self, ids: &[String]) {
+        self.lock().retain(|id, _| ids.contains(id));
+    }
+
     /// The version cached for `id`.
     #[must_use]
     pub fn version(&self, id: &str) -> Option<u64> {
@@ -137,6 +142,22 @@ mod tests {
         cache.remove("doc-1");
         assert_eq!(cache.version("doc-1"), None);
         assert!(!cache.is_empty());
+    }
+
+    #[test]
+    fn keeping_only_some_ids_forgets_the_others() {
+        let cache = EmergencyCache::new();
+        cache.put("doc-1", cached("one", 1));
+        cache.put("doc-2", cached("two", 1));
+        cache.put("untitled-3", cached("three", 1));
+        let keep = ["doc-2", "untitled-3", "gone"].map(String::from);
+        cache.keep_only(&keep);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.version("doc-1"), None);
+        assert_eq!(cache.version("doc-2"), Some(1));
+        assert_eq!(cache.version("untitled-3"), Some(1));
+        cache.keep_only(&[]);
+        assert!(cache.is_empty());
     }
 
     #[test]

@@ -9,7 +9,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Params, Row, Transaction};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Params, Row, Transaction, TransactionBehavior,
+};
 use thiserror::Error;
 
 /// Unix time in seconds.
@@ -143,6 +145,10 @@ pub const MIGRATIONS: &[&str] = &[
     ) WITHOUT ROWID;
     CREATE INDEX image_cache_by_access ON image_cache(last_access);
     ",
+    // 5: deleting a history blob checks the snapshots that still refer to it.
+    "
+    CREATE INDEX history_snapshots_by_hash ON history_snapshots(hash);
+    ",
 ];
 
 /// The schema version produced by the newest migration.
@@ -231,6 +237,10 @@ impl Store {
     /// Run `body` in one transaction: it is committed when `body` returns `Ok` and rolled back
     /// when `body` or the commit fails, so a failed operation changes nothing.
     ///
+    /// The transaction takes the write lock when it begins (waiting for the busy timeout), so
+    /// a body that reads before it writes never fails because another connection committed in
+    /// between. Keep `body` short: every other connection waits for the lock meanwhile.
+    ///
     /// # Errors
     /// What `body` returns, and [`StoreError::Sqlite`] when the transaction cannot begin or
     /// commit.
@@ -239,7 +249,7 @@ impl Store {
         body: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         self.conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::from)
             .and_then(|tx| {
                 body(&tx).and_then(|value| tx.commit().map(|()| value).map_err(StoreError::from))
@@ -568,6 +578,25 @@ mod tests {
             error.to_string().contains("within a transaction"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_transaction_holds_the_write_lock_from_its_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = open_store(&tmp);
+        let other = Connection::open(store.path()).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let insert = "INSERT INTO kv (key, value) VALUES ('other', '1')";
+        store
+            .in_transaction(|_| {
+                // The body has not written anything yet, and the lock is taken already.
+                let error = other.execute(insert, []).unwrap_err();
+                assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+                Ok(())
+            })
+            .unwrap();
+        other.execute(insert, []).unwrap();
+        assert_eq!(store.kv_get("other").unwrap().as_deref(), Some("1"));
     }
 
     #[test]

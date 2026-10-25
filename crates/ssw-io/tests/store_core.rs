@@ -228,6 +228,15 @@ fn every_older_schema_is_migrated_to_the_latest() {
                 .unwrap();
             assert_eq!(found, 1, "table {table} after upgrading from v{old}");
         }
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'history_snapshots_by_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1, "snapshot index after upgrading from v{old}");
     }
 }
 

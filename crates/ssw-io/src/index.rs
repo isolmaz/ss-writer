@@ -33,6 +33,10 @@ pub const MAX_PARSE_BYTES: u64 = 16 * 1024 * 1024;
 
 const MARKDOWN_EXTENSIONS: [&str; 3] = ["md", "markdown", "mdx"];
 
+/// Steps written per transaction: few enough that the write lock is held for milliseconds, so
+/// the interface's own writes to the database never wait for an indexing run.
+const WRITE_CHUNK: usize = 256;
+
 /// What to index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexOptions {
@@ -352,6 +356,7 @@ fn analyze(src: &str, source_rel: &str) -> Analysis {
 // Walking
 // ---------------------------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Found {
     rel: String,
     path: PathBuf,
@@ -495,6 +500,40 @@ fn find_root(conn: &Connection, key: &str) -> Result<Option<Root>, StoreError> {
     Ok(row.map(|(id, text)| Root { id, text }))
 }
 
+/// Create the row of the root `key` or refresh its path and time; returns its id.
+fn upsert_root(
+    conn: &Connection,
+    key: &str,
+    text: &str,
+    now: UnixSeconds,
+) -> Result<i64, StoreError> {
+    Ok(conn.query_row(
+        "INSERT INTO index_roots (key, path, indexed_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET path = excluded.path, indexed_at = excluded.indexed_at
+         RETURNING id",
+        params![key, text, now],
+        |row| row.get(0),
+    )?)
+}
+
+/// Size, modification time and placeholder flag of every stored file of the root `key`, by
+/// relative key.
+fn stored_files(
+    conn: &Connection,
+    key: &str,
+) -> Result<HashMap<String, (i64, i64, bool)>, StoreError> {
+    let rows: Vec<(String, i64, i64, bool)> = query_rows(
+        conn,
+        "SELECT f.rel_key, f.size, f.mtime, f.placeholder
+         FROM index_files f JOIN index_roots r ON r.id = f.root_id WHERE r.key = ?1",
+        [key],
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|(rel_key, size, mtime, placeholder)| (rel_key, (size, mtime, placeholder)))
+        .collect())
+}
+
 /// Delete the file `rel_key`; with `children` also everything below it (it was a folder).
 fn remove_path(
     tx: &Transaction<'_>,
@@ -522,20 +561,46 @@ fn read_markdown(path: &Path) -> Option<String> {
         .map(|bytes| encoding_rs::UTF_8.decode(&bytes).0.into_owned())
 }
 
-fn store_file(
-    tx: &Transaction<'_>,
-    root_id: i64,
-    found: &Found,
+/// A file read and analysed before its rows are written, so that no transaction waits for the
+/// disk or the parser.
+struct Prepared {
+    found: Found,
     placeholder: bool,
-) -> Result<bool, StoreError> {
-    let markdown = is_markdown_path(&found.rel);
-    let parsed = if markdown && !placeholder && (found.size as u64) <= MAX_PARSE_BYTES {
+    /// `None` when the file is not parsed: not Markdown, a placeholder, too large or unreadable.
+    analysis: Option<Analysis>,
+}
+
+fn prepare(found: Found, placeholder: bool) -> Prepared {
+    let analysis = if is_markdown_path(&found.rel)
+        && !placeholder
+        && (found.size as u64) <= MAX_PARSE_BYTES
+    {
         read_markdown(&found.path).map(|text| analyze(&text, &found.rel))
     } else {
         None
     };
-    let did_parse = parsed.is_some();
-    let analysis = parsed.unwrap_or_default();
+    Prepared {
+        found,
+        placeholder,
+        analysis,
+    }
+}
+
+/// One write of an update from file-system events.
+enum Step {
+    /// Drop the file `key` (a relative key); with `children` also everything below it (it was a
+    /// folder).
+    Remove { key: String, children: bool },
+    /// Store the file unless the limit on indexed files stops a new one.
+    Store(Prepared),
+}
+
+/// Writes the rows of `file`; returns whether the file was parsed.
+fn store_file(tx: &Transaction<'_>, root_id: i64, file: &Prepared) -> Result<bool, StoreError> {
+    let found = &file.found;
+    let markdown = is_markdown_path(&found.rel);
+    let unparsed = Analysis::default();
+    let analysis = file.analysis.as_ref().unwrap_or(&unparsed);
     let file_id: i64 = tx
         .prepare_cached(
             "INSERT INTO index_files (root_id, rel, rel_key, size, mtime, markdown, placeholder)
@@ -553,7 +618,7 @@ fn store_file(
                 found.size,
                 found.mtime,
                 markdown,
-                placeholder
+                file.placeholder
             ],
             |row| row.get(0),
         )?;
@@ -591,11 +656,11 @@ fn store_file(
             link.range.end as i64
         ])?;
     }
-    Ok(did_parse)
+    Ok(file.analysis.is_some())
 }
 
-fn count_files(tx: &Transaction<'_>, root_id: i64) -> Result<usize, StoreError> {
-    let count: i64 = tx.query_row(
+fn count_files(conn: &Connection, root_id: i64) -> Result<usize, StoreError> {
+    let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM index_files WHERE root_id = ?1",
         [root_id],
         |row| row.get(0),
@@ -616,9 +681,11 @@ impl Store {
     /// Build or refresh the index of the workspace `root`.
     ///
     /// Files whose size and modification time are unchanged are not re-read; files that
-    /// disappeared (or are now ignored / hidden / beyond the limit) are dropped. All changes
-    /// are applied in one transaction, so a failure or cancellation leaves the previous index
-    /// intact.
+    /// disappeared (or are now ignored / hidden / beyond the limit) are dropped. Files are read
+    /// and parsed outside any transaction and written in short ones, so the rest of the
+    /// application keeps writing to the database during a run. A failure or cancellation can
+    /// leave the files written so far in the index; every file is stored whole and the next run
+    /// completes the rest.
     ///
     /// # Errors
     /// [`StoreError::Cancelled`] when `cancel` was set, [`StoreError::NonUnicodePath`] and
@@ -633,29 +700,15 @@ impl Store {
     ) -> Result<IndexStats, StoreError> {
         let (root_text, root_key) = root_identity(root)?;
         let (found, truncated) = walk(root, &root_text, opts, cancel)?;
-        self.in_transaction(|tx| {
-            let root_id: i64 = tx.query_row(
-                "INSERT INTO index_roots (key, path, indexed_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(key) DO UPDATE SET path = excluded.path, indexed_at = excluded.indexed_at
-                 RETURNING id",
-                params![root_key, root_text, now],
-                |row| row.get(0),
-            )?;
-            let rows: Vec<(String, i64, i64, bool)> = query_rows(
-                tx,
-                "SELECT rel_key, size, mtime, placeholder FROM index_files WHERE root_id = ?1",
-                [root_id],
-            )?;
-            let existing: HashMap<String, (i64, i64, bool)> = rows
-                .into_iter()
-                .map(|(key, size, mtime, placeholder)| (key, (size, mtime, placeholder)))
-                .collect();
-            let mut stats = IndexStats {
-                truncated,
-                ..IndexStats::default()
-            };
-            let mut seen = HashSet::new();
-            for file in &found {
+        let existing = stored_files(&self.conn, &root_key)?;
+        let mut stats = IndexStats {
+            truncated,
+            ..IndexStats::default()
+        };
+        let mut seen = HashSet::new();
+        for chunk in found.chunks(WRITE_CHUNK) {
+            let mut changed = Vec::new();
+            for file in chunk {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(StoreError::Cancelled);
                 }
@@ -665,22 +718,53 @@ impl Store {
                 let unchanged = existing
                     .get(&rel_key)
                     .is_some_and(|state| *state == (file.size, file.mtime, placeholder));
-                if !unchanged && store_file(tx, root_id, file, placeholder)? {
-                    stats.parsed += 1;
+                if !unchanged {
+                    changed.push(prepare(file.clone(), placeholder));
                 }
                 seen.insert(rel_key);
             }
-            for key in existing.keys().filter(|key| !seen.contains(*key)) {
-                stats.removed += remove_path(tx, root_id, key, false)?;
+            if !changed.is_empty() {
+                stats.parsed += self.index_store(&root_key, &root_text, now, &changed)?;
             }
-            // The count reads the table the statements above just wrote, so it cannot fail where
-            // they succeeded; a failure would simply travel on.
-            count_files(tx, root_id).map(|files| IndexStats { files, ..stats })
+        }
+        let root_id = upsert_root(&self.conn, &root_key, &root_text, now)?;
+        let gone: Vec<&String> = existing.keys().filter(|k| !seen.contains(*k)).collect();
+        for keys in gone.chunks(WRITE_CHUNK) {
+            stats.removed += self.in_transaction(|tx| {
+                let mut removed = 0;
+                for key in keys {
+                    removed += remove_path(tx, root_id, key, false)?;
+                }
+                Ok(removed)
+            })?;
+        }
+        // The count reads the table the statements above wrote, so it cannot fail where they
+        // succeeded; a failure would simply travel on.
+        count_files(&self.conn, root_id).map(|files| IndexStats { files, ..stats })
+    }
+
+    /// Write `files` and the row of their root in one transaction; returns how many were
+    /// parsed.
+    fn index_store(
+        &mut self,
+        root_key: &str,
+        root_text: &str,
+        now: UnixSeconds,
+        files: &[Prepared],
+    ) -> Result<usize, StoreError> {
+        self.in_transaction(|tx| {
+            let root_id = upsert_root(tx, root_key, root_text, now)?;
+            let mut parsed = 0;
+            for file in files {
+                parsed += usize::from(store_file(tx, root_id, file)?);
+            }
+            Ok(parsed)
         })
     }
 
     /// Apply file-system events to the index of `root` (see [`IndexChange`]). Does nothing
-    /// when `root` has not been indexed yet.
+    /// when `root` has not been indexed yet. Files are read and parsed outside any transaction
+    /// and written in short ones, like [`Store::index_workspace`] does.
     ///
     /// # Errors
     /// [`StoreError::NonUnicodePath`] and [`StoreError::Sqlite`].
@@ -692,72 +776,109 @@ impl Store {
         is_placeholder: &dyn Fn(&Path) -> bool,
     ) -> Result<IndexStats, StoreError> {
         let (_, root_key) = root_identity(root)?;
-        self.in_transaction(|tx| {
-            let Some(found_root) = find_root(tx, &root_key)? else {
-                return Ok(IndexStats::default());
+        let Some(found_root) = find_root(&self.conn, &root_key)? else {
+            return Ok(IndexStats::default());
+        };
+        let root_id = found_root.id;
+        let mut stats = IndexStats::default();
+        let mut count = count_files(&self.conn, root_id)?;
+        let mut steps = Vec::new();
+        for change in changes {
+            if steps.len() >= WRITE_CHUNK {
+                self.index_write(root_id, opts, &mut steps, &mut count, &mut stats)?;
+            }
+            let (path, removed) = match change {
+                IndexChange::Changed(path) => (path, false),
+                IndexChange::Removed(path) => (path, true),
             };
-            let mut stats = IndexStats::default();
-            let mut count = count_files(tx, found_root.id)?;
-            for change in changes {
-                let (path, removed) = match change {
-                    IndexChange::Changed(path) => (path, false),
-                    IndexChange::Removed(path) => (path, true),
-                };
-                let Some(rel) = relative_path(&found_root.text, path_text(path)?) else {
+            let Some(rel) = relative_path(&found_root.text, path_text(path)?) else {
+                continue;
+            };
+            let metadata = match std::fs::metadata(path) {
+                Ok(metadata) if !removed => metadata,
+                _ => {
+                    steps.push(Step::Remove {
+                        key: key_of(&rel),
+                        children: true,
+                    });
                     continue;
-                };
-                let metadata = match std::fs::metadata(path) {
-                    Ok(metadata) if !removed => metadata,
-                    _ => {
-                        stats.removed += remove_path(tx, found_root.id, &key_of(&rel), true)?;
-                        continue;
+                }
+            };
+            let mut candidates = Vec::new();
+            if metadata.is_dir() {
+                for entry in WalkBuilder::new(path)
+                    .standard_filters(false)
+                    .build()
+                    .flatten()
+                {
+                    if entry.file_type().is_some_and(|kind| kind.is_file()) {
+                        candidates.extend(found_from(&found_root.text, &entry));
                     }
-                };
-                let mut candidates = Vec::new();
-                if metadata.is_dir() {
-                    for entry in WalkBuilder::new(path)
-                        .standard_filters(false)
-                        .build()
-                        .flatten()
-                    {
-                        if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                            candidates.extend(found_from(&found_root.text, &entry));
-                        }
-                    }
+                }
+            } else {
+                candidates.push(Found {
+                    rel: rel.clone(),
+                    path: path.clone(),
+                    size: metadata.len() as i64,
+                    mtime: modified_millis(&metadata),
+                });
+            }
+            for candidate in candidates {
+                if steps.len() >= WRITE_CHUNK {
+                    self.index_write(root_id, opts, &mut steps, &mut count, &mut stats)?;
+                }
+                if is_included(Path::new(&found_root.text), &candidate.rel, opts) {
+                    let placeholder = is_placeholder(&candidate.path);
+                    steps.push(Step::Store(prepare(candidate, placeholder)));
                 } else {
-                    candidates.push(Found {
-                        rel: rel.clone(),
-                        path: path.clone(),
-                        size: metadata.len() as i64,
-                        mtime: modified_millis(&metadata),
+                    steps.push(Step::Remove {
+                        key: key_of(&candidate.rel),
+                        children: false,
                     });
                 }
-                for candidate in candidates {
-                    let rel_key = key_of(&candidate.rel);
-                    if !is_included(Path::new(&found_root.text), &candidate.rel, opts) {
-                        stats.removed += remove_path(tx, found_root.id, &rel_key, false)?;
+            }
+        }
+        self.index_write(root_id, opts, &mut steps, &mut count, &mut stats)?;
+        // The first count above read this table already, so this one cannot fail; a failure
+        // would simply travel on.
+        count_files(&self.conn, root_id).map(|files| IndexStats { files, ..stats })
+    }
+
+    /// Carry out and clear `steps` in one transaction. `count` is the number of files in the
+    /// index, kept up to date for the limit of [`IndexOptions::max_files`].
+    fn index_write(
+        &mut self,
+        root_id: i64,
+        opts: &IndexOptions,
+        steps: &mut Vec<Step>,
+        count: &mut usize,
+        stats: &mut IndexStats,
+    ) -> Result<(), StoreError> {
+        self.in_transaction(|tx| {
+            for step in steps.drain(..) {
+                let file = match step {
+                    Step::Remove { key, children } => {
+                        stats.removed += remove_path(tx, root_id, &key, children)?;
                         continue;
                     }
-                    let known: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM index_files WHERE root_id = ?1 AND rel_key = ?2)",
-                        params![found_root.id, rel_key],
-                        |row| row.get(0),
-                    )?;
-                    if !known && count >= opts.max_files {
-                        stats.truncated = true;
-                        continue;
-                    }
-                    count += usize::from(!known);
-                    let placeholder = is_placeholder(&candidate.path);
-                    stats.placeholders += usize::from(placeholder);
-                    if store_file(tx, found_root.id, &candidate, placeholder)? {
-                        stats.parsed += 1;
-                    }
+                    Step::Store(file) => file,
+                };
+                let known: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM index_files WHERE root_id = ?1 AND rel_key = ?2)",
+                    params![root_id, key_of(&file.found.rel)],
+                    |row| row.get(0),
+                )?;
+                if !known && *count >= opts.max_files {
+                    stats.truncated = true;
+                    continue;
+                }
+                *count += usize::from(!known);
+                stats.placeholders += usize::from(file.placeholder);
+                if store_file(tx, root_id, &file)? {
+                    stats.parsed += 1;
                 }
             }
-            // The first count above read this table already, so this one cannot fail; a failure
-            // would simply travel on.
-            count_files(tx, found_root.id).map(|files| IndexStats { files, ..stats })
+            Ok(())
         })
     }
 

@@ -105,7 +105,11 @@ impl EditorView {
             Event::Wheel(wheel) => self.on_wheel(wheel),
             _ => EventResult::ignored(),
         };
-        if result.handled {
+        // A plain hover repaints only when the hovered item changes (`pointer_move` asks for
+        // that itself); it neither repaints the editor nor restarts the caret blink.
+        let hover = matches!(e, Event::Pointer(p) if p.kind == PointerEventKind::Move)
+            && !cx.has_pointer_capture();
+        if result.handled && !hover {
             let resets_blink = matches!(
                 e,
                 Event::Key(_) | Event::Text(_) | Event::Ime(_) | Event::Pointer(_)

@@ -179,12 +179,14 @@ pub fn diff(old: &AccessTree, new: &AccessTree) -> Vec<UiaChange> {
     changes
 }
 
-/// Raises the UIA events for `changes`, if a UIA client is listening.
-pub(crate) fn raise(shared: &Arc<Shared>, changes: &[UiaChange]) -> Result<(), UiaError> {
+/// Whether a UIA client is listening for events.
+pub(crate) fn clients_listening() -> bool {
     // SAFETY: UiaClientsAreListening has no preconditions.
-    if changes.is_empty() || !unsafe { UiaClientsAreListening() }.as_bool() {
-        return Ok(());
-    }
+    unsafe { UiaClientsAreListening() }.as_bool()
+}
+
+/// Raises the UIA events for `changes`.
+pub(crate) fn raise(shared: &Arc<Shared>, changes: &[UiaChange]) -> Result<(), UiaError> {
     for change in changes {
         match change {
             UiaChange::FocusChanged(id) => {

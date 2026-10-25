@@ -671,6 +671,7 @@ fn uia_client_sees_the_window_children_with_names_roles_and_geometry() {
 fn uia_client_patterns_reach_the_action_sink() {
     let fixture = Fixture::new();
     let client = Client::new(&fixture);
+    let _events = listen(&client);
     let ids = fixture.ids;
     // Invoke.
     let save = client.find("Save");
@@ -732,6 +733,7 @@ fn uia_client_patterns_reach_the_action_sink() {
     );
     uia!(expand.Expand()).expect("expand");
     assert_eq!(fixture.sink.take(), [(ids.theme, AccessAction::Expand)]);
+    uia!(client.automation.RemoveAllEventHandlers()).expect("handlers removed");
 }
 
 #[test]
@@ -765,6 +767,7 @@ fn uia_client_unsupported_patterns_disabled_nodes_and_refusals_fail() {
 fn uia_client_republished_values_and_focus_are_visible() {
     let fixture = Fixture::new();
     let client = Client::new(&fixture);
+    let _events = listen(&client);
     let name = client.find("Name");
     let save = client.find("Save");
     assert!(
@@ -795,6 +798,7 @@ fn uia_client_republished_values_and_focus_are_visible() {
         focused: Some(fixture.ids.save),
     });
     assert_eq!(again, 0);
+    uia!(client.automation.RemoveAllEventHandlers()).expect("handlers removed");
 }
 
 #[test]
@@ -2098,6 +2102,26 @@ impl IUIAutomationEventHandler_Impl for EventLog_Impl {
         let _ = lock(&self.sender).send(eventid.0);
         Ok(())
     }
+}
+
+/// Registers an event handler for `client`: that is what makes UIA report that clients are
+/// listening, so the bridge compares the snapshots it is given. The events arrive on the
+/// returned channel.
+fn listen(client: &Client) -> mpsc::Receiver<i32> {
+    let (sender, receiver) = mpsc::channel();
+    let handler: IUIAutomationEventHandler = EventLog {
+        sender: Mutex::new(sender),
+    }
+    .into();
+    uia!(client.automation.AddAutomationEventHandler(
+        UIA_Text_TextSelectionChangedEventId,
+        &client.root,
+        TreeScope_Subtree,
+        None::<&IUIAutomationCacheRequest>,
+        &handler
+    ))
+    .expect("handler registered");
+    receiver
 }
 
 /// The snapshot after the app moved the editor's selection, added a child to the window (the

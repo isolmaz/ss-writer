@@ -496,9 +496,11 @@ fn the_line_ending_menu_marks_the_current_style_and_changes_what_is_saved() {
 fn the_word_count_follows_the_text_once_typing_pauses() {
     with_rig(&[("a.md", b"one two\n")], |rig| {
         assert_eq!(rig.status(StatusSegment::Words), "2 words");
+        rig.clock.advance(Duration::from_millis(200));
         let entry = rig.entry();
         replace_text(&mut entry.document().borrow_mut(), "one two three\n");
-        // Counted a moment ago: the previous count stays, and a timer brings it up to date.
+        // Counted 200 ms ago: the previous count stays, and a timer brings it up to date once
+        // the 500 ms have passed.
         assert_eq!(rig.status(StatusSegment::Words), "2 words");
         let window = rig.window();
         let mut view = window.view.borrow_mut();
@@ -511,7 +513,7 @@ fn the_word_count_follows_the_text_once_typing_pauses() {
                     id,
                     interval,
                     repeat: false,
-                } if *interval == Duration::from_millis(500) => Some(*id),
+                } if *interval == Duration::from_millis(300) => Some(*id),
                 _ => None,
             })
             .expect("a timer for the next count");
@@ -519,7 +521,7 @@ fn the_word_count_follows_the_text_once_typing_pauses() {
         view.event(&Event::Timer(TimerId::allocate()), &rig.engine);
         assert_eq!(view.statusbar().text(StatusSegment::Words), "2 words");
         view.requests_mut().take_invalidation();
-        rig.clock.advance(Duration::from_millis(500));
+        rig.clock.advance(Duration::from_millis(300));
         view.event(&Event::Timer(timer), &rig.engine);
         assert_eq!(view.statusbar().text(StatusSegment::Words), "3 words");
         assert!(

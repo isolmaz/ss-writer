@@ -114,6 +114,19 @@ impl DocError {
             Self::AlreadyOpen(_) => "app-error-already-open",
         }
     }
+
+    /// The message describing the failure to the user. A save that lost the original file
+    /// names the temp file that holds the new content.
+    #[must_use]
+    pub fn message(&self, i18n: &Localizer) -> String {
+        match self {
+            Self::Save(SaveError::TempKept { temp, .. }) => i18n.format(
+                "app-error-temp-kept",
+                &[("path", Arg::Str(&temp.to_string_lossy()))],
+            ),
+            _ => i18n.text(self.message_id()),
+        }
+    }
 }
 
 /// How a document relates to the file on disk after an external change.

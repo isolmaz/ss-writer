@@ -508,10 +508,9 @@ impl Controller {
     }
 
     pub(super) fn report(&self, error: &DocError) {
-        let message = self.i18n.text(error.message_id());
         let _ = self.dialogs.borrow_mut().message_box(&MessageBoxOptions {
             title: self.i18n.text("window-error-title"),
-            message,
+            message: error.message(&self.i18n),
             buttons: MessageBoxButtons::Ok,
             icon: Some(MessageBoxIcon::Error),
         });

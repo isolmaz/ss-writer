@@ -1,17 +1,17 @@
 name: Mutants
 
-# Mutation testing runs on GitHub, never on a developer machine. The weekly run tests the mutants
-# of the code that changed in the last seven days; a run started by hand tests the code that
-# changed since the commit it names, or the whole workspace. The mutants are split into shards
-# of about 400 (a mutant takes about 20 s, a job may run six hours), at most 64; the report of
-# every shard is kept as an artifact.
+# Mutation testing runs on GitHub, never on a developer machine, over the code that changed: the
+# weekly run since the last commit older than seven days, a run started by hand since the commit
+# or tag it names. The mutants are split into shards of 50 (a mutant of ssw-app takes up to about
+# five minutes to build and test, a job may run six hours), at most 256, GitHub's limit; the
+# whole workspace (about 31 000 mutants) does not fit. The report of every shard is kept as an
+# artifact.
 on:
   workflow_dispatch:
     inputs:
       base:
-        description: "Test only the code changed since this commit or tag (empty: the whole workspace)"
-        required: false
-        default: ""
+        description: "Test the code changed since this commit or tag"
+        required: true
   schedule:
     - cron: "0 3 * * 0"
 
@@ -52,16 +52,15 @@ jobs:
           if [ "$EVENT" = schedule ]; then
             BASE=$(git rev-list -1 --before="7 days ago" HEAD)
           fi
-          scope=()
-          if [ -n "$BASE" ]; then
-            BASE=$(git rev-parse --verify "$BASE^{commit}")
-            git diff "$BASE" HEAD -- crates > mutants.diff
-            scope=(--in-diff mutants.diff)
+          BASE=$(git rev-parse --verify "$BASE^{commit}")
+          git diff "$BASE" HEAD -- crates > mutants.diff
+          count=$(cargo mutants --list --workspace --exclude 'xtask/**' --in-diff mutants.diff | wc -l)
+          total=$(( (count + 49) / 50 ))
+          echo "$count mutants since $BASE, $total shards"
+          if [ "$total" -gt 256 ]; then
+            echo "::error::$count mutants need more than 256 shards; name a later commit"
+            exit 1
           fi
-          count=$(cargo mutants --list --workspace --exclude 'xtask/**' "${scope[@]}" | wc -l)
-          total=$(( (count + 399) / 400 ))
-          if [ "$total" -gt 64 ]; then total=64; fi
-          echo "$count mutants since ${BASE:-the first commit}, $total shards"
           {
             echo "base=$BASE"
             echo "total=$total"
@@ -96,12 +95,8 @@ jobs:
           BASE: ${{ needs.scope.outputs.base }}
           SHARD: ${{ matrix.shard }}/${{ needs.scope.outputs.total }}
         run: |
-          scope=()
-          if [ -n "$BASE" ]; then
-            git diff "$BASE" HEAD -- crates > mutants.diff
-            scope=(--in-diff mutants.diff)
-          fi
-          cargo xtask mutants -j 2 -- --shard "$SHARD" --all-features --timeout 600 "${scope[@]}"
+          git diff "$BASE" HEAD -- crates > mutants.diff
+          cargo xtask mutants -j 2 -- --shard "$SHARD" --all-features --timeout 600 --in-diff mutants.diff
       - name: Keep the report
         if: always()
         uses: actions/upload-artifact@v4

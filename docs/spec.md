@@ -210,7 +210,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Inspector (`Ctrl+Shift+I`), right panel, two tabs:
   - **Contents**: collapsible heading tree with staircase hairlines; current section highlighted; click scrolls and flashes the heading; level filter (H1–H6).
   - **Info**: words, characters (with/without spaces), paragraphs, sentences, reading time (default 200 wpm, setting); selection-aware; file path, size, created, modified, encoding, line endings; backlinks.
-- Status bar (View toggle), left to right: Ln/Col, words, zoom %, encoding, EOL, language (plain-text documents only); encoding, EOL and language are clickable.
+- Status bar (View toggle), left to right: Ln/Col, words, zoom %, encoding, EOL, language (plain-text documents only); encoding, EOL and language are clickable. While the text keeps changing the word count is recomputed at most twice a second and catches up when typing pauses.
 
 ## 9. Copy, share, export, print
 - `Ctrl+C` puts Markdown text (`CF_UNICODETEXT`), `HTML Format` and `Rich Text Format` on the clipboard (local images of the selection are embedded); `Ctrl+X` does the same and removes the selection. Edit → Copy as: Plain text (markers stripped), Markdown, Rich text (RTF + HTML, plain text as fallback), HTML (also as text). Documents that are not Markdown copy their text only.

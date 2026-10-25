@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Every keystroke recounted the words of the whole document for the status bar, which slowed typing in long documents. The word count follows the text at most twice a second and catches up when typing pauses.
+- When the workspace index held as many files as its limit allows, a file renamed or moved inside the workspace dropped out of the index (search, links and backlinks lost it) until the workspace was indexed again: the removal of the old name did not free its place.
+
 ## [0.1.7] - 2026-10-25
 
 ### Changed

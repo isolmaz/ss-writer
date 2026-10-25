@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::Args;
@@ -23,10 +24,11 @@ use ssw_ui::canvas::RecordingCanvas;
 use ssw_ui::editor::highlight::Language;
 use ssw_ui::geometry::Size;
 use ssw_ui::input::{Event, PointerButton, PointerEvent, PointerEventKind};
-use ssw_ui::services::{Clock, FakeClock, MemoryClipboard, MessageBoxResult};
+use ssw_ui::services::{Clock, FakeClock, MemoryClipboard, MessageBoxResult, TimerId};
 use ssw_ui::shell::sidebar::SidebarEvent;
 use ssw_ui::shell::statusbar::StatusSegment;
 use ssw_ui::text::MonoTextEngine;
+use ssw_ui::widget::TimerRequest;
 use ssw_ui::widgets::SharedClipboard;
 use ssw_win::gfx::Driver;
 use ssw_win::menus::{CheckState, MenuEntry, MenuItem, MenuModel};
@@ -48,6 +50,7 @@ fn process(args: &Args) -> ProcessEnv {
 struct Rig {
     controller: Rc<Controller>,
     services: ScriptedServices,
+    clock: Rc<FakeClock>,
     engine: MonoTextEngine,
     work: PathBuf,
 }
@@ -62,7 +65,8 @@ impl<B: FnOnce(&Rig)> ShellHost for Host<B> {
         let services = ScriptedServices::new();
         let memory = Rc::new(RefCell::new(MemoryClipboard::default()));
         let clipboard: SharedClipboard = memory;
-        let clock: Rc<dyn Clock> = Rc::new(FakeClock::default());
+        let fake = Rc::new(FakeClock::default());
+        let clock: Rc<dyn Clock> = fake.clone();
         let plan = core.plan.clone();
         let controller =
             Controller::new(core, services.dialogs(), services.shell(), clipboard, clock);
@@ -70,6 +74,7 @@ impl<B: FnOnce(&Rig)> ShellHost for Host<B> {
         let rig = Rig {
             controller,
             services,
+            clock: fake,
             engine: MonoTextEngine::default(),
             work: self.work.clone(),
         };
@@ -484,6 +489,43 @@ fn the_line_ending_menu_marks_the_current_style_and_changes_what_is_saved() {
             b"one\rtwo\r"
         );
         assert_eq!(rig.status(StatusSegment::LineEnding), "CR");
+    });
+}
+
+#[test]
+fn the_word_count_follows_the_text_once_typing_pauses() {
+    with_rig(&[("a.md", b"one two\n")], |rig| {
+        assert_eq!(rig.status(StatusSegment::Words), "2 words");
+        let entry = rig.entry();
+        replace_text(&mut entry.document().borrow_mut(), "one two three\n");
+        // Counted a moment ago: the previous count stays, and a timer brings it up to date.
+        assert_eq!(rig.status(StatusSegment::Words), "2 words");
+        let window = rig.window();
+        let mut view = window.view.borrow_mut();
+        let timer = view
+            .requests_mut()
+            .timers()
+            .iter()
+            .find_map(|timer| match timer {
+                TimerRequest::Set {
+                    id,
+                    interval,
+                    repeat: false,
+                } if *interval == Duration::from_millis(500) => Some(*id),
+                _ => None,
+            })
+            .expect("a timer for the next count");
+        // Another timer before the interval ends changes nothing.
+        view.event(&Event::Timer(TimerId::allocate()), &rig.engine);
+        assert_eq!(view.statusbar().text(StatusSegment::Words), "2 words");
+        view.requests_mut().take_invalidation();
+        rig.clock.advance(Duration::from_millis(500));
+        view.event(&Event::Timer(timer), &rig.engine);
+        assert_eq!(view.statusbar().text(StatusSegment::Words), "3 words");
+        assert!(
+            !view.requests_mut().take_invalidation().is_clean(),
+            "the new count is painted"
+        );
     });
 }
 

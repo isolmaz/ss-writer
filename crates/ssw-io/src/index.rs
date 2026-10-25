@@ -844,13 +844,14 @@ impl Store {
                 if is_included(Path::new(&found_root.text), &candidate.rel, opts) {
                     let key = key_of(&candidate.rel);
                     // Near the limit the pending steps decide whether a new file still fits:
-                    // they are written first, so that a file the limit drops is not read. A
-                    // file the index has, or one already pending, always fits.
+                    // they are written first, so that a pending removal frees its room and a
+                    // file the limit drops is not read. A file the index has, or one already
+                    // pending, always fits.
                     if count + steps.len() >= opts.max_files
                         && !file_known(&self.conn, root_id, &key)?
                         && !steps.iter().any(|step| step.stores(&key))
                     {
-                        if count < opts.max_files {
+                        if !steps.is_empty() {
                             self.index_write(root_id, &mut steps, &mut count, &mut stats)?;
                         }
                         if count >= opts.max_files {
@@ -887,7 +888,9 @@ impl Store {
             for step in steps.drain(..) {
                 let file = match step {
                     Step::Remove { key, children } => {
-                        stats.removed += remove_path(tx, root_id, &key, children)?;
+                        let removed = remove_path(tx, root_id, &key, children)?;
+                        stats.removed += removed;
+                        *count -= removed;
                         continue;
                     }
                     Step::Store(file) => file,

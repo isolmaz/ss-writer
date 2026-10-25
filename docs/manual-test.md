@@ -264,7 +264,7 @@ Item format: `- [ ] **ID** Steps → Expected`. Steps assume the installed build
 
 - [ ] **INSP-01** Inspector (Ctrl+Shift+I) opens as a right panel with Mica; Contents tab: collapsible tree with staircase hairlines, current section highlighted while scrolling (including while using touchpad inertia), click scrolls and flashes the heading, level filter H1-H6 works.
 - [ ] **INSP-02** Info tab: words, characters (with/without spaces), paragraphs, sentences, reading time (change reading speed in Settings), selection-aware (select text → values change), file path/size/created/modified (compare with Explorer properties), encoding, line endings, backlinks (click opens the linking file). Numbers use the active locale's digit grouping (e.g. `1.234` in German, `1 234` in French).
-- [ ] **INSP-03** Status bar (View toggle): Ln/Col, words, zoom %, encoding, EOL and, for a plain document, its language ("Plain text" or the language name) update live while typing/selecting; encoding and EOL are clickable and open the menus; hidden when toggled off; text readable at 200 % DPI; not covered by the taskbar in full screen.
+- [ ] **INSP-03** Status bar (View toggle): Ln/Col, words, zoom %, encoding, EOL and, for a plain document, its language ("Plain text" or the language name) update live while typing/selecting (the word count at most twice a second, exact once typing pauses); encoding and EOL are clickable and open the menus; hidden when toggled off; text readable at 200 % DPI; not covered by the taskbar in full screen.
 - [ ] **INSP-04** Inspector and sidebar splitter drag; widths persist; Inspector content scrolls with touch/touchpad.
 
 ## 9. Copy, share, export, print (spec §9)

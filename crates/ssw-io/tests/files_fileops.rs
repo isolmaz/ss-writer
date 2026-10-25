@@ -1,4 +1,6 @@
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use ssw_io::fileops::{
     self, FileOpError, MAX_NAME_UTF16, NameError, NameStyle, copy_into, copy_tree, duplicate,
@@ -337,6 +339,114 @@ fn copy_and_remove_trees_recursively() {
         fileops::remove_tree(&RealFs, &copy),
         Err(FsError::NotFound(_))
     ));
+}
+
+/// A directory junction (needs no privilege) at `link` pointing at `target`.
+fn junction(link: &Path, target: &Path) {
+    let made = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .creation_flags(0x0800_0000)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "mklink /J failed: {made:?}");
+}
+
+/// A folder `src` (the sample tree) with a junction `link` to a folder `outside` and a junction
+/// `loop` back to `src` itself. Returns `(src, outside)`.
+fn tree_with_junctions(dir: &Path) -> (PathBuf, PathBuf) {
+    let outside = dir.join("outside");
+    touch(&outside.join("keep.md"), "keep");
+    touch(&outside.join("deep").join("more.md"), "more");
+    let source = dir.join("src");
+    sample_tree(&source);
+    junction(&source.join("link"), &outside);
+    junction(&source.join("loop"), &source);
+    assert_eq!(names(&source), ["a", "empty", "link", "loop", "top.md"]);
+    (source, outside)
+}
+
+fn assert_outside_is_intact(outside: &Path) {
+    let deep = outside.join("deep").join("more.md");
+    let keep = std::fs::read_to_string(outside.join("keep.md")).unwrap();
+    let more = std::fs::read_to_string(deep).unwrap();
+    assert_eq!((keep.as_str(), more.as_str()), ("keep", "more"));
+}
+
+#[test]
+fn copying_a_tree_leaves_out_the_links_in_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (source, outside) = tree_with_junctions(dir.path());
+    let copy = dir.path().join("copy");
+    copy_tree(&RealFs, &source, &copy).unwrap();
+    assert_eq!(
+        tree_listing(&copy),
+        [
+            "a\\",
+            "a\\b\\",
+            "a\\b\\two.txt=two",
+            "a\\one.md=one",
+            "empty\\",
+            "top.md=top"
+        ]
+    );
+    assert_outside_is_intact(&outside);
+    // The junctions go first so that the cleanup of the folder never walks through them.
+    std::fs::remove_dir(source.join("link")).unwrap();
+    std::fs::remove_dir(source.join("loop")).unwrap();
+}
+
+#[test]
+fn removing_a_tree_removes_the_links_in_it_and_not_what_they_point_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let (source, outside) = tree_with_junctions(dir.path());
+    fileops::remove_tree(&RealFs, &source).unwrap();
+    assert!(!source.exists());
+    assert_outside_is_intact(&outside);
+}
+
+#[test]
+fn a_link_that_is_removed_as_a_tree_is_removed_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (source, outside) = tree_with_junctions(dir.path());
+    let link = source.join("link");
+    fileops::remove_tree(&RealFs, &link).unwrap();
+    assert!(!link.exists());
+    assert_outside_is_intact(&outside);
+    assert_eq!(names(&source), ["a", "empty", "loop", "top.md"]);
+    std::fs::remove_dir(source.join("loop")).unwrap();
+}
+
+#[test]
+fn moving_a_tree_across_volumes_does_not_copy_or_delete_what_its_links_point_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let (source, outside) = tree_with_junctions(dir.path());
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let fault = FaultFs::new();
+    fault.fail(FsOp::Rename, FsFailure::Code(win32::NOT_SAME_DEVICE), 1);
+    let moved = move_into(&fault, &source, &out).unwrap();
+    assert_eq!(moved, out.join("src"));
+    assert_eq!(names(&moved), ["a", "empty", "top.md"]);
+    assert!(!source.exists());
+    assert_outside_is_intact(&outside);
+
+    // A link itself stays where it is: copying it across volumes would copy its target.
+    let alias = dir.path().join("alias");
+    junction(&alias, &outside);
+    fault.fail(FsOp::Rename, FsFailure::Code(win32::NOT_SAME_DEVICE), 1);
+    assert_eq!(
+        move_into(&fault, &alias, &out),
+        Err(FileOpError::Fs(FsError::Os {
+            code: win32::NOT_SAME_DEVICE,
+            path: out.join("alias")
+        }))
+    );
+    assert!(alias.exists());
+    assert_eq!(names(&out), ["src"]);
+    assert_outside_is_intact(&outside);
+    std::fs::remove_dir(&alias).unwrap();
 }
 
 #[test]

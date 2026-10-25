@@ -115,6 +115,12 @@ pub trait ShellHost {
     /// # Errors
     /// The OS failed to open the window.
     fn select_in_explorer(&mut self, item: &ItemIdList) -> windows::core::Result<()>;
+
+    /// The window of the calling thread that is active: the owner of the requests made for a
+    /// caller that named none.
+    fn active_window(&self) -> Option<HWND> {
+        super::active_window()
+    }
 }
 
 /// The real [`ShellHost`]: `ShellExecuteExW` and `SHOpenFolderAndSelectItems`.
@@ -141,7 +147,8 @@ pub struct WindowsShell<H = SystemShellHost> {
 }
 
 impl WindowsShell {
-    /// Shell calls made by the system, parented to `owner`.
+    /// Shell calls made by the system, parented to `owner`; without one, to the window of the
+    /// thread that is active when a request is made.
     #[must_use]
     pub fn new(owner: Option<HWND>) -> Self {
         Self::with_host(owner, SystemShellHost)
@@ -155,12 +162,18 @@ impl<H: ShellHost> WindowsShell<H> {
         Self { owner, host }
     }
 
+    /// The window a request made now belongs to: the one named at construction, else the one
+    /// that is active.
+    fn owner_window(&self) -> Option<HWND> {
+        self.owner.or_else(|| self.host.active_window())
+    }
+
     fn execute(&mut self, target: &str) -> Result<(), ServiceError> {
         let target = HSTRING::from(target);
         let mut info = SHELLEXECUTEINFOW {
             cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
             fMask: SEE_MASK_NOASYNC,
-            hwnd: self.owner.unwrap_or_default(),
+            hwnd: self.owner_window().unwrap_or_default(),
             lpVerb: w!("open"),
             lpFile: PCWSTR(target.as_ptr()),
             nShow: SW_SHOWNORMAL.0,
@@ -218,7 +231,8 @@ impl<H: ShellHost> Shell for WindowsShell<H> {
     }
 
     fn open_default_apps_settings(&mut self) -> Result<(), ServiceError> {
-        crate::assoc::open_default_apps_settings(&mut self.host, self.owner)
+        let owner = self.owner_window();
+        crate::assoc::open_default_apps_settings(&mut self.host, owner)
     }
 }
 

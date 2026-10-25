@@ -992,6 +992,10 @@ impl UiApp {
         if report.jobs > 0 || !report.external.is_empty() || !report.tick.saved.is_empty() {
             self.controller.refresh_all();
         }
+        if report.jobs > 0 {
+            // An import or a download that finished added a recent file, or found it gone.
+            self.recent_stale.set(true);
+        }
         for outcome in &report.external {
             let doc = outcome.entry.id();
             self.controller.note_reload(doc, Some(outcome));

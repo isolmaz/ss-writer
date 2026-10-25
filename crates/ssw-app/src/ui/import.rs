@@ -74,11 +74,11 @@ fn finish(
     let loaded = match outcome {
         Ok(Ok(loaded)) => loaded,
         Ok(Err(error)) => {
-            controller.report(&DocError::Load(error));
+            controller.open_failed_later(path, error);
             return;
         }
         Err(error) => {
-            controller.report(&DocError::Convert(error.to_string()));
+            controller.open_failed_later(path, DocError::Convert(error.to_string()));
             return;
         }
     };

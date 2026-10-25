@@ -524,17 +524,21 @@ impl Documents {
         }
         let canonical = canonical_path(path);
         let loaded = load_file(self.env.fs.as_ref(), &canonical, self.env.tld.as_deref())
-            .inspect_err(|error| {
-                if matches!(error, LoadError::Fs(FsError::NotFound(_))) {
-                    // A recent list that cannot be written keeps the entry, nothing else.
-                    let _ = self
-                        .env
-                        .store
-                        .borrow()
-                        .recent_remove(RecentKind::File, &canonical);
-                }
-            })?;
+            .inspect_err(|error| self.forget_missing(&canonical, error))?;
         Ok(self.open_loaded(&canonical, loaded))
+    }
+
+    /// Takes `path` off the recent list when `error`, the failure to read it, says that the file
+    /// no longer exists. For a file that was read elsewhere (a worker thread).
+    pub fn forget_missing(&self, path: &Path, error: &LoadError) {
+        if matches!(error, LoadError::Fs(FsError::NotFound(_))) {
+            // A recent list that cannot be written keeps the entry, nothing else.
+            let _ = self
+                .env
+                .store
+                .borrow()
+                .recent_remove(RecentKind::File, &canonical_path(path));
+        }
     }
 
     /// Opens a file that was read elsewhere (a worker thread). When the file was opened in the

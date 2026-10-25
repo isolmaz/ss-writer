@@ -518,7 +518,7 @@ impl Controller {
 
     /// Tells the user which files of one action did not open, and why, in a single box that
     /// names every file; nothing is shown when all of them opened.
-    fn report_open_failures(&self, failures: &[(PathBuf, DocError)]) {
+    pub(super) fn report_open_failures(&self, failures: &[(PathBuf, DocError)]) {
         if failures.is_empty() {
             return;
         }

@@ -192,7 +192,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - `Ctrl+T` new tab, `Ctrl+W` close, `Ctrl+Tab`/`Ctrl+Shift+Tab`, `Ctrl+PgDn`/`Ctrl+PgUp`, `Ctrl+Shift+T` reopen closed. Window → Merge all windows.
 - Same file in several tabs/windows shares one document (instant sync).
 - Single instance (named mutex + `WM_COPYDATA`); new launches open tabs in the last active window (or a new window for folders). A launched file the window shows already activates its tab instead of opening a second one, also when it starts the app and the restored session has it.
-- The files one action cannot open (startup, launch, File → Open, drop, sidebar) are named with their reason in one message. A file that no longer exists leaves the recent list and the Jump List.
+- The files one action cannot open (startup, launch, File → Open, drop, sidebar) are named with their reason in one message; so are the word-processor imports and OneDrive downloads that fail while it runs, together when they fail in the same turn. A file that no longer exists leaves the recent list and the Jump List.
 - Session restore: windows (placement), tabs, workspaces, caret, scroll, folds. Per-file caret/scroll remembered for reopened files.
 - When Windows ends the session (shutdown, restart, sign-out) nothing is asked and shutdown is not delayed: autosave writes what it can, the session is stored with the untitled text, and the unsaved text of every other file goes to the recovery folder, offered at the next start.
 

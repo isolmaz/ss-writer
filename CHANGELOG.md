@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- The files one action could not open (the startup session, a launch from Explorer or the Jump List, File → Open, a drop, the sidebar) are named in one message with the reason for each, instead of one nameless "The file no longer exists." box per file.
+- The files one action could not open (the startup session, a launch from Explorer or the Jump List, File → Open, a drop, the sidebar) are named in one message with the reason for each, instead of one nameless "The file no longer exists." box per file. A word-processor import or a OneDrive download that fails is named the same way (together with the others that fail in the same turn).
 - The folder of an open document is watched without its subfolders, and a folder that cannot be watched (an offline share) is tried again after 30 s instead of several times a second. An unreachable network share counts as a changed file, not a deleted one.
 - With autosave on, a document autosave cannot write (untitled, imported from Word, ODT, RTF or DOC, read-only, changed or deleted on disk, decoded with losses) shows the dirty dot.
 - The encoding menus list Turkish once; ISO-8859-9 was a second name for Windows-1254.
@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Opening a file that a restored session already showed added a second tab for it, and every later start from Explorer added another; once the file moved or was deleted, each copy reported "The file no longer exists." at startup. A launched file the window shows already now activates its tab, and duplicate tabs stored by earlier versions are restored once.
-- A deleted file stayed on the recent list and in the Jump List, and opening it from there failed every time. A file that no longer exists is taken off both.
+- A deleted file stayed on the recent list and in the Jump List, and opening it from there failed every time. A file that no longer exists is taken off both, also when it was opened as an import or a OneDrive placeholder.
 - A document that could not be read again after an external change (locked by a sync client, share offline) was reported again every time the window was activated, including when the error box itself closed; the same failure from the file watcher was not reported at all. Each is reported once until the file reads again.
 - A recent-list entry that could not be written made an open fail although the file had been read.
 - Typing paused for up to 1.5 s at every autosave while another program (antivirus, OneDrive, the indexer) held the file: the save slept between its retries on the interface thread. Autosave now retries on its clock without blocking and reports once. Saving when the window is deactivated (Alt+Tab, a message box) does not wait either: a file another program holds stays unsaved until the autosave timer writes it.

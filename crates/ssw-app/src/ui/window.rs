@@ -31,6 +31,7 @@ use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::WM_MOVE;
 
 use super::controller::{Controller, Request, WindowCell};
+use super::host::end_session;
 use super::platform::Platform;
 use super::shell_view::ShellAction;
 
@@ -278,6 +279,11 @@ impl WindowHandler for WindowGlue {
             .controller
             .push(Request::CloseRequested(self.cell.id));
         false
+    }
+
+    fn on_end_session(&mut self, _info: &WindowInfo) {
+        // The one job that cannot wait for the loop owner: the process ends with this message.
+        end_session(&self.env.controller);
     }
 
     fn on_destroy(&mut self, _info: &WindowInfo) {

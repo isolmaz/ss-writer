@@ -22,6 +22,7 @@ use ssw_core::i18n::Localizer;
 use ssw_io::fs::RealFs;
 use ssw_io::logging::{Level, Logger};
 use ssw_io::net::{Http, WinHttp};
+use ssw_io::recovery::{RecoveryKind, now_millis};
 use ssw_io::session::{RecentKind, Session, WindowPlacement};
 use ssw_ui::geometry::Point;
 use ssw_ui::services::{Clock, Dialogs, Shell};
@@ -60,6 +61,7 @@ use super::shell_view::ShellAction;
 use super::window::{WindowEnv, WindowGlue, WindowLink};
 use crate::app::{AppCore, EXIT_NO_DEVICE, EXIT_NO_SHELL, ShellHost};
 use crate::args::{Args, Launch};
+use crate::emergency::{CachedDoc, EmergencyCache};
 use crate::startup::{InstanceError, InstanceHook, InstanceRole};
 use crate::workers::{Waker, WindowId};
 
@@ -1258,6 +1260,63 @@ impl ShellHost for UiShell {
         }
         app.finish();
         code
+    }
+}
+
+/// The system is ending the session (shutdown, restart, sign-out). The process can be killed as
+/// soon as the window procedure returns, so nothing is asked: it does what a quit does, the
+/// documents autosave covers are saved, the session is stored with the text of the untitled
+/// buffers, and the text of every file with changes nobody saved goes to the recovery folder,
+/// where the next start offers it.
+pub fn end_session(controller: &Controller) {
+    controller.flush_settings();
+    let session = controller.session();
+    let mut core = controller.core().borrow_mut();
+    core.shutdown(&session);
+    keep_unsaved_text(&core);
+}
+
+/// Writes the text of the files with unsaved changes to the recovery folder. Untitled buffers
+/// are left out: the session stores them.
+fn keep_unsaved_text(core: &AppCore) {
+    let unsaved = EmergencyCache::new();
+    for entry in core.docs.all().iter().filter(|entry| entry.is_dirty()) {
+        let Some(path) = entry.path() else {
+            continue;
+        };
+        let display_name = path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+        unsaved.put(
+            &format!("doc-{}", entry.id().0),
+            CachedDoc {
+                kind: RecoveryKind::Dirty,
+                original_path: Some(path),
+                display_name,
+                text: entry.document().borrow().text(),
+                format: entry.format(),
+                version: entry.document().borrow().version(),
+            },
+        );
+    }
+    let saved = unsaved
+        .save_all(&core.recovery, now_millis())
+        .map(Option::unwrap_or_default);
+    match saved {
+        Ok(report) => {
+            for (id, error) in &report.failed {
+                core.logger.log(
+                    Level::Error,
+                    "shutdown",
+                    &format!("unsaved text of {id} not kept: {error}"),
+                );
+            }
+        }
+        Err(error) => core.logger.log(
+            Level::Error,
+            "shutdown",
+            &format!("unsaved text not kept: {error}"),
+        ),
     }
 }
 

@@ -62,7 +62,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_XBUTTONUP, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, PT_TOUCHPAD};
+use windows::Win32::UI::WindowsAndMessaging::{
+    POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, PT_TOUCHPAD, WM_ENDSESSION, WM_QUERYENDSESSION,
+};
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::canvas::{CanvasAssets, D2dCanvas, TargetResources};
@@ -280,6 +282,10 @@ pub trait WindowHandler {
     fn on_close_requested(&mut self, _info: &WindowInfo) -> bool {
         true
     }
+    /// The system is ending the session (shutdown, restart or sign-out) and does not ask the
+    /// window again: the process can be killed once this returns, so whatever must survive is
+    /// written here, without asking the user anything.
+    fn on_end_session(&mut self, _info: &WindowInfo) {}
     /// The window is being destroyed.
     fn on_destroy(&mut self, _info: &WindowInfo) {}
     /// Sees every message before the window's own translation. `Some(result)` answers the
@@ -1254,6 +1260,16 @@ impl WindowState {
                     (Some(LRESULT(0)), After::None)
                 }
             }
+            // Agrees to every shutdown: the application keeps nothing that has to be asked.
+            WM_QUERYENDSESSION => (Some(LRESULT(1)), After::None),
+            WM_ENDSESSION => {
+                // A zero `wparam` says the session goes on after all.
+                if wparam.0 != 0 {
+                    let info = self.info();
+                    self.handler.on_end_session(&info);
+                }
+                (Some(LRESULT(0)), After::None)
+            }
             WM_DESTROY => {
                 let info = self.info();
                 self.handler.on_destroy(&info);
@@ -1834,6 +1850,7 @@ mod tests {
         activations: Vec<bool>,
         themes: u32,
         paints: u32,
+        end_sessions: u32,
     }
 
     struct TestHandler {
@@ -1876,6 +1893,9 @@ mod tests {
         fn on_close_requested(&mut self, _info: &WindowInfo) -> bool {
             self.log.borrow_mut().closes += 1;
             self.allow_close
+        }
+        fn on_end_session(&mut self, _info: &WindowInfo) {
+            self.log.borrow_mut().end_sessions += 1;
         }
         fn on_destroy(&mut self, _info: &WindowInfo) {
             self.log.borrow_mut().destroys += 1;
@@ -2859,12 +2879,33 @@ mod tests {
             handler.on_close_requested(&info),
             "closing is allowed by default"
         );
+        handler.on_end_session(&info);
         handler.on_destroy(&info);
         assert_eq!(
             handler.on_message(&info, WM_APP, WPARAM(0), LPARAM(0)),
             None,
             "messages are not answered by default"
         );
+    }
+
+    #[test]
+    fn the_end_of_the_session_is_agreed_to_and_told_to_the_handler_once_it_is_certain() {
+        let (host, log) = host(true, false);
+        assert_eq!(
+            feed(&host, WM_QUERYENDSESSION, 0, 0),
+            (Some(1), After::None),
+            "no shutdown is held up"
+        );
+        assert_eq!(log.borrow().end_sessions, 0, "being asked changes nothing");
+        // `wparam == 0`: another program refused, the session goes on.
+        assert_eq!(feed(&host, WM_ENDSESSION, 0, 0), (Some(0), After::None));
+        assert_eq!(log.borrow().end_sessions, 0);
+        assert_eq!(feed(&host, WM_ENDSESSION, 1, 0), (Some(0), After::None));
+        assert_eq!(log.borrow().end_sessions, 1);
+        // The window procedure takes the same way and answers without default processing.
+        assert_eq!(send(&host, WM_QUERYENDSESSION, 0, 0), 1);
+        assert_eq!(send(&host, WM_ENDSESSION, 1, 0), 0);
+        assert_eq!(log.borrow().end_sessions, 2);
     }
 
     /// A handler that answers one private message before the window translates anything.

@@ -593,6 +593,13 @@ enum Step {
     Store(Prepared),
 }
 
+impl Step {
+    /// Whether this step writes the file `key` (a relative key).
+    fn stores(&self, key: &str) -> bool {
+        matches!(self, Self::Store(file) if key_of(&file.found.rel) == key)
+    }
+}
+
 /// Writes the rows of `file`; returns whether the file was parsed.
 fn store_file(tx: &Transaction<'_>, root_id: i64, file: &Prepared) -> Result<bool, StoreError> {
     let found = &file.found;
@@ -835,16 +842,21 @@ impl Store {
                     self.index_write(root_id, &mut steps, &mut count, &mut stats)?;
                 }
                 if is_included(Path::new(&found_root.text), &candidate.rel, opts) {
+                    let key = key_of(&candidate.rel);
                     // Near the limit the pending steps decide whether a new file still fits:
-                    // they are written first, so that a file the limit drops is not read.
-                    if count < opts.max_files && count + steps.len() >= opts.max_files {
-                        self.index_write(root_id, &mut steps, &mut count, &mut stats)?;
-                    }
-                    if count >= opts.max_files
-                        && !file_known(&self.conn, root_id, &key_of(&candidate.rel))?
+                    // they are written first, so that a file the limit drops is not read. A
+                    // file the index has, or one already pending, always fits.
+                    if count + steps.len() >= opts.max_files
+                        && !file_known(&self.conn, root_id, &key)?
+                        && !steps.iter().any(|step| step.stores(&key))
                     {
-                        stats.truncated = true;
-                        continue;
+                        if count < opts.max_files {
+                            self.index_write(root_id, &mut steps, &mut count, &mut stats)?;
+                        }
+                        if count >= opts.max_files {
+                            stats.truncated = true;
+                            continue;
+                        }
                     }
                     let placeholder = is_placeholder(&candidate.path);
                     steps.push(Step::Store(prepare(candidate, placeholder)));

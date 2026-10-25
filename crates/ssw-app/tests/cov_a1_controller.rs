@@ -1315,7 +1315,7 @@ fn a_deactivated_window_writes_its_own_documents_at_once() {
 }
 
 #[test]
-fn a_deactivated_window_neither_waits_for_nor_reports_a_file_another_program_holds() {
+fn a_tab_switch_or_a_deactivated_window_neither_waits_for_nor_reports_a_held_file() {
     with_rig("{}", |rig| {
         let window = rig.window();
         rig.open("a.md");
@@ -1329,6 +1329,11 @@ fn a_deactivated_window_neither_waits_for_nor_reports_a_file_another_program_hol
             .share_mode(0)
             .open(&path)
             .unwrap();
+        assert!(handled(&rig.cmd(CommandId::TabNext)));
+        assert!(
+            entry.is_dirty(),
+            "the tab switch leaves it to the autosave timer"
+        );
         rig.controller.window_deactivated(window.id);
         assert!(entry.is_dirty(), "left to the autosave timer");
         drop(lock);

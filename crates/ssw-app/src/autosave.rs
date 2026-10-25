@@ -1,14 +1,14 @@
 //! The autosave scheduler (spec §4.3, §4.4, §4.5).
 //!
 //! The UI calls [`Autosave::tick`] from a timer (a few times a second), [`Autosave::flush`] on
-//! tab switch and close and [`Autosave::flush_without_waiting`] on window deactivation. The
+//! close and [`Autosave::flush_without_waiting`] on tab switch and window deactivation. The
 //! scheduler decides, from a fake-able clock:
 //!
 //! - save a changed file document once typing stopped for the configured delay (autosave on);
 //!   the tick never sleeps: a file another program holds is tried again after the backoff of an
 //!   explicit save (50, 100, 200, 400, 800 ms) and only then reported,
-//! - save immediately on those triggers (autosave on); only the deactivation trigger never
-//!   waits for a file another program holds and leaves it to the tick,
+//! - save immediately on those triggers (autosave on); the tab switch and deactivation
+//!   triggers never wait for a file another program holds and leave it to the tick,
 //! - back up dirty untitled buffers every 30 s (recovery folder and session store),
 //! - snapshot edited files in the version history every 5 minutes,
 //! - delete the history older than the retention every hour (startup purges once as well),
@@ -416,16 +416,17 @@ impl Autosave {
         self.state.borrow_mut().reported.remove(&entry.id());
     }
 
-    /// Saves `entry` now when autosave is on and it has unsaved changes: the tab switch and
-    /// close triggers; a file another program holds is tried again after 50 to 800 ms. `None`
+    /// Saves `entry` now when autosave is on and it has unsaved changes: the close trigger; a
+    /// file another program holds is tried again after 50 to 800 ms. `None`
     /// when there is nothing to do (autosave off, clean, not autosavable). A failure is returned
     /// as it is; whether it is news is [`Autosave::is_new_failure`].
     pub fn flush(&self, entry: &DocEntry) -> Option<Result<Saved, DocError>> {
         self.flush_by(entry, Documents::save)
     }
 
-    /// [`Autosave::flush`] for the trigger that must not stall the UI (window deactivation: a
-    /// message box or an Alt+Tab deactivates the window while a spreadsheet may hold the file).
+    /// [`Autosave::flush`] for the triggers that must not stall the UI (a tab switch, and window
+    /// deactivation: a message box or an Alt+Tab deactivates the window while a spreadsheet may
+    /// hold the file).
     /// It never sleeps. A file another program holds is not a failure here: the document stays
     /// unsaved and `None` is returned, and the tick tries again after its backoff and reports
     /// the file if it stays held.

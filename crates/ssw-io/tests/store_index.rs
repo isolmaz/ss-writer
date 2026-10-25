@@ -732,6 +732,33 @@ fn events_for_files_beyond_the_limit_do_not_probe_or_read_them() {
 }
 
 #[test]
+fn a_new_file_pending_at_the_limit_is_stored_again_by_its_next_event() {
+    let mut fx = standard();
+    let opts = IndexOptions {
+        show_hidden: false,
+        max_files: 5,
+    };
+    run(&mut fx.store, &fx.root, &opts);
+    write(&fx.root, "one.md", "# One\n");
+    let probed = Cell::new(0);
+    let counting = |_: &Path| {
+        probed.set(probed.get() + 1);
+        false
+    };
+    // The second event finds the file pending, not new: it still fits and is read again.
+    let one = path_of(&fx.root, "one.md");
+    let changes = [IndexChange::Changed(one.clone()), IndexChange::Changed(one)];
+    let stats = fx
+        .store
+        .index_apply_changes(&fx.root, &changes, &opts, &counting)
+        .unwrap();
+    assert_eq!(probed.get(), 2);
+    assert!(!stats.truncated);
+    assert_eq!(stats.files, 5);
+    assert!(rels(&fx.store, &fx.root).contains(&"one.md".to_owned()));
+}
+
+#[test]
 fn placeholders_are_listed_but_never_read() {
     let mut fx = standard();
     let opts = IndexOptions::default();

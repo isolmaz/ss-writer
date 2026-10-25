@@ -729,24 +729,16 @@ impl Controller {
             .map(|tab| Rc::clone(&tab.entry));
         if let Some(entry) = previous {
             // The tab switch autosave trigger (spec §4.3).
-            self.flush(&entry, true);
+            self.flush(&entry);
         }
         cell.view.borrow_mut().activate_tab(key);
     }
 
     /// Writes `entry` for the autosave triggers of a tab switch or a deactivated window and
-    /// shows a failure unless the user has seen the same one for this document already. A tab
-    /// switch waits for a file another program holds; a deactivated window does not (`wait`
-    /// false) and leaves the file to the autosave timer.
-    fn flush(&self, entry: &DocEntry, wait: bool) {
-        let outcome = {
-            let core = self.core.borrow();
-            if wait {
-                core.autosave.flush(entry)
-            } else {
-                core.autosave.flush_without_waiting(entry)
-            }
-        };
+    /// shows a failure unless the user has seen the same one for this document already. A file
+    /// another program holds is not waited for: the autosave timer writes it later.
+    fn flush(&self, entry: &DocEntry) {
+        let outcome = self.core.borrow().autosave.flush_without_waiting(entry);
         if let Some(Err(error)) = outcome
             && self.core.borrow().autosave.is_new_failure(entry, &error)
         {
@@ -760,7 +752,7 @@ impl Controller {
             return;
         };
         for (_, entry) in tab_entries(&cell) {
-            self.flush(&entry, false);
+            self.flush(&entry);
         }
         self.refresh(&cell);
     }

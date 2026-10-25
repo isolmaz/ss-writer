@@ -438,7 +438,10 @@ mod tests {
         let error = read_pack(&zip_of(&entries)).unwrap_err();
         assert_eq!(
             error.to_string(),
-            format!("the bundle is too large: 10001 entries (limit {MAX_ENTRIES})")
+            format!(
+                "the bundle is too large: {} entries (limit {MAX_ENTRIES})",
+                MAX_ENTRIES + 1
+            )
         );
     }
 

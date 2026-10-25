@@ -713,6 +713,8 @@ struct WindowState {
     hwnd: HWND,
     handler: Box<dyn WindowHandler>,
     dpi: u32,
+    /// The DPI the swap chain and the handler were last given (see `resize`).
+    applied_dpi: u32,
     size_px: (i32, i32),
     chrome: ChromeState,
     theme: Theme,
@@ -842,9 +844,11 @@ impl WindowState {
         }));
     }
 
-    /// Resizes the swap chain and repaints immediately (flicker-free live resize).
+    /// Resizes the swap chain and repaints immediately (flicker-free live resize). The swap
+    /// chain and the handler learn the DPI here too.
     fn resize(&mut self, width: i32, height: i32) {
         self.size_px = (width, height);
+        self.applied_dpi = self.dpi;
         if let Some(graphics) = self.graphics.as_mut() {
             graphics.surface.set_dpi(self.dpi as f32);
             let resized = graphics
@@ -859,6 +863,16 @@ impl WindowState {
         let info = self.info();
         self.handler.on_resize(&info);
         self.paint();
+    }
+
+    /// Gives the swap chain and the handler a new DPI that no `WM_SIZE` carried to them: the
+    /// suggested rectangle of a `WM_DPICHANGED` can have the size the window already has (a
+    /// maximized or snapped window moved to a monitor of the same resolution and another scale).
+    fn apply_dpi(&mut self) {
+        if self.applied_dpi != self.dpi {
+            let (width, height) = self.size_px;
+            self.resize(width, height);
+        }
     }
 
     fn paint(&mut self) {
@@ -1380,6 +1394,9 @@ fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
+            if let Ok(mut state) = cell.try_borrow_mut() {
+                state.apply_dpi();
+            }
         }
         After::Close => {
             // SAFETY: posts WM_CLOSE to our own window.
@@ -1435,6 +1452,7 @@ impl WindowHost {
             hwnd: HWND::default(),
             handler,
             dpi: DEFAULT_DPI,
+            applied_dpi: DEFAULT_DPI,
             size_px: (0, 0),
             chrome: ChromeState::default(),
             theme,
@@ -1494,6 +1512,7 @@ impl WindowHost {
             let mut borrowed = host.state.borrow_mut();
             borrowed.hwnd = hwnd;
             borrowed.dpi = dpi;
+            borrowed.applied_dpi = dpi;
             borrowed.size_px = (client.right - client.left, client.bottom - client.top);
         }
         apply_dark_mode(hwnd, options.dark);
@@ -1810,6 +1829,8 @@ mod tests {
         destroys: u32,
         wakes: u32,
         resizes: Vec<(i32, i32)>,
+        /// The DPI the handler saw with each of `resizes`.
+        dpis: Vec<u32>,
         activations: Vec<bool>,
         themes: u32,
         paints: u32,
@@ -1839,7 +1860,9 @@ mod tests {
             );
         }
         fn on_resize(&mut self, info: &WindowInfo) {
-            self.log.borrow_mut().resizes.push(info.size_px);
+            let mut log = self.log.borrow_mut();
+            log.resizes.push(info.size_px);
+            log.dpis.push(info.dpi);
         }
         fn on_activate(&mut self, _info: &WindowInfo, active: bool) {
             self.log.borrow_mut().activations.push(active);
@@ -2359,6 +2382,7 @@ mod tests {
             (1000, 800)
         );
         assert_eq!(host.info().dpi, 192);
+        assert_eq!(log.borrow().dpis.last().copied(), Some(192));
         // A suggestion below the minimum size of the new DPI is raised to the minimum
         // (`WM_GETMINMAXINFO`): 480 x 320 DIPs are 960 x 640 pixels at 192 DPI.
         let tiny = RECT {
@@ -2380,6 +2404,19 @@ mod tests {
             (rect.right - rect.left, rect.bottom - rect.top),
             (min_width, min_height)
         );
+        // A suggestion with the window's own size sends no WM_SIZE; the swap chain and the
+        // handler still switch to the new DPI and the window repaints.
+        let (resizes, paints) = (log.borrow().resizes.len(), log.borrow().paints);
+        send(
+            &host,
+            WM_DPICHANGED,
+            0x0090_0090,
+            (&rect as *const RECT) as isize,
+        );
+        assert_eq!(host.info().dpi, 144);
+        assert_eq!(log.borrow().resizes.len(), resizes + 1);
+        assert_eq!(log.borrow().dpis.last().copied(), Some(144));
+        assert!(log.borrow().paints > paints);
     }
 
     #[test]

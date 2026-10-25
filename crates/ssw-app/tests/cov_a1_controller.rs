@@ -1465,17 +1465,21 @@ fn two_tabs_of_one_document_are_asked_about_once() {
         let entry = entry_of(&first);
         edit(&entry, "edited\n");
         let name = entry.title(rig.controller.i18n());
-        // Merging puts both tabs into one window.
+        // Merging puts both tabs into one window (the file replaced the second window's
+        // untitled tab).
         assert!(handled(&rig.cmd_in(&first, CommandId::WindowMergeAll)));
+        assert_eq!(
+            names(&first),
+            [file("notes.md"), file("a.md"), file("a.md")]
+        );
         let tabs = keys(&first);
-        assert_eq!(tabs.len(), 4);
 
         rig.answer(MessageBoxResult::DontSave);
         assert!(rig.controller.request_close_window(first.id));
         assert_eq!(rig.asked(&name), 1);
 
         // A tab whose document another tab shows closes without a question.
-        let outcome = rig.controller.close_tab(&first, tabs[3]);
+        let outcome = rig.controller.close_tab(&first, tabs[2]);
         assert_eq!(outcome, CloseOutcome::Closed);
         assert_eq!(entry.users(), 1);
         assert_eq!(rig.asked(&name), 1);

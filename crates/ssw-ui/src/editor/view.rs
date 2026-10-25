@@ -944,7 +944,7 @@ impl EditorView {
             let index = index.min(c.items.len() - 1);
             self.ensure(&doc, env, &self.reveal(&doc), width, c, index);
             let offset = offset.min(0.99 * f64::from(c.heights.height(index)));
-            c.scroll_y = (f64::from(TOP_PAD) + c.heights.prefix(index) + offset) as f32;
+            c.scroll_y = scroll_to_content(c.heights.prefix(index) + offset);
         }
         let max = self.max_scroll(c);
         c.scroll_y = c.scroll_y.clamp(0.0, max);
@@ -978,7 +978,7 @@ impl EditorView {
             }
             let max = self.max_scroll(c);
             c.scroll_y =
-                ((c.heights.prefix(anchor) + anchor_offset) as f32 + TOP_PAD).clamp(0.0, max);
+                scroll_to_content(c.heights.prefix(anchor) + anchor_offset).clamp(0.0, max);
         }
         // Keep the layouts a screen or so around the viewport; the rest is re-measured on demand.
         let near = c.heights.find(f64::from(c.scroll_y - viewport - TOP_PAD))
@@ -1320,5 +1320,17 @@ impl Widget for EditorView {
 impl Control for EditorView {
     fn id(&self) -> WidgetId {
         self.id
+    }
+}
+
+/// The scroll offset that puts content y `y` at the top of the viewport. Rounded up to the
+/// next `f32` when rounding to nearest falls short: the item starting at `y` then stays the
+/// item under the top edge instead of the one above it.
+fn scroll_to_content(y: f64) -> f32 {
+    let scroll = (y + f64::from(TOP_PAD)) as f32;
+    if f64::from(scroll - TOP_PAD) < y {
+        scroll.next_up()
+    } else {
+        scroll
     }
 }

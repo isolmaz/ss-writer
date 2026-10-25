@@ -138,11 +138,12 @@ impl Searcher {
         }
     }
 
-    /// First match starting at or after `from` (a char boundary of `text`), wrapping to the
-    /// first match of the text. The search starts at `from`, so a match that begins there is
-    /// found even when the matches reported by [`Searcher::find_all`] overlap it. `None` when
-    /// there is no match at all.
+    /// First match starting at or after `from` (rounded up to a char boundary of `text`),
+    /// wrapping to the first match of the text. The search starts at `from`, so a match that
+    /// begins there is found even when the matches reported by [`Searcher::find_all`] overlap
+    /// it. `None` when there is no match at all.
     pub fn next(&self, text: &str, from: usize) -> Option<TextRange> {
+        let from = text.ceil_char_boundary(from);
         match &self.engine {
             Engine::Empty => None,
             Engine::Regex(re) => re
@@ -172,7 +173,7 @@ impl Searcher {
     pub fn replace_one(&self, text: &str, replacement: &str, from: usize) -> Option<Edit> {
         match &self.engine {
             Engine::Regex(re) => re
-                .captures_at(text, from)
+                .captures_at(text, text.ceil_char_boundary(from))
                 .or_else(|| re.captures_at(text, 0))
                 .map(|caps| regex_edit(&caps, replacement)),
             Engine::Empty | Engine::Literal(_) => self

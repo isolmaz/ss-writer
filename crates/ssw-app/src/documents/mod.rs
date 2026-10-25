@@ -106,7 +106,7 @@ impl DocError {
             Self::Save(SaveError::SharingViolation(_)) => "app-error-in-use",
             Self::Save(SaveError::DiskFull(_)) => "app-error-disk-full",
             Self::Save(SaveError::AccessDenied(_)) => "app-error-access-denied",
-            Self::Save(SaveError::Fs(_)) => "app-error-file",
+            Self::Save(SaveError::Fs(_) | SaveError::TempKept { .. }) => "app-error-file",
             Self::Encode(_) => "app-error-encoding",
             Self::Untitled => "app-error-untitled",
             Self::NeedsSaveAs => "app-error-needs-save-as",

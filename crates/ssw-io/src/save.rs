@@ -93,6 +93,15 @@ pub enum SaveError {
     /// Permission denied (ACL).
     #[error("access denied: {}", .0.display())]
     AccessDenied(PathBuf),
+    /// Replacing the file removed the old one and moving the new content into its place failed
+    /// too: the new content stays in the temp file.
+    #[error("the new content is kept in {}: {source}", temp.display())]
+    TempKept {
+        /// The temp file holding the new content.
+        temp: PathBuf,
+        /// Why the move into place failed.
+        source: FsError,
+    },
     /// Any other failure.
     #[error(transparent)]
     Fs(FsError),
@@ -172,6 +181,29 @@ fn replace_existing(
     }
 }
 
+/// Settles a failed move of `temp` over `path`. A replace that fails half-way can have removed
+/// the old file already, and then `temp` holds the only copy of the new content: it is moved into
+/// place once more, and kept when that fails as well. In every other case `temp` is removed and
+/// `error` is the failure.
+fn settle_failed_move(
+    fs: &dyn FileSystem,
+    sleeper: &dyn Sleeper,
+    path: &Path,
+    temp: &Path,
+    replaced: bool,
+    error: FsError,
+) -> Result<(), SaveError> {
+    if replaced && fs.metadata(path).is_err() {
+        let moved = with_retry(sleeper, || fs.rename(temp, path));
+        return moved.map_err(|source| SaveError::TempKept {
+            temp: temp.to_path_buf(),
+            source,
+        });
+    }
+    let _ = fs.delete_file(temp);
+    Err(error.into())
+}
+
 /// Saves `data` to `path` atomically and returns the stamp of what was written.
 ///
 /// The bytes go to a temp file next to `path` first; the target is then replaced in one step so
@@ -181,7 +213,8 @@ fn replace_existing(
 /// [`SaveError::ReadOnly`] when the target has the read-only attribute,
 /// [`SaveError::SharingViolation`] after the retries are exhausted, [`SaveError::DiskFull`],
 /// [`SaveError::AccessDenied`] and [`SaveError::Fs`] for everything else. The temp file is
-/// removed on failure.
+/// removed on failure, except when the failed replace left the target missing:
+/// [`SaveError::TempKept`] names the temp file that then holds the new content.
 pub fn save_atomic(
     fs: &dyn FileSystem,
     sleeper: &dyn Sleeper,
@@ -202,8 +235,7 @@ pub fn save_atomic(
         None => with_retry(sleeper, || fs.rename(&temp, path)),
     };
     if let Err(error) = outcome {
-        let _ = fs.delete_file(&temp);
-        return Err(error.into());
+        settle_failed_move(fs, sleeper, path, &temp, existing.is_some(), error)?;
     }
     let meta = fs.metadata(path)?;
     Ok(SaveStamp {

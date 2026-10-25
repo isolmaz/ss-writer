@@ -489,6 +489,10 @@ fn every_error_has_a_message_id_in_the_app_catalog() {
         DocError::Save(SaveError::DiskFull(PathBuf::from("a"))),
         DocError::Save(SaveError::AccessDenied(PathBuf::from("a"))),
         DocError::Save(SaveError::Fs(FsError::NotFound(PathBuf::from("a")))),
+        DocError::Save(SaveError::TempKept {
+            temp: PathBuf::from("a"),
+            source: FsError::NotFound(PathBuf::from("a")),
+        }),
     ];
     let missing: Vec<&str> = errors
         .iter()

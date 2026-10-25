@@ -105,11 +105,35 @@ fn a_session_the_database_refuses_is_logged_and_the_exit_still_completes() {
     let (mut core, _) = core_in(tmp.path());
     break_tables(&core, "DROP TABLE session_windows");
 
-    core.shutdown(&Session::default());
+    assert!(!core.shutdown(&Session::default()));
 
     let log = log_of(&core);
     assert!(log.contains("session not saved"), "{log}");
     assert!(log.contains("SS Writer exiting"), "{log}");
+}
+
+#[test]
+fn a_session_the_database_refuses_leaves_the_backups_of_this_run_for_the_next_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("local").join("SS Writer").join("recovery");
+    let store = RecoveryStore::new(Arc::new(RealFs), folder);
+    let (mut core, _) = core_in(tmp.path());
+    // This run backs up an untitled buffer of its own.
+    let scratch = core.docs.new_untitled();
+    assert!(replace_text(
+        &mut scratch.document().borrow_mut(),
+        "new words"
+    ));
+    core.pump();
+    assert_eq!(store.list().unwrap().len(), 1);
+    break_tables(&core, "DROP TABLE session_windows");
+
+    assert!(!core.shutdown(&Session::default()));
+
+    let left = store.list().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].kind, RecoveryKind::Untitled);
+    assert_eq!(store.restore(&left[0].id).unwrap().text, "new words");
 }
 
 #[test]
@@ -139,7 +163,7 @@ fn a_clean_exit_keeps_the_crash_recovery_nobody_answered_and_drops_its_own_backu
     core.pump();
     assert_eq!(store.list().unwrap().len(), 2);
 
-    core.shutdown(&Session::default());
+    assert!(core.shutdown(&Session::default()));
 
     let left = store.list().unwrap();
     assert_eq!(left.len(), 1);

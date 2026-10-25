@@ -21,6 +21,7 @@ use ssw_core::format_text::{
 use ssw_core::i18n::{Arg, Localizer};
 use ssw_core::keymap::Keymap;
 use ssw_core::settings::{Settings, StartupBehavior};
+use ssw_io::logging::Logger;
 use ssw_io::session::{Session, ViewState, WindowPlacement};
 use ssw_ui::editor::blocks_media::MediaEvent;
 use ssw_ui::editor::highlight::Language;
@@ -51,6 +52,7 @@ use super::tree_source::{TreePaths, WorkspaceTree};
 use crate::app::AppCore;
 use crate::commands::{AppActions, Dispatch};
 use crate::documents::{DocEntry, DocError, DocId, DocMode, LoadError, replace_text};
+use crate::emergency::EmergencyCache;
 use crate::session::{PlannedDocument, SessionManager, StartupPlan, TabState, WindowState};
 use crate::workers::{JobKey, JobKind, JobSpec, WindowId};
 
@@ -180,6 +182,13 @@ pub struct Controller {
     pub(super) settings_hub: super::settings_window::SettingsHub,
     /// Which banners the user closed, the recovery offer (see [`super::banner_flows`]).
     pub(super) flows: super::banner_flows::FlowState,
+    /// The end of the session was handled; every window receives the message that announces it.
+    pub(super) session_ended: Cell<bool>,
+    /// The crash copy of the documents with unsaved changes, which the end of the session
+    /// writes to the recovery folder when the core is borrowed.
+    pub(super) crash_copy: Arc<EmergencyCache>,
+    /// The log, for the same case.
+    pub(super) logger: Arc<Logger>,
 }
 
 impl fmt::Debug for Controller {
@@ -207,6 +216,8 @@ impl Controller {
             me: me.clone(),
             i18n: Rc::clone(&core.i18n),
             docs: Rc::clone(&core.docs),
+            crash_copy: Arc::clone(core.autosave.emergency()),
+            logger: Arc::clone(&core.logger),
             router: RefCell::new(ShortcutRouter::new(keymap)),
             settings: RefCell::new(settings),
             core: RefCell::new(core),
@@ -227,6 +238,7 @@ impl Controller {
             export: super::export::ExportState::default(),
             settings_hub: super::settings_window::SettingsHub::default(),
             flows: super::banner_flows::FlowState::default(),
+            session_ended: Cell::new(false),
         })
     }
 
@@ -552,7 +564,10 @@ impl Controller {
             controller: self,
             cell: Rc::clone(&cell),
         };
-        let outcome = self.core.borrow().commands.dispatch(command, &mut actions);
+        // A command can open dialogs, and the system can end the session while one is up: the
+        // core is not borrowed meanwhile.
+        let commands = Rc::clone(&self.core.borrow().commands);
+        let outcome = commands.dispatch(command, &mut actions);
         self.refresh(&cell);
         outcome
     }

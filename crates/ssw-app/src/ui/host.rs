@@ -19,10 +19,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ssw_core::i18n::Localizer;
+use ssw_core::settings::StartupBehavior;
 use ssw_io::fs::RealFs;
 use ssw_io::logging::{Level, Logger};
 use ssw_io::net::{Http, WinHttp};
-use ssw_io::recovery::{RecoveryKind, now_millis};
+use ssw_io::recovery::{RecoveryKind, RecoveryStore, now_millis};
 use ssw_io::session::{RecentKind, Session, WindowPlacement};
 use ssw_ui::geometry::Point;
 use ssw_ui::services::{Clock, Dialogs, Shell};
@@ -987,7 +988,11 @@ impl UiApp {
         self.drain_requests();
         // After the requests: a window made in this turn is shown before the devices count.
         self.attach_devices();
-        let report = self.controller.core().borrow_mut().pump();
+        // A worker result can open a message box, and the system can end the session while it is
+        // up: the results are delivered with the core not borrowed.
+        let workers = Rc::clone(&self.controller.core().borrow().workers);
+        let jobs = workers.poll();
+        let report = self.controller.core().borrow_mut().housekeeping(jobs);
         self.controller.pump_files();
         if report.jobs > 0 || !report.external.is_empty() || !report.tick.saved.is_empty() {
             self.controller.refresh_all();
@@ -1271,52 +1276,89 @@ impl ShellHost for UiShell {
 /// soon as the window procedure returns, so nothing is asked: it does what a quit does, the
 /// documents autosave covers are saved, the session is stored with the text of the untitled
 /// buffers, and the text of every file with changes nobody saved goes to the recovery folder,
-/// where the next start offers it.
+/// where the next start offers it. The untitled buffers go there too when the next start does
+/// not restore the session or the session could not be stored.
+///
+/// Every window receives the message; the first one does the work. While a dialog holds the
+/// core, what the crash copy has of the documents with unsaved changes goes to the recovery
+/// folder instead, and the session is not stored.
 pub fn end_session(controller: &Controller) {
-    controller.flush_settings();
+    if controller.session_ended.replace(true) {
+        return;
+    }
+    let cell = controller.core();
+    if cell.try_borrow().is_ok() {
+        controller.flush_settings();
+    }
+    let Ok(mut core) = cell.try_borrow_mut() else {
+        controller.logger.log(
+            Level::Warn,
+            "shutdown",
+            "the core is busy: unsaved text kept from the crash copy",
+        );
+        write_recovery(
+            &controller.crash_copy,
+            &controller.docs().env().recovery,
+            &controller.logger,
+        );
+        return;
+    };
     let session = controller.session();
-    let mut core = controller.core().borrow_mut();
-    core.shutdown(&session);
-    keep_unsaved_text(&core);
+    let stored = core.shutdown(&session);
+    let restored =
+        stored && controller.settings().general.on_startup == StartupBehavior::RestoreSession;
+    keep_unsaved_text(&core, !restored);
 }
 
-/// Writes the text of the files with unsaved changes to the recovery folder. Untitled buffers
-/// are left out: the session stores them.
-fn keep_unsaved_text(core: &AppCore) {
+/// Writes the text of the files with unsaved changes to the recovery folder, and that of the
+/// untitled buffers when `untitled` is set: otherwise the session stores them.
+fn keep_unsaved_text(core: &AppCore, untitled: bool) {
     let unsaved = EmergencyCache::new();
     for entry in core.docs.all().iter().filter(|entry| entry.is_dirty()) {
-        let Some(path) = entry.path() else {
-            continue;
+        let text = entry.document().borrow().text();
+        let (kind, original_path, display_name) = match entry.path() {
+            Some(path) => {
+                let name = path
+                    .file_name()
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                (RecoveryKind::Dirty, Some(path), name)
+            }
+            None if untitled && !text.is_empty() => {
+                (RecoveryKind::Untitled, None, entry.title(&core.i18n))
+            }
+            None => continue,
         };
-        let display_name = path
-            .file_name()
-            .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
         unsaved.put(
             &core.autosave.recovery_id(entry),
             CachedDoc {
-                kind: RecoveryKind::Dirty,
-                original_path: Some(path),
+                kind,
+                original_path,
                 display_name,
-                text: entry.document().borrow().text(),
+                text,
                 format: entry.format(),
                 version: entry.document().borrow().version(),
             },
         );
     }
+    write_recovery(&unsaved, &core.recovery, &core.logger);
+}
+
+/// Writes `unsaved` to the recovery folder; what cannot be written is logged.
+fn write_recovery(unsaved: &EmergencyCache, recovery: &RecoveryStore, logger: &Logger) {
     let saved = unsaved
-        .save_all(&core.recovery, now_millis())
+        .save_all(recovery, now_millis())
         .map(Option::unwrap_or_default);
     match saved {
         Ok(report) => {
             for (id, error) in &report.failed {
-                core.logger.log(
+                logger.log(
                     Level::Error,
                     "shutdown",
                     &format!("unsaved text of {id} not kept: {error}"),
                 );
             }
         }
-        Err(error) => core.logger.log(
+        Err(error) => logger.log(
             Level::Error,
             "shutdown",
             &format!("unsaved text not kept: {error}"),

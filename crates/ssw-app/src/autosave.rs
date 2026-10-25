@@ -140,6 +140,12 @@ impl Autosave {
         }
     }
 
+    /// The crash copy this scheduler keeps current.
+    #[must_use]
+    pub fn emergency(&self) -> &Arc<EmergencyCache> {
+        &self.emergency
+    }
+
     /// The id of `entry` in the crash copy and the recovery folder. An untitled buffer has its
     /// own id; a file's holds the start of this run, because document numbers begin at 1 in
     /// every run while the recovery folder keeps what earlier runs left unrecovered.

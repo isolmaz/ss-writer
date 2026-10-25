@@ -4,7 +4,9 @@ use std::path::Path;
 
 use ssw_convert::import::Asset;
 use ssw_convert::markdown_export::{ATTACHMENTS_DIR, MarkdownExportError, export_to_folder};
-use ssw_convert::textbundle::{TextBundleError, read_dir, read_pack, write_dir, write_pack};
+use ssw_convert::textbundle::{
+    MAX_ENTRIES, TextBundleError, read_dir, read_pack, write_dir, write_pack,
+};
 
 fn asset(path: &str, bytes: &[u8]) -> Asset {
     Asset {
@@ -65,6 +67,28 @@ fn textpack_round_trip_and_unsafe_paths() {
     ));
     let empty = write_pack("", &[]).unwrap();
     assert_eq!(read_pack(&empty).unwrap().text, "");
+}
+
+fn pack_of(assets: usize) -> Vec<u8> {
+    let assets: Vec<Asset> = (0..assets)
+        .map(|i| asset(&format!("assets/{i}.bin"), b"x"))
+        .collect();
+    write_pack("text", &assets).unwrap()
+}
+
+#[test]
+fn textpack_entry_count_is_limited() {
+    // info.json and the text file are two of the entries
+    let at_limit = read_pack(&pack_of(MAX_ENTRIES - 2)).unwrap();
+    assert_eq!(at_limit.assets.len(), MAX_ENTRIES - 2);
+    let error = read_pack(&pack_of(MAX_ENTRIES - 1)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the bundle is too large: {} entries (limit {MAX_ENTRIES})",
+            MAX_ENTRIES + 1
+        )
+    );
 }
 
 fn write(path: &Path, bytes: &[u8]) {

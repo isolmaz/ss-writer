@@ -4,6 +4,7 @@
 //! refers to assets as `assets/<name>`. A pack is the same layout zipped, optionally inside one
 //! top-level folder.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
 
@@ -14,6 +15,8 @@ use crate::import::Asset;
 pub const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 /// Total size cap of all assets of one bundle.
 pub const MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+/// Cap on the number of entries of a `.textpack` archive.
+pub const MAX_ENTRIES: usize = 10_000;
 
 /// Names tried, in order, for the text file; any other `text.*` file is the last resort.
 const TEXT_NAMES: [&str; 6] = [
@@ -140,9 +143,20 @@ fn read_dir_limited(
     Ok(TextBundle { text, assets })
 }
 
+/// Splits an archive path into its folder (empty at the root) and its file name.
+fn split_folder(path: &str) -> (&str, &str) {
+    path.rsplit_once('/').unwrap_or(("", path))
+}
+
 /// Reads a `.textpack` archive.
 pub fn read_pack(bytes: &[u8]) -> Result<TextBundle, TextBundleError> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    if archive.len() > MAX_ENTRIES {
+        return Err(TextBundleError::TooLarge(format!(
+            "{} entries (limit {MAX_ENTRIES})",
+            archive.len()
+        )));
+    }
     let mut entries: Vec<(usize, String)> = Vec::new();
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
@@ -159,19 +173,21 @@ pub fn read_pack(bytes: &[u8]) -> Result<TextBundle, TextBundleError> {
             .join("/");
         entries.push((i, name));
     }
+    let mut folders: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (_, name) in &entries {
+        let (dir, file) = split_folder(name);
+        folders.entry(dir).or_default().push(file);
+    }
+    let text_names: HashMap<&str, &str> = folders
+        .iter()
+        .filter_map(|(dir, files)| Some((*dir, pick_text_name(files)?)))
+        .collect();
     // The text file closest to the root decides the bundle folder.
     // (depth, archive index of the text file, its folder)
     let mut best: Option<(usize, usize, &str)> = None;
     for (index, name) in &entries {
-        let (dir, file) = name.rsplit_once('/').unwrap_or(("", name.as_str()));
-        let siblings: Vec<&str> = entries
-            .iter()
-            .filter_map(|(_, n)| {
-                let (d, f) = n.rsplit_once('/').unwrap_or(("", n.as_str()));
-                (d == dir).then_some(f)
-            })
-            .collect();
-        if pick_text_name(&siblings) == Some(file) {
+        let (dir, file) = split_folder(name);
+        if text_names.get(dir) == Some(&file) {
             let depth = name.matches('/').count();
             if best.is_none_or(|(d, ..)| depth < d) {
                 best = Some((depth, *index, dir));

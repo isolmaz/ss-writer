@@ -70,10 +70,22 @@ impl<'a> Ctx<'a> {
     }
 
     /// Offset of the first character of `line` after block-container prefixes (indentation,
-    /// quote markers, list markers and task boxes).
+    /// quote markers, list markers and task boxes). Text that only looks like a list marker
+    /// (`2. ` on a paragraph continuation line) is content.
     pub fn content_start(&self, line: usize) -> usize {
         let range = self.line_range(line);
-        range.start + container_prefix_len(&self.slice(range))
+        let prefix = prefix_len(&self.slice(range), |at| self.item_starts_at(range.start + at));
+        range.start + prefix
+    }
+
+    /// True when a list item of the tree has its marker at `offset`.
+    fn item_starts_at(&self, offset: usize) -> bool {
+        self.ast.path_at(offset).into_iter().any(|node| {
+            matches!(
+                node.as_block().map(|b| &b.kind),
+                Some(BlockKind::ListItem { marker, .. }) if marker.start == offset
+            )
+        })
     }
 
     /// True when `offset` lies inside a block whose text is verbatim (code, math, front
@@ -116,6 +128,12 @@ impl<'a> Ctx<'a> {
 /// Byte length of the container prefix of `line`: leading whitespace, `>` markers (with one
 /// optional following space), list markers and task boxes, repeated for nested containers.
 pub fn container_prefix_len(line: &str) -> usize {
+    prefix_len(line, |_| true)
+}
+
+/// [`container_prefix_len`] where a list marker at byte `at` of `line` only counts when
+/// `is_item(at)` holds.
+fn prefix_len(line: &str, mut is_item: impl FnMut(usize) -> bool) -> usize {
     let bytes = line.as_bytes();
     let mut pos = 0;
     loop {
@@ -127,7 +145,7 @@ pub fn container_prefix_len(line: &str) -> usize {
                     pos += 1;
                 }
             }
-            _ => match list_marker_len(&line[pos..]) {
+            _ => match list_marker_len(&line[pos..]).filter(|_| is_item(pos)) {
                 Some(len) => {
                     pos = skip_blanks(bytes, pos + len);
                     if let Some(task) = task_box_len(&line[pos..]) {
@@ -329,6 +347,17 @@ mod tests {
         ] {
             assert_eq!(container_prefix_len(line), len, "{line:?}");
         }
+    }
+
+    #[test]
+    fn content_start_skips_only_markers_that_start_a_list_item() {
+        ctx_for("text\n2. a\n\n3. b\n\n- [ ] c‸", |c| {
+            // A paragraph continuation line, not an item.
+            assert_eq!(c.content_start(1), 5);
+            // A new list after a blank line may start at any number.
+            assert_eq!(c.content_start(3), 14);
+            assert_eq!(c.content_start(5), 23);
+        });
     }
 
     #[test]

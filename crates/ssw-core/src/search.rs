@@ -138,33 +138,46 @@ impl Searcher {
         }
     }
 
-    /// First match starting at or after `from`, wrapping to the first match of the text.
-    /// `None` when there is no match at all.
+    /// First match starting at or after `from` (a char boundary of `text`), wrapping to the
+    /// first match of the text. The search starts at `from`, so a match that begins there is
+    /// found even when the matches reported by [`Searcher::find_all`] overlap it. `None` when
+    /// there is no match at all.
     pub fn next(&self, text: &str, from: usize) -> Option<TextRange> {
-        let all = self.find_all(text);
-        let idx = all.partition_point(|m| m.start < from);
-        all.get(idx).or_else(|| all.first()).copied()
+        match &self.engine {
+            Engine::Empty => None,
+            Engine::Regex(re) => re
+                .find_at(text, from)
+                .or_else(|| re.find_at(text, 0))
+                .map(match_range),
+            Engine::Literal(literal) => {
+                let bounds = literal.bounds(text);
+                literal
+                    .find_from(text, from, &bounds)
+                    .or_else(|| literal.find_from(text, 0, &bounds))
+            }
+        }
     }
 
     /// Last match starting before `from`, wrapping to the last match of the text.
     /// `None` when there is no match at all.
     pub fn prev(&self, text: &str, from: usize) -> Option<TextRange> {
-        let all = self.find_all(text);
-        let idx = all.partition_point(|m| m.start < from);
-        idx.checked_sub(1)
-            .and_then(|i| all.get(i))
-            .or_else(|| all.last())
-            .copied()
+        match &self.engine {
+            Engine::Empty => None,
+            Engine::Regex(re) => last_before(re.find_iter(text).map(match_range), from),
+            Engine::Literal(literal) => last_before(literal.matches(text), from),
+        }
     }
 
     /// The edit that replaces the match found by [`Searcher::next`] from `from`.
     pub fn replace_one(&self, text: &str, replacement: &str, from: usize) -> Option<Edit> {
-        let range = self.next(text, from)?;
         match &self.engine {
             Engine::Regex(re) => re
-                .captures_at(text, range.start)
+                .captures_at(text, from)
+                .or_else(|| re.captures_at(text, 0))
                 .map(|caps| regex_edit(&caps, replacement)),
-            Engine::Empty | Engine::Literal(_) => Some(Edit::replace(range, replacement)),
+            Engine::Empty | Engine::Literal(_) => self
+                .next(text, from)
+                .map(|range| Edit::replace(range, replacement)),
         }
     }
 
@@ -195,18 +208,26 @@ impl Searcher {
 
 impl Literal {
     fn find_all(&self, text: &str) -> Vec<TextRange> {
-        let bounds = if self.whole_word {
+        self.matches(text).collect()
+    }
+
+    /// The matches in `text`, left to right, found on demand.
+    fn matches<'a>(&'a self, text: &'a str) -> LiteralMatches<'a> {
+        LiteralMatches {
+            literal: self,
+            text,
+            bounds: self.bounds(text),
+            pos: 0,
+        }
+    }
+
+    /// The word boundaries of `text` when matches must be whole words, otherwise none.
+    fn bounds(&self, text: &str) -> Vec<usize> {
+        if self.whole_word {
             word_boundaries(text)
         } else {
             Vec::new()
-        };
-        let mut out = Vec::new();
-        let mut pos = 0;
-        while let Some(found) = self.find_from(text, pos, &bounds) {
-            pos = found.end;
-            out.push(found);
         }
-        out
     }
 
     /// First match starting at or after `from` (a char boundary of `text`). `bounds` are the
@@ -226,6 +247,44 @@ impl Literal {
             from = found.start + text[found.start..].chars().next().map_or(1, char::len_utf8);
         }
     }
+}
+
+/// Iterator over the matches of a [`Literal`].
+struct LiteralMatches<'a> {
+    literal: &'a Literal,
+    text: &'a str,
+    bounds: Vec<usize>,
+    pos: usize,
+}
+
+impl Iterator for LiteralMatches<'_> {
+    type Item = TextRange;
+
+    fn next(&mut self) -> Option<TextRange> {
+        let found = self.literal.find_from(self.text, self.pos, &self.bounds)?;
+        self.pos = found.end;
+        Some(found)
+    }
+}
+
+fn match_range(m: regex::Match<'_>) -> TextRange {
+    TextRange::new(m.start(), m.end())
+}
+
+/// The last of `matches` (in ascending order) that starts before `from`; when none does, the
+/// last one overall. Stops reading as soon as a match at or after `from` follows one before it.
+fn last_before(matches: impl Iterator<Item = TextRange>, from: usize) -> Option<TextRange> {
+    let (mut before, mut last) = (None, None);
+    for m in matches {
+        if m.start < from {
+            before = Some(m);
+        } else if before.is_some() {
+            break;
+        } else {
+            last = Some(m);
+        }
+    }
+    before.or(last)
 }
 
 /// Compiles the user's pattern; with `whole_word` additionally the `\b(?: … )\b` wrapper (the
@@ -647,6 +706,61 @@ mod tests {
     }
 
     #[test]
+    fn next_and_prev_treat_a_match_at_the_offset_as_after_and_not_before() {
+        let text = "a1 b a2 a3";
+        let regex = with(r"a\d", true, false, true);
+        let next = |from| find_next(text, &regex, from).unwrap();
+        let prev = |from| find_prev(text, &regex, from).unwrap();
+        assert_eq!(next(0), Some(TextRange::new(0, 2)));
+        assert_eq!(next(1), Some(TextRange::new(5, 7)));
+        assert_eq!(next(5), Some(TextRange::new(5, 7)));
+        assert_eq!(next(8), Some(TextRange::new(8, 10)));
+        assert_eq!(next(9), Some(TextRange::new(0, 2)));
+        assert_eq!(prev(10), Some(TextRange::new(8, 10)));
+        assert_eq!(prev(8), Some(TextRange::new(5, 7)));
+        assert_eq!(prev(6), Some(TextRange::new(5, 7)));
+        assert_eq!(prev(5), Some(TextRange::new(0, 2)));
+        assert_eq!(prev(0), Some(TextRange::new(8, 10)));
+        assert_eq!(find_next("xyz", &regex, 1).unwrap(), None);
+        assert_eq!(find_prev("xyz", &regex, 1).unwrap(), None);
+        // Anchors and word boundaries see the text in front of the offset.
+        let line_start = with("^b", true, false, true);
+        assert_eq!(
+            find_next("a\nb", &line_start, 2).unwrap(),
+            Some(TextRange::new(2, 3))
+        );
+        assert_eq!(find_next("ab", &line_start, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn next_and_prev_find_whole_words_and_case_folded_literals() {
+        let text = "foobar foo bar foo";
+        let word = with("foo", true, true, false);
+        let next = |from| find_next(text, &word, from).unwrap();
+        let prev = |from| find_prev(text, &word, from).unwrap();
+        assert_eq!(next(0), Some(TextRange::new(7, 10)));
+        assert_eq!(next(7), Some(TextRange::new(7, 10)));
+        assert_eq!(next(8), Some(TextRange::new(15, 18)));
+        assert_eq!(next(16), Some(TextRange::new(7, 10)));
+        assert_eq!(prev(18), Some(TextRange::new(15, 18)));
+        assert_eq!(prev(15), Some(TextRange::new(7, 10)));
+        assert_eq!(prev(7), Some(TextRange::new(15, 18)));
+        let folded = query("ÇA");
+        let next_folded = |from| find_next("çaÇA", &folded, from).unwrap();
+        assert_eq!(next_folded(2), Some(TextRange::new(3, 6)));
+        assert_eq!(next_folded(3), Some(TextRange::new(3, 6)));
+        assert_eq!(next_folded(6), Some(TextRange::new(0, 3)));
+    }
+
+    #[test]
+    fn next_starts_at_the_offset_even_inside_an_earlier_overlapping_match() {
+        let q = with("aa", true, false, false);
+        let next = |from| find_next("aaaaa", &q, from).unwrap();
+        assert_eq!(next(1), Some(TextRange::new(1, 3)));
+        assert_eq!(next(4), Some(TextRange::new(0, 2)));
+    }
+
+    #[test]
     fn replace_all_literal_offsets_and_dollar_signs() {
         let text = "a.b a.b";
         let q = with("a.b", true, false, false);
@@ -732,6 +846,10 @@ mod tests {
             Some(Edit::replace(TextRange::new(3, 5), "$1"))
         );
         assert_eq!(replace_one("abc", &literal, "", 0).unwrap(), None);
+        let wrapped = replace_one(text, &literal, "Y", 6).unwrap().unwrap();
+        assert_eq!(wrapped, Edit::replace(TextRange::new(3, 5), "Y"));
+        let at_offset = replace_one(text, &literal, "Y", 3).unwrap().unwrap();
+        assert_eq!(at_offset, Edit::replace(TextRange::new(3, 5), "Y"));
         // The whole-word wrapper keeps its context when the search starts mid-text.
         let word = with("bar", true, true, true);
         let edit = replace_one("foobar bar", &word, "Z", 3).unwrap().unwrap();

@@ -195,27 +195,41 @@ pub fn renumber_lists(ctx: Ctx<'_>) -> Option<Transaction> {
     (!edits.is_empty()).then(|| ctx.transaction_mapped(edits))
 }
 
-/// The smallest range covering `edits` and the top-level blocks they touch, when one of those
-/// blocks holds an ordered list.
+/// The smallest range covering `edits`, the top-level blocks they touch and the ordered-list
+/// blocks next to those, when one of them holds an ordered list. Removing what separates two
+/// ordered lists merges them, so a list next to the edit is renumbered with it.
 fn renumber_window(ctx: Ctx<'_>, edits: &[Edit]) -> Option<TextRange> {
+    let blocks = &ctx.ast.blocks;
     let mut window: Option<TextRange> = None;
     let mut has_ordered = false;
     for edit in edits {
+        let first = blocks.partition_point(|b| b.range.end < edit.range.start);
+        let end = blocks.partition_point(|b| b.range.start <= edit.range.end);
         let mut range = edit.range;
-        let touched = ctx
-            .ast
-            .blocks
-            .iter()
-            .filter(|b| b.range.start <= edit.range.end && edit.range.start <= b.range.end);
-        for block in touched {
+        for block in &blocks[first..end] {
             range = range.cover(block.range);
-            has_ordered |= block
-                .descendants()
-                .any(|b| matches!(b.kind, BlockKind::List { ordered: true, .. }));
+            has_ordered |= holds_ordered_list(block);
+        }
+        let neighbours = first
+            .checked_sub(1)
+            .map(|i| &blocks[i])
+            .into_iter()
+            .chain(blocks.get(end))
+            .filter(|b| holds_ordered_list(b));
+        for block in neighbours {
+            range = range.cover(block.range);
+            has_ordered = true;
         }
         window = Some(window.map_or(range, |w| w.cover(range)));
     }
     if has_ordered { window } else { None }
+}
+
+/// True when `block` is or contains an ordered list.
+fn holds_ordered_list(block: &Block) -> bool {
+    block
+        .descendants()
+        .any(|b| matches!(b.kind, BlockKind::List { ordered: true, .. }))
 }
 
 /// Lengths of the common prefix and suffix of `a` and `b` (char boundaries in both, not

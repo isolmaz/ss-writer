@@ -589,7 +589,7 @@ enum Step {
     /// Drop the file `key` (a relative key); with `children` also everything below it (it was a
     /// folder).
     Remove { key: String, children: bool },
-    /// Store the file unless the limit on indexed files stops a new one.
+    /// Store the file; the caller has checked the limit on indexed files.
     Store(Prepared),
 }
 
@@ -655,6 +655,15 @@ fn store_file(tx: &Transaction<'_>, root_id: i64, file: &Prepared) -> Result<boo
         ])?;
     }
     Ok(file.analysis.is_some())
+}
+
+/// Whether the index of `root_id` has a row for the file `rel_key`.
+fn file_known(conn: &Connection, root_id: i64, rel_key: &str) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM index_files WHERE root_id = ?1 AND rel_key = ?2)",
+        params![root_id, rel_key],
+        |row| row.get(0),
+    )?)
 }
 
 fn count_files(conn: &Connection, root_id: i64) -> Result<usize, StoreError> {
@@ -783,7 +792,7 @@ impl Store {
         let mut steps = Vec::new();
         for change in changes {
             if steps.len() >= WRITE_CHUNK {
-                self.index_write(root_id, opts, &mut steps, &mut count, &mut stats)?;
+                self.index_write(root_id, &mut steps, &mut count, &mut stats)?;
             }
             let (path, removed) = match change {
                 IndexChange::Changed(path) => (path, false),
@@ -823,9 +832,20 @@ impl Store {
             }
             for candidate in candidates {
                 if steps.len() >= WRITE_CHUNK {
-                    self.index_write(root_id, opts, &mut steps, &mut count, &mut stats)?;
+                    self.index_write(root_id, &mut steps, &mut count, &mut stats)?;
                 }
                 if is_included(Path::new(&found_root.text), &candidate.rel, opts) {
+                    // Near the limit the pending steps decide whether a new file still fits:
+                    // they are written first, so that a file the limit drops is not read.
+                    if count < opts.max_files && count + steps.len() >= opts.max_files {
+                        self.index_write(root_id, &mut steps, &mut count, &mut stats)?;
+                    }
+                    if count >= opts.max_files
+                        && !file_known(&self.conn, root_id, &key_of(&candidate.rel))?
+                    {
+                        stats.truncated = true;
+                        continue;
+                    }
                     let placeholder = is_placeholder(&candidate.path);
                     steps.push(Step::Store(prepare(candidate, placeholder)));
                 } else {
@@ -836,18 +856,17 @@ impl Store {
                 }
             }
         }
-        self.index_write(root_id, opts, &mut steps, &mut count, &mut stats)?;
+        self.index_write(root_id, &mut steps, &mut count, &mut stats)?;
         // The first count above read this table already, so this one cannot fail; a failure
         // would simply travel on.
         count_files(&self.conn, root_id).map(|files| IndexStats { files, ..stats })
     }
 
     /// Carry out and clear `steps` in one transaction. `count` is the number of files in the
-    /// index, kept up to date for the limit of [`IndexOptions::max_files`].
+    /// index, kept up to date for the limit of [`IndexOptions::max_files`] that the caller checks.
     fn index_write(
         &mut self,
         root_id: i64,
-        opts: &IndexOptions,
         steps: &mut Vec<Step>,
         count: &mut usize,
         stats: &mut IndexStats,
@@ -861,15 +880,7 @@ impl Store {
                     }
                     Step::Store(file) => file,
                 };
-                let known: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM index_files WHERE root_id = ?1 AND rel_key = ?2)",
-                    params![root_id, key_of(&file.found.rel)],
-                    |row| row.get(0),
-                )?;
-                if !known && *count >= opts.max_files {
-                    stats.truncated = true;
-                    continue;
-                }
+                let known = file_known(tx, root_id, &key_of(&file.found.rel))?;
                 *count += usize::from(!known);
                 stats.placeholders += usize::from(file.placeholder);
                 if store_file(tx, root_id, &file)? {

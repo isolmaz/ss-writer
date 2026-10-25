@@ -699,6 +699,39 @@ fn the_file_limit_applies_to_the_walk_and_to_events() {
 }
 
 #[test]
+fn events_for_files_beyond_the_limit_do_not_probe_or_read_them() {
+    let mut fx = standard();
+    let opts = IndexOptions {
+        show_hidden: false,
+        max_files: 5,
+    };
+    run(&mut fx.store, &fx.root, &opts);
+    for name in ["one", "two", "three"] {
+        write(&fx.root, &format!("{name}.md"), &format!("# {name}\n"));
+    }
+    // The placeholder probe comes before the read of every file that is stored.
+    let probed = Cell::new(0);
+    let counting = |_: &Path| {
+        probed.set(probed.get() + 1);
+        false
+    };
+    let changes: Vec<IndexChange> = ["one", "two", "three"]
+        .iter()
+        .map(|name| IndexChange::Changed(path_of(&fx.root, &format!("{name}.md"))))
+        .collect();
+    let stats = fx
+        .store
+        .index_apply_changes(&fx.root, &changes, &opts, &counting)
+        .unwrap();
+    assert_eq!(probed.get(), 1, "only the file that still fits is read");
+    assert!(stats.truncated);
+    assert_eq!((stats.files, stats.parsed), (5, 1));
+    let rels = rels(&fx.store, &fx.root);
+    assert!(rels.contains(&"one.md".to_owned()));
+    assert!(!rels.contains(&"two.md".to_owned()) && !rels.contains(&"three.md".to_owned()));
+}
+
+#[test]
 fn placeholders_are_listed_but_never_read() {
     let mut fx = standard();
     let opts = IndexOptions::default();

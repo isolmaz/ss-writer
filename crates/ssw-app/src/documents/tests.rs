@@ -758,22 +758,61 @@ fn mixed_line_endings_are_announced_once_and_debug_output_names_its_parts() {
 }
 
 #[test]
-fn a_database_that_refuses_the_recent_list_leaves_no_open_document_to_report() {
+fn a_recent_list_the_database_refuses_does_not_fail_the_open() {
     let f = fixture();
     let path = f.write("a.md", b"one\n");
     rusqlite::Connection::open(f.tmp.path().join("state").join("state.db"))
         .unwrap()
         .execute_batch("DROP TABLE recent_items")
         .unwrap();
-    let error = f.docs.open(&path).unwrap_err();
-    assert_eq!(error.message_id(), "app-error-file");
-    assert!(f.docs.all().is_empty());
-    // The file stays known to the change tracker, but nobody shows it: its events are ignored.
+    let entry = f.docs.open(&path).unwrap();
+    assert_eq!(entry.document().borrow().text(), "one\n");
+    assert_eq!(f.docs.all().len(), 1);
+    // The file is tracked like any other: another program's change reloads it.
     std::fs::write(&path, b"two, longer\n").unwrap();
     let outcomes = f
         .docs
         .handle_fs_events(&[Fixture::event(&path, FsEventKind::Modified)]);
-    assert!(outcomes.is_empty());
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(action_name(&outcomes[0].action), "reloaded");
+    assert_eq!(entry.document().borrow().text(), "two, longer\n");
+}
+
+/// The paths of the recent files, newest first.
+fn recent_files(f: &Fixture) -> Vec<PathBuf> {
+    let items = f.store.borrow().recent_items(RecentKind::File).unwrap();
+    items.into_iter().map(|item| item.path).collect()
+}
+
+#[test]
+fn a_file_that_no_longer_exists_is_taken_off_the_recent_list_when_it_fails_to_open() {
+    let f = fixture();
+    let kept = f.write("kept.md", b"kept\n");
+    let gone = f.write("gone.md", b"gone\n");
+    for path in [&gone, &kept] {
+        let entry = f.docs.open(path).unwrap();
+        f.docs.release(&entry);
+    }
+    assert_eq!(recent_files(&f), [kept.clone(), gone.clone()]);
+
+    std::fs::remove_file(&gone).unwrap();
+    let error = f.docs.open(&gone).unwrap_err();
+    assert_eq!(error.message_id(), "app-error-not-found");
+    assert_eq!(recent_files(&f), [kept]);
+}
+
+#[test]
+fn a_file_that_fails_to_open_for_another_reason_stays_on_the_recent_list() {
+    let fault = Arc::new(FaultFs::new());
+    let f = fixture_on(fault.clone());
+    let path = f.write("a.md", b"one\n");
+    let entry = f.docs.open(&path).unwrap();
+    f.docs.release(&entry);
+
+    fault.fail(FsOp::Read, FsFailure::AccessDenied, 1);
+    let error = f.docs.open(&path).unwrap_err();
+    assert_eq!(error.message_id(), "app-error-file");
+    assert_eq!(recent_files(&f), [path]);
 }
 
 #[test]
@@ -899,7 +938,7 @@ fn a_file_read_elsewhere_joins_the_document_that_is_open_already() {
     let path = f.write("a.md", b"one\n");
     let entry = f.docs.open(&path).unwrap();
     let loaded = load_file(&RealFs, &path, None).unwrap();
-    let again = f.docs.open_loaded(&path, loaded).unwrap();
+    let again = f.docs.open_loaded(&path, loaded);
     assert!(Rc::ptr_eq(&entry, &again));
     assert_eq!(entry.users(), 2);
     assert_eq!(f.docs.all().len(), 1);

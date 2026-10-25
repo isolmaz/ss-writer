@@ -16,7 +16,7 @@ use ssw_io::workspace::ensure_default_folder;
 use ssw_ui::editor::highlight::Language;
 
 use crate::args::Launch;
-use crate::documents::{DocEntry, DocError, Documents, SharedStore};
+use crate::documents::{DocEntry, DocError, Documents, SharedStore, canonical_path};
 
 /// How many closed tabs "Reopen closed tab" remembers.
 pub const CLOSED_TAB_LIMIT: usize = 20;
@@ -159,11 +159,30 @@ fn folder_window(folder: &Path) -> PlannedWindow {
     }])
 }
 
+/// The identity of the file `path` under any spelling of its path, as [`Documents::find`] sees it.
+fn file_key(path: &Path) -> String {
+    ssw_io::watch::path_key(&canonical_path(path))
+}
+
+/// The index of the tab of `window` that shows the file `path`; a tab for it is appended when
+/// none does.
+fn tab_for(window: &mut PlannedWindow, path: &Path) -> usize {
+    let wanted = file_key(path);
+    let shown = window.tabs.iter().position(|tab| {
+        matches!(&tab.document, PlannedDocument::File(open) if file_key(open) == wanted)
+    });
+    shown.unwrap_or_else(|| {
+        window.tabs.push(file_tab(path));
+        window.tabs.len() - 1
+    })
+}
+
 /// Decides which windows and tabs to create (spec §5, §6, §10 "On startup").
 ///
 /// - A stored session is restored when the setting says so and it has windows.
-/// - Files of the launch become tabs of the active restored window (a single file in a fresh
-///   process opens editor-only, without a workspace); `new_window` gives them a window.
+/// - Files of the launch become tabs of the active restored window, except the ones it shows
+///   already: their tab is the one that is activated (a single file in a fresh process opens
+///   editor-only, without a workspace); `new_window` gives them a window.
 /// - Every folder of the launch gets its own window with that folder as workspace.
 /// - Without a session or launch items: a new untitled buffer, in the default folder when the
 ///   setting says so.
@@ -202,15 +221,15 @@ pub fn plan_startup(
 
     let files: Vec<&Path> = launch.files().collect();
     if !files.is_empty() {
-        let tabs: Vec<PlannedTab> = files.iter().map(|path| file_tab(path)).collect();
         let restored_active = plan.active_window;
         match restored_active {
             Some(active) if !launch.new_window => {
                 let window = &mut plan.windows[active];
-                window.active_tab = Some(window.tabs.len());
-                window.tabs.extend(tabs);
+                let shown: Vec<usize> = files.iter().map(|path| tab_for(window, path)).collect();
+                window.active_tab = shown.first().copied();
             }
             _ => {
+                let tabs = files.iter().map(|path| file_tab(path)).collect();
                 plan.windows.push(new_window(tabs));
                 plan.active_window = Some(plan.windows.len() - 1);
             }
@@ -625,6 +644,70 @@ mod tests {
             PlannedDocument::File(PathBuf::from(r"C:\new.md"))
         );
         assert_eq!(active.active_tab, Some(1));
+    }
+
+    #[test]
+    fn a_launch_file_the_restored_window_shows_already_is_activated_not_added_again() {
+        let tab = |document| SessionTab {
+            document,
+            workspace: None,
+        };
+        let session = Session {
+            windows: vec![SessionWindow {
+                placement: placement(1),
+                tabs: vec![
+                    tab(TabDocument::Untitled("u1".to_owned())),
+                    tab(TabDocument::File(PathBuf::from(r"C:\a.md"))),
+                    tab(TabDocument::File(PathBuf::from(r"C:\b.md"))),
+                ],
+                active_tab: Some(0),
+            }],
+            active_window: Some(0),
+        };
+        let plan_for = |files: &[&str]| {
+            plan_startup(
+                StartupBehavior::RestoreSession,
+                None,
+                &session,
+                &launch(files, &[], false),
+            )
+        };
+        let documents = |plan: &StartupPlan| -> Vec<PlannedDocument> {
+            plan.windows[0]
+                .tabs
+                .iter()
+                .map(|tab| tab.document.clone())
+                .collect()
+        };
+        let restored = vec![
+            PlannedDocument::RestoredUntitled("u1".to_owned()),
+            PlannedDocument::File(PathBuf::from(r"C:\a.md")),
+            PlannedDocument::File(PathBuf::from(r"C:\b.md")),
+        ];
+        let with_new = || {
+            let mut documents = restored.clone();
+            documents.push(PlannedDocument::File(PathBuf::from(r"C:\new.md")));
+            documents
+        };
+
+        // The case of the path does not matter: it is the same file, and its tab comes forward.
+        let plan = plan_for(&[r"C:\A.MD"]);
+        assert_eq!(documents(&plan), restored);
+        assert_eq!(plan.windows[0].active_tab, Some(1));
+        assert_eq!(plan.active_window, Some(0));
+
+        // The first file of the launch decides which tab is active, whether it is new or not.
+        let plan = plan_for(&[r"C:\B.MD", r"C:\new.md"]);
+        assert_eq!(documents(&plan), with_new());
+        assert_eq!(plan.windows[0].active_tab, Some(2));
+        let plan = plan_for(&[r"C:\new.md", r"C:\b.md"]);
+        assert_eq!(documents(&plan), with_new());
+        assert_eq!(plan.windows[0].active_tab, Some(3));
+
+        // A file the launch names twice gets one tab.
+        let plan = plan_for(&[r"C:\new.md", r"C:\NEW.md"]);
+        assert_eq!(documents(&plan), with_new());
+        assert_eq!(plan.windows[0].active_tab, Some(3));
     }
 
     #[test]

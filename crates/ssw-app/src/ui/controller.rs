@@ -90,6 +90,9 @@ pub enum Request {
     /// A window was activated (the user came back to it): compare its files with the disk
     /// ([`Controller::check_external_changes`]).
     Activated(WindowId),
+    /// Files were dropped on a window: open them there, as File → Open does. The drop only
+    /// queues them, so the drag source (Explorer) is not held up by a dialog.
+    OpenFiles(WindowId, Vec<PathBuf>),
 }
 
 /// The state of one window that does not depend on the operating system.
@@ -358,11 +361,12 @@ impl Controller {
         cell
     }
 
-    /// Creates the windows and tabs of the startup plan. Files that cannot be opened are
-    /// reported and skipped.
+    /// Creates the windows and tabs of the startup plan. A file a window shows already gets no
+    /// second tab there. Files that cannot be opened are skipped and reported together.
     pub fn open_plan(&self, plan: &StartupPlan) {
         let size = Size::new(1280.0, 800.0);
         let mut created = Vec::new();
+        let mut failures = Vec::new();
         for planned in &plan.windows {
             let cell = self.create_window(planned.placement, size, 1.0);
             let mut active_key = None;
@@ -371,7 +375,7 @@ impl Controller {
                     PlannedDocument::File(path) => match self.docs.open(path) {
                         Ok(entry) => entry,
                         Err(error) => {
-                            self.report(&error);
+                            failures.push((path.clone(), error));
                             continue;
                         }
                     },
@@ -391,7 +395,21 @@ impl Controller {
                     }
                     PlannedDocument::NewUntitled => self.docs.new_untitled(),
                 };
-                let key = cell.view.borrow_mut().add_tab(entry, tab.workspace.clone());
+                let shown = cell
+                    .view
+                    .borrow()
+                    .tabs()
+                    .iter()
+                    .find(|open| Rc::ptr_eq(&open.entry, &entry))
+                    .map(|open| open.key);
+                let key = match shown {
+                    Some(key) => {
+                        // Opening counted a user for this tab; the tab that shows it has one.
+                        self.docs.release(&entry);
+                        key
+                    }
+                    None => cell.view.borrow_mut().add_tab(entry, tab.workspace.clone()),
+                };
                 if planned.active_tab == Some(index) {
                     active_key = Some(key);
                 }
@@ -426,6 +444,7 @@ impl Controller {
         for cell in &created {
             self.refresh(cell);
         }
+        self.report_open_failures(&failures);
         self.offer_recovery();
     }
 
@@ -493,6 +512,31 @@ impl Controller {
             buttons: MessageBoxButtons::Ok,
             icon: Some(MessageBoxIcon::Error),
         });
+    }
+
+    /// Tells the user which files of one action did not open, and why, in a single box that
+    /// names every file; nothing is shown when all of them opened.
+    fn report_open_failures(&self, failures: &[(PathBuf, DocError)]) {
+        if failures.is_empty() {
+            return;
+        }
+        let lines: Vec<String> = failures
+            .iter()
+            .map(|(path, error)| {
+                self.i18n.format(
+                    "app-open-failed-file",
+                    &[
+                        ("path", Arg::Str(&path.to_string_lossy())),
+                        ("reason", Arg::Str(&self.i18n.text(error.message_id()))),
+                    ],
+                )
+            })
+            .collect();
+        let count = i64::try_from(failures.len()).unwrap_or(i64::MAX);
+        let heading = self
+            .i18n
+            .format("app-open-failed", &[("count", Arg::Int(count))]);
+        self.show_error(format!("{heading}\n\n{}", lines.join("\n")));
     }
 
     // ----- commands ------------------------------------------------------------------------
@@ -737,14 +781,42 @@ impl Controller {
     }
 
     /// Opens `path` the way the user asked for a document: word-processor files are imported
-    /// on a worker (spec §4.1, see [`super::import`]), everything else is read now. Failures
-    /// are reported.
+    /// on a worker (spec §4.1, see [`super::import`]), everything else is read now and a file
+    /// that cannot be read is reported with its name.
     pub(super) fn open_document(&self, cell: &Rc<WindowCell>, path: &Path) {
-        if super::import::is_import(path) {
-            super::import::open_import(self, cell, path);
-        } else if let Err(error) = self.open_file(cell, path) {
-            self.report(&error);
-        }
+        self.open_documents(cell, [path]);
+    }
+
+    /// [`Self::open_document`] for the files of one action (File → Open, a launch, a drop): the
+    /// ones that do not open are reported together, in one box.
+    fn open_documents(
+        &self,
+        cell: &Rc<WindowCell>,
+        paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) {
+        let failures: Vec<(PathBuf, DocError)> = paths
+            .into_iter()
+            .filter_map(|path| {
+                let path = path.as_ref();
+                let opened = if super::import::is_import(path) {
+                    super::import::open_import(self, cell, path);
+                    Ok(())
+                } else {
+                    self.open_file(cell, path)
+                };
+                opened.err().map(|error| (path.to_path_buf(), error))
+            })
+            .collect();
+        self.report_open_failures(&failures);
+    }
+
+    /// Opens `paths` in window `id` (files dropped on it), as File → Open does.
+    pub(super) fn open_files(&self, id: WindowId, paths: &[PathBuf]) {
+        let Some(cell) = self.window(id) else {
+            return;
+        };
+        self.open_documents(&cell, paths);
+        self.refresh(&cell);
     }
 
     /// Opens a file the user browsed to (the sidebar, Quick Open, a search result, a log or
@@ -763,7 +835,7 @@ impl Controller {
         } else {
             self.open_text_file(cell, path, true)
                 .unwrap_or_else(|error| {
-                    self.report(&error);
+                    self.report_open_failures(&[(path.to_path_buf(), error)]);
                     Browsed::Handled
                 })
         }
@@ -967,9 +1039,7 @@ impl Controller {
             }
             None => return,
         };
-        for path in launch.files() {
-            self.open_document(&target, path);
-        }
+        self.open_documents(&target, launch.files());
         for folder in launch.folders() {
             let fresh = self.create_window(None, size, 1.0);
             self.new_untitled(&fresh);
@@ -1636,9 +1706,8 @@ impl AppActions for WindowActions<'_> {
                 true
             }
             CommandId::FileOpen => {
-                for path in controller.open_dialog() {
-                    controller.open_document(&cell, &path);
-                }
+                let paths = controller.open_dialog();
+                controller.open_documents(&cell, &paths);
                 true
             }
             CommandId::FileOpenFolder => {

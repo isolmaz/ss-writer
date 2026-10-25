@@ -1019,15 +1019,11 @@ impl Controller {
                         return report_later(&outbox, error);
                     }
                 };
-                match docs.open_loaded(&done_path, loaded) {
-                    Ok(entry) => {
-                        let mut view = target.view.borrow_mut();
-                        let workspace = view.active_tab().and_then(|tab| tab.workspace.clone());
-                        view.open_tab(entry, workspace, &docs);
-                        target.dirty.set(true);
-                    }
-                    Err(error) => report_later(&outbox, error),
-                }
+                let entry = docs.open_loaded(&done_path, loaded);
+                let mut view = target.view.borrow_mut();
+                let workspace = view.active_tab().and_then(|tab| tab.workspace.clone());
+                view.open_tab(entry, workspace, &docs);
+                target.dirty.set(true);
             },
         );
         if submitted.is_err() {

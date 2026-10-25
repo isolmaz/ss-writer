@@ -1919,7 +1919,7 @@ fn a_workspace_whose_watch_is_lost_has_its_index_rebuilt_by_a_full_run() {
 }
 
 #[test]
-fn a_document_the_recent_list_refuses_is_reported_after_its_background_read() {
+fn a_recent_list_the_database_refuses_does_not_fail_a_background_open() {
     let files = vec![
         text_file("a.md", "# A\n"),
         text_file("cloud.md", "# Cloud\n"),
@@ -1933,22 +1933,13 @@ fn a_document_the_recent_list_refuses_is_reported_after_its_background_read() {
             .execute_batch("DROP TABLE recent_items;")
             .unwrap();
         make_placeholder(&rig.work.join("cloud.md"));
-        rig.answer(MessageBoxResult::Ok);
-        rig.answer(MessageBoxResult::Ok);
         // A placeholder is read on a worker, a word-processor file is imported on one.
         rig.controller
             .open_file(&rig.window(), &rig.work.join("cloud.md"))
             .unwrap();
         open_in_sidebar(rig, &rig.work.join("doc.rtf"));
-        rig.wait_for("both errors", || rig.messages().len() == 2);
-        assert_eq!(
-            rig.messages(),
-            [
-                "The file could not be read or written.",
-                "The file could not be read or written."
-            ]
-        );
-        assert_eq!(rig.tab_count(), 1);
+        rig.wait_for("both documents", || rig.tab_count() == 3);
+        assert_eq!(message_boxes(rig), Vec::<String>::new());
     });
 }
 
@@ -2010,6 +2001,19 @@ fn an_import_that_finishes_after_its_window_was_merged_away_opens_nothing() {
 
 /// What the user is told about a binary file.
 const NOT_TEXT: &str = "This file is not a text file.";
+
+/// The box that names the binary files `paths` of one action, which the editor refused.
+fn refused(paths: &[&Path]) -> String {
+    let heading = match paths {
+        [_] => "The file could not be opened:".to_owned(),
+        _ => format!("{} files could not be opened:", paths.len()),
+    };
+    let lines: Vec<String> = paths
+        .iter()
+        .map(|path| format!("{}: {NOT_TEXT}", path.display()))
+        .collect();
+    format!("{heading}\n\n{}", lines.join("\n"))
+}
 
 /// Text files without a known extension, and what they show.
 const UNKNOWN_TEXT: [(&str, &str); 6] = [
@@ -2275,30 +2279,36 @@ fn a_binary_file_is_refused_with_a_message_by_every_way_of_asking_the_editor_to_
         byte_file("pic.png", PNG_START),
     ];
     with_rig(files, "a.md", nothing, |rig| {
-        // File > Open: the binary file is refused, the text file after it opens.
+        let tool = rig.work.join("tool.exe");
+        let picture = rig.work.join("pic.png");
+        // File > Open: the binary file is refused by name, the text file after it opens.
         rig.services.answer(
             DialogKind::OpenFile,
-            Answer::Paths(vec![rig.work.join("tool.exe"), rig.work.join("notes.kt")]),
+            Answer::Paths(vec![tool.clone(), rig.work.join("notes.kt")]),
         );
         rig.answer(MessageBoxResult::Ok);
         let _ = rig
             .controller
             .run_command(rig.id(), ssw_core::command::CommandId::FileOpen);
-        assert_eq!(message_boxes(rig), [NOT_TEXT]);
+        assert_eq!(message_boxes(rig), [refused(&[tool.as_path()])]);
         assert_eq!(rig.tab_count(), 2);
         assert_eq!(rig.path(), canonical_path(&rig.work.join("notes.kt")));
         assert_eq!(rig.active().mode(), DocMode::Plain);
 
         // A launch (Explorer "Open with", the command line, a forwarded second start) and a
         // dropped file end in the same call: a picture is no more text than a program.
-        for name in ["tool.exe", "pic.png"] {
+        for path in [&tool, &picture] {
             rig.answer(MessageBoxResult::Ok);
             rig.controller.open_launch(&Launch {
-                items: vec![LaunchItem::File(rig.work.join(name))],
+                items: vec![LaunchItem::File(path.clone())],
                 new_window: false,
             });
         }
-        assert_eq!(message_boxes(rig), [NOT_TEXT; 3]);
+        let (tool, picture) = (tool.as_path(), picture.as_path());
+        assert_eq!(
+            message_boxes(rig),
+            [refused(&[tool]), refused(&[tool]), refused(&[picture])]
+        );
         assert_eq!(rig.tab_count(), 2, "no tab shows a refused file");
         let mut open: Vec<PathBuf> = rig
             .controller

@@ -666,6 +666,7 @@ impl UiApp {
             Request::Settings(event) => self.controller.settings_event(event),
             Request::CloseSettings => self.close_settings(),
             Request::Activated(id) => self.controller.check_external_changes(id),
+            Request::OpenFiles(id, paths) => self.controller.open_files(id, &paths),
         }
     }
 
@@ -871,6 +872,8 @@ impl UiApp {
         };
         for launch in link.take_launches() {
             self.controller.open_launch(&launch);
+            // A launch can add recent files and drop the ones that are gone, without a request.
+            self.recent_stale.set(true);
             self.drain_requests();
             // A hidden application (tests) has nothing to bring to the foreground.
             if !self.hidden
@@ -982,6 +985,10 @@ impl UiApp {
         self.controller.pump_files();
         if report.jobs > 0 || !report.external.is_empty() || !report.tick.saved.is_empty() {
             self.controller.refresh_all();
+        }
+        for outcome in &report.external {
+            let doc = outcome.entry.id();
+            self.controller.note_reload(doc, Some(outcome));
         }
         for (_, error) in &report.tick.failed {
             self.controller.report(error);

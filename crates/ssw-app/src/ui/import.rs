@@ -82,18 +82,14 @@ fn finish(
             return;
         }
     };
-    match controller.docs().open_loaded(path, loaded) {
-        Ok(entry) => {
-            let workspace = cell
-                .view
-                .borrow()
-                .active_tab()
-                .and_then(|tab| tab.workspace.clone());
-            cell.view
-                .borrow_mut()
-                .open_tab(entry, workspace, controller.docs());
-            controller.refresh(&cell);
-        }
-        Err(error) => controller.report(&error),
-    }
+    let entry = controller.docs().open_loaded(path, loaded);
+    let workspace = cell
+        .view
+        .borrow()
+        .active_tab()
+        .and_then(|tab| tab.workspace.clone());
+    cell.view
+        .borrow_mut()
+        .open_tab(entry, workspace, controller.docs());
+    controller.refresh(&cell);
 }

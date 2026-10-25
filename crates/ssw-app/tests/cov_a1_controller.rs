@@ -25,7 +25,7 @@ use ssw_core::command::CommandId;
 use ssw_core::edit::Selection;
 use ssw_core::i18n::Arg;
 use ssw_io::folder_search::SearchOptions;
-use ssw_io::session::WindowPlacement;
+use ssw_io::session::{RecentKind, WindowPlacement};
 use ssw_ui::canvas::RecordingCanvas;
 use ssw_ui::editor::blocks_media::MediaEvent;
 use ssw_ui::editor::{EditorEvent, LinkTarget};
@@ -192,6 +192,19 @@ fn with_rig(settings: &str, body: impl FnOnce(&Rig)) {
 
 fn text_of(id: &str) -> String {
     localizer_for("en").text(id)
+}
+
+/// The one box that names the files `paths`, none of which opened because it no longer exists.
+fn gone_box(paths: &[PathBuf]) -> String {
+    let heading = match paths {
+        [_] => "The file could not be opened:".to_owned(),
+        _ => format!("{} files could not be opened:", paths.len()),
+    };
+    let lines: Vec<String> = paths
+        .iter()
+        .map(|path| format!("{}: {}", path.display(), text_of("app-error-not-found")))
+        .collect();
+    format!("{heading}\n\n{}", lines.join("\n"))
 }
 
 fn set_readonly(path: &Path, readonly: bool) {
@@ -598,7 +611,7 @@ fn a_launch_adds_tabs_to_the_active_window_and_gives_folders_their_own() {
             new_window: false,
         });
         assert_eq!(names(&first), [file("notes.md"), file("a.md")]);
-        assert_eq!(rig.messages(), [text_of("app-error-not-found")]);
+        assert_eq!(rig.messages(), [gone_box(&[rig.work.join("missing.md")])]);
         let windows = rig.controller.windows();
         assert_eq!(windows.len(), 2);
         let fresh = &windows[1];
@@ -609,6 +622,80 @@ fn a_launch_adds_tabs_to_the_active_window_and_gives_folders_their_own() {
             Some(folder.as_path())
         );
         assert_eq!(rig.controller.active_window().unwrap().id, fresh.id);
+    });
+}
+
+#[test]
+fn the_files_of_a_launch_that_do_not_open_are_named_in_one_box() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let first = rig.window();
+        let gone = [rig.work.join("gone-1.md"), rig.work.join("gone-2.md")];
+        rig.ok();
+        rig.controller.open_launch(&Launch {
+            items: vec![
+                LaunchItem::File(gone[0].clone()),
+                LaunchItem::File(rig.work.join("a.md")),
+                LaunchItem::File(gone[1].clone()),
+            ],
+            new_window: false,
+        });
+        assert_eq!(names(&first), [file("notes.md"), file("a.md")]);
+        assert_eq!(rig.messages(), [gone_box(&gone)]);
+    });
+}
+
+#[test]
+fn file_open_names_every_file_it_could_not_open_in_one_box() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let window = rig.window();
+        let gone = [rig.work.join("gone-1.md"), rig.work.join("gone-2.md")];
+        let picked = vec![gone[0].clone(), rig.work.join("b.md"), gone[1].clone()];
+        let services = &rig.services;
+        services.answer(DialogKind::OpenFile, Answer::Paths(picked));
+        rig.ok();
+        assert!(handled(&rig.cmd(CommandId::FileOpen)));
+        assert_eq!(names(&window), [file("notes.md"), file("b.md")]);
+        let boxes: Vec<String> = services
+            .dialog_log()
+            .into_iter()
+            .filter(|dialog| dialog.kind == DialogKind::MessageBox)
+            .map(|dialog| dialog.message)
+            .collect();
+        assert_eq!(boxes, [gone_box(&gone)]);
+    });
+}
+
+#[test]
+fn a_file_that_vanished_is_taken_off_the_recent_list_when_it_fails_to_open() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let window = rig.window();
+        let recent = || -> Vec<PathBuf> {
+            let items = rig
+                .controller
+                .docs()
+                .env()
+                .store
+                .borrow()
+                .recent_items(RecentKind::File)
+                .unwrap();
+            items.into_iter().map(|item| item.path).collect()
+        };
+        let a = rig.work.join("a.md");
+        rig.open("a.md");
+        let key = active_key(&window);
+        assert!(recent().iter().any(|path| path.ends_with("a.md")));
+        rig.controller.close_tab(&window, key);
+
+        std::fs::remove_file(&a).unwrap();
+        rig.ok();
+        rig.controller.open_launch(&Launch {
+            items: vec![LaunchItem::File(a.clone())],
+            new_window: false,
+        });
+        assert_eq!(rig.messages(), [gone_box(&[a])]);
+        let left = recent();
+        assert!(left.iter().all(|path| !path.ends_with("a.md")), "{left:?}");
+        assert!(left.iter().any(|path| path.ends_with("notes.md")), "{left:?}");
     });
 }
 
@@ -719,7 +806,7 @@ fn a_startup_plan_restores_tabs_skips_what_is_gone_and_picks_the_active_window()
         };
         rig.ok();
         rig.controller.open_plan(&plan);
-        assert_eq!(rig.messages(), [text_of("app-error-not-found")]);
+        assert_eq!(rig.messages(), [gone_box(&[rig.work.join("missing.md")])]);
 
         let windows = rig.controller.windows();
         assert_eq!(windows.len(), 5);
@@ -763,6 +850,76 @@ fn a_startup_plan_restores_tabs_skips_what_is_gone_and_picks_the_active_window()
         });
         assert_eq!(rig.controller.active_window().unwrap().id, windows[3].id);
         assert_eq!(rig.controller.windows().len(), 5);
+    });
+}
+
+#[test]
+fn a_startup_plan_names_every_file_it_could_not_open_in_one_box() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let gone = [
+            rig.work.join("gone-1.md"),
+            rig.work.join("gone-2.md"),
+            rig.work.join("sub").join("gone-3.md"),
+        ];
+        let tab = |path: &Path| PlannedTab {
+            document: PlannedDocument::File(path.to_path_buf()),
+            workspace: None,
+        };
+        let plan = StartupPlan {
+            windows: vec![
+                PlannedWindow {
+                    placement: None,
+                    tabs: vec![tab(&gone[0]), tab(&gone[1])],
+                    active_tab: Some(0),
+                },
+                PlannedWindow {
+                    placement: None,
+                    tabs: vec![tab(&gone[2])],
+                    active_tab: None,
+                },
+            ],
+            active_window: Some(0),
+        };
+        rig.ok();
+        rig.controller.open_plan(&plan);
+        assert_eq!(rig.messages(), [gone_box(&gone)]);
+        assert_eq!(rig.controller.windows().len(), 3);
+    });
+}
+
+#[test]
+fn a_startup_plan_shows_a_file_once_per_window_without_leaking_a_user_of_it() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let a = rig.work.join("a.md");
+        let b = rig.work.join("b.md");
+        let tab = |path: &Path| PlannedTab {
+            document: PlannedDocument::File(path.to_path_buf()),
+            workspace: None,
+        };
+        let plan = StartupPlan {
+            windows: vec![PlannedWindow {
+                placement: None,
+                tabs: vec![tab(&a), tab(&b), tab(&a)],
+                active_tab: Some(2),
+            }],
+            active_window: Some(0),
+        };
+        rig.controller.open_plan(&plan);
+        assert!(rig.messages().is_empty());
+        let restored = Rc::clone(&rig.controller.windows()[1]);
+        assert_eq!(names(&restored), [file("a.md"), file("b.md")]);
+        assert_eq!(
+            active_key(&restored),
+            keys(&restored)[0],
+            "the repeated tab activates the tab that shows the file"
+        );
+
+        rig.controller.close_tab(&restored, keys(&restored)[0]);
+        assert!(
+            rig.controller.docs().find(&a).is_none(),
+            "closing its only tab closes the document"
+        );
+        assert!(rig.controller.docs().find(&b).is_some());
     });
 }
 
@@ -848,10 +1005,11 @@ fn links_open_the_browser_documents_and_files_in_the_documents_folder() {
         rig.act(link("notes.txt"));
         rig.act(link(&absolute_markdown));
         assert_eq!(names(&window)[4..], [file("notes.txt"), file("d.md")]);
-        // A missing document is reported.
+        // A missing document is reported, by name.
+        let missing = rig.entry().path().unwrap().with_file_name("missing.md");
         rig.ok();
         rig.act(link("missing.md"));
-        assert_eq!(rig.messages(), [text_of("app-error-not-found")]);
+        assert_eq!(rig.messages(), [gone_box(&[missing])]);
         assert_eq!(names(&window).len(), 6);
         assert_eq!(
             rig.services.shell_log().len(),
@@ -2133,7 +2291,7 @@ fn overlay_actions_open_files_and_select_the_match() {
         rig.act(ShellAction::Overlay(OverlayAction::OpenFile(
             "gone.md".to_owned(),
         )));
-        assert_eq!(rig.messages(), [text_of("app-error-not-found")]);
+        assert_eq!(rig.messages(), [gone_box(&[root.join("gone.md")])]);
         assert_eq!(names(&window).len(), 4);
 
         // If every tab disappears while the error is shown, there is no tab to select in.

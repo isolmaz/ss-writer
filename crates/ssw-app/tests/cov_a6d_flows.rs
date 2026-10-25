@@ -404,7 +404,7 @@ fn an_import_loss_with_a_detail_is_listed_with_it() {
                     detail: None,
                 },
             ];
-            let entry = rig.controller.docs().open_loaded(&other, loaded).unwrap();
+            let entry = rig.controller.docs().open_loaded(&other, loaded);
             rig.window().view.borrow_mut().add_tab(entry, None);
             rig.controller.refresh_all();
             assert_eq!(rig.banners(), [BannerKind::ImportLoss]);
@@ -539,6 +539,54 @@ fn a_file_that_cannot_be_reloaded_is_reported_and_an_unknown_window_checks_nothi
             rig.controller.check_external_changes(rig.id());
             assert_eq!(rig.text(), "one\ntwo\n");
             assert_eq!(rig.messages().len(), 1);
+        },
+    );
+}
+
+#[test]
+fn a_file_that_stays_unreadable_is_reported_once_and_again_after_it_was_read() {
+    let faults = Arc::new(FaultFs::new());
+    let installed = Arc::clone(&faults);
+    with_rig(
+        NO_AUTOSAVE,
+        &[("notes.md", "one\n")],
+        move |core, _| install(core, installed),
+        |rig| {
+            // A sync client keeps the file locked: every activation finds it changed and cannot
+            // read it. Closing the box activates the window again, so only the first is shown.
+            std::fs::write(rig.path(), "one\ntwo\n").unwrap();
+            faults.fail_always(FsOp::Read, FsFailure::AccessDenied);
+            rig.answer(MessageBoxResult::Ok);
+            for _ in 0..3 {
+                rig.controller.check_external_changes(rig.id());
+            }
+            assert_eq!(rig.messages(), [FILE_ERROR]);
+            assert_eq!(rig.text(), "one\n");
+
+            // The file can be read again: it is reloaded, quietly.
+            faults.clear();
+            rig.controller.check_external_changes(rig.id());
+            assert_eq!(rig.text(), "one\ntwo\n");
+            assert_eq!(rig.messages().len(), 1);
+
+            // A later failure is news again.
+            std::fs::write(rig.path(), "one\ntwo\nthree\n").unwrap();
+            faults.fail_always(FsOp::Read, FsFailure::AccessDenied);
+            rig.answer(MessageBoxResult::Ok);
+            rig.controller.check_external_changes(rig.id());
+            rig.controller.check_external_changes(rig.id());
+            assert_eq!(rig.messages(), [FILE_ERROR, FILE_ERROR]);
+
+            // The file is put back as the document has it: a check that finds nothing to do ends
+            // the failure as well.
+            faults.clear();
+            std::fs::write(rig.path(), "one\ntwo\n").unwrap();
+            rig.controller.check_external_changes(rig.id());
+            std::fs::write(rig.path(), "one\ntwo\nfour\n").unwrap();
+            faults.fail_always(FsOp::Read, FsFailure::AccessDenied);
+            rig.answer(MessageBoxResult::Ok);
+            rig.controller.check_external_changes(rig.id());
+            assert_eq!(rig.messages().len(), 3);
         },
     );
 }

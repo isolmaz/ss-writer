@@ -26,6 +26,13 @@ app-error-needs-save-as = Imported documents are saved with Save as, or saved ba
 app-error-unsupported = This format cannot be written.
 app-error-already-open = This file is already open in another tab.
 
+# One box for the files that a single action could not open: a heading, then a line per file.
+app-open-failed = { $count ->
+    [one] The file could not be opened:
+   *[other] { $count } files could not be opened:
+}
+app-open-failed-file = { $path }: { $reason }
+
 app-loss-merged-cells = Merged table cells
 app-loss-headers-footers = Headers and footers
 app-loss-columns = Text columns

@@ -168,9 +168,9 @@ fn file_key(path: &Path) -> String {
 /// none does.
 fn tab_for(window: &mut PlannedWindow, path: &Path) -> usize {
     let wanted = file_key(path);
-    let shown = window.tabs.iter().position(|tab| {
-        matches!(&tab.document, PlannedDocument::File(open) if file_key(open) == wanted)
-    });
+    let shown = window.tabs.iter().position(
+        |tab| matches!(&tab.document, PlannedDocument::File(open) if file_key(open) == wanted),
+    );
     shown.unwrap_or_else(|| {
         window.tabs.push(file_tab(path));
         window.tabs.len() - 1

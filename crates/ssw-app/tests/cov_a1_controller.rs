@@ -695,7 +695,10 @@ fn a_file_that_vanished_is_taken_off_the_recent_list_when_it_fails_to_open() {
         assert_eq!(rig.messages(), [gone_box(&[a])]);
         let left = recent();
         assert!(left.iter().all(|path| !path.ends_with("a.md")), "{left:?}");
-        assert!(left.iter().any(|path| path.ends_with("notes.md")), "{left:?}");
+        assert!(
+            left.iter().any(|path| path.ends_with("notes.md")),
+            "{left:?}"
+        );
     });
 }
 

@@ -105,7 +105,7 @@ description = "Open and save Markdown, plain text, Mermaid, TextBundle, DOCX, OD
 id = "plain-text-mode"
 title = "Plain text mode"
 spec = "4.1"
-description = "Text files such as .txt, logs and source code open as plain lines: every line is shown as written and nothing is rendered; Enter inserts a line break, Tab an indent, and the Markdown formatting commands are off. View → Word wrap wraps long lines at the window edge or lets them run on and scroll sideways, and View → Render as Markdown shows the file as live Markdown without changing how it is saved."
+description = "Every file whose content is text opens, whatever its name; binary files are refused with a message. Text opens as plain lines with quiet syntax colors for the languages SS Writer knows; the language comes from the file name, extension, a #! line or an XML/HTML declaration, the status bar names it and lets you pick another one per file. Enter inserts a line break, Tab an indent, and the Markdown formatting commands are off. View → Word wrap wraps long lines or lets them scroll sideways, and View → Render as Markdown shows the file as live Markdown without changing how it is saved."
 
 [[feature]]
 id = "mermaid-files"
@@ -147,7 +147,7 @@ description = "Emergency save of unsaved documents on a crash and an offer to re
 id = "format-document"
 title = "Format document"
 spec = "4.7"
-description = "Indents a JSON, XML or HTML file without rewriting it: every token is copied byte for byte, preserved content stays verbatim and malformed markup is refused instead of changed."
+description = "Indents a JSON, XML or HTML file with the indent you choose (2 spaces, 4 spaces or a tab) without rewriting it: every token is copied byte for byte, pre, script and style bodies stay verbatim and malformed markup is refused instead of changed."
 
 [[feature]]
 id = "workspace-sidebar"
@@ -219,4 +219,4 @@ description = "Settings > General > Default apps… opens the Windows page where
 id = "distribution-updates"
 title = "Installer, portable zip and updates"
 spec = "13"
-description = "A per-user MSI that needs no administrator rights, a portable zip, a winget package, and a weekly update check that can be turned off: the banner downloads the new version with a progress bar, checks it against the release checksums and installs it when you choose to restart."
+description = "A per-user MSI that needs no administrator rights, a portable zip, winget manifests attached to every release, and a weekly update check that can be turned off: the banner downloads the new version with a progress bar, checks it against the release checksums and installs it when you choose to restart."

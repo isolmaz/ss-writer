@@ -201,7 +201,7 @@ The behavior of each feature is defined in [`docs/spec.md`](docs/spec.md); [`doc
 - **Keyboard shortcuts** — A complete default keymap without Ctrl+Alt conflicts, every command rebindable, with conflicts flagged.
 - **Windows integration** — File associations, an Open with SS Writer folder verb, a Jump List, an Explorer preview pane, touch and pen input, IME and dictation support and UI Automation for every control.
 - **Default apps button** — Settings > General > Default apps… opens the Windows page where you choose which app opens Markdown and text files; the installer offers SS Writer under Open with but never takes over a default.
-- **Installer, portable zip and updates** — A per-user MSI that needs no administrator rights, a portable zip, a winget package and a weekly update notification that can be turned off.
+- **Installer, portable zip and updates** — A per-user MSI that needs no administrator rights, a portable zip, winget manifests attached to every release, and a weekly update check that can be turned off: the banner downloads the new version with a progress bar, checks it against the release checksums and installs it when you choose to restart.
 
 ## Install
 
@@ -215,8 +215,11 @@ Download the files of a release from the [Releases page](https://github.com/isol
 
 ### winget
 
+SS Writer is not in the winget community repository yet. The manifests attached to a release install it from a local folder (local manifests must be enabled once, from an elevated prompt):
+
 ```powershell
-winget install isolmaz.SSWriter
+winget settings --enable LocalManifestFiles
+winget install --manifest <folder with the release's .yaml files>
 ```
 
 ### MSI (per user)

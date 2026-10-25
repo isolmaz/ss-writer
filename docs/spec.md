@@ -5,7 +5,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Name: **SS Writer** — "Markdown & Text Editor". Binary `SSWriter.exe`.
 - Platform: Windows 11 22H2 (build 22621) or later, x64. Lower builds: installer refuses, the exe shows a message box and exits. No Windows 10 code paths.
 - UI language: English. All UI strings come from Fluent `.ftl` files (`assets/i18n/<locale>/*.ftl`); no string literals in UI code. Locale = OS UI language, overridable in Settings; fallback `en`. Numbers/dates formatted with `GetNumberFormatEx`/`GetDateFormatEx` for the active locale.
-- Principles: speed, quality, simplicity. The file on disk is the truth; the app never writes non-standard markers into user files. App state lives in `%LOCALAPPDATA%\SS Writer\` (or next to the exe in portable mode).
+- Principles: speed, quality, simplicity. The file on disk is the truth; the app never writes non-standard markers into user files. App state lives in `%LOCALAPPDATA%\SS Writer\` and `settings.json` in `%APPDATA%\SS Writer\` (both in the `data` folder next to the exe in portable mode).
 
 ## 1. Window
 
@@ -220,11 +220,11 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 ## 10. Settings (`Ctrl+,`)
 Stored in `settings.json` (human-editable; unknown keys preserved).
 - **General**: language; on startup (restore session | new document | default folder); default folder; autosave on/off + delay; new file location; sync file name with heading; check for updates.
-- **Appearance**: theme; accent; Mica on/off; sidebar font size; show status bar; show B I U pill.
-- **Editor**: text/heading/code fonts; size; line height; paragraph spacing; line width; list indent (align | 2 | 4 | tab); auto-hide Markdown; typewriter position + dead zone; spell check + languages; sort completed tasks; syntax highlighting; format tables on exit; reading speed.
+- **Appearance**: theme; accent; Mica on/off; sidebar font size; show status bar; show B I U pill; zoom.
+- **Editor**: text/heading/code fonts; size; line height; paragraph spacing; line width; list indent (align | 2 | 4 | tab); format indent (2 spaces | 4 spaces | tab); auto-hide Markdown; typewriter position + dead zone; spell check + languages; sort completed tasks; syntax highlighting; format tables on exit; hide the YAML front matter card; reading speed.
 - **Sidebar**: sort, folders first, show extensions, hidden items, hide images, hide non-Markdown, modified date.
 - **Attachments**: location, naming template, load remote images.
-- **Export**: page size, margins, page numbers, black text, default format.
+- **Export**: page size, margins, base font size, page numbers, black text, light theme, include title, default format.
 - **Shortcuts**: every command, rebindable; conflicts flagged.
 - **Advanced**: index limits (max files, default 100 000), history retention, open logs folder, reset settings.
 
@@ -263,7 +263,7 @@ Stored in `settings.json` (human-editable; unknown keys preserved).
 - File associations registered per user by the installer (`OpenWithProgids`; Settings button opens `ms-settings:defaultapps`). Folder verb "Open with SS Writer".
 - The installer also registers the application itself (`Applications\SSWriter.exe` with its open command, friendly name and icon) and lists it under `*\OpenWithProgids`, so "Open with" offers SS Writer for any file. `.json`, `.csv`, `.log`, `.xml`, `.html`, `.css`, `.js`, `.yml` and `.py` name it directly. No default association is taken.
 - Jump List: recent files/folders, "New window".
-- Explorer preview pane handler (`ssw-preview.dll`, `IPreviewHandler`) for `.md`/`.markdown`/`.mmd`.
+- Explorer preview pane handler (`ssw_preview.dll`, `IPreviewHandler`) for `.md`/`.markdown`/`.mmd`.
 - DirectManipulation for touchpad/touch panning with inertia; animated mouse wheel; pen acts as pointer (barrel button = right click). Touch keyboard appears on tap into text (TSF + UIA).
 - TSF text store for IME, dictation (`Win+H`), emoji panel (`Win+.`), reconversion.
 - UI Automation for every control: editor as Document with TextPattern; tree, tabs, buttons, menus with proper roles. Hidden system caret (`CreateCaret`/`SetCaretPos`) tracks the drawn caret. Honors `SPI_GETCLIENTAREAANIMATION`. Full keyboard navigation (F6 cycles panes).

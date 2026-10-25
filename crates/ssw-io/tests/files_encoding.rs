@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use ssw_io::encoding::{
@@ -436,6 +437,22 @@ fn encoding_names_labels_and_serde() {
     for encoding in selectable {
         assert_eq!(TextEncoding::from_label(encoding.name()), Some(encoding));
     }
+}
+
+#[test]
+fn every_selectable_encoding_is_offered_once() {
+    let names: Vec<&str> = TextEncoding::selectable()
+        .into_iter()
+        .map(TextEncoding::name)
+        .collect();
+    let distinct: HashSet<&str> = names.iter().copied().collect();
+    assert_eq!(distinct.len(), names.len(), "{names:?}");
+    // ISO-8859-9 is the Turkish code page the menu offers as windows-1254.
+    assert!(names.contains(&"windows-1254"), "{names:?}");
+    assert_eq!(
+        TextEncoding::from_label("iso-8859-9"),
+        TextEncoding::from_label("windows-1254")
+    );
 }
 
 #[test]

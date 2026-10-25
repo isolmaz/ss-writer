@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::{Args, Launch, LaunchItem};
 use ssw_app::commands::Dispatch;
-use ssw_app::documents::replace_text;
+use ssw_app::documents::{DocEntry, replace_text};
 use ssw_app::i18n::localizer_for;
 use ssw_app::session::{PlannedDocument, PlannedTab, PlannedWindow, StartupPlan};
 use ssw_app::startup::ProcessEnv;
@@ -26,6 +26,7 @@ use ssw_core::edit::Selection;
 use ssw_core::i18n::Arg;
 use ssw_io::folder_search::SearchOptions;
 use ssw_io::session::{RecentKind, WindowPlacement};
+use ssw_ui::access::Role;
 use ssw_ui::canvas::RecordingCanvas;
 use ssw_ui::editor::blocks_media::MediaEvent;
 use ssw_ui::editor::{EditorEvent, LinkTarget};
@@ -248,6 +249,43 @@ fn handled(outcome: &Dispatch) -> bool {
     matches!(outcome, Dispatch::Handled)
 }
 
+/// The document of the active tab of `cell`.
+fn entry_of(cell: &WindowCell) -> Rc<DocEntry> {
+    let view = cell.view.borrow();
+    Rc::clone(&view.active_tab().expect("a tab is open").entry)
+}
+
+/// Replaces the text of `entry`; the windows show the change at their next refresh.
+fn edit(entry: &DocEntry, text: &str) {
+    assert!(replace_text(&mut entry.document().borrow_mut(), text));
+}
+
+/// The question that asks what to do with the unsaved changes of the document `name`.
+fn unsaved_question(name: &str) -> String {
+    localizer_for("en").format("window-unsaved-message", &[("name", Arg::Str(name))])
+}
+
+/// Whether each tab of `cell` shows the unsaved-changes dot, left to right.
+fn dots(cell: &WindowCell) -> Vec<bool> {
+    let engine = MonoTextEngine::default();
+    let mut view = cell.view.borrow_mut();
+    view.paint(&mut RecordingCanvas::new(), &engine, false);
+    let unsaved = text_of("tabs-unsaved");
+    view.access_tree(&engine, "SS Writer")
+        .nodes()
+        .iter()
+        .filter(|node| node.role == Role::TabItem)
+        .map(|node| node.description == unsaved)
+        .collect()
+}
+
+/// A small Word document of the shared fixtures.
+fn word_document() -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/docx/mammoth_empty.docx");
+    std::fs::read(path).unwrap()
+}
+
 impl Rig {
     fn window(&self) -> Rc<WindowCell> {
         Rc::clone(&self.controller.windows()[0])
@@ -310,12 +348,33 @@ impl Rig {
         self.answer(MessageBoxResult::Ok);
     }
 
+    /// The user clicks the tab `key`.
+    fn activate(&self, key: u64) {
+        let event = TitleEvent::Tabs(TabsEvent::Activated(key));
+        self.act(ShellAction::Title(event));
+    }
+
+    /// The user picks `path` in the next Save As dialog.
+    fn pick_save_target(&self, path: &Path) {
+        let answer = Answer::Paths(vec![path.to_path_buf()]);
+        self.services.answer(DialogKind::SaveFile, answer);
+    }
+
     fn messages(&self) -> Vec<String> {
         self.services
             .dialog_log()
             .into_iter()
             .map(|dialog| dialog.message)
             .collect()
+    }
+
+    /// How often the unsaved-changes question about the document `name` was shown.
+    fn asked(&self, name: &str) -> usize {
+        let question = unsaved_question(name);
+        self.messages()
+            .iter()
+            .filter(|message| **message == question)
+            .count()
     }
 
     fn requests(&self) -> Vec<Request> {
@@ -1078,32 +1137,179 @@ fn links_open_the_browser_documents_and_files_in_the_documents_folder() {
 
 // ----- unsaved changes, closing tabs and windows ------------------------------------------------
 
+/// Closing the active tab of `window` asks about its unsaved changes: Cancel keeps the tab and
+/// Don't save closes it.
+fn closing_asks(rig: &Rig, window: &Rc<WindowCell>) {
+    let key = active_key(window);
+    let tabs = keys(window).len();
+    let name = entry_of(window).title(rig.controller.i18n());
+    let before = rig.asked(&name);
+
+    rig.answer(MessageBoxResult::Cancel);
+    let outcome = rig.controller.close_tab(window, key);
+    assert_eq!(outcome, CloseOutcome::Cancelled);
+    assert_eq!(keys(window).len(), tabs);
+
+    rig.answer(MessageBoxResult::DontSave);
+    let outcome = rig.controller.close_tab(window, key);
+    assert_eq!(outcome, CloseOutcome::Closed);
+    assert_eq!(keys(window).len(), tabs - 1);
+    assert_eq!(rig.asked(&name), before + 2);
+}
+
 #[test]
-fn a_failing_autosave_is_reported_when_switching_and_keeps_the_tab_open() {
+fn a_failing_autosave_is_reported_once_and_closing_asks_what_to_do_with_the_changes() {
     with_rig("{}", |rig| {
         rig.open("a.md");
         let window = rig.window();
         let ids = keys(&window);
         let a_path = rig.work.join("a.md");
+        let name = entry_of(&window).title(rig.controller.i18n());
         // The file turns read-only behind the document's back.
         set_readonly(&a_path, true);
         rig.set_text("changed\n");
 
+        // Leaving the tab writes the document and shows the failure.
         rig.ok();
-        rig.act(ShellAction::Title(TitleEvent::Tabs(TabsEvent::Activated(
-            ids[0],
-        ))));
+        rig.activate(ids[0]);
         assert_eq!(rig.messages(), [text_of("app-error-read-only")]);
         assert_eq!(active_key(&window), ids[0]);
 
+        // The same failure of the same document is not shown again.
+        rig.activate(ids[1]);
+        rig.activate(ids[0]);
+        rig.activate(ids[1]);
+        assert_eq!(rig.messages().len(), 1);
+
+        // Closing asks instead: Cancel keeps the tab, Save shows why it fails, Don't save drops
+        // the changes.
+        rig.answer(MessageBoxResult::Cancel);
+        let outcome = rig.controller.close_tab(&window, ids[1]);
+        assert_eq!(outcome, CloseOutcome::Cancelled);
+        rig.answer(MessageBoxResult::Save);
         rig.ok();
-        assert_eq!(
-            rig.controller.close_tab(&window, ids[1]),
-            CloseOutcome::Cancelled
-        );
+        let outcome = rig.controller.close_tab(&window, ids[1]);
+        assert_eq!(outcome, CloseOutcome::Cancelled);
         assert_eq!(names(&window), [file("notes.md"), file("a.md")]);
-        assert_eq!(rig.messages().len(), 2);
+        let messages = rig.messages();
+        assert_eq!(messages.last(), Some(&text_of("app-error-read-only")));
+        rig.answer(MessageBoxResult::DontSave);
+        let outcome = rig.controller.close_tab(&window, ids[1]);
+        assert_eq!(outcome, CloseOutcome::Closed);
+        assert_eq!(names(&window), [file("notes.md")]);
+        assert_eq!(rig.asked(&name), 3);
+
         set_readonly(&a_path, false);
+        let on_disk = std::fs::read_to_string(&a_path).unwrap();
+        assert_eq!(on_disk, "# A\nfind the needle\n");
+    });
+}
+
+#[test]
+fn closing_an_untitled_tab_with_text_asks_even_though_autosave_is_on() {
+    with_rig("{}", |rig| {
+        let window = rig.window();
+        assert!(handled(&rig.cmd(CommandId::TabNew)));
+        rig.set_text("draft\n");
+        let key = active_key(&window);
+        let name = entry_of(&window).title(rig.controller.i18n());
+        assert_eq!(dots(&window), [false, true]);
+
+        rig.answer(MessageBoxResult::Cancel);
+        let outcome = rig.controller.close_tab(&window, key);
+        assert_eq!(outcome, CloseOutcome::Cancelled);
+        assert_eq!(names(&window), [file("notes.md"), None]);
+        assert_eq!(rig.asked(&name), 1);
+
+        let target = rig.work.join("draft.md");
+        rig.answer(MessageBoxResult::Save);
+        rig.pick_save_target(&target);
+        let outcome = rig.controller.close_tab(&window, key);
+        assert_eq!(outcome, CloseOutcome::Closed);
+        assert_eq!(names(&window), [file("notes.md")]);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "draft\n");
+
+        assert!(handled(&rig.cmd(CommandId::TabNew)));
+        rig.set_text("again\n");
+        let key = active_key(&window);
+        rig.answer(MessageBoxResult::DontSave);
+        let outcome = rig.controller.close_tab(&window, key);
+        assert_eq!(outcome, CloseOutcome::Closed);
+        assert_eq!(names(&window), [file("notes.md")]);
+    });
+}
+
+#[test]
+fn documents_autosave_cannot_write_show_the_dot_and_ask_when_closed() {
+    with_rig("{}", |rig| {
+        let window = rig.window();
+        std::fs::write(rig.work.join("w.docx"), word_document()).unwrap();
+
+        // A read-only file.
+        let read_only = rig.work.join("a.md");
+        set_readonly(&read_only, true);
+        rig.open("a.md");
+        rig.set_text("changed\n");
+        assert_eq!(dots(&window), [false, true]);
+        closing_asks(rig, &window);
+        set_readonly(&read_only, false);
+
+        // A document imported from Word is written by its converter on request only.
+        rig.open("w.docx");
+        rig.set_text("changed\n");
+        assert_eq!(dots(&window), [false, true]);
+        closing_asks(rig, &window);
+
+        // The file changed on disk while the document has unsaved edits.
+        rig.open("b.md");
+        rig.set_text("mine\n");
+        std::fs::write(rig.work.join("b.md"), "theirs, and more\n").unwrap();
+        rig.controller.check_external_changes(window.id);
+        assert_eq!(dots(&window), [false, true]);
+        closing_asks(rig, &window);
+
+        // The file was deleted.
+        rig.open("c.markdown");
+        rig.set_text("mine\n");
+        std::fs::remove_file(rig.work.join("c.markdown")).unwrap();
+        rig.controller.check_external_changes(window.id);
+        assert_eq!(dots(&window), [false, true]);
+        closing_asks(rig, &window);
+
+        // A document autosave writes shows no dot and closes without a question.
+        rig.open("d.md");
+        rig.set_text("x\n");
+        assert_eq!(dots(&window), [false, false]);
+        let outcome = rig.controller.close_tab(&window, active_key(&window));
+        assert_eq!(outcome, CloseOutcome::Closed);
+        let on_disk = std::fs::read_to_string(rig.work.join("d.md")).unwrap();
+        assert_eq!(on_disk, "x\n");
+    });
+}
+
+#[test]
+fn a_deactivated_window_writes_its_own_documents_at_once() {
+    with_rig("{}", |rig| {
+        let first = rig.window();
+        rig.open("a.md");
+        edit(&entry_of(&first), "a edited\n");
+        assert!(handled(&rig.cmd(CommandId::FileNewWindow)));
+        let second = Rc::clone(&rig.controller.windows()[1]);
+        let b_path = rig.work.join("b.md");
+        rig.controller.open_file(&second, &b_path).unwrap();
+        edit(&entry_of(&second), "b edited\n");
+        let disk = |name: &str| std::fs::read_to_string(rig.work.join(name)).unwrap();
+
+        rig.controller.window_deactivated(WindowId(999));
+        assert_eq!(disk("a.md"), "# A\nfind the needle\n");
+        assert_eq!(disk("b.md"), "# B\n");
+
+        rig.controller.window_deactivated(second.id);
+        assert_eq!(disk("a.md"), "# A\nfind the needle\n");
+        assert_eq!(disk("b.md"), "b edited\n");
+
+        rig.controller.window_deactivated(first.id);
+        assert_eq!(disk("a.md"), "a edited\n");
     });
 }
 
@@ -1214,6 +1420,112 @@ fn closing_a_window_asks_about_every_tab_until_one_is_cancelled() {
         rig.answer(MessageBoxResult::DontSave);
         rig.answer(MessageBoxResult::DontSave);
         assert!(rig.controller.request_close_window(id));
+    });
+}
+
+#[test]
+fn a_document_shown_in_two_windows_is_asked_about_when_the_last_window_goes() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let first = rig.window();
+        rig.open("a.md");
+        assert!(handled(&rig.cmd(CommandId::FileNewWindow)));
+        let second = Rc::clone(&rig.controller.windows()[1]);
+        let a_path = rig.work.join("a.md");
+        rig.controller.open_file(&second, &a_path).unwrap();
+        let entry = entry_of(&first);
+        assert_eq!(entry.users(), 2);
+        edit(&entry, "edited\n");
+        let name = entry.title(rig.controller.i18n());
+
+        // The other window keeps the document open: closing either window asks nothing.
+        assert!(rig.controller.request_close_window(first.id));
+        assert!(rig.controller.request_close_window(second.id));
+        assert!(rig.messages().is_empty());
+
+        // Closing both asks once.
+        let both = [first.id, second.id];
+        rig.answer(MessageBoxResult::Cancel);
+        assert!(!rig.controller.request_close_windows(&both));
+        assert_eq!(rig.asked(&name), 1);
+        rig.answer(MessageBoxResult::DontSave);
+        assert!(rig.controller.request_close_windows(&both));
+        assert_eq!(rig.asked(&name), 2);
+    });
+}
+
+#[test]
+fn two_tabs_of_one_document_are_asked_about_once() {
+    with_rig(NO_AUTOSAVE, |rig| {
+        let first = rig.window();
+        rig.open("a.md");
+        assert!(handled(&rig.cmd(CommandId::FileNewWindow)));
+        let second = Rc::clone(&rig.controller.windows()[1]);
+        let a_path = rig.work.join("a.md");
+        rig.controller.open_file(&second, &a_path).unwrap();
+        let entry = entry_of(&first);
+        edit(&entry, "edited\n");
+        let name = entry.title(rig.controller.i18n());
+        // Merging puts both tabs into one window.
+        assert!(handled(&rig.cmd_in(&first, CommandId::WindowMergeAll)));
+        let tabs = keys(&first);
+        assert_eq!(tabs.len(), 4);
+
+        rig.answer(MessageBoxResult::DontSave);
+        assert!(rig.controller.request_close_window(first.id));
+        assert_eq!(rig.asked(&name), 1);
+
+        // A tab whose document another tab shows closes without a question.
+        let outcome = rig.controller.close_tab(&first, tabs[3]);
+        assert_eq!(outcome, CloseOutcome::Closed);
+        assert_eq!(entry.users(), 1);
+        assert_eq!(rig.asked(&name), 1);
+        rig.answer(MessageBoxResult::Cancel);
+        let outcome = rig.controller.close_tab(&first, tabs[1]);
+        assert_eq!(outcome, CloseOutcome::Cancelled);
+        assert_eq!(rig.asked(&name), 2);
+    });
+}
+
+#[test]
+fn quitting_keeps_untitled_buffers_for_the_session_without_asking() {
+    with_rig("{}", |rig| {
+        let window = rig.window();
+        assert!(handled(&rig.cmd(CommandId::TabNew)));
+        rig.set_text("draft\n");
+        let name = entry_of(&window).title(rig.controller.i18n());
+
+        // The last window goes: the session stores the buffer.
+        assert!(rig.controller.request_close_window(window.id));
+        assert!(rig.messages().is_empty());
+
+        // Another window stays: the buffer is lost with this one.
+        assert!(handled(&rig.cmd(CommandId::FileNewWindow)));
+        let second = Rc::clone(&rig.controller.windows()[1]);
+        rig.answer(MessageBoxResult::Cancel);
+        assert!(!rig.controller.request_close_window(window.id));
+        assert_eq!(rig.asked(&name), 1);
+
+        // Exit closes both.
+        let both = [window.id, second.id];
+        assert!(rig.controller.request_close_windows(&both));
+        assert_eq!(rig.asked(&name), 1);
+    });
+}
+
+#[test]
+fn quitting_asks_about_untitled_buffers_when_the_session_is_not_restored() {
+    with_rig(r#"{"general":{"on_startup":"new_document"}}"#, |rig| {
+        let window = rig.window();
+        assert!(handled(&rig.cmd(CommandId::TabNew)));
+        rig.set_text("draft\n");
+        let name = entry_of(&window).title(rig.controller.i18n());
+
+        rig.answer(MessageBoxResult::Cancel);
+        assert!(!rig.controller.request_close_window(window.id));
+        assert_eq!(rig.asked(&name), 1);
+        rig.answer(MessageBoxResult::DontSave);
+        assert!(rig.controller.request_close_window(window.id));
+        assert_eq!(rig.asked(&name), 2);
     });
 }
 

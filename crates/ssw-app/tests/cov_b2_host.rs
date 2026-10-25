@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::Args;
+use ssw_app::documents::replace_text;
 use ssw_app::startup::{ProcessEnv, boot};
 use ssw_app::ui::controller::Request;
 use ssw_app::ui::host::{UiApp, UiOptions, UiServices, UiShell, WinInstance};
@@ -22,7 +23,7 @@ use ssw_app::ui::shell_view::ShellAction;
 use ssw_app::workers::{DeferredWaker, JobKey, JobKind, JobSpec, WindowId};
 use ssw_core::command::CommandId;
 use ssw_core::edit::{Edit, Selection, Transaction};
-use ssw_ui::geometry::Point;
+use ssw_ui::geometry::{Point, Size};
 use ssw_ui::services::{MemoryClipboard, MessageBoxResult};
 use ssw_ui::shell::settings::SettingsEvent;
 use ssw_ui::shell::titlebar::{MenuKind, TitleEvent};
@@ -209,6 +210,48 @@ fn a_quit_a_window_refuses_leaves_the_loop_running() {
         assert_eq!(app.exit_code(), None);
         assert!(app.idle().is_some());
         assert_eq!(app.controller().windows().len(), 1);
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_quit_asks_once_about_a_document_that_two_windows_show() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "text\n");
+    let services = ScriptedServices::new();
+    let code = start(std::slice::from_ref(&file), tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let app = UiApp::new(core, options(&services, None)).unwrap();
+        app.pump();
+        let second = app
+            .controller()
+            .create_window(None, Size::new(800.0, 600.0), 1.0);
+        app.controller().open_file(&second, &file).unwrap();
+        app.pump();
+        let entry = app.controller().docs().find(&file).unwrap();
+        assert_eq!(entry.users(), 2);
+        assert!(replace_text(&mut entry.document().borrow_mut(), "more\n"));
+
+        // Both windows go with the quit: the document is asked about once.
+        services.answer(
+            DialogKind::MessageBox,
+            Answer::Button(MessageBoxResult::Cancel),
+        );
+        app.controller().push(Request::Quit);
+        app.pump();
+        assert_eq!(app.exit_code(), None);
+        assert_eq!(app.controller().windows().len(), 2);
+        assert_eq!(services.dialog_log().len(), 1);
+
+        services.answer(
+            DialogKind::MessageBox,
+            Answer::Button(MessageBoxResult::DontSave),
+        );
+        app.controller().push(Request::Quit);
+        app.pump();
+        assert_eq!(app.exit_code(), Some(0));
+        assert_eq!(services.dialog_log().len(), 2);
         0
     });
     assert_eq!(code, 0);

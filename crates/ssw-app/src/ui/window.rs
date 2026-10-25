@@ -258,6 +258,9 @@ impl WindowHandler for WindowGlue {
             self.env.controller.set_active_window(self.cell.id);
             // Files may have changed while the user was elsewhere: the loop owner checks them.
             self.env.controller.push(Request::Activated(self.cell.id));
+        } else {
+            // Autosave writes the documents when the user leaves; the loop owner does it.
+            self.env.controller.push(Request::Deactivated(self.cell.id));
         }
         self.platform.activation_changed(active);
     }

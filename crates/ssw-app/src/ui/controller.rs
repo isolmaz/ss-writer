@@ -20,7 +20,7 @@ use ssw_core::format_text::{
 };
 use ssw_core::i18n::{Arg, Localizer};
 use ssw_core::keymap::Keymap;
-use ssw_core::settings::Settings;
+use ssw_core::settings::{Settings, StartupBehavior};
 use ssw_io::session::{Session, ViewState, WindowPlacement};
 use ssw_ui::editor::blocks_media::MediaEvent;
 use ssw_ui::editor::highlight::Language;
@@ -50,7 +50,7 @@ use super::shell_view::{ShellAction, ShellView, TabView, ViewConfig, sidebar_opt
 use super::tree_source::{TreePaths, WorkspaceTree};
 use crate::app::AppCore;
 use crate::commands::{AppActions, Dispatch};
-use crate::documents::{DocEntry, DocError, DocMode, LoadError, replace_text};
+use crate::documents::{DocEntry, DocError, DocId, DocMode, LoadError, replace_text};
 use crate::session::{PlannedDocument, SessionManager, StartupPlan, TabState, WindowState};
 use crate::workers::{JobKey, JobKind, JobSpec, WindowId};
 
@@ -93,6 +93,9 @@ pub enum Request {
     /// Files were dropped on a window: open them there, as File → Open does. The drop only
     /// queues them, so the drag source (Explorer) is not held up by a dialog.
     OpenFiles(WindowId, Vec<PathBuf>),
+    /// A window was deactivated (the user went elsewhere): write its documents
+    /// ([`Controller::window_deactivated`]).
+    Deactivated(WindowId),
 }
 
 /// The state of one window that does not depend on the operating system.
@@ -488,9 +491,9 @@ impl Controller {
 
     /// Brings the tab strip, banners and status bar of `cell` up to date with its documents.
     pub fn refresh(&self, cell: &WindowCell) {
-        let show_dirty = !self.settings.borrow().general.autosave;
+        let autosave = self.settings.borrow().general.autosave;
         let mut view = cell.view.borrow_mut();
-        view.sync_tabs(show_dirty);
+        view.sync_tabs(autosave);
         self.sync_banners(cell.id, &mut view);
         self.sync_update_banner(&mut view);
         self.sync_inspector(cell.id, &mut view);
@@ -717,10 +720,26 @@ impl Controller {
         cell.view.borrow_mut().activate_tab(key);
     }
 
+    /// Writes `entry` for the autosave triggers of a tab switch or a deactivated window and
+    /// shows a failure unless the user has seen the same one for this document already.
     fn flush(&self, entry: &DocEntry) {
-        if let Some(Err(error)) = self.core.borrow().autosave.flush(entry) {
+        let outcome = self.core.borrow().autosave.flush(entry);
+        if let Some(Err(error)) = outcome
+            && self.core.borrow().autosave.is_new_failure(entry, &error)
+        {
             self.report(&error);
         }
+    }
+
+    /// The window `id` was deactivated: its documents are written (spec §4.3).
+    pub fn window_deactivated(&self, id: WindowId) {
+        let Some(cell) = self.window(id) else {
+            return;
+        };
+        for (_, entry) in tab_entries(&cell) {
+            self.flush(&entry);
+        }
+        self.refresh(&cell);
     }
 
     /// Activates the tab of `cell` that shows `path`; false when no tab of the window does.
@@ -890,7 +909,8 @@ impl Controller {
         let Some(entry) = cell.view.borrow().tab(key).map(|tab| Rc::clone(&tab.entry)) else {
             return CloseOutcome::Closed;
         };
-        if !self.confirm_close(cell, key, &entry) {
+        // A document that another tab shows stays open with its changes.
+        if entry.users() <= 1 && !self.confirm_close(cell, key, &entry, false) {
             return CloseOutcome::Cancelled;
         }
         let Some(tab) = cell.view.borrow_mut().close_tab(key) else {
@@ -914,18 +934,25 @@ impl Controller {
         CloseOutcome::Closed
     }
 
-    /// Whether the tab `key` (showing `entry`) may close: with autosave the document is
-    /// flushed, otherwise unsaved changes are asked about (save, discard, cancel). Returns
-    /// false when the user cancelled or the save failed.
-    fn confirm_close(&self, cell: &Rc<WindowCell>, key: u64, entry: &Rc<DocEntry>) -> bool {
-        if self.settings.borrow().general.autosave {
-            if let Some(Err(error)) = self.core.borrow().autosave.flush(entry) {
-                self.report(&error);
-                return false;
-            }
-            return true;
+    /// Whether the document `entry` of the tab `key` may go away with the tab. With autosave it
+    /// is written first; what is still unsaved then — autosave cannot write the document or the
+    /// write failed — is asked about (save, discard, cancel), as is every unsaved document
+    /// without autosave. A failed write is not reported here: the question follows, and Save
+    /// reports it when it fails again. `keeps_untitled`: the session stores untitled buffers
+    /// (the application quits and restores its session), so autosave does not ask about them.
+    /// Returns false when the user cancelled or the save failed.
+    fn confirm_close(
+        &self,
+        cell: &Rc<WindowCell>,
+        key: u64,
+        entry: &Rc<DocEntry>,
+        keeps_untitled: bool,
+    ) -> bool {
+        let autosave = self.settings.borrow().general.autosave;
+        if autosave {
+            let _ = self.core.borrow().autosave.flush(entry);
         }
-        if !entry.is_dirty() || entry.users() > 1 {
+        if !entry.is_dirty() || (autosave && keeps_untitled && entry.is_untitled()) {
             return true;
         }
         let title = entry.title(&self.i18n);
@@ -944,22 +971,48 @@ impl Controller {
         }
     }
 
-    /// The close button or File → Exit asked to close window `id`: every tab is confirmed as
-    /// for a tab close. Returns false when the user cancelled (the window stays open). The
-    /// window is not closed here: call [`Controller::close_window`] when this returns true.
+    /// The close button asked to close window `id`: [`Controller::request_close_windows`] for
+    /// that window. Returns false when the user cancelled (the window stays open). The window
+    /// is not closed here: call [`Controller::close_window`] when this returns true.
     pub fn request_close_window(&self, id: WindowId) -> bool {
-        let Some(cell) = self.window(id) else {
-            return true;
-        };
-        let tabs: Vec<(u64, Rc<DocEntry>)> = cell
-            .view
-            .borrow()
-            .tabs()
+        self.request_close_windows(&[id])
+    }
+
+    /// The close button or File → Exit asked to close the windows `ids` (Exit: all of them):
+    /// every document that goes away with them is confirmed as for a tab close, once, however
+    /// many tabs show it. A document that a tab outside `ids` shows stays open and is not asked
+    /// about. When no other window is left the application quits, and its session keeps the
+    /// untitled buffers (spec §4.4) if the setting restores the session on startup. Returns
+    /// false when the user cancelled (the windows stay open). The windows are not closed here.
+    pub fn request_close_windows(&self, ids: &[WindowId]) -> bool {
+        let closing: Vec<(Rc<WindowCell>, u64, Rc<DocEntry>)> = ids
             .iter()
-            .map(|tab| (tab.key, Rc::clone(&tab.entry)))
+            .filter_map(|id| self.window(*id))
+            .flat_map(|cell| {
+                tab_entries(&cell)
+                    .into_iter()
+                    .map(move |(key, entry)| (Rc::clone(&cell), key, entry))
+            })
             .collect();
-        tabs.iter()
-            .all(|(key, entry)| self.confirm_close(&cell, *key, entry))
+        let quitting = self
+            .windows
+            .borrow()
+            .iter()
+            .all(|window| ids.contains(&window.id));
+        let keeps_untitled = quitting
+            && self.settings.borrow().general.on_startup == StartupBehavior::RestoreSession;
+        let mut asked: Vec<DocId> = Vec::new();
+        closing.iter().all(|(cell, key, entry)| {
+            let tabs = closing
+                .iter()
+                .filter(|(_, _, other)| Rc::ptr_eq(other, entry))
+                .count();
+            if entry.users() > tabs || asked.contains(&entry.id()) {
+                return true;
+            }
+            asked.push(entry.id());
+            self.confirm_close(cell, *key, entry, keeps_untitled)
+        })
     }
 
     fn save_for_close(&self, cell: &Rc<WindowCell>, key: u64, entry: &Rc<DocEntry>) -> bool {
@@ -1238,6 +1291,16 @@ fn search_key(id: WindowId) -> JobKey {
 fn close_first_tab(cell: &WindowCell) -> Option<TabView> {
     let key = cell.view.borrow().tabs().first()?.key;
     cell.view.borrow_mut().close_tab(key)
+}
+
+/// The tabs of `cell`, left to right, as their keys and documents.
+fn tab_entries(cell: &WindowCell) -> Vec<(u64, Rc<DocEntry>)> {
+    cell.view
+        .borrow()
+        .tabs()
+        .iter()
+        .map(|tab| (tab.key, Rc::clone(&tab.entry)))
+        .collect()
 }
 
 /// The work of a folder search (it runs on a worker): the files with matches and the totals,

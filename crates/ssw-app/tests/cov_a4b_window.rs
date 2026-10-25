@@ -335,8 +335,13 @@ fn activating_a_window_makes_it_the_active_one_and_asks_for_a_file_check() {
         let mut second = fixture(controller, Layout(false));
         assert_eq!(controller.active_window().unwrap().id, first.cell.id);
 
+        // Leaving a window asks the loop owner to write its documents; the active window stays.
         second.glue.on_activate(&info(), false);
         assert_eq!(controller.active_window().unwrap().id, first.cell.id);
+        assert_eq!(
+            controller.take_request(),
+            Some(Request::Deactivated(second.cell.id))
+        );
         assert_eq!(controller.take_request(), None);
 
         second.glue.on_activate(&info(), true);

@@ -667,6 +667,7 @@ impl UiApp {
             Request::CloseSettings => self.close_settings(),
             Request::Activated(id) => self.controller.check_external_changes(id),
             Request::OpenFiles(id, paths) => self.controller.open_files(id, &paths),
+            Request::Deactivated(id) => self.controller.window_deactivated(id),
         }
     }
 
@@ -758,14 +759,17 @@ impl UiApp {
         }
     }
 
-    /// File → Exit: asks about every window, then leaves.
+    /// File → Exit: asks about the unsaved documents of every window, then leaves.
     fn quit(&self) {
-        for cell in self.controller.windows() {
-            if !self.controller.request_close_window(cell.id) {
-                return;
-            }
+        let ids: Vec<WindowId> = self
+            .controller
+            .windows()
+            .iter()
+            .map(|cell| cell.id)
+            .collect();
+        if self.controller.request_close_windows(&ids) {
+            self.finish_quit();
         }
-        self.finish_quit();
     }
 
     /// Every window agreed to close: the session is captured while the tabs still exist, then

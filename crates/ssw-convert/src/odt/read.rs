@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
+use crate::assets::picture_extension;
 use crate::doc::md::{self, Align, Block, Ctx, Fmt, Inline};
 use crate::doc::sniff;
-use crate::import::{Asset, ImportError, ImportResult, LossKind};
+use crate::import::{Asset, ImportError, ImportResult, LossKind, MAX_CELLS, MAX_COLUMNS};
 
 use super::package::{Package, PackageError};
 use super::slug::unique_slug;
@@ -24,10 +25,6 @@ const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const MAX_REPEAT: usize = 64;
 /// Largest number of spaces a single `text:s` stands for.
 const MAX_SPACES: usize = 1000;
-/// Largest number of cells of one table row.
-const MAX_COLUMNS: usize = 4096;
-/// Largest number of cells of a whole document.
-const MAX_CELLS: usize = 1_000_000;
 const UNSUPPORTED_IMAGES: [&str; 5] = ["emf", "wmf", "svm", "pict", "eps"];
 const PAGE_FIELDS: [&str; 3] = [
     "text:page-number",
@@ -259,15 +256,12 @@ fn image_extension(href: &str, bytes: &[u8]) -> String {
         .rsplit('/')
         .next()
         .and_then(|file| file.rsplit_once('.'))
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .filter(|ext| {
-            !ext.is_empty() && ext.len() <= 5 && ext.chars().all(|c| c.is_ascii_alphanumeric())
-        });
-    match named.as_deref() {
-        Some("jpeg") => "jpg".to_string(),
-        Some(ext) => ext.to_string(),
-        None => "bin".to_string(),
+        .map_or(String::new(), |(_, ext)| ext.to_ascii_lowercase());
+    match picture_extension(&named) {
+        "jpeg" => "jpg",
+        known => known,
     }
+    .to_string()
 }
 
 /// True for image destinations that are not parts of the package.
@@ -1660,7 +1654,9 @@ mod tests {
         }
         let names = [
             ("Pictures/a.JPEG", "jpg"),
-            ("a.dat", "dat"),
+            ("a.dat", "bin"),
+            ("evil.exe", "bin"),
+            ("Pictures/x.TIFF", "tiff"),
             ("noext", "bin"),
             ("d.d/file", "bin"),
             ("a.toolongext", "bin"),
@@ -2504,7 +2500,8 @@ mod tests {
             ("objects with parts", r##"<text:p><draw:frame><draw:object xlink:href="./Obj1/"/></draw:frame><draw:frame><draw:object xlink:href="Obj2"/></draw:frame>x</text:p>"##, &[("Obj1/content.xml", b"<x>MathML</x>"), ("Obj2/content.xml", b"<x>chart</x>")], "x\n", &[(LossKind::VectorShapes, 1), (LossKind::UnsupportedEquations, 1)], 0),
             ("image", r##"<text:p>a <draw:frame svg:width="2in"><draw:image xlink:href="Pictures/a.png"/><svg:desc>alt [x]</svg:desc><svg:title>t</svg:title></draw:frame> b</text:p>"##, &[("Pictures/a.png", b"\x89PNG\x0d\x0a\x1a\x0a1234")], "a ![alt \\[x\\]|192](doc_assets/image-1.png) b\n", &[], 1),
             ("title alt, jpeg by magic, twice", r##"<text:p><draw:frame svg:width="1cm"><draw:image xlink:href="Pictures/b.dat"/><svg:title>The  title</svg:title></draw:frame><draw:frame><draw:image xlink:href="Pictures/b.dat"/></draw:frame><draw:frame><draw:image xlink:href="./Pictures/c.jpeg"/></draw:frame></text:p>"##, &[("Pictures/b.dat", b"\xff\xd8\xff\xe0abcd"), ("Pictures/c.jpeg", b"plain bytes")], "![The title|38](doc_assets/image-1.jpg)![](doc_assets/image-1.jpg)![](doc_assets/image-2.jpg)\n", &[], 2),
-            ("unnamed ext", r##"<text:p><draw:frame><draw:image xlink:href="Pictures/x.dat"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/noext"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/x.toolongext"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/y.p-g"/></draw:frame></text:p>"##, &[("Pictures/x.dat", b"plain bytes"), ("Pictures/noext", b"plain bytes"), ("Pictures/x.toolongext", b"plain bytes"), ("Pictures/y.p-g", b"plain bytes")], "![](doc_assets/image-1.dat)![](doc_assets/image-2.bin)![](doc_assets/image-3.bin)![](doc_assets/image-4.bin)\n", &[], 4),
+            ("unnamed ext", r##"<text:p><draw:frame><draw:image xlink:href="Pictures/x.dat"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/noext"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/x.toolongext"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/y.p-g"/></draw:frame></text:p>"##, &[("Pictures/x.dat", b"plain bytes"), ("Pictures/noext", b"plain bytes"), ("Pictures/x.toolongext", b"plain bytes"), ("Pictures/y.p-g", b"plain bytes")], "![](doc_assets/image-1.bin)![](doc_assets/image-2.bin)![](doc_assets/image-3.bin)![](doc_assets/image-4.bin)\n", &[], 4),
+            ("listed and unlisted names", r##"<text:p><draw:frame><draw:image xlink:href="Pictures/x.exe"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/y.PNG"/></draw:frame></text:p>"##, &[("Pictures/x.exe", b"plain bytes"), ("Pictures/y.PNG", b"plain bytes")], "![](doc_assets/image-1.bin)![](doc_assets/image-2.png)\n", &[], 2),
             ("emf", r##"<text:p><draw:frame svg:width="100pt"><draw:image xlink:href="Pictures/e.emf"/></draw:frame></text:p>"##, &[("Pictures/e.emf", b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00 EMF")], "![|133](doc_assets/image-1.emf)\n", &[(LossKind::UnsupportedImages, 1)], 1),
             ("missing and external", r##"<text:p><draw:frame><draw:image xlink:href="Pictures/none.png"/></draw:frame> <draw:frame svg:width="50px"><draw:image xlink:href="http://e.com/x.png"/><svg:desc>ext</svg:desc></draw:frame> <draw:frame><draw:image xlink:href="../up/x.png"/></draw:frame> <draw:frame><draw:image xlink:href="/abs/x.png"/></draw:frame> <draw:frame><draw:image xlink:href=""/></draw:frame><draw:frame><draw:image xlink:href="Pictures/gone%20too.png"/></draw:frame></text:p>"##, &[], "![ext|50](http://e.com/x.png) ![](../up/x.png) ![](/abs/x.png)\n", &[(LossKind::CorruptParts, 3)], 0),
             ("percent", r##"<text:p><draw:frame><draw:image xlink:href="Pictures/a%20b.png"/></draw:frame><draw:frame><draw:image xlink:href="Pictures/a%20b.png"/></draw:frame></text:p>"##, &[("Pictures/a b.png", b"\x89PNG\x0d\x0a\x1a\x0a1234")], "![](doc_assets/image-1.png)![](doc_assets/image-1.png)\n", &[], 1),

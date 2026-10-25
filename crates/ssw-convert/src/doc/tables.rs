@@ -3,6 +3,7 @@
 
 use super::md::{Align, join_cell, majority_alignments};
 use super::props::CellDef;
+use crate::import::fit_table;
 
 /// Deepest table nesting that is tracked (Word allows 64; deeper values are clamped).
 pub(super) const MAX_DEPTH: usize = 15;
@@ -13,6 +14,8 @@ pub(super) struct TableLoss {
     pub merged_cells: usize,
     pub multi_paragraph_cells: usize,
     pub nested_tables: usize,
+    /// Tables cut to the column or cell limit.
+    pub truncated_tables: usize,
 }
 
 #[derive(Default)]
@@ -54,6 +57,8 @@ pub(super) struct Tables {
     stack: Vec<TableState>,
     /// Column alignments of the outermost table that `close_to` returned last.
     finished_align: Vec<Align>,
+    /// Cells of the outermost tables returned so far, padding included.
+    cells_used: usize,
 }
 
 impl Tables {
@@ -141,8 +146,13 @@ impl Tables {
                     }
                 }
                 None => {
-                    self.finished_align = majority_alignments(&t.rows, &t.aligns);
-                    finished = Some(t.rows);
+                    if fit_table(&mut t.rows, &mut self.cells_used) {
+                        loss.truncated_tables += 1;
+                    }
+                    if !t.rows.is_empty() {
+                        self.finished_align = majority_alignments(&t.rows, &t.aligns);
+                        finished = Some(t.rows);
+                    }
                 }
             }
         }
@@ -192,7 +202,8 @@ mod tests {
             TableLoss {
                 merged_cells: 0,
                 multi_paragraph_cells: 1,
-                nested_tables: 0
+                nested_tables: 0,
+                truncated_tables: 0
             }
         );
         assert!(t.close_to(0, &mut loss).is_none());
@@ -303,5 +314,43 @@ mod tests {
         t.push_paragraph(1, "a".into());
         t.end_cell(1, &mut loss);
         assert_eq!(t.close_to(0, &mut loss), Some(vec![vec!["a".to_string()]]));
+    }
+
+    #[test]
+    fn grids_beyond_the_column_and_cell_limits_are_cut() {
+        use crate::import::{MAX_CELLS, MAX_COLUMNS};
+        let mut t = Tables::default();
+        let mut loss = TableLoss::default();
+        t.open_to(1);
+        for _ in 0..=MAX_COLUMNS {
+            t.push_paragraph(1, "x".into());
+            t.end_cell(1, &mut loss);
+        }
+        t.end_row(1, None, &mut loss);
+        for _ in 0..MAX_CELLS / MAX_COLUMNS + 5 {
+            t.push_paragraph(1, "y".into());
+            t.end_cell(1, &mut loss);
+            t.end_row(1, None, &mut loss);
+        }
+        let rows = t.close_to(0, &mut loss).unwrap();
+        assert_eq!(rows.len(), MAX_CELLS / MAX_COLUMNS);
+        assert_eq!(rows[0].len(), MAX_COLUMNS);
+        assert_eq!(rows[1], ["y"]);
+        assert_eq!(t.take_alignments().len(), MAX_COLUMNS);
+        assert_eq!(loss.truncated_tables, 1);
+
+        // what is left of the budget fits no row of a second table
+        t.open_to(1);
+        t.push_paragraph(1, "z".into());
+        t.end_cell(1, &mut loss);
+        t.end_row(1, None, &mut loss);
+        for _ in 0..MAX_COLUMNS {
+            t.push_paragraph(1, "z".into());
+            t.end_cell(1, &mut loss);
+        }
+        t.end_row(1, None, &mut loss);
+        assert!(t.close_to(0, &mut loss).is_none());
+        assert!(t.take_alignments().is_empty());
+        assert_eq!(loss.truncated_tables, 2);
     }
 }

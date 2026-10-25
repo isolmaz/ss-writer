@@ -54,6 +54,22 @@ pub fn extension_for_mime(mime: &str) -> &'static str {
     }
 }
 
+/// Extensions an imported picture keeps: the formats Word and OpenDocument documents embed.
+const PICTURE_EXTENSIONS: [&str; 18] = [
+    "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "svg", "ico", "emf", "wmf", "emz",
+    "wmz", "pict", "wdp", "svm", "eps",
+];
+
+/// `ext` (lower case) when it names a picture format, else `bin`: the extension of a part name
+/// inside a document package is not trusted to be a safe file extension.
+pub(crate) fn picture_extension(ext: &str) -> &str {
+    if PICTURE_EXTENSIONS.contains(&ext) {
+        ext
+    } else {
+        "bin"
+    }
+}
+
 /// MIME type guessed from a path's extension (case-insensitive); `None` for non-images.
 pub fn image_mime_for_path(path: &str) -> Option<&'static str> {
     let name = path.split(['?', '#']).next().unwrap_or(path);
@@ -116,6 +132,16 @@ mod tests {
         assert!(p.image("a.png").is_none());
         assert!(p.math_svg("x", false).is_none());
         assert!(p.mermaid_svg("graph TD").is_none());
+    }
+
+    #[test]
+    fn picture_extensions_are_limited_to_image_formats() {
+        for known in PICTURE_EXTENSIONS {
+            assert_eq!(picture_extension(known), known);
+        }
+        for other in ["exe", "", "dat", "png/../x", "toolongextension", "p-g", "PNG"] {
+            assert_eq!(picture_extension(other), "bin", "{other:?}");
+        }
     }
 
     #[test]

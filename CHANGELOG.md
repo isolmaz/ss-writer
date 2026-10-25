@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-10-25
+
 ### Fixed
 
 - Every keystroke recounted the words of the whole document for the status bar, which slowed typing in long documents. The word count follows the text at most twice a second and catches up when typing pauses.
@@ -219,7 +221,8 @@ First release.
 
 - Scrolling very large documents (60 000 lines) at high speed does not yet keep up with a 144 Hz display: in the stress test a frame takes about 16 ms instead of 7 ms. See [docs/performance.md](docs/performance.md#known-issues).
 
-[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/isolmaz/ss-writer/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/isolmaz/ss-writer/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/isolmaz/ss-writer/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/isolmaz/ss-writer/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/isolmaz/ss-writer/compare/v0.1.4...v0.1.5

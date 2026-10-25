@@ -165,7 +165,9 @@ pub struct Overlays {
     export: ExportHost,
     pending_heading: Option<(Point, u8)>,
     wiki_start: Option<usize>,
-    highlights_on: bool,
+    /// The editor, search generation and current match last pushed to the editor as find
+    /// highlights.
+    synced_highlights: Option<(WidgetId, u64, Option<usize>)>,
     refocus: bool,
     actions: Vec<OverlayAction>,
 }
@@ -214,7 +216,7 @@ impl Overlays {
             export: ExportHost::new(Rc::clone(localizer), Rc::clone(clipboard)),
             pending_heading: None,
             wiki_start: None,
-            highlights_on: false,
+            synced_highlights: None,
             refocus: false,
             actions: Vec::new(),
             localizer: Rc::clone(localizer),
@@ -782,7 +784,7 @@ impl Overlays {
                     if let Some(editor) = editor.as_mut() {
                         editor.clear_search_highlights();
                     }
-                    self.highlights_on = false;
+                    self.synced_highlights = None;
                     self.refocus = true;
                 }
             }
@@ -862,16 +864,21 @@ impl Overlays {
         std::mem::take(&mut self.actions)
     }
 
-    /// Keeps the editor's find highlights in step with the bar (the document may have
-    /// changed since the last pump).
+    /// Keeps the active editor's find highlights in step with the bar (the document may have
+    /// changed since the last pump). While the bar is closed the editor shows none, including
+    /// an editor that was inactive when the bar closed.
     pub fn sync_highlights(&mut self, editor: &mut EditorView) {
-        if self.find.is_visible() {
-            self.find.refresh();
-            editor.set_search_highlights(self.find.matches().to_vec(), self.find.current_index());
-            self.highlights_on = true;
-        } else if self.highlights_on {
+        if !self.find.is_visible() {
             editor.clear_search_highlights();
-            self.highlights_on = false;
+            self.synced_highlights = None;
+            return;
+        }
+        self.find.refresh();
+        let current = self.find.current_index();
+        let synced = (editor.id(), self.find.generation(), current);
+        if self.synced_highlights != Some(synced) {
+            editor.set_search_highlights(self.find.matches().to_vec(), current);
+            self.synced_highlights = Some(synced);
         }
     }
 }

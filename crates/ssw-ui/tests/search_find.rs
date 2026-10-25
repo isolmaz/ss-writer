@@ -489,6 +489,43 @@ fn matches_follow_edits_made_elsewhere() {
 }
 
 #[test]
+fn a_search_runs_only_for_a_changed_query_or_document() {
+    let (mut host, mut bar, doc) = setup("one");
+    host.text(&mut bar, "one");
+    let searches = bar.generation();
+    bar.refresh();
+    doc.borrow_mut().set_selections(Selection::caret(1), &[]);
+    bar.refresh();
+    assert_eq!(bar.generation(), searches, "a caret move searches nothing");
+    let before = doc.borrow().primary_selection();
+    doc.borrow_mut()
+        .apply(Transaction::single(
+            Edit::insert(0, "one "),
+            before,
+            Selection::caret(4),
+        ))
+        .expect("edit");
+    bar.refresh();
+    assert_eq!(bar.generation(), searches + 1);
+    assert_eq!(bar.matches().len(), 2);
+}
+
+#[test]
+fn a_hidden_bar_searches_another_document_only_when_it_is_shown() {
+    let (_host, mut bar, _doc) = setup("one one");
+    bar.set_pattern("one");
+    assert_eq!(bar.matches().len(), 2);
+    bar.close();
+    let searches = bar.generation();
+    let other: SharedDocument = Rc::new(RefCell::new(Document::new("one two one one")));
+    bar.set_document(other);
+    assert_eq!(bar.generation(), searches, "the hidden bar searched nothing");
+    bar.open(false);
+    assert_eq!(bar.generation(), searches + 1);
+    assert_eq!(bar.matches().len(), 3);
+}
+
+#[test]
 fn a_single_line_selection_seeds_the_find_box() {
     let doc: SharedDocument = Rc::new(RefCell::new(Document::new("hello world\nsecond line")));
     doc.borrow_mut().set_selections(Selection::new(6, 11), &[]);

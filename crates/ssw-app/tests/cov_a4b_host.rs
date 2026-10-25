@@ -345,7 +345,7 @@ fn a_file_the_watcher_cannot_reload_is_reported_once_until_it_reloads_again() {
     let file = note(tmp.path(), "a.md", "one\n");
     let faults = Arc::new(FaultFs::new());
     let services = ScriptedServices::new();
-    let code = start(&[file.clone()], tmp.path(), |mut core, _| {
+    let code = start(std::slice::from_ref(&file), tmp.path(), |mut core, _| {
         let _ole = OleGuard::initialize().unwrap();
         let env = DocEnv {
             fs: faults.clone(),

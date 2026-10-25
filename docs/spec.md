@@ -194,6 +194,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Single instance (named mutex + `WM_COPYDATA`); new launches open tabs in the last active window (or a new window for folders). A launched file the window shows already activates its tab instead of opening a second one, also when it starts the app and the restored session has it.
 - The files one action cannot open (startup, launch, File → Open, drop, sidebar) are named with their reason in one message. A file that no longer exists leaves the recent list and the Jump List.
 - Session restore: windows (placement), tabs, workspaces, caret, scroll, folds. Per-file caret/scroll remembered for reopened files.
+- When Windows ends the session (shutdown, restart, sign-out) nothing is asked and shutdown is not delayed: autosave writes what it can, the session is stored with the untitled text, and the unsaved text of every other file goes to the recovery folder, offered at the next start.
 
 ## 7. Search
 - Find bar (`Ctrl+F`, floating top-right of the editor): Match case, Whole word, Regex; highlights all matches; `n/m` counter; `Enter`/`F3` next, `Shift+Enter`/`Shift+F3` previous; `Esc` closes. Matches in hidden markers reveal them; in folds unfold.

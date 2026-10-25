@@ -44,6 +44,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Deleting the paragraph between two ordered lists merged them without renumbering the second one.
 - Heading and other block commands treated `2. ` at the start of a paragraph continuation line as a list marker.
 - Find next, Find previous and Replace collected every match of the document to pick one; they now search from the caret.
+- Shutting down, restarting or signing out of Windows with SS Writer open lost unsaved changes and left the previous session to be restored: the end of the session was not handled. Autosave now writes what it can, the session is stored, and the unsaved text of the other files is offered by the recovery banner at the next start.
+- Message boxes and file dialogs had no owner window, so the window behind them kept taking clicks and file drops, and closing a box re-activated the window and could show the same error again. They belong to the active window and are modal.
+- After switching tabs, an IME, dictation or the emoji panel kept working on the text of the previous tab; a composition in progress is ended without inserting it anywhere.
+- Moving a maximized or snapped window to a monitor with the same resolution and a different scale kept the old DPI.
+- Once any UI Automation client had looked at the window, every repaint compared the whole accessibility tree, also after the client had gone.
+- When the graphics device could not be rebuilt after a device loss the window stayed blank for good; rebuilding is tried again on later paints.
 
 ## [0.1.6] - 2026-10-13
 

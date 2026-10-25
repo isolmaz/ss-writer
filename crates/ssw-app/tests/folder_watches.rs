@@ -113,12 +113,12 @@ fn a_flat_set_of_watches_ignores_the_folders_below_and_a_recursive_one_sees_them
     let mut deep_watches = folder_watches(true);
     assert!(
         flat_watches
-            .sync(&[flat.clone()], Duration::ZERO)
+            .sync(std::slice::from_ref(&flat), Duration::ZERO)
             .is_empty()
     );
     assert!(
         deep_watches
-            .sync(&[deep.clone()], Duration::ZERO)
+            .sync(std::slice::from_ref(&deep), Duration::ZERO)
             .is_empty()
     );
 

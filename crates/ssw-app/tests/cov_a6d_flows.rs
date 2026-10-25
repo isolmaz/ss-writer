@@ -12,10 +12,12 @@ use std::time::{Duration, Instant};
 
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::Args;
+use ssw_app::commands::{CommandDispatcher, Dispatch};
 use ssw_app::documents::{
-    DocEntry, DocEnv, Documents, ExternalState, canonical_path, load_file, loss_message_id,
-    replace_text,
+    DocEntry, DocEnv, DocError, Documents, ExternalState, canonical_path, load_file,
+    loss_message_id, replace_text,
 };
+use ssw_app::i18n::localizer_for;
 use ssw_app::session::StartupPlan;
 use ssw_app::startup::ProcessEnv;
 use ssw_app::ui::controller::{Controller, WindowCell};
@@ -27,12 +29,16 @@ use ssw_app::ui::shell_view::ShellAction;
 use ssw_app::workers::WindowId;
 use ssw_convert::import::{Loss, LossKind};
 use ssw_core::command::CommandId;
+use ssw_core::i18n::Arg;
 use ssw_core::markdown::ast::CalloutKind;
 use ssw_core::text::TextRange;
 use ssw_io::encoding::TextFormat;
-use ssw_io::fs::{FaultFs, FsFailure, FsOp, RealFs};
+use ssw_io::fs::{
+    Attributes, DirEntry, FaultFs, FileMeta, FileSystem, FsError, FsFailure, FsOp, RealFs,
+};
 use ssw_io::history::{SnapshotOutcome, SnapshotReason};
 use ssw_io::recovery::{RecoveryDoc, RecoveryKind, now_millis};
+use ssw_io::save::SaveError;
 use ssw_io::store::Store;
 use ssw_ui::access::{AccessNode, AccessTree, Role};
 use ssw_ui::canvas::RecordingCanvas;
@@ -164,7 +170,7 @@ fn with_rig(
 fn nothing(_: &mut AppCore, _: &Path) {}
 
 /// Makes the documents of the started application go through `fs`.
-fn install(core: &mut AppCore, fs: Arc<FaultFs>) {
+fn install(core: &mut AppCore, fs: Arc<dyn FileSystem>) {
     let env = DocEnv {
         fs,
         ..core.docs.env().clone()
@@ -404,7 +410,7 @@ fn an_import_loss_with_a_detail_is_listed_with_it() {
                     detail: None,
                 },
             ];
-            let entry = rig.controller.docs().open_loaded(&other, loaded).unwrap();
+            let entry = rig.controller.docs().open_loaded(&other, loaded);
             rig.window().view.borrow_mut().add_tab(entry, None);
             rig.controller.refresh_all();
             assert_eq!(rig.banners(), [BannerKind::ImportLoss]);
@@ -544,6 +550,54 @@ fn a_file_that_cannot_be_reloaded_is_reported_and_an_unknown_window_checks_nothi
 }
 
 #[test]
+fn a_file_that_stays_unreadable_is_reported_once_and_again_after_it_was_read() {
+    let faults = Arc::new(FaultFs::new());
+    let installed = Arc::clone(&faults);
+    with_rig(
+        NO_AUTOSAVE,
+        &[("notes.md", "one\n")],
+        move |core, _| install(core, installed),
+        |rig| {
+            // A sync client keeps the file locked: every activation finds it changed and cannot
+            // read it. Closing the box activates the window again, so only the first is shown.
+            std::fs::write(rig.path(), "one\ntwo\n").unwrap();
+            faults.fail_always(FsOp::Read, FsFailure::AccessDenied);
+            rig.answer(MessageBoxResult::Ok);
+            for _ in 0..3 {
+                rig.controller.check_external_changes(rig.id());
+            }
+            assert_eq!(rig.messages(), [FILE_ERROR]);
+            assert_eq!(rig.text(), "one\n");
+
+            // The file can be read again: it is reloaded, quietly.
+            faults.clear();
+            rig.controller.check_external_changes(rig.id());
+            assert_eq!(rig.text(), "one\ntwo\n");
+            assert_eq!(rig.messages().len(), 1);
+
+            // A later failure is news again.
+            std::fs::write(rig.path(), "one\ntwo\nthree\n").unwrap();
+            faults.fail_always(FsOp::Read, FsFailure::AccessDenied);
+            rig.answer(MessageBoxResult::Ok);
+            rig.controller.check_external_changes(rig.id());
+            rig.controller.check_external_changes(rig.id());
+            assert_eq!(rig.messages(), [FILE_ERROR, FILE_ERROR]);
+
+            // The file is put back as the document has it: a check that finds nothing to do ends
+            // the failure as well.
+            faults.clear();
+            std::fs::write(rig.path(), "one\ntwo\n").unwrap();
+            rig.controller.check_external_changes(rig.id());
+            std::fs::write(rig.path(), "one\ntwo\nfour\n").unwrap();
+            faults.fail_always(FsOp::Read, FsFailure::AccessDenied);
+            rig.answer(MessageBoxResult::Ok);
+            rig.controller.check_external_changes(rig.id());
+            assert_eq!(rig.messages().len(), 3);
+        },
+    );
+}
+
+#[test]
 fn the_update_banners_download_button_without_an_offer_opens_nothing() {
     with_rig(NO_AUTOSAVE, &[("notes.md", "one\n")], nothing, |rig| {
         rig.banner_event(HostEvent::Action {
@@ -552,6 +606,99 @@ fn the_update_banners_download_button_without_an_offer_opens_nothing() {
         });
         assert!(rig.services.shell_log().is_empty());
     });
+}
+
+// ----- a save that loses the file --------------------------------------------------------------
+
+/// A disk whose replace removes the target and then fails, as `ReplaceFileW` does when it cannot
+/// move the replacement into place, and whose moves all fail: a save leaves the new text in its
+/// temp file only.
+#[derive(Debug)]
+struct LosingFs;
+
+impl FileSystem for LosingFs {
+    fn read(&self, path: &Path) -> Result<Vec<u8>, FsError> {
+        RealFs.read(path)
+    }
+    fn read_prefix(&self, path: &Path, max: usize) -> Result<Vec<u8>, FsError> {
+        RealFs.read_prefix(path, max)
+    }
+    fn metadata(&self, path: &Path) -> Result<FileMeta, FsError> {
+        RealFs.metadata(path)
+    }
+    fn write_new(&self, path: &Path, data: &[u8]) -> Result<(), FsError> {
+        RealFs.write_new(path, data)
+    }
+    fn replace_file(&self, target: &Path, _replacement: &Path) -> Result<(), FsError> {
+        RealFs.delete_file(target)?;
+        Err(FsError::ReplaceUnsupported(target.to_path_buf()))
+    }
+    fn move_replace(&self, _from: &Path, to: &Path) -> Result<(), FsError> {
+        Err(FsError::AccessDenied(to.to_path_buf()))
+    }
+    fn rename(&self, _from: &Path, to: &Path) -> Result<(), FsError> {
+        Err(FsError::AccessDenied(to.to_path_buf()))
+    }
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        RealFs.copy_file(from, to)
+    }
+    fn delete_file(&self, path: &Path) -> Result<(), FsError> {
+        RealFs.delete_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> Result<(), FsError> {
+        RealFs.remove_dir(path)
+    }
+    fn create_dir(&self, path: &Path) -> Result<(), FsError> {
+        RealFs.create_dir(path)
+    }
+    fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
+        RealFs.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &Path) -> Result<Vec<DirEntry>, FsError> {
+        RealFs.list_dir(path)
+    }
+    fn set_attributes(&self, path: &Path, attrs: Attributes) -> Result<(), FsError> {
+        RealFs.set_attributes(path, attrs)
+    }
+    fn is_writable(&self, path: &Path) -> Result<bool, FsError> {
+        RealFs.is_writable(path)
+    }
+    fn recycle(&self, paths: &[PathBuf]) -> Result<(), FsError> {
+        RealFs.recycle(paths)
+    }
+}
+
+#[test]
+fn a_save_that_loses_the_file_tells_the_user_where_the_new_text_is() {
+    with_rig(
+        NO_AUTOSAVE,
+        &[("notes.md", "old\n")],
+        |core, _| {
+            install(core, Arc::new(LosingFs));
+            // File → Save runs through the dispatcher: it saves through the same documents.
+            core.commands = Rc::new(CommandDispatcher::new(Rc::clone(&core.docs)));
+        },
+        |rig| {
+            rig.set_text("new\n");
+            rig.answer(MessageBoxResult::Ok);
+
+            let outcome = rig.controller.run_command(rig.id(), CommandId::FileSave);
+
+            let Dispatch::Failed(DocError::Save(SaveError::TempKept { temp, .. })) = &outcome
+            else {
+                panic!("expected the temp file to be kept: {outcome:?}");
+            };
+            assert_eq!(std::fs::read_to_string(temp).unwrap(), "new\n");
+            assert!(!rig.path().exists(), "the original file is gone");
+            let expected = localizer_for("en").format(
+                "app-error-temp-kept",
+                &[("path", Arg::Str(&temp.to_string_lossy()))],
+            );
+            assert!(expected.contains(&*temp.to_string_lossy()), "{expected}");
+            assert_eq!(rig.messages(), [expected]);
+            assert!(rig.active().is_dirty());
+        },
+    );
 }
 
 // ----- the recovery offer ----------------------------------------------------------------------

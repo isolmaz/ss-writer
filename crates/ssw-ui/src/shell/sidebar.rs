@@ -12,6 +12,8 @@
 //! and the drag source / drop target protocol. The app answers by changing files and calling
 //! [`SidebarView::refresh_folder`].
 
+use std::collections::HashMap;
+
 use ssw_core::i18n::Localizer;
 
 use crate::access::{AccessAction, AccessNode, AccessTree, Role};
@@ -691,14 +693,15 @@ impl SidebarView {
         folder: NodeKey,
         previous: Option<Vec<Node>>,
     ) -> Vec<Node> {
-        let mut previous = previous.unwrap_or_default();
+        let mut previous: HashMap<NodeKey, Node> = previous
+            .unwrap_or_default()
+            .into_iter()
+            .map(|node| (node.entry.key, node))
+            .collect();
         let entries = source.children(folder, options);
         let mut nodes = Vec::with_capacity(entries.len());
         for entry in entries {
-            let old = previous
-                .iter()
-                .position(|node| node.entry.key == entry.key)
-                .map(|index| previous.swap_remove(index));
+            let old = previous.remove(&entry.key);
             let mut node = Node::new(entry);
             if let Some(old) = old {
                 node.id = old.id;
@@ -817,25 +820,20 @@ impl SidebarView {
 
     /// Expands every folder, listing all of them (the ⋯ menu).
     pub fn expand_all(&mut self) {
-        let mut pending: Vec<NodeKey> = self
-            .roots
-            .iter()
-            .filter(|node| node.entry.is_folder())
-            .map(|node| node.entry.key)
-            .collect();
-        while let Some(key) = pending.pop() {
-            self.set_expanded(key, true);
-            // A folder that was just expanded has its children listed.
-            let children = find(&self.roots, key).and_then(|node| node.children.as_deref());
-            pending.extend(
-                children
-                    .into_iter()
-                    .flatten()
-                    .filter(|child| child.entry.is_folder())
-                    .map(|child| child.entry.key),
-            );
-        }
+        Self::expand_nodes(&mut *self.source, &self.options, &mut self.roots);
         self.rebuild_rows();
+    }
+
+    /// Expands every folder below `nodes`, listing the ones not listed yet.
+    fn expand_nodes(source: &mut dyn TreeSource, options: &SidebarOptions, nodes: &mut [Node]) {
+        for node in nodes.iter_mut().filter(|node| node.entry.is_folder()) {
+            node.expanded = true;
+            let key = node.entry.key;
+            let children = node
+                .children
+                .get_or_insert_with(|| Self::list(source, options, key, None));
+            Self::expand_nodes(source, options, children);
+        }
     }
 
     fn select_row(&mut self, index: usize) {
@@ -2775,6 +2773,56 @@ mod tests {
         f.view.collapse_all();
         assert_eq!(f.view.is_expanded(5), Some(false));
         assert_eq!(f.view.row_count(), 6);
+    }
+
+    #[test]
+    fn relisting_a_long_folder_keeps_the_expansion_selection_and_identity_of_what_remains() {
+        let mut f = fixture(SidebarOptions::default());
+        f.view.expand_all();
+        f.view.select_key(3);
+        f.layout();
+        let row_ids = |f: &Fixture| -> Vec<(String, WidgetId)> {
+            let tree = f.harness.tree(&f.view);
+            tree.nodes()
+                .iter()
+                .filter(|node| {
+                    [
+                        "docs", "deep", "c.md", "a.md", "b.txt", "empty", "cloud.md", "data.bin",
+                    ]
+                    .contains(&node.name.as_str())
+                })
+                .map(|node| (node.name.clone(), node.id))
+                .collect()
+        };
+        let before = row_ids(&f);
+        assert_eq!(before.len(), 8);
+        many_files(&mut f);
+        assert_eq!(f.view.row_count(), 50);
+        assert_eq!(row_ids(&f), before, "the rows keep their accessibility ids");
+        for folder in [1, 2, 5] {
+            assert_eq!(f.view.is_expanded(folder), Some(true));
+        }
+        assert_eq!(f.view.selected_key(), Some(3));
+        assert_eq!(
+            f.names()[6..9],
+            ["cloud.md", "data.bin", "note-100.md"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn expand_all_lists_each_unlisted_folder_once_and_keeps_the_selection() {
+        let mut f = fixture(SidebarOptions::default());
+        f.view.user_expand(1, true);
+        f.view.select_key(3);
+        f.view.take_events();
+        let listed = f.calls.borrow().len();
+        f.view.expand_all();
+        let mut now = f.calls.borrow()[listed..].to_vec();
+        now.sort_unstable();
+        assert_eq!(now, [2, 5], "the listed folder 1 is not listed again");
+        assert_eq!(f.view.row_count(), 10);
+        assert_eq!(f.view.selected_key(), Some(3));
+        assert!(f.view.take_events().is_empty());
     }
 
     #[test]

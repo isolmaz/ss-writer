@@ -38,6 +38,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 struct Log {
     events: Vec<Event>,
     resizes: Vec<(i32, i32)>,
+    /// The DPI the handler saw with each of `resizes`.
+    dpis: Vec<u32>,
     themes: Vec<SystemTheme>,
     wakes: u32,
     close_requests: u32,
@@ -80,7 +82,9 @@ impl WindowHandler for Recorder {
     }
 
     fn on_resize(&mut self, info: &WindowInfo) {
-        self.log.borrow_mut().resizes.push(info.size_px);
+        let mut log = self.log.borrow_mut();
+        log.resizes.push(info.size_px);
+        log.dpis.push(info.dpi);
     }
 
     fn on_theme_changed(&mut self, _info: &WindowInfo, theme: &SystemTheme) {
@@ -356,6 +360,7 @@ fn caption_hit_testing_follows_the_dpi() {
         "the new size reached the handler"
     );
     assert_eq!(log.borrow().resizes.last().copied(), Some(info.size_px));
+    assert_eq!(log.borrow().dpis.last().copied(), Some(144));
     let mut after = RECT::default();
     // SAFETY: valid out pointer.
     unsafe { GetWindowRect(hwnd, &mut after) }.unwrap();
@@ -415,6 +420,7 @@ fn pointer_text_and_key_messages_become_events_in_dips() {
     let mut rect = RECT::default();
     // SAFETY: valid out pointer.
     unsafe { GetWindowRect(hwnd, &mut rect) }.unwrap();
+    let (resizes_before, dpis_before) = (log.borrow().resizes.len(), log.borrow().dpis.len());
     send(
         hwnd,
         WM_DPICHANGED,
@@ -422,6 +428,10 @@ fn pointer_text_and_key_messages_become_events_in_dips() {
         (&rect as *const RECT) as isize,
     );
     assert_eq!(host.info().scale(), 1.5);
+    // The suggested rectangle is the window's own, so no WM_SIZE follows; the handler still
+    // learns the new scale, once.
+    assert_eq!(log.borrow().resizes.len(), resizes_before + 1);
+    assert_eq!(log.borrow().dpis[dpis_before..], [144]);
     log.borrow_mut().events.clear();
 
     send(hwnd, WM_MOUSEMOVE, 0, pack(150, 90));

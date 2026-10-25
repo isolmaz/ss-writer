@@ -56,6 +56,33 @@ fn front_matter_config_applies_and_directive_overrides_it() {
 }
 
 #[test]
+fn click_links_keep_only_destinations_that_cannot_run_script() {
+    let links = [
+        ("A", "https://e.com/a", true),
+        ("B", "http://e.com/b", true),
+        ("C", "mailto:x@e.com", true),
+        ("D", "docs/page.html", true),
+        ("E", "docs/a:b", true),
+        ("F", "javascript:alert(1)", false),
+        ("G", "java script:alert(2)", false),
+        ("H", "data:text/html,x", false),
+        ("I", "vbscript:x", false),
+    ];
+    let mut src = String::from("flowchart LR\n");
+    for pair in links.windows(2) {
+        src.push_str(&format!("  {} --> {}\n", pair[0].0, pair[1].0));
+    }
+    for (id, url, _) in links {
+        src.push_str(&format!("  click {id} \"{url}\"\n"));
+    }
+    let svg = svg_of(&src, MermaidTheme::Light);
+    for (_, url, kept) in links {
+        assert_eq!(svg.contains(&format!("href=\"{url}\"")), kept, "{url}");
+    }
+    assert!(!svg.contains("alert"));
+}
+
+#[test]
 fn font_is_segoe_ui_unless_configured() {
     assert!(svg_of(FLOW, MermaidTheme::Light).contains("Segoe UI"));
     let svg = svg_of(

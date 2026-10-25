@@ -522,6 +522,22 @@ mod tests {
     }
 
     #[test]
+    fn deleting_what_separates_two_ordered_lists_renumbers_the_second() {
+        check(
+            "1. a\n\n«text»\n\n3. b",
+            "1. a\n\n‸\n\n2. b",
+            delete_forward,
+        );
+        check(
+            "1. a\n\n«text»\n\n3. b\n4. c",
+            "1. a\n\n‸\n\n2. b\n3. c",
+            backspace,
+        );
+        // A paragraph between a list and a bullet list merges nothing.
+        check("1. a\n\n«text»\n\n- b", "1. a\n\n‸\n\n- b", delete_forward);
+    }
+
+    #[test]
     fn keystroke_transactions_classify_as_typing() {
         use crate::undo::{TypingKind, typing_kind};
         let keystroke = |before: &str, op: fn(Ctx<'_>) -> Option<Transaction>| {

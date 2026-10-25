@@ -3,6 +3,7 @@
 //! which also inspects what it was handed. The clock is measured against real time.
 
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use ssw_win::com::{ComGuard, WinError};
 use ssw_win::services::clock::QpcClock;
 use ssw_win::services::dialogs::{DialogHost, DialogStrings, SystemDialogHost, WindowsDialogs};
 use ssw_win::services::service_error;
-use ssw_win::services::shell::{ItemIdList, ShellHost, WindowsShell};
+use ssw_win::services::shell::{ItemIdList, ShellHost, SystemShellHost, WindowsShell};
 use windows::Win32::Foundation::{E_FAIL, E_NOTIMPL, E_UNEXPECTED, ERROR_CANCELLED, HWND, S_OK};
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -176,6 +177,7 @@ struct TaskDialogCall {
     common_buttons: i32,
     custom_buttons: Vec<(i32, String)>,
     has_icon: bool,
+    owner: Option<isize>,
 }
 
 #[derive(Default)]
@@ -189,9 +191,20 @@ struct ScriptedDialogs {
     picked: Vec<PathBuf>,
     pressed: i32,
     fail: bool,
+    /// The window the host reports as the active one.
+    active: Option<HWND>,
+}
+
+/// A window handle that names no window: the scripted hosts only hand it back.
+fn handle(value: usize) -> HWND {
+    HWND(value as *mut c_void)
 }
 
 impl DialogHost for ScriptedDialogs {
+    fn active_window(&self) -> Option<HWND> {
+        self.active
+    }
+
     fn pick(
         &mut self,
         dialog: &IFileDialog,
@@ -230,7 +243,7 @@ impl DialogHost for ScriptedDialogs {
         }
         let (title, content) = (config.pszWindowTitle, config.pszContent);
         let (count, buttons) = (config.cButtons, config.pButtons);
-        let common = config.dwCommonButtons.0;
+        let (common, parent) = (config.dwCommonButtons.0, config.hwndParent);
         // SAFETY: the union holds the main icon as a pointer-sized value, and `pszMainIcon`
         // is the member the code under test writes.
         let icon = unsafe { config.Anonymous1.pszMainIcon };
@@ -253,6 +266,7 @@ impl DialogHost for ScriptedDialogs {
                     })
                     .collect(),
                 has_icon: !icon.is_null(),
+                owner: (!parent.is_invalid()).then_some(parent.0 as isize),
             }
         };
         self.seen.borrow_mut().tasks.push(call);
@@ -265,18 +279,31 @@ fn scripted(
     pressed: i32,
     fail: bool,
 ) -> (WindowsDialogs<ScriptedDialogs>, Rc<RefCell<Seen>>) {
+    scripted_over(picked, pressed, fail, None, None)
+}
+
+/// [`scripted`] with `owner` named at construction and `active` the window the host reports as
+/// the active one.
+fn scripted_over(
+    picked: Vec<PathBuf>,
+    pressed: i32,
+    fail: bool,
+    owner: Option<HWND>,
+    active: Option<HWND>,
+) -> (WindowsDialogs<ScriptedDialogs>, Rc<RefCell<Seen>>) {
     let seen = Rc::new(RefCell::new(Seen::default()));
     let host = ScriptedDialogs {
         seen: Rc::clone(&seen),
         picked,
         pressed,
         fail,
+        active,
     };
     let strings = DialogStrings {
         save: "Kaydet".to_owned(),
         dont_save: "Kaydetme".to_owned(),
     };
-    (WindowsDialogs::with_host(None, strings, host), seen)
+    (WindowsDialogs::with_host(owner, strings, host), seen)
 }
 
 fn failed(error: &ServiceError, service: &str) -> bool {
@@ -444,6 +471,7 @@ fn message_boxes_hand_the_planned_buttons_to_the_task_dialog() {
             common_buttons: 8,
             custom_buttons: vec![(101, "Kaydet".to_owned()), (102, "Kaydetme".to_owned())],
             has_icon: true,
+            owner: None,
         }]
     );
     assert_eq!(
@@ -454,6 +482,7 @@ fn message_boxes_hand_the_planned_buttons_to_the_task_dialog() {
             common_buttons: 2 | 4,
             custom_buttons: Vec::new(),
             has_icon: false,
+            owner: None,
         }]
     );
     // A command id the plan never offered is an error, not a guess.
@@ -485,6 +514,57 @@ fn every_icon_is_handed_to_the_task_dialog_except_the_plain_question() {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].has_icon, has_icon, "{icon:?}");
     }
+}
+
+/// Shows one dialog of every kind: three file dialogs and a message box.
+fn show_every_dialog(dialogs: &mut WindowsDialogs<ScriptedDialogs>) {
+    dialogs.open_file(&OpenFileOptions::default()).unwrap();
+    dialogs.save_file(&SaveFileOptions::default()).unwrap();
+    dialogs.pick_folder(&PickFolderOptions::default()).unwrap();
+    dialogs.message_box(&MessageBoxOptions::default()).unwrap();
+}
+
+/// The owner of every dialog the host was asked to show: the file dialogs, then the message
+/// boxes.
+fn owners_seen(seen: &Rc<RefCell<Seen>>) -> Vec<Option<isize>> {
+    let seen = seen.borrow();
+    let files = seen.files.iter().map(|call| call.owner);
+    let tasks = seen.tasks.iter().map(|call| call.owner);
+    files.chain(tasks).collect()
+}
+
+#[test]
+fn a_dialog_without_a_named_owner_belongs_to_the_window_that_is_active() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let active = handle(0x4000);
+    let (mut dialogs, seen) = scripted_over(Vec::new(), 1, false, None, Some(active));
+    show_every_dialog(&mut dialogs);
+    // The application's window is the owner, so it is disabled while the dialog is up.
+    assert_eq!(owners_seen(&seen), [Some(active.0 as isize); 4]);
+}
+
+#[test]
+fn a_named_owner_keeps_its_dialogs_whichever_window_is_active() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let named = handle(0x2000);
+    let (mut dialogs, seen) =
+        scripted_over(Vec::new(), 1, false, Some(named), Some(handle(0x4000)));
+    show_every_dialog(&mut dialogs);
+    assert_eq!(owners_seen(&seen), [Some(named.0 as isize); 4]);
+}
+
+#[test]
+fn dialogs_are_ownerless_while_no_window_is_active() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let (mut dialogs, seen) = scripted_over(Vec::new(), 1, false, None, None);
+    show_every_dialog(&mut dialogs);
+    assert_eq!(owners_seen(&seen), [None::<isize>; 4]);
+}
+
+#[test]
+fn the_system_hosts_find_no_active_window_in_a_thread_that_made_none() {
+    assert_eq!(SystemDialogHost.active_window(), None);
+    assert_eq!(SystemShellHost.active_window(), None);
 }
 
 /// What a file dialog that is never shown answers to `Show`, `GetResult` and `GetResults`.
@@ -752,9 +832,15 @@ struct ScriptedShell {
     executed: Executed,
     revealed: Revealed,
     fail: bool,
+    /// The window the host reports as the active one.
+    active: Option<HWND>,
 }
 
 impl ShellHost for ScriptedShell {
+    fn active_window(&self) -> Option<HWND> {
+        self.active
+    }
+
     fn execute(&mut self, info: &mut SHELLEXECUTEINFOW) -> windows::core::Result<()> {
         // SAFETY: the strings are NUL-terminated and alive for the call.
         let (verb, file) = unsafe {
@@ -766,7 +852,7 @@ impl ShellHost for ScriptedShell {
         assert_eq!(info.cbSize as usize, size_of::<SHELLEXECUTEINFOW>());
         self.executed
             .borrow_mut()
-            .push((verb, file, info.fMask, info.nShow));
+            .push((verb, file, info.fMask, info.nShow, info.hwnd.0 as isize));
         if self.fail {
             Err(E_FAIL.into())
         } else {
@@ -784,18 +870,30 @@ impl ShellHost for ScriptedShell {
     }
 }
 
-type Executed = Rc<RefCell<Vec<(String, String, u32, i32)>>>;
+/// `(verb, file, mask, show command, owner)` of every request the host was asked to run.
+type Executed = Rc<RefCell<Vec<(String, String, u32, i32, isize)>>>;
 type Revealed = Rc<RefCell<Vec<Option<PathBuf>>>>;
 
 fn shell(fail: bool) -> (WindowsShell<ScriptedShell>, Executed, Revealed) {
+    shell_over(fail, None, None)
+}
+
+/// [`shell`] with `owner` named at construction and `active` the window the host reports as
+/// the active one.
+fn shell_over(
+    fail: bool,
+    owner: Option<HWND>,
+    active: Option<HWND>,
+) -> (WindowsShell<ScriptedShell>, Executed, Revealed) {
     let executed = Rc::new(RefCell::new(Vec::new()));
     let revealed = Rc::new(RefCell::new(Vec::new()));
     let host = ScriptedShell {
         executed: Rc::clone(&executed),
         revealed: Rc::clone(&revealed),
         fail,
+        active,
     };
-    (WindowsShell::with_host(None, host), executed, revealed)
+    (WindowsShell::with_host(owner, host), executed, revealed)
 }
 
 #[test]
@@ -857,6 +955,23 @@ fn shell_requests_are_validated_before_the_os_call() {
     assert_eq!(calls.len(), 4, "refused requests never reached the host");
     assert_eq!(PathBuf::from(&calls[2].1), document);
     std::fs::remove_file(document).unwrap();
+}
+
+#[test]
+fn shell_requests_belong_to_the_named_owner_or_else_to_the_active_window() {
+    let _com = ComGuard::apartment_threaded().unwrap();
+    let (named, active) = (handle(0x2000), handle(0x4000));
+    for (owner, active_now, expected) in [
+        (None, Some(active), active.0 as isize),
+        (Some(named), Some(active), named.0 as isize),
+        (None, None, 0),
+    ] {
+        let (mut shell, executed, _) = shell_over(false, owner, active_now);
+        shell.open_url("https://example.com").unwrap();
+        shell.open_default_apps_settings().unwrap();
+        let owners: Vec<isize> = executed.borrow().iter().map(|call| call.4).collect();
+        assert_eq!(owners, [expected, expected], "{owner:?} {active_now:?}");
+    }
 }
 
 #[test]

@@ -876,6 +876,76 @@ fn find_highlights_follow_the_bar_and_vanish_when_it_closes() {
 }
 
 #[test]
+fn find_highlights_follow_the_current_match_and_edits() {
+    let mut rig = Rig::new(
+        "ab
+
+ab
+",
+    );
+    let palette = &rig.theme.tokens.highlight;
+    let (current, other) = (palette.orange.background, palette.yellow.background);
+    rig.overlays.open_find(false);
+    rig.overlays.find_mut().set_pattern("ab");
+    rig.pump();
+    rig.pump();
+    assert_eq!(rig.highlight_fills(), [current, other]);
+    assert!(rig.overlays.find_mut().find_next());
+    rig.pump();
+    assert_eq!(rig.highlight_fills(), [other, current]);
+    let before = rig.doc.borrow().primary_selection();
+    rig.doc
+        .borrow_mut()
+        .apply(Transaction::single(
+            Edit::insert(0, "ab "),
+            before,
+            Selection::caret(3),
+        ))
+        .unwrap();
+    rig.pump();
+    assert_eq!(rig.highlight_fills(), [other, current, other]);
+}
+
+#[test]
+fn closing_find_after_a_tab_switch_leaves_no_highlights_in_the_tab_left_behind() {
+    let mut rig = Rig::new(
+        "ab
+
+ab
+",
+    );
+    let doc_a = Rc::clone(&rig.doc);
+    let doc_b = Rc::new(RefCell::new(Document::new(
+        "xx ab
+",
+    )));
+    let clock: Rc<dyn Clock> = Rc::new(FakeClock::default());
+    let mut tab_b = EditorView::new(Rc::clone(&doc_b), clock);
+    rig.overlays.open_find(false);
+    rig.overlays.find_mut().set_pattern("ab");
+    rig.pump();
+    assert_eq!(rig.highlight_fills().len(), 2);
+
+    std::mem::swap(&mut rig.editor, &mut tab_b);
+    rig.overlays.set_document(&doc_b);
+    rig.layout();
+    rig.pump();
+    assert_eq!(rig.highlight_fills().len(), 1, "the match of the new tab");
+
+    rig.overlays.find_mut().close();
+    rig.pump();
+    assert!(rig.highlight_fills().is_empty());
+
+    std::mem::swap(&mut rig.editor, &mut tab_b);
+    rig.overlays.set_document(&doc_a);
+    rig.pump();
+    assert!(
+        rig.highlight_fills().is_empty(),
+        "the first tab still painted the matches of the closed bar"
+    );
+}
+
+#[test]
 fn go_to_line_moves_the_editor_and_quick_open_goes_to_headings_or_closes() {
     let mut rig = Rig::new("alpha\nbeta\ngamma\n");
     rig.overlays.open_goto();

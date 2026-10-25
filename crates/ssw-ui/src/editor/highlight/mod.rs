@@ -302,8 +302,8 @@ const CACHE_LIMIT: usize = 256;
 /// its start offset) remembers its lines, their tokens and the scanner state before each line.
 /// Highlighting changed text reuses every line whose content and incoming state are unchanged,
 /// so typing in a large block rescans one line (plus the lines whose state it changes, such as
-/// the rest of a block comment). Lines are matched by index: inserting or deleting a line break
-/// moves every line below it to another index and rescans them.
+/// the rest of a block comment). Cached and new lines are aligned by their common head and tail,
+/// so inserting or deleting a line break rescans only the lines around it.
 #[derive(Debug, Default)]
 pub struct Highlighter {
     entries: HashMap<usize, Entry>,
@@ -322,20 +322,42 @@ impl Highlighter {
     pub fn highlight(&mut self, key: usize, language: Language, text: &str) -> Vec<Token> {
         self.clock += 1;
         self.scanned = 0;
-        let mut previous: Vec<Option<CachedLine>> = self
+        let old: Vec<CachedLine> = self
             .entries
             .remove(&key)
             .filter(|entry| entry.language == language)
-            .map(|entry| entry.lines.into_iter().map(Some).collect())
+            .map(|entry| entry.lines)
             .unwrap_or_default();
+        let new: Vec<(&str, usize)> = lines(text).collect();
+        // Cached lines are aligned with the new ones by their common head and common tail, so
+        // a line break inserted or removed in the middle leaves both sides reusable.
+        let prefix = old
+            .iter()
+            .zip(&new)
+            .take_while(|(line, (content, _))| line.text == *content)
+            .count();
+        let suffix = old[prefix..]
+            .iter()
+            .rev()
+            .zip(new[prefix..].iter().rev())
+            .take_while(|(line, (content, _))| line.text == *content)
+            .count();
+        let (old_len, new_len) = (old.len(), new.len());
+        let mut previous: Vec<Option<CachedLine>> = old.into_iter().map(Some).collect();
         let mut cached = Vec::new();
         let mut tokens = Vec::new();
         let mut state = State::default();
         let mut offset = 0;
-        for (index, (content, full)) in lines(text).enumerate() {
-            let reused = previous
-                .get_mut(index)
-                .and_then(Option::take)
+        for (index, (content, full)) in new.into_iter().enumerate() {
+            let source = if index < prefix {
+                Some(index)
+            } else if index + suffix >= new_len {
+                Some(index + old_len - new_len)
+            } else {
+                None
+            };
+            let reused = source
+                .and_then(|from| previous[from].take())
                 .filter(|line| line.state_in == state && line.text == content);
             let line = reused.unwrap_or_else(|| {
                 self.scanned += 1;

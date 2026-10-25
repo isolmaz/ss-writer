@@ -748,6 +748,7 @@ impl Conv<'_> {
             (LossKind::MergedCells, t.merged_cells),
             (LossKind::MultiParagraphCells, t.multi_paragraph_cells),
             (LossKind::NestedTables, t.nested_tables),
+            (LossKind::CorruptParts, t.truncated_tables),
         ];
         for (kind, count) in list {
             self.res.record_loss(kind, count, None);

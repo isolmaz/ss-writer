@@ -26,6 +26,7 @@ use ssw_core::command::CommandId;
 use ssw_core::edit::Selection;
 use ssw_core::links::RelPath;
 use ssw_io::fs::{Attributes, FileSystem, RealFs};
+use ssw_io::session::RecentKind;
 use ssw_io::watch::{FsEvent, FsEventKind};
 use ssw_ui::editor::{EditorEvent, LinkTarget};
 use ssw_ui::geometry::{Point, Rect, Size};
@@ -1526,7 +1527,13 @@ fn a_placeholder_that_cannot_be_read_is_reported_and_a_closed_window_reads_nothi
         rig.answer(MessageBoxResult::Ok);
         rig.controller.open_file(&window, &locked).unwrap();
         rig.wait_for("the error", || !rig.messages().is_empty());
-        assert_eq!(rig.messages(), ["The file could not be read or written."]);
+        assert_eq!(
+            rig.messages(),
+            [failed_box(
+                &[locked.as_path()],
+                "The file could not be read or written."
+            )]
+        );
         assert_eq!(rig.tab_count(), 1);
         assert_eq!(
             rig.progress(),
@@ -1624,29 +1631,39 @@ fn the_completion_outline_is_fed_when_the_caret_enters_a_wikilink_after_the_file
     });
 }
 
-/// The real disk, except that reads panic while the flag is set.
-#[derive(Debug)]
-struct PanickingRead(std::sync::atomic::AtomicBool);
+/// The real disk, except that reads panic while the first flag is set and fail as if the file
+/// were gone while the second is.
+#[derive(Debug, Default)]
+struct PanickingRead(std::sync::atomic::AtomicBool, std::sync::atomic::AtomicBool);
 
 impl PanickingRead {
     fn arm(&self, armed: bool) {
         self.0.store(armed, std::sync::atomic::Ordering::SeqCst);
     }
+
+    fn vanish(&self, gone: bool) {
+        self.1.store(gone, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn check(&self, path: &Path) -> Result<(), ssw_io::fs::FsError> {
+        assert!(
+            !self.0.load(std::sync::atomic::Ordering::SeqCst),
+            "the disk went away"
+        );
+        if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ssw_io::fs::FsError::NotFound(path.to_path_buf()));
+        }
+        Ok(())
+    }
 }
 
 impl FileSystem for PanickingRead {
     fn read(&self, path: &Path) -> Result<Vec<u8>, ssw_io::fs::FsError> {
-        assert!(
-            !self.0.load(std::sync::atomic::Ordering::SeqCst),
-            "the disk went away"
-        );
+        self.check(path)?;
         RealFs.read(path)
     }
     fn read_prefix(&self, path: &Path, max: usize) -> Result<Vec<u8>, ssw_io::fs::FsError> {
-        assert!(
-            !self.0.load(std::sync::atomic::Ordering::SeqCst),
-            "the disk went away"
-        );
+        self.check(path)?;
         RealFs.read_prefix(path, max)
     }
     fn metadata(&self, path: &Path) -> Result<ssw_io::fs::FileMeta, ssw_io::fs::FsError> {
@@ -1721,7 +1738,7 @@ fn a_file_read_that_panics_is_reported_like_any_other_failure_to_read_it() {
         text_file("a.md", "# A\n"),
         text_file("cloud.md", "# Cloud\n"),
     ];
-    let fs = Arc::new(PanickingRead(std::sync::atomic::AtomicBool::new(false)));
+    let fs = Arc::new(PanickingRead::default());
     with_rig_on(&fs, files, "a.md", |rig| {
         let cloud = rig.work.join("cloud.md");
         make_placeholder(&cloud);
@@ -1731,7 +1748,13 @@ fn a_file_read_that_panics_is_reported_like_any_other_failure_to_read_it() {
         rig.controller.open_file(&window, &cloud).unwrap();
         rig.wait_for("the error", || !rig.messages().is_empty());
         fs.arm(false);
-        assert_eq!(rig.messages(), ["The file could not be read or written."]);
+        assert_eq!(
+            rig.messages(),
+            [failed_box(
+                &[cloud.as_path()],
+                "The file could not be read or written."
+            )]
+        );
         assert_eq!(rig.tab_count(), 1);
     });
 }
@@ -1919,7 +1942,7 @@ fn a_workspace_whose_watch_is_lost_has_its_index_rebuilt_by_a_full_run() {
 }
 
 #[test]
-fn a_document_the_recent_list_refuses_is_reported_after_its_background_read() {
+fn a_recent_list_the_database_refuses_does_not_fail_a_background_open() {
     let files = vec![
         text_file("a.md", "# A\n"),
         text_file("cloud.md", "# Cloud\n"),
@@ -1933,22 +1956,13 @@ fn a_document_the_recent_list_refuses_is_reported_after_its_background_read() {
             .execute_batch("DROP TABLE recent_items;")
             .unwrap();
         make_placeholder(&rig.work.join("cloud.md"));
-        rig.answer(MessageBoxResult::Ok);
-        rig.answer(MessageBoxResult::Ok);
         // A placeholder is read on a worker, a word-processor file is imported on one.
         rig.controller
             .open_file(&rig.window(), &rig.work.join("cloud.md"))
             .unwrap();
         open_in_sidebar(rig, &rig.work.join("doc.rtf"));
-        rig.wait_for("both errors", || rig.messages().len() == 2);
-        assert_eq!(
-            rig.messages(),
-            [
-                "The file could not be read or written.",
-                "The file could not be read or written."
-            ]
-        );
-        assert_eq!(rig.tab_count(), 1);
+        rig.wait_for("both documents", || rig.tab_count() == 3);
+        assert_eq!(message_boxes(rig), Vec::<String>::new());
     });
 }
 
@@ -1958,7 +1972,7 @@ fn an_import_whose_worker_panics_is_reported_as_a_failed_conversion() {
         text_file("a.md", "# A\n"),
         byte_file("doc.rtf", &rtf_fixture()),
     ];
-    let fs = Arc::new(PanickingRead(std::sync::atomic::AtomicBool::new(false)));
+    let fs = Arc::new(PanickingRead::default());
     with_rig_on(&fs, files, "a.md", |rig| {
         rig.show();
         rig.answer(MessageBoxResult::Ok);
@@ -1966,8 +1980,136 @@ fn an_import_whose_worker_panics_is_reported_as_a_failed_conversion() {
         open_in_sidebar(rig, &rig.work.join("doc.rtf"));
         rig.wait_for("the error", || !rig.messages().is_empty());
         fs.arm(false);
-        assert_eq!(rig.messages(), ["The document could not be converted."]);
+        let doc = rig.work.join("doc.rtf");
+        assert_eq!(
+            rig.messages(),
+            [failed_box(
+                &[doc.as_path()],
+                "The document could not be converted."
+            )]
+        );
         assert_eq!(rig.tab_count(), 1);
+    });
+}
+
+/// The paths of the recent files, newest first.
+fn recent_files(rig: &Rig) -> Vec<PathBuf> {
+    let items = rig
+        .controller
+        .docs()
+        .env()
+        .store
+        .borrow()
+        .recent_items(RecentKind::File)
+        .unwrap();
+    items.into_iter().map(|item| item.path).collect()
+}
+
+fn remember(rig: &Rig, path: &Path) {
+    rig.controller
+        .docs()
+        .env()
+        .store
+        .borrow_mut()
+        .recent_add(RecentKind::File, path, 1_000)
+        .unwrap();
+}
+
+#[test]
+fn a_placeholder_that_is_gone_when_it_is_read_is_named_and_taken_off_the_recent_list() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        text_file("cloud.md", "# Cloud\n"),
+    ];
+    let fs = Arc::new(PanickingRead::default());
+    with_rig_on(&fs, files, "a.md", |rig| {
+        let cloud = rig.work.join("cloud.md");
+        make_placeholder(&cloud);
+        remember(rig, &cloud);
+        assert!(recent_files(rig).contains(&cloud));
+        rig.answer(MessageBoxResult::Ok);
+        fs.vanish(true);
+        rig.controller.open_file(&rig.window(), &cloud).unwrap();
+        rig.wait_for("the error", || !rig.messages().is_empty());
+        fs.vanish(false);
+        assert_eq!(
+            rig.messages(),
+            [failed_box(&[cloud.as_path()], "The file no longer exists.")]
+        );
+        assert_eq!(rig.tab_count(), 1);
+        assert!(!recent_files(rig).contains(&cloud));
+    });
+}
+
+#[test]
+fn an_import_of_a_file_that_is_gone_is_named_and_taken_off_the_recent_list() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        byte_file("doc.rtf", &rtf_fixture()),
+    ];
+    let fs = Arc::new(PanickingRead::default());
+    with_rig_on(&fs, files, "a.md", |rig| {
+        rig.show();
+        let doc = rig.work.join("doc.rtf");
+        remember(rig, &doc);
+        assert!(recent_files(rig).contains(&doc));
+        rig.answer(MessageBoxResult::Ok);
+        fs.vanish(true);
+        open_in_sidebar(rig, &doc);
+        rig.wait_for("the error", || !rig.messages().is_empty());
+        fs.vanish(false);
+        assert_eq!(
+            rig.messages(),
+            [failed_box(&[doc.as_path()], "The file no longer exists.")]
+        );
+        assert_eq!(rig.tab_count(), 1);
+        assert!(!recent_files(rig).contains(&doc));
+    });
+}
+
+#[test]
+fn background_opens_that_fail_in_the_same_turn_share_one_box() {
+    let files = vec![
+        text_file("a.md", "# A\n"),
+        text_file("cloud.md", "# Cloud\n"),
+        byte_file("doc.rtf", &rtf_fixture()),
+    ];
+    let fs = Arc::new(PanickingRead::default());
+    with_rig_on(&fs, files, "a.md", |rig| {
+        rig.show();
+        let cloud = rig.work.join("cloud.md");
+        let doc = rig.work.join("doc.rtf");
+        make_placeholder(&cloud);
+        rig.answer(MessageBoxResult::Ok);
+        fs.vanish(true);
+        rig.controller.open_file(&rig.window(), &cloud).unwrap();
+        open_in_sidebar(rig, &doc);
+        // The results of both jobs are delivered before the turn that reports failures runs,
+        // so that it finds both.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while rig.controller.core().borrow().workers.pending() > 0 {
+            assert!(Instant::now() < deadline, "the jobs did not finish");
+            rig.controller.core().borrow_mut().pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            rig.messages().is_empty(),
+            "nothing is reported before the turn"
+        );
+        rig.pump();
+        fs.vanish(false);
+        let messages = rig.messages();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        let lines: Vec<&str> = messages[0].lines().collect();
+        assert_eq!(lines[..2], ["2 files could not be opened:", ""]);
+        let mut named = lines[2..].to_vec();
+        named.sort_unstable();
+        let mut expected = [
+            format!("{}: The file no longer exists.", cloud.display()),
+            format!("{}: The file no longer exists.", doc.display()),
+        ];
+        expected.sort_unstable();
+        assert_eq!(named, expected);
     });
 }
 
@@ -2010,6 +2152,24 @@ fn an_import_that_finishes_after_its_window_was_merged_away_opens_nothing() {
 
 /// What the user is told about a binary file.
 const NOT_TEXT: &str = "This file is not a text file.";
+
+/// The box that names the binary files `paths` of one action, which the editor refused.
+fn refused(paths: &[&Path]) -> String {
+    failed_box(paths, NOT_TEXT)
+}
+
+/// The one box that names the files `paths` of one action that did not open, each with `reason`.
+fn failed_box(paths: &[&Path], reason: &str) -> String {
+    let heading = match paths {
+        [_] => "The file could not be opened:".to_owned(),
+        _ => format!("{} files could not be opened:", paths.len()),
+    };
+    let lines: Vec<String> = paths
+        .iter()
+        .map(|path| format!("{}: {reason}", path.display()))
+        .collect();
+    format!("{heading}\n\n{}", lines.join("\n"))
+}
 
 /// Text files without a known extension, and what they show.
 const UNKNOWN_TEXT: [(&str, &str); 6] = [
@@ -2275,30 +2435,36 @@ fn a_binary_file_is_refused_with_a_message_by_every_way_of_asking_the_editor_to_
         byte_file("pic.png", PNG_START),
     ];
     with_rig(files, "a.md", nothing, |rig| {
-        // File > Open: the binary file is refused, the text file after it opens.
+        let tool = rig.work.join("tool.exe");
+        let picture = rig.work.join("pic.png");
+        // File > Open: the binary file is refused by name, the text file after it opens.
         rig.services.answer(
             DialogKind::OpenFile,
-            Answer::Paths(vec![rig.work.join("tool.exe"), rig.work.join("notes.kt")]),
+            Answer::Paths(vec![tool.clone(), rig.work.join("notes.kt")]),
         );
         rig.answer(MessageBoxResult::Ok);
         let _ = rig
             .controller
             .run_command(rig.id(), ssw_core::command::CommandId::FileOpen);
-        assert_eq!(message_boxes(rig), [NOT_TEXT]);
+        assert_eq!(message_boxes(rig), [refused(&[tool.as_path()])]);
         assert_eq!(rig.tab_count(), 2);
         assert_eq!(rig.path(), canonical_path(&rig.work.join("notes.kt")));
         assert_eq!(rig.active().mode(), DocMode::Plain);
 
         // A launch (Explorer "Open with", the command line, a forwarded second start) and a
         // dropped file end in the same call: a picture is no more text than a program.
-        for name in ["tool.exe", "pic.png"] {
+        for path in [&tool, &picture] {
             rig.answer(MessageBoxResult::Ok);
             rig.controller.open_launch(&Launch {
-                items: vec![LaunchItem::File(rig.work.join(name))],
+                items: vec![LaunchItem::File(path.clone())],
                 new_window: false,
             });
         }
-        assert_eq!(message_boxes(rig), [NOT_TEXT; 3]);
+        let (tool, picture) = (tool.as_path(), picture.as_path());
+        assert_eq!(
+            message_boxes(rig),
+            [refused(&[tool]), refused(&[tool]), refused(&[picture])]
+        );
         assert_eq!(rig.tab_count(), 2, "no tab shows a refused file");
         let mut open: Vec<PathBuf> = rig
             .controller

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use crate::doc::md::flank;
-use crate::import::{Asset, ImportError, ImportResult, LossKind};
+use crate::import::{Asset, ImportError, ImportResult, LossKind, fit_table};
 
 /// Group nesting beyond this depth is ignored (the groups are still balanced).
 const MAX_DEPTH: usize = 256;
@@ -315,6 +315,7 @@ struct Reader {
     blocks: Vec<Block>,
     cells: Vec<String>,
     rows: Vec<Vec<String>>,
+    cells_used: usize,
     cell_text: String,
     /// The current row is a header row (`\\trhdr`).
     row_header: bool,
@@ -356,6 +357,7 @@ impl Reader {
             blocks: Vec::new(),
             cells: Vec::new(),
             rows: Vec::new(),
+            cells_used: 0,
             cell_text: String::new(),
             row_header: false,
             counters: Vec::new(),
@@ -962,8 +964,11 @@ impl Reader {
     }
 
     fn flush_table(&mut self) {
-        if !self.rows.is_empty() {
-            let rows = std::mem::take(&mut self.rows);
+        let mut rows = std::mem::take(&mut self.rows);
+        if fit_table(&mut rows, &mut self.cells_used) {
+            self.result.record_loss(LossKind::CorruptParts, 1, None);
+        }
+        if !rows.is_empty() {
             self.blocks.push(Block::Table(rows));
         }
     }
@@ -1515,6 +1520,22 @@ mod tests {
         let kinds: Vec<LossKind> = r.losses.iter().map(|l| l.kind).collect();
         assert!(kinds.contains(&LossKind::MergedCells));
         assert!(kinds.contains(&LossKind::MultiParagraphCells));
+    }
+
+    #[test]
+    fn table_grids_beyond_the_column_and_cell_limits_are_cut() {
+        use crate::import::{MAX_CELLS, MAX_COLUMNS};
+        let wide = format!(
+            "\\trowd{}\\row",
+            "\\pard\\intbl x\\cell".repeat(MAX_COLUMNS + 1)
+        );
+        let narrow = "\\trowd\\pard\\intbl x\\cell\\row".repeat(MAX_CELLS / MAX_COLUMNS + 6);
+        let r = import_rtf(format!("{{\\rtf1{wide}{narrow}}}").as_bytes()).unwrap();
+        let lines: Vec<&str> = r.markdown.lines().collect();
+        assert_eq!(lines[0].matches('|').count(), MAX_COLUMNS + 1);
+        assert_eq!(lines.len(), MAX_CELLS / MAX_COLUMNS + 1);
+        let kinds: Vec<(LossKind, usize)> = r.losses.iter().map(|l| (l.kind, l.count)).collect();
+        assert_eq!(kinds, [(LossKind::CorruptParts, 1)]);
     }
 
     #[test]

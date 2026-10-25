@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use ssw_app::app::{AppCore, ShellHost, run};
 use ssw_app::args::Args;
-use ssw_app::documents::{DocError, canonical_path};
+use ssw_app::documents::{DocEnv, DocError, Documents, canonical_path};
 use ssw_app::startup::ProcessEnv;
 use ssw_app::ui::controller::{Controller, Request, WindowCell};
 use ssw_app::ui::help::{
@@ -63,10 +63,19 @@ struct Rig {
 struct Host<B> {
     body: Option<B>,
     services: ScriptedServices,
+    /// The file system the documents go through instead of the real one.
+    faults: Option<Arc<FaultFs>>,
 }
 
 impl<B: FnOnce(&Rig)> ShellHost for Host<B> {
-    fn run(&mut self, core: AppCore, _args: &Args) -> i32 {
+    fn run(&mut self, mut core: AppCore, _args: &Args) -> i32 {
+        if let Some(fs) = self.faults.take() {
+            let env = DocEnv {
+                fs,
+                ..core.docs.env().clone()
+            };
+            core.docs = Rc::new(Documents::new(env));
+        }
         let services = self.services.clone();
         let clipboard: SharedClipboard = Rc::new(RefCell::new(MemoryClipboard::default()));
         let clock: Rc<dyn Clock> = Rc::new(FakeClock::default());
@@ -95,16 +104,26 @@ impl<B: FnOnce(&Rig)> ShellHost for Host<B> {
 
 /// Runs `body` over a started application whose first window shows `notes.md`.
 fn with_rig(settings: &str, body: impl FnOnce(&Rig)) {
-    with_rig_of(settings, false, body);
+    with_rig_on(None, settings, false, body);
 }
 
 /// The same application, started as a portable copy (the `portable` marker next to the
 /// executable), which has no package to install.
 fn with_portable_rig(body: impl FnOnce(&Rig)) {
-    with_rig_of(NO_AUTOSAVE, true, body);
+    with_rig_on(None, NO_AUTOSAVE, true, body);
 }
 
-fn with_rig_of(settings: &str, portable: bool, body: impl FnOnce(&Rig)) {
+/// The same application whose documents reach the disk through `faults`.
+fn with_faulty_rig(faults: Arc<FaultFs>, body: impl FnOnce(&Rig)) {
+    with_rig_on(Some(faults), NO_AUTOSAVE, false, body);
+}
+
+fn with_rig_on(
+    faults: Option<Arc<FaultFs>>,
+    settings: &str,
+    portable: bool,
+    body: impl FnOnce(&Rig),
+) {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -132,6 +151,7 @@ fn with_rig_of(settings: &str, portable: bool, body: impl FnOnce(&Rig)) {
         &mut Host {
             body: Some(body),
             services: ScriptedServices::new(),
+            faults,
         },
     );
     assert_eq!(code, 0);
@@ -390,13 +410,10 @@ fn a_help_folder_that_cannot_be_created_is_reported() {
 
 #[test]
 fn a_help_page_that_cannot_be_opened_is_reported_and_leaves_no_tab() {
-    with_rig(NO_AUTOSAVE, |rig| {
-        // The recent list is gone: opening any document fails when it is recorded.
-        let database = rig.controller.core().borrow().paths.state_db();
-        rusqlite::Connection::open(database)
-            .unwrap()
-            .execute_batch("DROP TABLE recent_items")
-            .unwrap();
+    let faults = Arc::new(FaultFs::new());
+    with_faulty_rig(Arc::clone(&faults), |rig| {
+        // The page is written, then reading it back fails.
+        faults.fail(FsOp::Read, FsFailure::AccessDenied, 1);
         rig.answer(MessageBoxResult::Ok);
         rig.command(CommandId::HelpKeyboardShortcuts);
         assert_eq!(rig.services.dialog_log().len(), 1);

@@ -1,5 +1,7 @@
 use std::io;
+use std::os::windows::process::CommandExt;
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ssw_io::fs::{
@@ -31,7 +33,13 @@ fn win32_codes_are_classified() {
     let cases = [
         (win32::FILE_NOT_FOUND, FsError::NotFound(p())),
         (win32::PATH_NOT_FOUND, FsError::NotFound(p())),
-        (win32::BAD_NETPATH, FsError::NotFound(p())),
+        (
+            win32::BAD_NETPATH,
+            FsError::Os {
+                code: win32::BAD_NETPATH,
+                path: p(),
+            },
+        ),
         (win32::ALREADY_EXISTS, FsError::AlreadyExists(p())),
         (win32::FILE_EXISTS, FsError::AlreadyExists(p())),
         (win32::ACCESS_DENIED, FsError::AccessDenied(p())),
@@ -191,6 +199,55 @@ fn real_fs_files_and_metadata() {
     assert_eq!(names(&fs, dir.path()), ["a.txt", "c.txt"]);
     fs.delete_file(&moved).unwrap();
     assert!(matches!(fs.delete_file(&moved), Err(FsError::NotFound(_))));
+}
+
+/// A directory junction (needs no privilege) at `link` pointing at `target`.
+fn junction(link: &Path, target: &Path) {
+    let made = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .creation_flags(0x0800_0000)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "mklink /J failed: {made:?}");
+}
+
+#[test]
+fn junctions_are_links_and_other_folders_and_files_are_not() {
+    let dir = temp();
+    let fs = RealFs;
+    let target = dir.path().join("target");
+    fs.create_dir(&target).unwrap();
+    let file = dir.path().join("file.txt");
+    fs.write_new(&file, b"x").unwrap();
+    let link = dir.path().join("link");
+    junction(&link, &target);
+
+    // The listing of the parent knows from the reparse tag of each entry.
+    let mut listed: Vec<(String, bool, bool)> = fs
+        .list_dir(dir.path())
+        .unwrap()
+        .into_iter()
+        .map(|entry| (entry.name, entry.meta.is_dir(), entry.meta.link))
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            ("file.txt".to_owned(), false, false),
+            ("link".to_owned(), true, true),
+            ("target".to_owned(), true, false)
+        ]
+    );
+    // The metadata of a single path agrees.
+    let meta = fs.metadata(&link).unwrap();
+    assert!(meta.link && meta.attrs.any(Attributes::REPARSE_POINT));
+    assert!(!fs.metadata(&target).unwrap().link);
+    assert!(!fs.metadata(&file).unwrap().link);
+    // Removing the junction first keeps the cleanup of the folder away from its target.
+    fs.remove_dir(&link).unwrap();
+    assert!(target.exists());
 }
 
 #[test]

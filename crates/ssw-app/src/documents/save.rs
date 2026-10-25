@@ -3,6 +3,7 @@
 //! snapshot taken first.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ssw_convert::assets::{AssetProvider, image_mime_for_path, is_external_url};
 use ssw_convert::docx::{ExportOptions, MathImage, Resources};
@@ -11,7 +12,7 @@ use ssw_convert::textbundle;
 use ssw_io::encoding::{self, TextFormat};
 use ssw_io::fs::FileSystem;
 use ssw_io::history::SnapshotReason;
-use ssw_io::save::{SaveStamp, WriteAccess, save_atomic};
+use ssw_io::save::{SaveStamp, Sleeper, WriteAccess, save_atomic};
 
 use crate::session::remember_language;
 
@@ -26,6 +27,15 @@ pub struct Saved {
     pub path: PathBuf,
     /// Identity of the content on disk after the write.
     pub stamp: SaveStamp,
+}
+
+/// A sleeper that returns at once: a save made with it tries again right away after a sharing
+/// violation instead of waiting for the other program to let go.
+#[derive(Debug)]
+struct NoSleep;
+
+impl Sleeper for NoSleep {
+    fn sleep(&self, _duration: Duration) {}
 }
 
 /// Images and math for exports: the importer's extracted images first, then files next to the
@@ -117,13 +127,29 @@ fn title_of(path: &Path) -> String {
 }
 
 impl Documents {
-    /// Saves a document to its file, in its own encoding and line endings, atomically.
+    /// Saves a document to its file, in its own encoding and line endings, atomically. A file
+    /// that another program holds is tried again after 50, 100, 200, 400 and 800 ms.
     ///
     /// # Errors
     /// [`DocError::Untitled`] for a buffer without a file, [`DocError::NeedsSaveAs`] for a
     /// converted document, [`DocError::Encode`] when the encoding cannot represent the text
     /// (offer UTF-8), [`DocError::Save`] for write failures (read-only: offer "Allow editing").
     pub fn save(&self, entry: &DocEntry) -> Result<Saved, DocError> {
+        self.save_waiting(entry, self.env.sleeper.as_ref())
+    }
+
+    /// [`Documents::save`] for a caller that must not stall the UI (the autosave tick): it never
+    /// sleeps. A file that another program holds is tried again at once instead of after the
+    /// backoff, and the sharing violation is returned when it lasts; the caller decides when to
+    /// try again.
+    ///
+    /// # Errors
+    /// The errors of [`Documents::save`].
+    pub fn save_without_waiting(&self, entry: &DocEntry) -> Result<Saved, DocError> {
+        self.save_waiting(entry, &NoSleep)
+    }
+
+    fn save_waiting(&self, entry: &DocEntry, sleeper: &dyn Sleeper) -> Result<Saved, DocError> {
         let (path, source) = {
             let state = entry.state.borrow();
             (state.path.clone(), state.source.clone())
@@ -137,28 +163,18 @@ impl Documents {
         let stamp = match &source {
             Source::Text => {
                 let bytes = encoding::encode(&text, &format)?;
-                save_atomic(
-                    self.env.fs.as_ref(),
-                    self.env.sleeper.as_ref(),
-                    &path,
-                    &bytes,
-                )?
+                save_atomic(self.env.fs.as_ref(), sleeper, &path, &bytes)?
             }
             Source::TextBundle { text_file } => save_atomic(
                 self.env.fs.as_ref(),
-                self.env.sleeper.as_ref(),
+                sleeper,
                 &path.join(text_file),
                 text.as_bytes(),
             )?,
             Source::TextPack => {
                 let assets = entry.state.borrow().assets.clone();
                 let bytes = textbundle::write_pack(&text, &assets).map_err(conversion_failed)?;
-                save_atomic(
-                    self.env.fs.as_ref(),
-                    self.env.sleeper.as_ref(),
-                    &path,
-                    &bytes,
-                )?
+                save_atomic(self.env.fs.as_ref(), sleeper, &path, &bytes)?
             }
             Source::Converted(_) => return Err(DocError::NeedsSaveAs),
         };

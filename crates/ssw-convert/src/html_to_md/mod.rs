@@ -16,7 +16,7 @@ use base64::engine::general_purpose::STANDARD;
 use markup5ever_rcdom::{Handle, NodeData};
 
 use crate::assets::{extension_for_mime, is_external_url, sniff_image_mime};
-use crate::import::{Asset, ImportResult, LossKind};
+use crate::import::{Asset, ImportResult, LossKind, fit_table};
 use dom::{Style, attr, children, has_class, tag, text_content, text_of};
 use render::{
     Align, Block, Fmt, Inline, Item, List, Table, code_span, destination, escape_inline,
@@ -71,6 +71,7 @@ fn convert(document: &Handle, asset_dir: &str) -> ImportResult {
         gdocs: gdocs::detect(document),
         depth: 0,
         in_cell: false,
+        cells_used: 0,
     };
     let mut sink = Sink::default();
     let mut acc = Vec::new();
@@ -186,6 +187,8 @@ struct Converter {
     depth: usize,
     /// Inside a table cell: line breaks become `<br>` and `|` is escaped.
     in_cell: bool,
+    /// Cells of the tables kept so far, padding included.
+    cells_used: usize,
 }
 
 impl Converter {
@@ -579,6 +582,9 @@ impl Converter {
             grid.push(line);
         }
         self.result.record_loss(LossKind::MergedCells, merged, None);
+        if fit_table(&mut grid, &mut self.cells_used) {
+            self.result.record_loss(LossKind::CorruptParts, 1, None);
+        }
         let columns = grid.iter().map(Vec::len).max().unwrap_or(0);
         for line in &mut grid {
             line.resize(columns, String::new());
@@ -1294,6 +1300,21 @@ mod tests {
         for (html, expected) in table {
             assert_eq!(md(html), expected, "{html}");
         }
+    }
+
+    #[test]
+    fn table_grids_beyond_the_column_and_cell_limits_are_cut() {
+        use crate::import::{MAX_CELLS, MAX_COLUMNS};
+        let cell = "<td>x</td>";
+        let wide = format!("<tr>{}</tr>", cell.repeat(MAX_COLUMNS + 1));
+        let narrow = format!("<tr>{cell}</tr>").repeat(MAX_CELLS / MAX_COLUMNS + 6);
+        let result = html_to_markdown(&format!("<table>{wide}{narrow}</table>"), "assets");
+        let lines: Vec<&str> = result.markdown.lines().collect();
+        assert_eq!(lines[0].matches('|').count(), MAX_COLUMNS + 1);
+        assert_eq!(lines.len(), MAX_CELLS / MAX_COLUMNS + 1);
+        let losses: Vec<(LossKind, usize)> =
+            result.losses.iter().map(|l| (l.kind, l.count)).collect();
+        assert_eq!(losses, [(LossKind::CorruptParts, 1)]);
     }
 
     #[test]

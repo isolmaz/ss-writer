@@ -301,6 +301,25 @@ fn purge_removes_snapshots_older_than_the_retention_and_unreferenced_blobs() {
 }
 
 #[test]
+fn the_snapshots_that_refer_to_a_blob_are_found_through_an_index() {
+    let (_tmp, _store, db) = open();
+    // Deleting a blob makes SQLite look up the snapshots with this hash (the foreign key).
+    let plan: Vec<String> = Connection::open(&db)
+        .unwrap()
+        .prepare("EXPLAIN QUERY PLAN SELECT 1 FROM history_snapshots WHERE hash = x'00'")
+        .unwrap()
+        .query_map([], |row| row.get(3))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("INDEX history_snapshots_by_hash")),
+        "{plan:?}"
+    );
+}
+
+#[test]
 fn moving_a_file_carries_its_history_along() {
     let (_tmp, mut store, _) = open();
     let from = Path::new("C:\\notes\\Draft.md");

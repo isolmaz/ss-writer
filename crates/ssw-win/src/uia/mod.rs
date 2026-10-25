@@ -1,12 +1,12 @@
 //! UI Automation bridge: maps an [`AccessTree`] snapshot to UIA providers.
 //!
 //! [`UiaBridge`] owns the latest tree snapshot. The UI thread publishes a new snapshot with
-//! [`UiaBridge::update`] after every frame that changed the tree; that call also raises the
-//! UIA events for what changed (focus, properties, structure, text selection). UIA calls the
-//! providers on its own threads, so every provider reads the current snapshot behind a lock
-//! and never touches widgets: requests (Invoke, Toggle, SetValue, …) go to an [`ActionSink`],
-//! which hands them to the UI thread (a channel plus `PostMessage` in the app) and reports
-//! whether the action is supported.
+//! [`UiaBridge::update`] after every frame that changed the tree; while a client listens, that
+//! call also raises the UIA events for what changed (focus, properties, structure, text
+//! selection). UIA calls the providers on its own threads, so every provider reads the current
+//! snapshot behind a lock and never touches widgets: requests (Invoke, Toggle, SetValue, …) go
+//! to an [`ActionSink`], which hands them to the UI thread (a channel plus `PostMessage` in the
+//! app) and reports whether the action is supported.
 //!
 //! The window procedure answers `WM_GETOBJECT` with [`UiaBridge::handle_get_object`].
 //!
@@ -326,14 +326,30 @@ impl UiaBridge {
         self.shared.tree()
     }
 
-    /// Publishes `tree` and raises UIA events for the differences from the previous snapshot
-    /// (only when a UIA client is listening). Returns the detected changes.
+    /// Publishes `tree`. While a UIA client is listening, the differences from the previous
+    /// snapshot are raised as UIA events and returned; without a listener nothing compares the
+    /// snapshots and the result is empty.
     ///
     /// # Errors
     /// Fails when raising an event fails.
     pub fn update(&self, tree: AccessTree) -> Result<Vec<events::UiaChange>, UiaError> {
+        self.publish(tree, events::clients_listening())
+    }
+
+    /// [`UiaBridge::update`] for a caller that knows whether a UIA client is `listening`.
+    ///
+    /// # Errors
+    /// Fails when raising an event fails.
+    pub fn publish(
+        &self,
+        tree: AccessTree,
+        listening: bool,
+    ) -> Result<Vec<events::UiaChange>, UiaError> {
         let new = Arc::new(tree);
         let old = std::mem::replace(&mut *locked(&self.shared.tree), new.clone());
+        if !listening {
+            return Ok(Vec::new());
+        }
         let changes = events::diff(&old, &new);
         events::raise(&self.shared, &changes)?;
         Ok(changes)
@@ -409,6 +425,40 @@ mod tests {
         assert_eq!(elements, [7, 8, 9]);
         // SAFETY: the array was just created and is destroyed exactly once.
         unsafe { SafeArrayDestroy(array) }.expect("the array is destroyed");
+    }
+
+    /// A sink that supports no action.
+    struct Refusing;
+
+    impl ActionSink for Refusing {
+        fn perform(&self, _id: WidgetId, _action: AccessAction) -> bool {
+            false
+        }
+    }
+
+    fn named(root: WidgetId, name: &str) -> AccessTree {
+        let mut tree = AccessTree::new(root);
+        tree.insert(AccessNode::new(
+            root,
+            Role::Window,
+            name,
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+        ));
+        tree
+    }
+
+    #[test]
+    fn a_snapshot_nobody_listens_to_is_published_without_being_compared() {
+        let root = WidgetId::new(1);
+        let bridge = UiaBridge::new(HWND::default(), Arc::new(Refusing), root);
+        let publish = |name: &str| bridge.publish(named(root, name), false).unwrap();
+        let current = || bridge.tree().node(root).map(|node| node.name.clone());
+        assert!(publish("one").is_empty());
+        assert_eq!(current().as_deref(), Some("one"));
+        // The rename is not reported later either: nothing compared the two snapshots.
+        assert!(publish("two").is_empty());
+        assert_eq!(current().as_deref(), Some("two"));
+        assert!(!bridge.shared.sink.perform(root, AccessAction::Invoke));
     }
 
     #[test]

@@ -276,6 +276,14 @@ impl TestHost {
         self.tell(Note::Selection);
     }
 
+    /// Shows another document, caret at its end, without telling the store: what a tab switch
+    /// does to the editor.
+    fn switch_to(&self, text: &str) {
+        let mut state = self.state.borrow_mut();
+        state.text = text.to_owned();
+        state.selection = Selection::caret(text.len());
+    }
+
     fn line_col(text: &str, byte: usize) -> (usize, usize) {
         let before = &text[..byte];
         let line = before.matches('\n').count();
@@ -1666,6 +1674,128 @@ fn direct_unadvise_inside_a_lock_drops_the_queued_grant() {
     assert_eq!(d.sink_events(), vec!["lock 2".to_owned()]);
 }
 
+#[test]
+fn direct_a_document_switch_resets_the_cache_and_tells_tsf_the_whole_text_changed() {
+    let d = Direct::new("abc");
+    let (p, log) = (d.proxy.clone(), d.log.clone());
+    d.locked_ok(READ_SYNC, move |_| {
+        let mut log = log.borrow_mut();
+        log.push(format!("before {:?}", p.text(0, -1, 100).map(|t| t.0).ok()));
+    });
+    d.take_events();
+
+    // The editor shows a longer document with a surrogate pair; no edit is reported.
+    d.host.switch_to("héllo 😀");
+    d.store.document_replaced();
+    assert_eq!(
+        d.take_events(),
+        vec![
+            "text 0:3->8".to_owned(),
+            "sel".to_owned(),
+            "layout 1".to_owned()
+        ]
+    );
+    let (p, log) = (d.proxy.clone(), d.log.clone());
+    d.locked_ok(READ_SYNC, move |_| {
+        let mut log = log.borrow_mut();
+        log.push(format!("end {:?}", p.end().ok()));
+        log.push(format!("after {:?}", p.text(0, -1, 100).map(|t| t.0).ok()));
+        log.push(format!("caret {:?}", p.selection().ok()));
+    });
+    assert_eq!(
+        d.logged(),
+        vec![
+            "before Some(\"abc\")".to_owned(),
+            "end Some(8)".to_owned(),
+            "after Some(\"héllo 😀\")".to_owned(),
+            "caret Some((8, 8, false))".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn direct_a_document_switch_before_tsf_read_any_text_reports_only_selection_and_layout() {
+    let d = Direct::new("abc");
+    d.host.switch_to("xyz!");
+    d.store.document_replaced();
+    assert_eq!(
+        d.take_events(),
+        vec!["sel".to_owned(), "layout 1".to_owned()]
+    );
+    let (p, log) = (d.proxy.clone(), d.log.clone());
+    d.locked_ok(READ_SYNC, move |_| {
+        log.borrow_mut().push(format!("end {:?}", p.end().ok()));
+    });
+    assert_eq!(d.logged(), vec!["end Some(4)".to_owned()]);
+}
+
+#[test]
+fn direct_a_document_switch_drops_the_composition_without_committing_it() {
+    let d = Direct::new("abcd");
+    d.host.move_caret(Selection::caret(2));
+    let sink = d.composition_sink();
+    assert!(
+        com!(sink.OnStartComposition(None::<&ITfCompositionView>))
+            .expect("start")
+            .as_bool()
+    );
+    let p = d.proxy.clone();
+    d.locked_ok(RW_SYNC, move |_| {
+        let _ = p.set_text(2, 2, "かな");
+    });
+    assert_eq!(d.host.overlay_now(), Some("かな".to_owned()));
+    d.take_events();
+
+    d.host.switch_to("xyz");
+    d.store.document_replaced();
+
+    assert!(!d.store.is_composing());
+    let events = d.host.events_now();
+    assert_eq!(events.last(), Some(&ImeEvent::End));
+    let committed = events
+        .iter()
+        .any(|event| matches!(event, ImeEvent::Commit(_)));
+    assert!(!committed, "{events:?}");
+    assert_eq!(d.host.overlay_now(), None);
+    assert_eq!(d.host.doc(), "xyz");
+    // TSF saw "abかなcd": the composition string leaves together with the old text.
+    assert_eq!(
+        d.take_events(),
+        vec![
+            "text 0:6->3".to_owned(),
+            "sel".to_owned(),
+            "layout 1".to_owned()
+        ]
+    );
+    // A late end of the composition has nothing to commit.
+    com!(sink.OnEndComposition(None::<&ITfCompositionView>)).expect("end");
+    assert_eq!(d.host.doc(), "xyz");
+    assert_eq!(d.host.selection_now(), Selection::caret(3));
+}
+
+#[test]
+fn direct_a_document_switch_without_a_sink_still_drops_the_composition() {
+    let _com = ComGuard::apartment_threaded().expect("COM initializes");
+    let window = HiddenWindow::new();
+    let host = TestHost::new("abcd");
+    let store = TextStore::new(window.0, host.clone());
+    host.move_caret(Selection::caret(2));
+    let sink: ITfContextOwnerCompositionSink = store
+        .interface()
+        .cast()
+        .expect("the store is a composition sink");
+    assert!(
+        com!(sink.OnStartComposition(None::<&ITfCompositionView>))
+            .expect("start")
+            .as_bool()
+    );
+    host.switch_to("xyz");
+    store.document_replaced();
+    assert!(!store.is_composing());
+    assert_eq!(host.events_now(), vec![ImeEvent::Start, ImeEvent::End]);
+    assert_eq!(host.doc(), "xyz");
+}
+
 // ---- real thread manager ------------------------------------------------------------------------
 
 /// Wires the host to the store of `services`; with `repaint`, every host change also reports a
@@ -2125,6 +2255,42 @@ fn tsf_terminating_the_composition_commits_it() {
     assert!(!t.services.store().is_composing());
     assert_eq!(t.host.doc(), "abx");
     assert_eq!(t.host.overlay_now(), None);
+}
+
+#[test]
+fn tsf_a_document_switch_hands_text_services_the_text_of_the_new_document() {
+    let t = Tsf::new("first");
+    assert_eq!(t.tsf_text(), "first");
+    t.host.switch_to("second text");
+    t.services.document_replaced();
+    assert_eq!(t.tsf_text(), "second text");
+    // Edits of the new document are followed from there.
+    t.host.edit(6..6, "!");
+    assert_eq!(t.tsf_text(), "second! text");
+}
+
+#[test]
+fn tsf_a_document_switch_ends_the_composition_without_committing_it_to_the_new_document() {
+    let t = Tsf::new("ab");
+    let tip = Tip::new();
+    t.host.move_caret(Selection::caret(2));
+    tip.start(&t, (2, 2), "x");
+    assert_eq!(t.host.overlay_now(), Some("x".to_owned()));
+    assert_eq!(t.tsf_text(), "abx");
+
+    t.host.switch_to("new");
+    t.services.document_replaced();
+
+    assert_eq!(tip.terminated.get(), 1, "the service was asked to end");
+    assert!(!t.services.store().is_composing());
+    assert_eq!(t.host.doc(), "new", "nothing was committed");
+    assert_eq!(t.host.overlay_now(), None);
+    let events = t.host.events_now();
+    let committed = events
+        .iter()
+        .any(|event| matches!(event, ImeEvent::Commit(_)));
+    assert!(!committed, "{events:?}");
+    assert_eq!(t.tsf_text(), "new");
 }
 
 #[test]

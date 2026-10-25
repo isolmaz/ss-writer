@@ -15,6 +15,7 @@ app-error-not-found = The file no longer exists.
 app-error-encrypted = The document is password protected and cannot be opened.
 app-error-conversion = The document could not be converted.
 app-error-file = The file could not be read or written.
+app-error-temp-kept = The file could not be replaced. Its new content is kept in { $path }.
 app-error-not-text = This file is not a text file.
 app-error-read-only = This file is read-only.
 app-error-in-use = The file is in use by another program.
@@ -25,6 +26,13 @@ app-error-untitled = The document has no file yet.
 app-error-needs-save-as = Imported documents are saved with Save as, or saved back to their original format.
 app-error-unsupported = This format cannot be written.
 app-error-already-open = This file is already open in another tab.
+
+# One box for the files that a single action could not open: a heading, then a line per file.
+app-open-failed = { $count ->
+    [one] The file could not be opened:
+   *[other] { $count } files could not be opened:
+}
+app-open-failed-file = { $path }: { $reason }
 
 app-loss-merged-cells = Merged table cells
 app-loss-headers-footers = Headers and footers

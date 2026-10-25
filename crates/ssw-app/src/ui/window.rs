@@ -31,6 +31,7 @@ use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::WM_MOVE;
 
 use super::controller::{Controller, Request, WindowCell};
+use super::host::end_session;
 use super::platform::Platform;
 use super::shell_view::ShellAction;
 
@@ -258,6 +259,9 @@ impl WindowHandler for WindowGlue {
             self.env.controller.set_active_window(self.cell.id);
             // Files may have changed while the user was elsewhere: the loop owner checks them.
             self.env.controller.push(Request::Activated(self.cell.id));
+        } else {
+            // Autosave writes the documents when the user leaves; the loop owner does it.
+            self.env.controller.push(Request::Deactivated(self.cell.id));
         }
         self.platform.activation_changed(active);
     }
@@ -275,6 +279,17 @@ impl WindowHandler for WindowGlue {
             .controller
             .push(Request::CloseRequested(self.cell.id));
         false
+    }
+
+    fn on_query_end_session(&mut self, _info: &WindowInfo) {
+        // Every window is asked before any is told: a new question starts a new end of the
+        // session, which the first window told then handles.
+        self.env.controller.session_ended.set(false);
+    }
+
+    fn on_end_session(&mut self, _info: &WindowInfo) {
+        // The one job that cannot wait for the loop owner: the process ends with this message.
+        end_session(&self.env.controller);
     }
 
     fn on_destroy(&mut self, _info: &WindowInfo) {

@@ -171,10 +171,9 @@ pub(super) struct Cache {
     pub line_px: f32,
     line_key: Option<(u64, u32)>,
     /// Tokenizer of a plain-text document as a whole; the code blocks of a Markdown document
-    /// have their own. It keeps the tokens of every line by line index: a new document version
-    /// rescans the lines whose text or incoming scanner state differs from the cached line at
-    /// the same index. Typing inside a line costs that line, but inserting or deleting a line
-    /// break shifts every line below it to another index and rescans them all.
+    /// have their own. It keeps the tokens of every line: a new document version rescans the
+    /// lines between the common head and tail of the old and new text, plus the lines whose
+    /// incoming scanner state changed.
     plain_highlighter: Highlighter,
     /// The document version and language `plain_tokens` were computed for.
     plain_key: Option<(u64, Option<Language>)>,
@@ -763,15 +762,32 @@ impl EditorView {
         cache: &Cache,
         item: &Item,
     ) -> Rc<dyn BlockLayout> {
+        let composing = self
+            .composition
+            .as_ref()
+            .is_some_and(|comp| item.content.touches(comp.at));
         match item.kind {
-            ItemKind::Block(index) => {
+            ItemKind::Gap { separator } if !composing => {
+                let touched = reveal.selection_touches(item.content);
+                let height = if separator && !touched {
+                    self.config.spacing_px().max(1.0)
+                } else {
+                    cache.line_px
+                };
+                Rc::new(GapLayout::new(item.content, height))
+            }
+            // A blank line holding an IME composition is laid out as the paragraph it becomes.
+            ItemKind::Block(_) | ItemKind::Gap { .. } => {
                 let kind = self.config.document_kind;
                 let synthesized;
-                let block = if kind == DocumentKind::Markdown {
-                    &doc.ast().blocks[index]
-                } else {
-                    synthesized = document_block(doc, item, kind);
-                    &synthesized
+                let block = match item.kind {
+                    ItemKind::Block(index) if kind == DocumentKind::Markdown => {
+                        &doc.ast().blocks[index]
+                    }
+                    _ => {
+                        synthesized = document_block(doc, item, kind);
+                        &synthesized
+                    }
                 };
                 // The tokens of the document that touch this line (sorted, disjoint).
                 let line_tokens: &[Token] = if kind == DocumentKind::PlainText {
@@ -805,15 +821,6 @@ impl EditorView {
                 } else {
                     Rc::from(self.registry.measure_document(kind, &cx, block))
                 }
-            }
-            ItemKind::Gap { separator } => {
-                let touched = reveal.selection_touches(item.content);
-                let height = if separator && !touched {
-                    self.config.spacing_px().max(1.0)
-                } else {
-                    cache.line_px
-                };
-                Rc::new(GapLayout::new(item.content, height))
             }
         }
     }
@@ -867,6 +874,13 @@ impl EditorView {
             }
         }
         let line_px = c.line_px;
+        // Rebuilding the heights replaces measured heights with estimates: the item at the top
+        // and the distance into it are restored below so the same text stays in view.
+        let anchor = (c.heights_dirty && !c.items.is_empty()).then(|| {
+            let y = f64::from(c.scroll_y - TOP_PAD);
+            let index = c.heights.find(y);
+            (index, y - c.heights.prefix(index))
+        });
         // One tokenizer run over the whole plain-text document per version (or language
         // change), never one per line: the highlighter rescans only the lines that changed.
         let language = self.plain_highlight_language();
@@ -926,6 +940,12 @@ impl EditorView {
             let items = &c.items;
             c.layouts.retain(|index, _| !touched(items[*index].range));
         }
+        if let Some((index, offset)) = anchor {
+            let index = index.min(c.items.len() - 1);
+            self.ensure(&doc, env, &self.reveal(&doc), width, c, index);
+            let offset = offset.min(0.99 * f64::from(c.heights.height(index)));
+            c.scroll_y = scroll_to_content(c.heights.prefix(index) + offset);
+        }
         let max = self.max_scroll(c);
         c.scroll_y = c.scroll_y.clamp(0.0, max);
     }
@@ -958,7 +978,7 @@ impl EditorView {
             }
             let max = self.max_scroll(c);
             c.scroll_y =
-                ((c.heights.prefix(anchor) + anchor_offset) as f32 + TOP_PAD).clamp(0.0, max);
+                scroll_to_content(c.heights.prefix(anchor) + anchor_offset).clamp(0.0, max);
         }
         // Keep the layouts a screen or so around the viewport; the rest is re-measured on demand.
         let near = c.heights.find(f64::from(c.scroll_y - viewport - TOP_PAD))
@@ -1300,5 +1320,17 @@ impl Widget for EditorView {
 impl Control for EditorView {
     fn id(&self) -> WidgetId {
         self.id
+    }
+}
+
+/// The scroll offset that puts content y `y` at the top of the viewport. Rounded up to the
+/// next `f32` when rounding to nearest falls short: the item starting at `y` then stays the
+/// item under the top edge instead of the one above it.
+fn scroll_to_content(y: f64) -> f32 {
+    let scroll = (y + f64::from(TOP_PAD)) as f32;
+    if f64::from(scroll - TOP_PAD) < y {
+        scroll.next_up()
+    } else {
+        scroll
     }
 }

@@ -4,6 +4,7 @@
 
 use super::fib::{Result, le32, slice};
 use super::pieces::Pieces;
+use crate::import::ImportError;
 
 // ---- sprm iteration ---------------------------------------------------------------------
 
@@ -264,6 +265,9 @@ pub(super) enum Kind {
     Papx,
 }
 
+/// Runs allowed beyond one per character of the document text.
+const MAX_EXTRA_RUNS: usize = 4096;
+
 /// The document streams an FKP reader needs.
 pub(super) struct FkpSource<'a> {
     pub word: &'a [u8],
@@ -273,7 +277,8 @@ pub(super) struct FkpSource<'a> {
 }
 
 /// Runs of one property kind, sorted by `cp0`. Pages that cannot be parsed are skipped and
-/// counted in `bad_pages`.
+/// counted in `bad_pages`. A document with more runs than characters (plus a margin) is
+/// refused: page references and pieces can repeat, which multiplies the runs.
 pub(super) fn read_runs(
     kind: Kind,
     src: &FkpSource<'_>,
@@ -287,6 +292,7 @@ pub(super) fn read_runs(
     let plc = slice(src.table, fc as usize, lcb as usize)?;
     // n + 1 CPs, then n page numbers: `plc` holds at least 4 + 8 * n bytes
     let n = (lcb as usize - 4) / 8;
+    let limit = src.pieces.total_cp() as usize + MAX_EXTRA_RUNS;
     let mut runs = Vec::new();
     let mut cps = Vec::new();
     for pn in plc[(n + 1) * 4..].as_chunks::<4>().0.iter().take(n) {
@@ -321,6 +327,11 @@ pub(super) fn read_runs(
             };
             cps.clear();
             src.pieces.fc_range_to_cp(fa, fb, &mut cps);
+            if runs.len() + cps.len() > limit {
+                return Err(ImportError::TooLarge(format!(
+                    "more than {limit} formatting runs"
+                )));
+            }
             for &(c0, c1, pi) in &cps {
                 // Pcd.prm modifiers apply after the FKP's own (fast-saved documents).
                 let mut g = grpprl.clone();
@@ -732,6 +743,38 @@ mod tests {
             read_runs(Kind::Papx, &src, 0, table2.len() as u32, &mut bad).unwrap();
             assert_eq!(bad, 1);
         }
+    }
+
+    /// A PlcBte of `n` entries that all name page 1 of [`fkp_fixture`].
+    fn repeated_page_plc(n: usize) -> Vec<u8> {
+        let mut plc = vec![0u8; (n + 1) * 4];
+        plc.extend(std::iter::repeat_n(1u32.to_le_bytes(), n).flatten());
+        plc
+    }
+
+    #[test]
+    fn page_references_that_repeat_cannot_multiply_the_runs_without_bound() {
+        let runs: Vec<(u32, u32, &[u8])> = (0..10).map(|i| (i, i + 1, &[][..])).collect();
+        let (word, _, pieces) = fkp_fixture(&chpx_page(&runs));
+        let read = |plc: &[u8]| {
+            let src = FkpSource {
+                word: &word,
+                table: plc,
+                data: &[],
+                pieces: &pieces,
+            };
+            read_runs(Kind::Chpx, &src, 0, plc.len() as u32, &mut 0)
+        };
+        // 500 entries give 5000 runs for 1000 characters: within the margin
+        assert_eq!(read(&repeated_page_plc(500)).unwrap().len(), 5000);
+        // 600 entries give 6000 runs
+        let limit = 1000 + MAX_EXTRA_RUNS;
+        assert_eq!(
+            read(&repeated_page_plc(600)).err(),
+            Some(ImportError::TooLarge(format!(
+                "more than {limit} formatting runs"
+            )))
+        );
     }
 
     #[test]

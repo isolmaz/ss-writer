@@ -2592,13 +2592,16 @@ quit
         let mut runner = ScriptRunner::start(core(tmp.path()));
         let edit = format!("open {}\nkey ctrl+end\ntype more\n", quoted(&file));
         runner.run(&Script::parse(&edit).unwrap()).unwrap();
-        // Another program takes the file before the autosave delay is over.
+        // Another program takes the file before the autosave delay is over. The tick tries
+        // once per turn and waits 50, 100, 200, 400 and 800 ms between the tries; the failure
+        // is noted when the last try fails. Every pause outlasts the wait it follows.
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
             .open(&file)
             .unwrap();
-        let wait = format!("sleep 600\ndump-state {}\n", quoted(&state));
+        let pauses = "sleep 300\nsleep 60\nsleep 110\nsleep 210\nsleep 410\nsleep 810\n";
+        let wait = format!("{pauses}dump-state {}\n", quoted(&state));
         runner.run(&Script::parse(&wait).unwrap()).unwrap();
         drop(lock);
         runner.finish();

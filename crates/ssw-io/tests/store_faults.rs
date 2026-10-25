@@ -621,6 +621,96 @@ fn applying_changes_reports_a_failure_to_store_a_new_file() {
 }
 
 #[test]
+fn indexing_reports_a_failure_to_write_the_root() {
+    // A new workspace: the root is written with the first files.
+    let mut ix = ix(&[("doc.md", DOC)]);
+    ix.db.abort("INSERT", "index_roots");
+    fails_with(ix.index(), "injected failure");
+    assert_eq!(ix.db.count("index_files"), 0);
+
+    // An indexed workspace without changes: only the root is refreshed, which aborts whether
+    // it counts as an insert or as the update of the row.
+    let mut ix = indexed(&[("doc.md", DOC)]);
+    ix.db.abort("INSERT", "index_roots");
+    ix.db.abort("UPDATE", "index_roots");
+    fails_with(ix.index(), "injected failure");
+    assert_eq!(ix.db.count("index_files"), 1);
+}
+
+/// More new files under `many` than one write holds.
+fn many_new_files(ix: &Ix) -> Vec<PathBuf> {
+    let folder = ix.at("many");
+    std::fs::create_dir_all(&folder).unwrap();
+    (0..300)
+        .map(|i| {
+            let path = folder.join(format!("n{i:03}.md"));
+            std::fs::write(&path, "# New\n").unwrap();
+            path
+        })
+        .collect()
+}
+
+#[test]
+fn applying_many_changes_reports_a_failure_to_write_a_full_chunk() {
+    // One event per file.
+    let mut ix = indexed(&[("doc.md", DOC)]);
+    let changes: Vec<IndexChange> = many_new_files(&ix)
+        .into_iter()
+        .map(IndexChange::Changed)
+        .collect();
+    ix.db.abort("INSERT", "index_files");
+    fails_with(ix.apply(&changes), "injected failure");
+    assert_eq!(ix.db.count("index_files"), 1);
+
+    // One event for the folder that holds them.
+    let mut ix = indexed(&[("doc.md", DOC)]);
+    many_new_files(&ix);
+    ix.db.abort("INSERT", "index_files");
+    let folder = ix.at("many");
+    fails_with(
+        ix.apply(&[IndexChange::Changed(folder)]),
+        "injected failure",
+    );
+    assert_eq!(ix.db.count("index_files"), 1);
+}
+
+#[test]
+fn applying_changes_near_the_file_limit_reports_failures() {
+    let limited = |max_files| IndexOptions {
+        max_files,
+        ..IndexOptions::default()
+    };
+
+    // One file still fits: the pending ones are written first, and that write fails.
+    let mut ix = indexed(&[("doc.md", DOC)]);
+    let new = [ix.at("a.md"), ix.at("b.md")];
+    for path in &new {
+        std::fs::write(path, "# New\n").unwrap();
+    }
+    ix.db.abort("INSERT", "index_files");
+    let changes = new.map(IndexChange::Changed);
+    let result = ix
+        .db
+        .store
+        .index_apply_changes(&ix.root, &changes, &limited(2), &no_placeholders);
+    fails_with(result, "injected failure");
+    assert_eq!(ix.db.count("index_files"), 1);
+
+    // The index is full: whether a changed file is known already cannot be looked up.
+    let mut ix = indexed(&[("doc.md", DOC)]);
+    std::fs::write(ix.at("c.md"), "# New\n").unwrap();
+    ix.db.sql(FILES_WITHOUT_NAMES);
+    ix.db
+        .sql("INSERT INTO index_files (root_id) SELECT id FROM index_roots");
+    let changes = [IndexChange::Changed(ix.at("c.md"))];
+    let result = ix
+        .db
+        .store
+        .index_apply_changes(&ix.root, &changes, &limited(1), &no_placeholders);
+    fails_with(result, "no such column");
+}
+
+#[test]
 fn reading_the_index_reports_missing_tables() {
     let files = [("doc.md", DOC)];
 

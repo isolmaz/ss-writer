@@ -1099,7 +1099,10 @@ pub fn export_odt(
     let mut writer = Writer::new(markdown, options, resources);
     for block in document.iter_blocks() {
         if let BlockKind::FootnoteDefinition { label } = &block.kind {
-            writer.footnote_defs.insert(normalize_label(label), block);
+            writer
+                .footnote_defs
+                .entry(normalize_label(label))
+                .or_insert(block);
         }
     }
     let mut used: HashMap<String, usize> = HashMap::new();
@@ -1828,6 +1831,16 @@ mod tests {
                 r#"<text:note-body><text:p text:style-name="Footnote"/></text:note-body>"#,
             ],
         );
+    }
+
+    #[test]
+    fn the_first_definition_of_a_footnote_label_wins() {
+        let xml = content("x[^a]\n\n[^a]: first\n\n[^a]: second\n");
+        assert_has(
+            &xml,
+            &[r#"<text:p text:style-name="Footnote">first</text:p>"#],
+        );
+        assert_lacks(&xml, &["second"]);
     }
 
     #[test]

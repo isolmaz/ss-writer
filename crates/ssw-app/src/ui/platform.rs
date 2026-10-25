@@ -506,11 +506,12 @@ impl DropHandler for WindowDrops {
     fn dropped(&self, event: &DragEvent<'_>, content: &DragContent) -> Effect {
         self.drag_leave();
         let point = self.point(event);
-        for path in &content.files {
-            self.env.controller.open_document(&self.cell, path);
-        }
         if !content.files.is_empty() {
-            self.env.controller.refresh(&self.cell);
+            // Opening can show a dialog; a drop callback must neither block the drag source
+            // nor reach into the dialogs while one is up, so the loop owner opens the files.
+            self.env
+                .controller
+                .push(Request::OpenFiles(self.cell.id, content.files.clone()));
             return Effect::Copy;
         }
         if let Some(text) = &content.text
@@ -1068,7 +1069,9 @@ impl Platform {
                     selection,
                 });
                 drop(shadow);
-                services.store().layout_changed();
+                // Another document: what the text store cached and what TSF knows of the old
+                // text no longer holds.
+                services.document_replaced();
             }
         }
     }

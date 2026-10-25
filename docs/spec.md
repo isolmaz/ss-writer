@@ -5,7 +5,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Name: **SS Writer** — "Markdown & Text Editor". Binary `SSWriter.exe`.
 - Platform: Windows 11 22H2 (build 22621) or later, x64. Lower builds: installer refuses, the exe shows a message box and exits. No Windows 10 code paths.
 - UI language: English. All UI strings come from Fluent `.ftl` files (`assets/i18n/<locale>/*.ftl`); no string literals in UI code. Locale = OS UI language, overridable in Settings; fallback `en`. Numbers/dates formatted with `GetNumberFormatEx`/`GetDateFormatEx` for the active locale.
-- Principles: speed, quality, simplicity. The file on disk is the truth; the app never writes non-standard markers into user files. App state lives in `%LOCALAPPDATA%\SS Writer\` (or next to the exe in portable mode).
+- Principles: speed, quality, simplicity. The file on disk is the truth; the app never writes non-standard markers into user files. App state lives in `%LOCALAPPDATA%\SS Writer\` and `settings.json` in `%APPDATA%\SS Writer\` (both in the `data` folder next to the exe in portable mode).
 
 ## 1. Window
 
@@ -153,11 +153,11 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Line endings: stored as `\n` internally; original style restored on save. Mixed files are normalized to the majority style and the user is notified once. Status bar line-ending menu (click the EOL): LF, CRLF or CR for the next save, current style marked; disabled for documents that a converter writes.
 
 ### 4.3 Saving
-- Autosave default on: 1 s after typing stops, on tab switch, window deactivate and close. Off → classic `Ctrl+S`, dirty dot on the tab, close prompt **Save / Don't save / Cancel**.
-- Atomic write: temp file in the same folder → `ReplaceFileW` (keeps attributes/ACLs). Network share failure → temp + `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`. `ERROR_SHARING_VIOLATION` → retry with backoff (50, 100, 200, 400, 800 ms) then banner.
+- Autosave default on: 1 s after typing stops, on tab switch, window deactivate and close. The 1 s write never blocks the editor: a file another program holds is tried again on the backoff below and reported only when that runs out. The saves on tab switch and window deactivation never wait for such a file either: it stays unsaved and the autosave timer writes it. A failed autosave is shown once per document until a save of it succeeds, and never keeps a tab or the app from closing. Off → classic `Ctrl+S`, dirty dot on the tab, close prompt **Save / Don't save / Cancel**. With autosave on, a document autosave cannot write (untitled, imported from Word/ODT/RTF/DOC, read-only, changed or deleted on disk, lossy decode) gets the dirty dot and the same prompt; untitled buffers are not asked about when the app quits and the session restores them (§4.4). A document another tab still shows is never asked about, and one shown in several tabs that all close is asked about once.
+- Atomic write: temp file in the same folder → `ReplaceFileW` (keeps attributes/ACLs). Network share failure → temp + `MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)`. `ERROR_SHARING_VIOLATION` → retry with backoff (50, 100, 200, 400, 800 ms) then an error. When a failed replace has lost the original file, the new content stays in the temp file and the error names it.
 - Own writes are recognized (expected size, mtime, content hash) and never trigger the external-change path.
 - Read-only files (attribute or ACL): banner "This file is read-only" + "Allow editing" (clears the attribute when permitted).
-- External change: no local unsaved edits → reload preserving caret/scroll (diff-based); otherwise conflict banner: Keep mine / Load theirs / Compare.
+- External change: no local unsaved edits → reload preserving caret/scroll (diff-based); otherwise conflict banner: Keep mine / Load theirs / Compare. A file that cannot be read again (locked by another program, share offline) is reported once until it reads again; an unreachable network share counts as a change, not a deletion. The folder of each open document is watched without its subfolders; a folder that cannot be watched is tried again after 30 s.
 - OneDrive placeholders (`RECALL_ON_DATA_ACCESS`/`RECALL_ON_OPEN`): never hydrated by indexing/search; cloud icon in the tree; opening hydrates with progress.
 
 ### 4.4 New & untitled
@@ -170,6 +170,7 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 
 ### 4.6 Crash recovery
 - Worker panics drop only that task. UI-thread panic → minidump (`MiniDumpWriteDump`) + emergency save of dirty documents to the recovery folder; next launch offers recovery. Local rolling log (5 × 1 MB). No telemetry.
+- A clean exit removes the recovery copies its run wrote, except when the session could not be stored: then they stay, and the next start offers them. Copies an earlier run left and nobody answered stay in every case (§6 for the end of a Windows session).
 
 ### 4.7 Format document
 - Edit → Format document (also in the command palette; no shortcut, §11 forbids Ctrl+Alt) indents a plain-text document whose language is JSON, XML or HTML; it is disabled for every other document.
@@ -188,11 +189,13 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 - Index (background, SQLite): file list, headings, links for Quick Open, wikilinks, backlinks, rename updates. Respects `.gitignore` and hidden-item settings. Case-insensitive ordinal file matching (`CompareStringOrdinal`).
 
 ## 6. Tabs, windows, session
-- Tabs: title (file stem; extension shown for non-Markdown), dirty dot (autosave off), close on hover, middle-click close, drag reorder, drag out → new window, drop onto another window's tab row → move. Context: Close, Close others, Close to the right, Copy path, Reveal in Explorer.
+- Tabs: title (file stem; extension shown for non-Markdown), dirty dot (autosave off, or a document autosave cannot write), close on hover, middle-click close, drag reorder, drag out → new window, drop onto another window's tab row → move. Context: Close, Close others, Close to the right, Copy path, Reveal in Explorer.
 - `Ctrl+T` new tab, `Ctrl+W` close, `Ctrl+Tab`/`Ctrl+Shift+Tab`, `Ctrl+PgDn`/`Ctrl+PgUp`, `Ctrl+Shift+T` reopen closed. Window → Merge all windows.
 - Same file in several tabs/windows shares one document (instant sync).
-- Single instance (named mutex + `WM_COPYDATA`); new launches open tabs in the last active window (or a new window for folders).
+- Single instance (named mutex + `WM_COPYDATA`); new launches open tabs in the last active window (or a new window for folders). A launched file the window shows already activates its tab instead of opening a second one, also when it starts the app and the restored session has it.
+- The files one action cannot open (startup, launch, File → Open, drop, sidebar) are named with their reason in one message; so are the word-processor imports and OneDrive downloads that fail in the background, in a message of their own that names every file that failed in the same turn. A file that no longer exists leaves the recent list and the Jump List.
 - Session restore: windows (placement), tabs, workspaces, caret, scroll, folds. Per-file caret/scroll remembered for reopened files.
+- When Windows ends the session (shutdown, restart, sign-out) nothing is asked and shutdown is not delayed: autosave writes what it can, the session is stored with the untitled text, and the unsaved text of every other file goes to the recovery folder, offered at the next start. The text of the untitled buffers goes there too when the next start does not restore the session (On startup = new document or default folder) or the session could not be stored. Every window receives the message and it is handled once per end of the session, also while a dialog is open; a session that goes on afterwards (an installer asking the application to close) is handled again when it ends for good. A settings change still waiting for its write is written last, and a failure is logged, not shown. If something still holds the application core at that moment, the unsaved text of the last autosave tick (untitled buffers included) goes to the recovery folder and the session is not stored. A quit (File → Exit, closing the last window) that cannot store the session writes the text of the untitled buffers it did not ask about to the recovery folder as well.
 
 ## 7. Search
 - Find bar (`Ctrl+F`, floating top-right of the editor): Match case, Whole word, Regex; highlights all matches; `n/m` counter; `Enter`/`F3` next, `Shift+Enter`/`Shift+F3` previous; `Esc` closes. Matches in hidden markers reveal them; in folds unfold.
@@ -220,11 +223,11 @@ Single source of truth for behavior. Code, tests, `README.md`, `docs/features.to
 ## 10. Settings (`Ctrl+,`)
 Stored in `settings.json` (human-editable; unknown keys preserved).
 - **General**: language; on startup (restore session | new document | default folder); default folder; autosave on/off + delay; new file location; sync file name with heading; check for updates.
-- **Appearance**: theme; accent; Mica on/off; sidebar font size; show status bar; show B I U pill.
-- **Editor**: text/heading/code fonts; size; line height; paragraph spacing; line width; list indent (align | 2 | 4 | tab); auto-hide Markdown; typewriter position + dead zone; spell check + languages; sort completed tasks; syntax highlighting; format tables on exit; reading speed.
+- **Appearance**: theme; accent; Mica on/off; sidebar font size; show status bar; show B I U pill; zoom.
+- **Editor**: text/heading/code fonts; size; line height; paragraph spacing; line width; list indent (align | 2 | 4 | tab); format indent (2 spaces | 4 spaces | tab); auto-hide Markdown; typewriter position + dead zone; spell check + languages; sort completed tasks; syntax highlighting; format tables on exit; hide the YAML front matter card; reading speed.
 - **Sidebar**: sort, folders first, show extensions, hidden items, hide images, hide non-Markdown, modified date.
 - **Attachments**: location, naming template, load remote images.
-- **Export**: page size, margins, page numbers, black text, default format.
+- **Export**: page size, margins, base font size, page numbers, black text, light theme, include title, default format.
 - **Shortcuts**: every command, rebindable; conflicts flagged.
 - **Advanced**: index limits (max files, default 100 000), history retention, open logs folder, reset settings.
 
@@ -263,7 +266,7 @@ Stored in `settings.json` (human-editable; unknown keys preserved).
 - File associations registered per user by the installer (`OpenWithProgids`; Settings button opens `ms-settings:defaultapps`). Folder verb "Open with SS Writer".
 - The installer also registers the application itself (`Applications\SSWriter.exe` with its open command, friendly name and icon) and lists it under `*\OpenWithProgids`, so "Open with" offers SS Writer for any file. `.json`, `.csv`, `.log`, `.xml`, `.html`, `.css`, `.js`, `.yml` and `.py` name it directly. No default association is taken.
 - Jump List: recent files/folders, "New window".
-- Explorer preview pane handler (`ssw-preview.dll`, `IPreviewHandler`) for `.md`/`.markdown`/`.mmd`.
+- Explorer preview pane handler (`ssw_preview.dll`, `IPreviewHandler`) for `.md`/`.markdown`/`.mmd`.
 - DirectManipulation for touchpad/touch panning with inertia; animated mouse wheel; pen acts as pointer (barrel button = right click). Touch keyboard appears on tap into text (TSF + UIA).
 - TSF text store for IME, dictation (`Win+H`), emoji panel (`Win+.`), reconversion.
 - UI Automation for every control: editor as Document with TextPattern; tree, tabs, buttons, menus with proper roles. Hidden system caret (`CreateCaret`/`SetCaretPos`) tracks the drawn caret. Honors `SPI_GETCLIENTAREAANIMATION`. Full keyboard navigation (F6 cycles panes).

@@ -23,7 +23,7 @@ use ssw_ui::input::{
     vk,
 };
 use ssw_ui::services::{ClipboardContent, MemoryClipboard, TimerId};
-use ssw_ui::widget::{LayoutCx, PaintCx, Widget};
+use ssw_ui::widget::{LayoutCx, PaintCx, TimerRequest, Widget};
 use ssw_ui::widgets::{Control, SharedClipboard};
 
 fn ctrl() -> Modifiers {
@@ -827,6 +827,54 @@ fn pointer_events_the_view_does_not_own_are_ignored() {
     let right_outside =
         PointerEvent::mouse(PointerEventKind::Down, Some(PointerButton::Right), outside);
     assert!(!h.event(Event::Pointer(right_outside)).handled);
+}
+
+#[test]
+fn a_hover_move_within_one_item_neither_repaints_the_editor_nor_restarts_the_blink() {
+    let mut h = Harness::new(
+        "a
+
+b
+",
+    );
+    let caret_color = h.theme.tokens.caret;
+    let carets = |h: &Harness| {
+        h.paint()
+            .ops()
+            .filter(|op| matches!(op, DrawOp::FillRect { color, .. } if *color == caret_color))
+            .count()
+    };
+    let timer = h
+        .requests
+        .timers()
+        .iter()
+        .find_map(|request| match request {
+            TimerRequest::Set { id, .. } => Some(*id),
+            TimerRequest::Kill(_) => None,
+        })
+        .expect("the view started its blink timer on focus");
+    h.event(Event::Timer(timer));
+    assert_eq!(carets(&h), 0, "blinked off");
+    h.requests.take_invalidation();
+
+    let first = h.first_line_point(0);
+    h.pointer(PointerEventKind::Move, first, 0, Modifiers::NONE);
+    assert!(
+        !h.requests.take_invalidation().is_clean(),
+        "entering an item repaints its hover state"
+    );
+    let second = h.first_line_point(1);
+    assert!(
+        h.pointer(PointerEventKind::Move, second, 0, Modifiers::NONE)
+            .handled
+    );
+    assert!(
+        h.requests.take_invalidation().is_clean(),
+        "a move within the hovered item repaints nothing"
+    );
+    assert_eq!(carets(&h), 0, "a hover move leaves the blink phase alone");
+    h.type_text("x");
+    assert_eq!(carets(&h), 1, "typing shows the caret");
 }
 
 #[test]

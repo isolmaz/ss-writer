@@ -1,11 +1,13 @@
 //! The workspace index: walking with .gitignore / hidden rules, headings, links and backlinks,
 //! incremental updates, limits, placeholders and cancellation.
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use ssw_io::index::{IndexChange, IndexOptions, IndexStats, IndexedHeading, MAX_PARSE_BYTES};
@@ -697,6 +699,90 @@ fn the_file_limit_applies_to_the_walk_and_to_events() {
 }
 
 #[test]
+fn events_for_files_beyond_the_limit_do_not_probe_or_read_them() {
+    let mut fx = standard();
+    let opts = IndexOptions {
+        show_hidden: false,
+        max_files: 5,
+    };
+    run(&mut fx.store, &fx.root, &opts);
+    for name in ["one", "two", "three"] {
+        write(&fx.root, &format!("{name}.md"), &format!("# {name}\n"));
+    }
+    // The placeholder probe comes before the read of every file that is stored.
+    let probed = Cell::new(0);
+    let counting = |_: &Path| {
+        probed.set(probed.get() + 1);
+        false
+    };
+    let changes: Vec<IndexChange> = ["one", "two", "three"]
+        .iter()
+        .map(|name| IndexChange::Changed(path_of(&fx.root, &format!("{name}.md"))))
+        .collect();
+    let stats = fx
+        .store
+        .index_apply_changes(&fx.root, &changes, &opts, &counting)
+        .unwrap();
+    assert_eq!(probed.get(), 1, "only the file that still fits is read");
+    assert!(stats.truncated);
+    assert_eq!((stats.files, stats.parsed), (5, 1));
+    let rels = rels(&fx.store, &fx.root);
+    assert!(rels.contains(&"one.md".to_owned()));
+    assert!(!rels.contains(&"two.md".to_owned()) && !rels.contains(&"three.md".to_owned()));
+}
+
+#[test]
+fn a_new_file_pending_at_the_limit_is_stored_again_by_its_next_event() {
+    let mut fx = standard();
+    let opts = IndexOptions {
+        show_hidden: false,
+        max_files: 5,
+    };
+    run(&mut fx.store, &fx.root, &opts);
+    write(&fx.root, "one.md", "# One\n");
+    let probed = Cell::new(0);
+    let counting = |_: &Path| {
+        probed.set(probed.get() + 1);
+        false
+    };
+    // The second event finds the file pending, not new: it still fits and is read again.
+    let one = path_of(&fx.root, "one.md");
+    let changes = [IndexChange::Changed(one.clone()), IndexChange::Changed(one)];
+    let stats = fx
+        .store
+        .index_apply_changes(&fx.root, &changes, &opts, &counting)
+        .unwrap();
+    assert_eq!(probed.get(), 2);
+    assert!(!stats.truncated);
+    assert_eq!(stats.files, 5);
+    assert!(rels(&fx.store, &fx.root).contains(&"one.md".to_owned()));
+}
+
+#[test]
+fn a_pending_update_near_the_limit_leaves_room_for_a_new_file() {
+    let mut fx = standard();
+    let opts = IndexOptions {
+        show_hidden: false,
+        max_files: 5,
+    };
+    run(&mut fx.store, &fx.root, &opts);
+    write(&fx.root, "readme.md", "# Readme again\n");
+    write(&fx.root, "one.md", "# One\n");
+    // The pending update of a file the index has is written first and takes no room.
+    let changes = [
+        IndexChange::Changed(path_of(&fx.root, "readme.md")),
+        IndexChange::Changed(path_of(&fx.root, "one.md")),
+    ];
+    let stats = fx
+        .store
+        .index_apply_changes(&fx.root, &changes, &opts, &no_placeholders)
+        .unwrap();
+    assert!(!stats.truncated);
+    assert_eq!(stats.files, 5);
+    assert!(rels(&fx.store, &fx.root).contains(&"one.md".to_owned()));
+}
+
+#[test]
 fn placeholders_are_listed_but_never_read() {
     let mut fx = standard();
     let opts = IndexOptions::default();
@@ -811,7 +897,8 @@ fn cancellation_leaves_the_previous_index_intact() {
     ] {
         write(&fx.root, rel, text);
     }
-    // The predicate is called per file inside the indexing transaction; it cancels the run.
+    // The predicate is called per file before any row of the batch is written; it cancels the
+    // run.
     let cancel = AtomicBool::new(false);
     let cancelling = |_: &Path| {
         cancel.store(true, Ordering::Relaxed);
@@ -830,6 +917,142 @@ fn cancellation_leaves_the_previous_index_intact() {
         headings[0].text, "Readme",
         "the cancelled run was rolled back"
     );
+}
+
+/// A second connection to the database of `fx` that fails at once instead of waiting for a lock.
+fn impatient(fx: &Fixture) -> Connection {
+    let conn = Connection::open(fx._tmp.path().join("state.db")).unwrap();
+    conn.busy_timeout(Duration::ZERO).unwrap();
+    conn
+}
+
+#[test]
+fn the_database_stays_writable_while_files_are_read_and_parsed() {
+    let mut fx = standard();
+    let opts = IndexOptions::default();
+    let other = impatient(&fx);
+    let writes = Cell::new(0);
+    // The predicate runs for every file before its rows are written, as the file is read and
+    // parsed: the interface's own writes (recent files, view state, history) must go through.
+    let writing = |_: &Path| {
+        other
+            .execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES ('ui', 'wrote')",
+                [],
+            )
+            .expect("the index run holds the write lock while it reads files");
+        writes.set(writes.get() + 1);
+        false
+    };
+
+    let stats = fx
+        .store
+        .index_workspace(&fx.root, &opts, &writing, &AtomicBool::new(false), NOW)
+        .unwrap();
+    assert_eq!((stats.files, stats.parsed, writes.get()), (4, 3, 4));
+
+    write(&fx.root, "Notes/New.md", "# New\n\n[[readme]]\n");
+    write(&fx.root, "Notes/Newer.md", "# Newer\n");
+    writes.set(0);
+    let changes = [
+        IndexChange::Changed(path_of(&fx.root, "Notes/New.md")),
+        IndexChange::Changed(path_of(&fx.root, "Notes/Newer.md")),
+    ];
+    let stats = fx
+        .store
+        .index_apply_changes(&fx.root, &changes, &opts, &writing)
+        .unwrap();
+    assert_eq!((stats.files, stats.parsed, writes.get()), (6, 2, 2));
+    assert_eq!(fx.store.kv_get("ui").unwrap().as_deref(), Some("wrote"));
+}
+
+#[test]
+fn a_run_over_many_files_writes_them_all_in_several_transactions() {
+    let mut fx = workspace(&[]);
+    let opts = IndexOptions::default();
+    let note = |i: usize| format!("notes/n{i:03}.md");
+    for i in 0..600 {
+        write(
+            &fx.root,
+            &note(i),
+            &format!("# Note {i}\n\nSee [[n{:03}]].\n", (i + 1) % 600),
+        );
+    }
+    let stats = run(&mut fx.store, &fx.root, &opts);
+    assert_eq!((stats.files, stats.parsed, stats.removed), (600, 600, 0));
+    assert_eq!(link_rows(&fx), 600);
+    let heading = |store: &Store, i: usize| {
+        let found = store
+            .index_headings(&fx.root, &path_of(&fx.root, &note(i)))
+            .unwrap();
+        found.into_iter().map(|h| h.text).collect::<Vec<_>>()
+    };
+    assert_eq!(heading(&fx.store, 599), ["Note 599"]);
+
+    // Changed files are re-read, vanished ones dropped, the rest is left alone.
+    for i in 0..300 {
+        write(&fx.root, &note(i), &format!("# Note {i} changed\n"));
+    }
+    for i in 300..450 {
+        std::fs::remove_file(path_of(&fx.root, &note(i))).unwrap();
+    }
+    let stats = run(&mut fx.store, &fx.root, &opts);
+    assert_eq!((stats.files, stats.parsed, stats.removed), (450, 300, 150));
+    assert_eq!(link_rows(&fx), 150);
+    assert_eq!(heading(&fx.store, 0), ["Note 0 changed"]);
+    assert_eq!(heading(&fx.store, 299), ["Note 299 changed"]);
+    assert_eq!(heading(&fx.store, 599), ["Note 599"]);
+    assert!(heading(&fx.store, 300).is_empty());
+}
+
+#[test]
+fn many_events_are_applied_in_several_transactions() {
+    let mut fx = standard();
+    let opts = IndexOptions::default();
+    run(&mut fx.store, &fx.root, &opts);
+    let apply = |store: &mut Store, changes: &[IndexChange]| {
+        store
+            .index_apply_changes(&fx.root, changes, &opts, &no_placeholders)
+            .unwrap()
+    };
+    let batch = |i: usize| path_of(&fx.root, &format!("batch/b{i:03}.md"));
+    for i in 0..300 {
+        write(
+            &fx.root,
+            &format!("batch/b{i:03}.md"),
+            &format!("# Batch {i}\n"),
+        );
+    }
+
+    // One event per file: the steps pending between two events are written first.
+    let changes: Vec<IndexChange> = (0..300).map(|i| IndexChange::Changed(batch(i))).collect();
+    let stats = apply(&mut fx.store, &changes);
+    assert_eq!((stats.files, stats.parsed, stats.removed), (304, 300, 0));
+
+    // One event for a folder: the steps pending between two of its files are written first.
+    for i in 0..300 {
+        write(
+            &fx.root,
+            &format!("folder/f{i:03}.md"),
+            &format!("# Folder {i}\n"),
+        );
+    }
+    let stats = apply(
+        &mut fx.store,
+        &[IndexChange::Changed(path_of(&fx.root, "folder"))],
+    );
+    assert_eq!((stats.files, stats.parsed, stats.removed), (604, 300, 0));
+
+    // Removals count as steps too.
+    for i in 0..300 {
+        std::fs::remove_file(batch(i)).unwrap();
+    }
+    let changes: Vec<IndexChange> = (0..300).map(|i| IndexChange::Removed(batch(i))).collect();
+    let stats = apply(&mut fx.store, &changes);
+    assert_eq!((stats.files, stats.parsed, stats.removed), (304, 0, 300));
+    let all = rels(&fx.store, &fx.root);
+    assert!(all.contains(&"folder/f299.md".to_owned()));
+    assert!(!all.iter().any(|rel| rel.starts_with("batch")));
 }
 
 #[test]

@@ -720,6 +720,15 @@ impl TextStore {
         self.store.status_changed();
     }
 
+    /// The host shows another document now (a tab switch). The store forgets what it cached of
+    /// the old text, drops a composition without committing it to the new document, and tells
+    /// TSF that the whole text, the selection and the layout changed. With text services
+    /// running, call [`TextServices::document_replaced`](super::TextServices::document_replaced)
+    /// instead: it also ends the composition on the text service's side.
+    pub fn document_replaced(&self) {
+        self.store.document_replaced();
+    }
+
     /// True while an IME composition is active.
     #[must_use]
     pub fn is_composing(&self) -> bool {

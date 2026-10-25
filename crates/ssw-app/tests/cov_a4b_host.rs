@@ -6,23 +6,26 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ssw_app::app::{AppCore, EXIT_NO_DEVICE, EXIT_NO_SHELL, ShellHost, run};
 use ssw_app::args::{Args, Launch};
+use ssw_app::documents::{DocEnv, Documents};
+use ssw_app::i18n::localizer_for;
 use ssw_app::startup::{InstanceHook, InstanceRole, ProcessEnv};
 use ssw_app::ui::controller::Request;
 use ssw_app::ui::host::{
     InstanceLink, OFFSCREEN_ORIGIN, UiApp, UiOptions, UiServices, UiShell, WinInstance,
 };
-use ssw_app::ui::scripted_services::ScriptedServices;
+use ssw_app::ui::scripted_services::{Answer, DialogKind, ScriptedServices};
 use ssw_app::workers::{JobKey, JobKind, JobSpec, WindowId};
 use ssw_core::command::CommandId;
-use ssw_io::fs::RealFs;
-use ssw_io::session::WindowPlacement;
+use ssw_io::fs::{FaultFs, FsFailure, FsOp, RealFs};
+use ssw_io::session::{RecentKind, WindowPlacement};
 use ssw_ui::geometry::Size;
 use ssw_ui::input::Cursor;
-use ssw_ui::services::MemoryClipboard;
+use ssw_ui::services::{MemoryClipboard, MessageBoxResult};
 use ssw_win::com::ComGuard;
 use ssw_win::dragdrop::OleGuard;
 use ssw_win::gfx::Driver;
@@ -77,7 +80,16 @@ fn start(files: &[PathBuf], tmp: &Path, body: impl FnOnce(AppCore, &Args) -> i32
 }
 
 fn options(hidden: bool, instance: Option<InstanceLink>, jump_list: bool) -> UiOptions {
-    let services = ScriptedServices::new();
+    options_over(&ScriptedServices::new(), hidden, instance, jump_list)
+}
+
+/// [`options`] whose dialogs and shell are `services`, so a test sees what the window showed.
+fn options_over(
+    services: &ScriptedServices,
+    hidden: bool,
+    instance: Option<InstanceLink>,
+    jump_list: bool,
+) -> UiOptions {
     UiOptions {
         hidden,
         services: Some(UiServices {
@@ -175,6 +187,200 @@ fn a_later_launch_is_forwarded_to_the_first_instance_and_opened_there() {
         ));
         app.pump();
         assert!(app.controller().docs().find(&second).is_some());
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+/// The text of the box that names `paths`, none of which opened because it no longer exists.
+fn gone_box(paths: &[PathBuf]) -> String {
+    let reason = localizer_for("en").text("app-error-not-found");
+    let heading = match paths {
+        [_] => "The file could not be opened:".to_owned(),
+        _ => format!("{} files could not be opened:", paths.len()),
+    };
+    let lines: Vec<String> = paths
+        .iter()
+        .map(|path| format!("{}: {reason}", path.display()))
+        .collect();
+    format!("{heading}\n\n{}", lines.join("\n"))
+}
+
+/// Presses OK in the next message box.
+fn answer_ok(services: &ScriptedServices) {
+    let ok = Answer::Button(MessageBoxResult::Ok);
+    services.answer(DialogKind::MessageBox, ok);
+}
+
+/// The file names of the recent files, the newest first.
+fn recent_names(app: &UiApp) -> Vec<String> {
+    let items = app
+        .controller()
+        .docs()
+        .env()
+        .store
+        .borrow()
+        .recent_items(RecentKind::File)
+        .unwrap();
+    items
+        .into_iter()
+        .map(|item| {
+            let name = item.path.file_name().unwrap();
+            name.to_string_lossy().into_owned()
+        })
+        .collect()
+}
+
+/// Pumps `app` until `done` holds.
+fn pump_until(app: &UiApp, what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        app.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn files_dropped_on_a_window_open_there_and_the_ones_that_fail_are_named_in_one_box() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = note(tmp.path(), "first.md", "first");
+    let good = note(tmp.path(), "good.md", "good");
+    let gone = [tmp.path().join("gone-1.md"), tmp.path().join("gone-2.md")];
+    let services = ScriptedServices::new();
+    let code = start(&[first], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let app = UiApp::new(core, options_over(&services, true, None, false)).unwrap();
+        app.pump();
+        let window = app.controller().windows()[0].id;
+
+        // A window that is gone has nothing to open the files in.
+        app.controller()
+            .push(Request::OpenFiles(WindowId(999), vec![good.clone()]));
+        app.pump();
+        assert!(app.controller().docs().find(&good).is_none());
+        assert!(services.dialog_log().is_empty());
+
+        answer_ok(&services);
+        let dropped = vec![gone[0].clone(), good.clone(), gone[1].clone()];
+        app.controller().push(Request::OpenFiles(window, dropped));
+        app.pump();
+        assert!(app.controller().docs().find(&good).is_some());
+        let shown = services.dialog_log();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].message, gone_box(&gone));
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_forwarded_launch_of_a_recent_file_that_vanished_names_it_and_forgets_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let first = note(tmp.path(), "first.md", "first");
+    let gone = note(tmp.path(), "gone.md", "gone");
+    let id = unique_id("vanished");
+    let services = ScriptedServices::new();
+    let code = start(&[first], tmp.path(), |core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let mut primary = WinInstance::with_app_id(id.clone());
+        assert!(matches!(
+            primary.claim(&Launch::default()).unwrap(),
+            InstanceRole::Primary
+        ));
+        let options = options_over(&services, true, Some(primary.link()), false);
+        let mut app = UiApp::new(core, options).unwrap();
+        app.pump();
+
+        // The file was opened once, so it is a recent file; then it is closed and deleted.
+        let cell = app.controller().windows()[0].clone();
+        app.controller().open_file(&cell, &gone).unwrap();
+        let key = cell.view.borrow().active_tab().unwrap().key;
+        app.controller().close_tab(&cell, key);
+        std::fs::remove_file(&gone).unwrap();
+        assert_eq!(recent_names(&app), ["gone.md", "first.md"]);
+
+        // A Jump List the shell refuses is logged at every refresh, which counts the refreshes.
+        let long_program = PathBuf::from(format!(r"C:\{id}\{}.exe", "x".repeat(300)));
+        app.set_jump_list(JumpList::new(
+            format!("{id}.refused"),
+            long_program,
+            "Recent",
+            "New window",
+        ));
+        app.pump();
+        let log = app.controller().core().borrow().paths.logs_dir();
+        let refreshes = || {
+            let text = std::fs::read_to_string(log.join("ssw.log")).unwrap();
+            text.matches("cannot update the Jump List").count()
+        };
+        assert_eq!(refreshes(), 1);
+
+        // A later process of the application asks for the vanished file.
+        answer_ok(&services);
+        let launch = Args {
+            paths: vec![gone.clone()],
+            ..Args::default()
+        }
+        .launch(&RealFs);
+        let mut later = WinInstance::with_app_id(id.clone());
+        assert!(matches!(
+            later.claim(&launch).unwrap(),
+            InstanceRole::Forwarded
+        ));
+        app.pump();
+        let shown = services.dialog_log();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].message, gone_box(&[gone]));
+        assert_eq!(recent_names(&app), ["first.md"]);
+        assert_eq!(refreshes(), 2, "the Jump List follows the pruned list");
+        0
+    });
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn a_file_the_watcher_cannot_reload_is_reported_once_until_it_reloads_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = note(tmp.path(), "a.md", "one\n");
+    let faults = Arc::new(FaultFs::new());
+    let services = ScriptedServices::new();
+    let code = start(std::slice::from_ref(&file), tmp.path(), |mut core, _| {
+        let _ole = OleGuard::initialize().unwrap();
+        let env = DocEnv {
+            fs: faults.clone(),
+            ..core.docs.env().clone()
+        };
+        core.docs = Rc::new(Documents::new(env));
+        let app = UiApp::new(core, options_over(&services, true, None, false)).unwrap();
+        app.pump();
+        let entry = app.controller().docs().find(&file).unwrap();
+        let boxes = || services.dialog_log().len();
+        let text = || entry.document().borrow().text();
+
+        // Reading fails from now on: the reload the watcher asks for fails and is reported.
+        faults.fail_always(FsOp::Read, FsFailure::AccessDenied);
+        answer_ok(&services);
+        std::fs::write(&file, "one, written by another program\n").unwrap();
+        pump_until(&app, "the failed reload is reported", || boxes() == 1);
+
+        // The file changes again and still cannot be read: nothing more is said.
+        let reads = faults.calls(FsOp::Read);
+        std::fs::write(&file, "one, written again by another program\n").unwrap();
+        pump_until(&app, "a second read", || faults.calls(FsOp::Read) > reads);
+        app.pump();
+        assert_eq!(boxes(), 1);
+
+        // A reload that works clears the report: the next failure is shown again.
+        faults.clear();
+        std::fs::write(&file, "readable again\n").unwrap();
+        pump_until(&app, "the file reloads", || text() == "readable again\n");
+        faults.fail_always(FsOp::Read, FsFailure::AccessDenied);
+        answer_ok(&services);
+        std::fs::write(&file, "unreadable once more, and longer\n").unwrap();
+        pump_until(&app, "the new failure is reported", || boxes() == 2);
+        assert_eq!(services.take_unexpected(), None);
+        assert!(services.unused_answers().is_empty());
         0
     });
     assert_eq!(code, 0);

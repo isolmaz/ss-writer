@@ -62,7 +62,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_XBUTTONUP, WNDCLASS_STYLES, WNDCLASSEXW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, PT_TOUCHPAD};
+use windows::Win32::UI::WindowsAndMessaging::{
+    POINTER_INPUT_TYPE, PT_PEN, PT_TOUCH, PT_TOUCHPAD, WM_ENDSESSION, WM_QUERYENDSESSION,
+};
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::canvas::{CanvasAssets, D2dCanvas, TargetResources};
@@ -280,6 +282,15 @@ pub trait WindowHandler {
     fn on_close_requested(&mut self, _info: &WindowInfo) -> bool {
         true
     }
+    /// The system starts asking whether the session may end (`WM_QUERYENDSESSION`; the answer
+    /// is always yes). Every window is asked before any of them is told the outcome with
+    /// [`Self::on_end_session`], and a process that is still running after being told (an
+    /// installer asking applications to close) is asked again before it is told again.
+    fn on_query_end_session(&mut self, _info: &WindowInfo) {}
+    /// The system is ending the session (shutdown, restart or sign-out) and does not ask the
+    /// window again: the process can be killed once this returns, so whatever must survive is
+    /// written here, without asking the user anything.
+    fn on_end_session(&mut self, _info: &WindowInfo) {}
     /// The window is being destroyed.
     fn on_destroy(&mut self, _info: &WindowInfo) {}
     /// Sees every message before the window's own translation. `Some(result)` answers the
@@ -709,10 +720,25 @@ struct Graphics {
     resources: TargetResources,
 }
 
+/// How many rebuilds of lost graphics may fail before the window stops trying.
+const GRAPHICS_RETRIES: u32 = 5;
+/// How long the window waits after the first failed rebuild; each failure doubles the wait.
+const GRAPHICS_RETRY_WAIT: Duration = Duration::from_millis(500);
+
+/// The devices of a failed rebuild: a later paint tries again from them.
+struct LostGraphics {
+    devices: GfxDevices,
+    /// The rebuilds that failed so far.
+    failures: u32,
+    retry_at: Instant,
+}
+
 struct WindowState {
     hwnd: HWND,
     handler: Box<dyn WindowHandler>,
     dpi: u32,
+    /// The DPI the swap chain and the handler were last given (see `resize`).
+    applied_dpi: u32,
     size_px: (i32, i32),
     chrome: ChromeState,
     theme: Theme,
@@ -720,6 +746,8 @@ struct WindowState {
     /// registrations survive until (and across) the graphics devices.
     assets: Option<CanvasAssets>,
     graphics: Option<Graphics>,
+    /// Set while `graphics` is `None` because a rebuild failed and may still be retried.
+    lost: Option<LostGraphics>,
     pending_high_surrogate: Option<u16>,
     clicks: ClickTracker,
     started: Instant,
@@ -842,9 +870,11 @@ impl WindowState {
         }));
     }
 
-    /// Resizes the swap chain and repaints immediately (flicker-free live resize).
+    /// Resizes the swap chain and repaints immediately (flicker-free live resize). The swap
+    /// chain and the handler learn the DPI here too.
     fn resize(&mut self, width: i32, height: i32) {
         self.size_px = (width, height);
+        self.applied_dpi = self.dpi;
         if let Some(graphics) = self.graphics.as_mut() {
             graphics.surface.set_dpi(self.dpi as f32);
             let resized = graphics
@@ -861,11 +891,22 @@ impl WindowState {
         self.paint();
     }
 
+    /// Gives the swap chain and the handler a new DPI that no `WM_SIZE` carried to them: the
+    /// suggested rectangle of a `WM_DPICHANGED` can have the size the window already has (a
+    /// maximized or snapped window moved to a monitor of the same resolution and another scale).
+    fn apply_dpi(&mut self) {
+        if self.applied_dpi != self.dpi {
+            let (width, height) = self.size_px;
+            self.resize(width, height);
+        }
+    }
+
     fn paint(&mut self) {
         if self.painting || self.size_px.0 <= 0 || self.size_px.1 <= 0 {
             return;
         }
         self.painting = true;
+        self.retry_graphics();
         let outcome = self.paint_once();
         if matches!(&outcome, Err(error) if error.is_device_lost()) {
             self.recover_graphics();
@@ -898,7 +939,8 @@ impl WindowState {
         })
     }
 
-    /// Rebuilds every device resource after a device loss; the next paint redraws.
+    /// Rebuilds every device resource after a device loss; the next paint redraws. A rebuild
+    /// that fails is tried again by later paints ([`WindowState::retry_graphics`]).
     fn recover_graphics(&mut self) {
         let Some(old) = self.graphics.take() else {
             return;
@@ -911,20 +953,44 @@ impl WindowState {
         // The composition target must be released before a new one is made for this HWND.
         drop(surface);
         drop(resources);
-        let Ok(devices) = devices.recreate() else {
-            return;
-        };
+        self.rebuild_graphics(devices, 0);
+    }
+
+    /// Makes the devices after `lost` and a surface on them. When that fails, the window keeps
+    /// `lost` for a later try, which waits twice as long after every failure; after
+    /// [`GRAPHICS_RETRIES`] failures it stays without graphics.
+    fn rebuild_graphics(&mut self, lost: GfxDevices, failures: u32) {
         let (width, height) = (self.size_px.0.max(1) as u32, self.size_px.1.max(1) as u32);
-        let Ok(surface) = WindowSurface::new(&devices, self.hwnd, width, height, self.dpi as f32)
-        else {
-            return;
-        };
-        let resources = TargetResources::new(devices.d2d_factory().clone(), devices.generation());
-        self.graphics = Some(Graphics {
-            devices,
-            surface,
-            resources,
+        let built = lost.recreate().and_then(|devices| {
+            let surface = WindowSurface::new(&devices, self.hwnd, width, height, self.dpi as f32)?;
+            Ok((devices, surface))
         });
+        match built {
+            Ok((devices, surface)) => {
+                let resources =
+                    TargetResources::new(devices.d2d_factory().clone(), devices.generation());
+                self.graphics = Some(Graphics {
+                    devices,
+                    surface,
+                    resources,
+                });
+            }
+            Err(_) => {
+                let failures = failures + 1;
+                self.lost = (failures < GRAPHICS_RETRIES).then(|| LostGraphics {
+                    devices: lost,
+                    failures,
+                    retry_at: Instant::now() + GRAPHICS_RETRY_WAIT * 2u32.pow(failures - 1),
+                });
+            }
+        }
+    }
+
+    /// Tries again to rebuild graphics a failed rebuild left behind, once its wait is over.
+    fn retry_graphics(&mut self) {
+        if let Some(lost) = self.lost.take_if(|lost| Instant::now() >= lost.retry_at) {
+            self.rebuild_graphics(lost.devices, lost.failures);
+        }
     }
 
     fn handle(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> (Option<LRESULT>, After) {
@@ -1240,10 +1306,25 @@ impl WindowState {
                     (Some(LRESULT(0)), After::None)
                 }
             }
+            // Agrees to every shutdown: the application keeps nothing that has to be asked.
+            WM_QUERYENDSESSION => {
+                let info = self.info();
+                self.handler.on_query_end_session(&info);
+                (Some(LRESULT(1)), After::None)
+            }
+            WM_ENDSESSION => {
+                // A zero `wparam` says the session goes on after all.
+                if wparam.0 != 0 {
+                    let info = self.info();
+                    self.handler.on_end_session(&info);
+                }
+                (Some(LRESULT(0)), After::None)
+            }
             WM_DESTROY => {
                 let info = self.info();
                 self.handler.on_destroy(&info);
                 self.graphics = None;
+                self.lost = None;
                 self.assets = None;
                 (Some(LRESULT(0)), After::None)
             }
@@ -1380,6 +1461,9 @@ fn dispatch(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
+            // This call borrowed the state above, so no outer call holds it, and the messages
+            // `SetWindowPos` sent are done.
+            cell.borrow_mut().apply_dpi();
         }
         After::Close => {
             // SAFETY: posts WM_CLOSE to our own window.
@@ -1435,11 +1519,13 @@ impl WindowHost {
             hwnd: HWND::default(),
             handler,
             dpi: DEFAULT_DPI,
+            applied_dpi: DEFAULT_DPI,
             size_px: (0, 0),
             chrome: ChromeState::default(),
             theme,
             assets: None,
             graphics: None,
+            lost: None,
             pending_high_surrogate: None,
             clicks: ClickTracker::new(
                 // SAFETY: pure query.
@@ -1494,6 +1580,7 @@ impl WindowHost {
             let mut borrowed = host.state.borrow_mut();
             borrowed.hwnd = hwnd;
             borrowed.dpi = dpi;
+            borrowed.applied_dpi = dpi;
             borrowed.size_px = (client.right - client.left, client.bottom - client.top);
         }
         apply_dark_mode(hwnd, options.dark);
@@ -1551,6 +1638,7 @@ impl WindowHost {
             surface,
             resources,
         });
+        state.lost = None;
         Ok(())
     }
 
@@ -1810,9 +1898,13 @@ mod tests {
         destroys: u32,
         wakes: u32,
         resizes: Vec<(i32, i32)>,
+        /// The DPI the handler saw with each of `resizes`.
+        dpis: Vec<u32>,
         activations: Vec<bool>,
         themes: u32,
         paints: u32,
+        end_session_queries: u32,
+        end_sessions: u32,
     }
 
     struct TestHandler {
@@ -1839,7 +1931,9 @@ mod tests {
             );
         }
         fn on_resize(&mut self, info: &WindowInfo) {
-            self.log.borrow_mut().resizes.push(info.size_px);
+            let mut log = self.log.borrow_mut();
+            log.resizes.push(info.size_px);
+            log.dpis.push(info.dpi);
         }
         fn on_activate(&mut self, _info: &WindowInfo, active: bool) {
             self.log.borrow_mut().activations.push(active);
@@ -1853,6 +1947,12 @@ mod tests {
         fn on_close_requested(&mut self, _info: &WindowInfo) -> bool {
             self.log.borrow_mut().closes += 1;
             self.allow_close
+        }
+        fn on_query_end_session(&mut self, _info: &WindowInfo) {
+            self.log.borrow_mut().end_session_queries += 1;
+        }
+        fn on_end_session(&mut self, _info: &WindowInfo) {
+            self.log.borrow_mut().end_sessions += 1;
         }
         fn on_destroy(&mut self, _info: &WindowInfo) {
             self.log.borrow_mut().destroys += 1;
@@ -2359,6 +2459,7 @@ mod tests {
             (1000, 800)
         );
         assert_eq!(host.info().dpi, 192);
+        assert_eq!(log.borrow().dpis.last().copied(), Some(192));
         // A suggestion below the minimum size of the new DPI is raised to the minimum
         // (`WM_GETMINMAXINFO`): 480 x 320 DIPs are 960 x 640 pixels at 192 DPI.
         let tiny = RECT {
@@ -2380,6 +2481,19 @@ mod tests {
             (rect.right - rect.left, rect.bottom - rect.top),
             (min_width, min_height)
         );
+        // A suggestion with the window's own size sends no WM_SIZE; the swap chain and the
+        // handler still switch to the new DPI and the window repaints.
+        let (resizes, paints) = (log.borrow().resizes.len(), log.borrow().paints);
+        send(
+            &host,
+            WM_DPICHANGED,
+            0x0090_0090,
+            (&rect as *const RECT) as isize,
+        );
+        assert_eq!(host.info().dpi, 144);
+        assert_eq!(log.borrow().resizes.len(), resizes + 1);
+        assert_eq!(log.borrow().dpis.last().copied(), Some(144));
+        assert!(log.borrow().paints > paints);
     }
 
     #[test]
@@ -2822,12 +2936,36 @@ mod tests {
             handler.on_close_requested(&info),
             "closing is allowed by default"
         );
+        handler.on_query_end_session(&info);
+        handler.on_end_session(&info);
         handler.on_destroy(&info);
         assert_eq!(
             handler.on_message(&info, WM_APP, WPARAM(0), LPARAM(0)),
             None,
             "messages are not answered by default"
         );
+    }
+
+    #[test]
+    fn the_end_of_the_session_is_agreed_to_and_told_to_the_handler_once_it_is_certain() {
+        let (host, log) = host(true, false);
+        assert_eq!(
+            feed(&host, WM_QUERYENDSESSION, 0, 0),
+            (Some(1), After::None),
+            "no shutdown is held up"
+        );
+        assert_eq!(log.borrow().end_session_queries, 1, "the handler is asked");
+        assert_eq!(log.borrow().end_sessions, 0, "being asked changes nothing");
+        // `wparam == 0`: another program refused, the session goes on.
+        assert_eq!(feed(&host, WM_ENDSESSION, 0, 0), (Some(0), After::None));
+        assert_eq!(log.borrow().end_sessions, 0);
+        assert_eq!(feed(&host, WM_ENDSESSION, 1, 0), (Some(0), After::None));
+        assert_eq!(log.borrow().end_sessions, 1);
+        // The window procedure takes the same way and answers without default processing.
+        assert_eq!(send(&host, WM_QUERYENDSESSION, 0, 0), 1);
+        assert_eq!(send(&host, WM_ENDSESSION, 1, 0), 0);
+        assert_eq!(log.borrow().end_session_queries, 2);
+        assert_eq!(log.borrow().end_sessions, 2);
     }
 
     /// A handler that answers one private message before the window translates anything.
@@ -3211,6 +3349,109 @@ mod tests {
         let mut expected = vec![Some(2); 5];
         expected.extend([None; 10]);
         assert_eq!(generations, expected);
+    }
+
+    /// How many rebuilds of its lost graphics have failed while `host` waits to try again.
+    #[cfg(feature = "fault-injection")]
+    fn failed_rebuilds(host: &WindowHost) -> Option<u32> {
+        host.state.borrow().lost.as_ref().map(|lost| lost.failures)
+    }
+
+    /// Lets the wait before the next try at the lost graphics of `host` end now.
+    #[cfg(feature = "fault-injection")]
+    fn end_graphics_wait(host: &WindowHost) {
+        let mut state = host.state.borrow_mut();
+        let lost = state.lost.as_mut().expect("a rebuild is waiting");
+        lost.retry_at = Instant::now();
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn graphics_that_could_not_be_rebuilt_are_tried_again_by_later_paints_after_a_growing_wait() {
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, log) = host(true, false);
+        attach(&host);
+
+        let before = Instant::now();
+        crate::fault::arm_from(0);
+        host.state.borrow_mut().recover_graphics();
+        crate::fault::disarm();
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(failed_rebuilds(&host), Some(1));
+        let retry_at = host.state.borrow().lost.as_ref().map(|lost| lost.retry_at);
+        assert!(retry_at >= Some(before + GRAPHICS_RETRY_WAIT));
+
+        // Within the wait a paint neither tries nor draws.
+        let paints = log.borrow().paints;
+        host.state.borrow_mut().paint();
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(log.borrow().paints, paints);
+        assert_eq!(failed_rebuilds(&host), Some(1));
+
+        // After it a try that fails again waits twice as long.
+        end_graphics_wait(&host);
+        let before = Instant::now();
+        crate::fault::arm_from(0);
+        host.state.borrow_mut().paint();
+        crate::fault::disarm();
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(failed_rebuilds(&host), Some(2));
+        let retry_at = host.state.borrow().lost.as_ref().map(|lost| lost.retry_at);
+        assert!(retry_at >= Some(before + GRAPHICS_RETRY_WAIT * 2));
+
+        // After that wait a try gets through: new devices, and the frame is drawn on them.
+        end_graphics_wait(&host);
+        host.state.borrow_mut().paint();
+        assert_eq!(host.graphics_generation(), Some(2));
+        assert_eq!(log.borrow().paints, paints + 1);
+        assert!(host.state.borrow().lost.is_none());
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn the_window_stops_trying_after_a_bounded_number_of_failed_rebuilds() {
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, log) = host(true, false);
+        attach(&host);
+
+        crate::fault::arm_from(0);
+        host.state.borrow_mut().recover_graphics();
+        let mut seen = vec![failed_rebuilds(&host)];
+        for _ in 1..GRAPHICS_RETRIES {
+            end_graphics_wait(&host);
+            host.state.borrow_mut().paint();
+            seen.push(failed_rebuilds(&host));
+        }
+        crate::fault::disarm();
+        // The last failure is the one that ends the tries.
+        assert_eq!(seen, [Some(1), Some(2), Some(3), Some(4), None]);
+        assert_eq!(host.graphics_generation(), None);
+
+        // Nothing is left to try: later paints do not rebuild and draw nothing.
+        let paints = log.borrow().paints;
+        host.state.borrow_mut().paint();
+        assert_eq!(host.graphics_generation(), None);
+        assert_eq!(log.borrow().paints, paints);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn graphics_attached_while_a_rebuild_waits_replace_it() {
+        let _com = crate::com::ComGuard::apartment_threaded().unwrap();
+        let (host, log) = host(true, false);
+        attach(&host);
+        crate::fault::arm_from(0);
+        host.state.borrow_mut().recover_graphics();
+        crate::fault::disarm();
+        assert!(host.state.borrow().lost.is_some());
+
+        attach(&host);
+        assert!(host.state.borrow().lost.is_none());
+        assert_eq!(host.graphics_generation(), Some(1));
+        let paints = log.borrow().paints;
+        host.state.borrow_mut().paint();
+        assert_eq!(host.graphics_generation(), Some(1));
+        assert_eq!(log.borrow().paints, paints + 1);
     }
 
     #[test]

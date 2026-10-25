@@ -20,7 +20,8 @@ use ssw_core::format_text::{
 };
 use ssw_core::i18n::{Arg, Localizer};
 use ssw_core::keymap::Keymap;
-use ssw_core::settings::Settings;
+use ssw_core::settings::{Settings, StartupBehavior};
+use ssw_io::logging::Logger;
 use ssw_io::session::{Session, ViewState, WindowPlacement};
 use ssw_ui::editor::blocks_media::MediaEvent;
 use ssw_ui::editor::highlight::Language;
@@ -50,7 +51,8 @@ use super::shell_view::{ShellAction, ShellView, TabView, ViewConfig, sidebar_opt
 use super::tree_source::{TreePaths, WorkspaceTree};
 use crate::app::AppCore;
 use crate::commands::{AppActions, Dispatch};
-use crate::documents::{DocEntry, DocError, DocMode, LoadError, replace_text};
+use crate::documents::{DocEntry, DocError, DocId, DocMode, LoadError, replace_text};
+use crate::emergency::EmergencyCache;
 use crate::session::{PlannedDocument, SessionManager, StartupPlan, TabState, WindowState};
 use crate::workers::{JobKey, JobKind, JobSpec, WindowId};
 
@@ -90,6 +92,12 @@ pub enum Request {
     /// A window was activated (the user came back to it): compare its files with the disk
     /// ([`Controller::check_external_changes`]).
     Activated(WindowId),
+    /// Files were dropped on a window: open them there, as File → Open does. The drop only
+    /// queues them, so the drag source (Explorer) is not held up by a dialog.
+    OpenFiles(WindowId, Vec<PathBuf>),
+    /// A window was deactivated (the user went elsewhere): write its documents
+    /// ([`Controller::window_deactivated`]).
+    Deactivated(WindowId),
 }
 
 /// The state of one window that does not depend on the operating system.
@@ -174,6 +182,13 @@ pub struct Controller {
     pub(super) settings_hub: super::settings_window::SettingsHub,
     /// Which banners the user closed, the recovery offer (see [`super::banner_flows`]).
     pub(super) flows: super::banner_flows::FlowState,
+    /// The end of the session was handled; every window receives the message that announces it.
+    pub(super) session_ended: Cell<bool>,
+    /// The crash copy of the documents with unsaved changes, which the end of the session
+    /// writes to the recovery folder when the core is borrowed.
+    pub(super) crash_copy: Arc<EmergencyCache>,
+    /// The log, for the same case.
+    pub(super) logger: Arc<Logger>,
 }
 
 impl fmt::Debug for Controller {
@@ -201,6 +216,8 @@ impl Controller {
             me: me.clone(),
             i18n: Rc::clone(&core.i18n),
             docs: Rc::clone(&core.docs),
+            crash_copy: Arc::clone(core.autosave.emergency()),
+            logger: Arc::clone(&core.logger),
             router: RefCell::new(ShortcutRouter::new(keymap)),
             settings: RefCell::new(settings),
             core: RefCell::new(core),
@@ -221,6 +238,7 @@ impl Controller {
             export: super::export::ExportState::default(),
             settings_hub: super::settings_window::SettingsHub::default(),
             flows: super::banner_flows::FlowState::default(),
+            session_ended: Cell::new(false),
         })
     }
 
@@ -358,11 +376,12 @@ impl Controller {
         cell
     }
 
-    /// Creates the windows and tabs of the startup plan. Files that cannot be opened are
-    /// reported and skipped.
+    /// Creates the windows and tabs of the startup plan. A file a window shows already gets no
+    /// second tab there. Files that cannot be opened are skipped and reported together.
     pub fn open_plan(&self, plan: &StartupPlan) {
         let size = Size::new(1280.0, 800.0);
         let mut created = Vec::new();
+        let mut failures = Vec::new();
         for planned in &plan.windows {
             let cell = self.create_window(planned.placement, size, 1.0);
             let mut active_key = None;
@@ -371,7 +390,7 @@ impl Controller {
                     PlannedDocument::File(path) => match self.docs.open(path) {
                         Ok(entry) => entry,
                         Err(error) => {
-                            self.report(&error);
+                            failures.push((path.clone(), error));
                             continue;
                         }
                     },
@@ -391,7 +410,21 @@ impl Controller {
                     }
                     PlannedDocument::NewUntitled => self.docs.new_untitled(),
                 };
-                let key = cell.view.borrow_mut().add_tab(entry, tab.workspace.clone());
+                let shown = cell
+                    .view
+                    .borrow()
+                    .tabs()
+                    .iter()
+                    .find(|open| Rc::ptr_eq(&open.entry, &entry))
+                    .map(|open| open.key);
+                let key = match shown {
+                    Some(key) => {
+                        // Opening counted a user for this tab; the tab that shows it has one.
+                        self.docs.release(&entry);
+                        key
+                    }
+                    None => cell.view.borrow_mut().add_tab(entry, tab.workspace.clone()),
+                };
                 if planned.active_tab == Some(index) {
                     active_key = Some(key);
                 }
@@ -426,6 +459,7 @@ impl Controller {
         for cell in &created {
             self.refresh(cell);
         }
+        self.report_open_failures(&failures);
         self.offer_recovery();
     }
 
@@ -469,9 +503,9 @@ impl Controller {
 
     /// Brings the tab strip, banners and status bar of `cell` up to date with its documents.
     pub fn refresh(&self, cell: &WindowCell) {
-        let show_dirty = !self.settings.borrow().general.autosave;
+        let autosave = self.settings.borrow().general.autosave;
         let mut view = cell.view.borrow_mut();
-        view.sync_tabs(show_dirty);
+        view.sync_tabs(autosave);
         self.sync_banners(cell.id, &mut view);
         self.sync_update_banner(&mut view);
         self.sync_inspector(cell.id, &mut view);
@@ -486,13 +520,37 @@ impl Controller {
     }
 
     pub(super) fn report(&self, error: &DocError) {
-        let message = self.i18n.text(error.message_id());
         let _ = self.dialogs.borrow_mut().message_box(&MessageBoxOptions {
             title: self.i18n.text("window-error-title"),
-            message,
+            message: error.message(&self.i18n),
             buttons: MessageBoxButtons::Ok,
             icon: Some(MessageBoxIcon::Error),
         });
+    }
+
+    /// Tells the user which files of one action did not open, and why, in a single box that
+    /// names every file; nothing is shown when all of them opened.
+    pub(super) fn report_open_failures(&self, failures: &[(PathBuf, DocError)]) {
+        if failures.is_empty() {
+            return;
+        }
+        let lines: Vec<String> = failures
+            .iter()
+            .map(|(path, error)| {
+                self.i18n.format(
+                    "app-open-failed-file",
+                    &[
+                        ("path", Arg::Str(&path.to_string_lossy())),
+                        ("reason", Arg::Str(&self.i18n.text(error.message_id()))),
+                    ],
+                )
+            })
+            .collect();
+        let count = i64::try_from(failures.len()).unwrap_or(i64::MAX);
+        let heading = self
+            .i18n
+            .format("app-open-failed", &[("count", Arg::Int(count))]);
+        self.show_error(format!("{heading}\n\n{}", lines.join("\n")));
     }
 
     // ----- commands ------------------------------------------------------------------------
@@ -506,7 +564,10 @@ impl Controller {
             controller: self,
             cell: Rc::clone(&cell),
         };
-        let outcome = self.core.borrow().commands.dispatch(command, &mut actions);
+        // A command can open dialogs, and the system can end the session while one is up: the
+        // core is not borrowed meanwhile.
+        let commands = Rc::clone(&self.core.borrow().commands);
+        let outcome = commands.dispatch(command, &mut actions);
         self.refresh(&cell);
         outcome
     }
@@ -673,10 +734,27 @@ impl Controller {
         cell.view.borrow_mut().activate_tab(key);
     }
 
+    /// Writes `entry` for the autosave triggers of a tab switch or a deactivated window and
+    /// shows a failure unless the user has seen the same one for this document already. A file
+    /// another program holds is not waited for: the autosave timer writes it later.
     fn flush(&self, entry: &DocEntry) {
-        if let Some(Err(error)) = self.core.borrow().autosave.flush(entry) {
+        let outcome = self.core.borrow().autosave.flush_without_waiting(entry);
+        if let Some(Err(error)) = outcome
+            && self.core.borrow().autosave.is_new_failure(entry, &error)
+        {
             self.report(&error);
         }
+    }
+
+    /// The window `id` was deactivated: its documents are written (spec §4.3).
+    pub fn window_deactivated(&self, id: WindowId) {
+        let Some(cell) = self.window(id) else {
+            return;
+        };
+        for (_, entry) in tab_entries(&cell) {
+            self.flush(&entry);
+        }
+        self.refresh(&cell);
     }
 
     /// Activates the tab of `cell` that shows `path`; false when no tab of the window does.
@@ -737,14 +815,42 @@ impl Controller {
     }
 
     /// Opens `path` the way the user asked for a document: word-processor files are imported
-    /// on a worker (spec §4.1, see [`super::import`]), everything else is read now. Failures
-    /// are reported.
+    /// on a worker (spec §4.1, see [`super::import`]), everything else is read now and a file
+    /// that cannot be read is reported with its name.
     pub(super) fn open_document(&self, cell: &Rc<WindowCell>, path: &Path) {
-        if super::import::is_import(path) {
-            super::import::open_import(self, cell, path);
-        } else if let Err(error) = self.open_file(cell, path) {
-            self.report(&error);
-        }
+        self.open_documents(cell, [path]);
+    }
+
+    /// [`Self::open_document`] for the files of one action (File → Open, a launch, a drop): the
+    /// ones that do not open are reported together, in one box.
+    fn open_documents(
+        &self,
+        cell: &Rc<WindowCell>,
+        paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) {
+        let failures: Vec<(PathBuf, DocError)> = paths
+            .into_iter()
+            .filter_map(|path| {
+                let path = path.as_ref();
+                let opened = if super::import::is_import(path) {
+                    super::import::open_import(self, cell, path);
+                    Ok(())
+                } else {
+                    self.open_file(cell, path)
+                };
+                opened.err().map(|error| (path.to_path_buf(), error))
+            })
+            .collect();
+        self.report_open_failures(&failures);
+    }
+
+    /// Opens `paths` in window `id` (files dropped on it), as File → Open does.
+    pub(super) fn open_files(&self, id: WindowId, paths: &[PathBuf]) {
+        let Some(cell) = self.window(id) else {
+            return;
+        };
+        self.open_documents(&cell, paths);
+        self.refresh(&cell);
     }
 
     /// Opens a file the user browsed to (the sidebar, Quick Open, a search result, a log or
@@ -763,7 +869,7 @@ impl Controller {
         } else {
             self.open_text_file(cell, path, true)
                 .unwrap_or_else(|error| {
-                    self.report(&error);
+                    self.report_open_failures(&[(path.to_path_buf(), error)]);
                     Browsed::Handled
                 })
         }
@@ -818,7 +924,8 @@ impl Controller {
         let Some(entry) = cell.view.borrow().tab(key).map(|tab| Rc::clone(&tab.entry)) else {
             return CloseOutcome::Closed;
         };
-        if !self.confirm_close(cell, key, &entry) {
+        // A document that another tab shows stays open with its changes.
+        if entry.users() <= 1 && !self.confirm_close(cell, key, &entry, false) {
             return CloseOutcome::Cancelled;
         }
         let Some(tab) = cell.view.borrow_mut().close_tab(key) else {
@@ -842,18 +949,25 @@ impl Controller {
         CloseOutcome::Closed
     }
 
-    /// Whether the tab `key` (showing `entry`) may close: with autosave the document is
-    /// flushed, otherwise unsaved changes are asked about (save, discard, cancel). Returns
-    /// false when the user cancelled or the save failed.
-    fn confirm_close(&self, cell: &Rc<WindowCell>, key: u64, entry: &Rc<DocEntry>) -> bool {
-        if self.settings.borrow().general.autosave {
-            if let Some(Err(error)) = self.core.borrow().autosave.flush(entry) {
-                self.report(&error);
-                return false;
-            }
-            return true;
+    /// Whether the document `entry` of the tab `key` may go away with the tab. With autosave it
+    /// is written first; what is still unsaved then — autosave cannot write the document or the
+    /// write failed — is asked about (save, discard, cancel), as is every unsaved document
+    /// without autosave. A failed write is not reported here: the question follows, and Save
+    /// reports it when it fails again. `keeps_untitled`: the session stores untitled buffers
+    /// (the application quits and restores its session), so autosave does not ask about them.
+    /// Returns false when the user cancelled or the save failed.
+    fn confirm_close(
+        &self,
+        cell: &Rc<WindowCell>,
+        key: u64,
+        entry: &Rc<DocEntry>,
+        keeps_untitled: bool,
+    ) -> bool {
+        let autosave = self.settings.borrow().general.autosave;
+        if autosave {
+            let _ = self.core.borrow().autosave.flush(entry);
         }
-        if !entry.is_dirty() || entry.users() > 1 {
+        if !entry.is_dirty() || (autosave && keeps_untitled && entry.is_untitled()) {
             return true;
         }
         let title = entry.title(&self.i18n);
@@ -872,22 +986,48 @@ impl Controller {
         }
     }
 
-    /// The close button or File → Exit asked to close window `id`: every tab is confirmed as
-    /// for a tab close. Returns false when the user cancelled (the window stays open). The
-    /// window is not closed here: call [`Controller::close_window`] when this returns true.
+    /// The close button asked to close window `id`: [`Controller::request_close_windows`] for
+    /// that window. Returns false when the user cancelled (the window stays open). The window
+    /// is not closed here: call [`Controller::close_window`] when this returns true.
     pub fn request_close_window(&self, id: WindowId) -> bool {
-        let Some(cell) = self.window(id) else {
-            return true;
-        };
-        let tabs: Vec<(u64, Rc<DocEntry>)> = cell
-            .view
-            .borrow()
-            .tabs()
+        self.request_close_windows(&[id])
+    }
+
+    /// The close button or File → Exit asked to close the windows `ids` (Exit: all of them):
+    /// every document that goes away with them is confirmed as for a tab close, once, however
+    /// many tabs show it. A document that a tab outside `ids` shows stays open and is not asked
+    /// about. When no other window is left the application quits, and its session keeps the
+    /// untitled buffers (spec §4.4) if the setting restores the session on startup. Returns
+    /// false when the user cancelled (the windows stay open). The windows are not closed here.
+    pub fn request_close_windows(&self, ids: &[WindowId]) -> bool {
+        let closing: Vec<(Rc<WindowCell>, u64, Rc<DocEntry>)> = ids
             .iter()
-            .map(|tab| (tab.key, Rc::clone(&tab.entry)))
+            .filter_map(|id| self.window(*id))
+            .flat_map(|cell| {
+                tab_entries(&cell)
+                    .into_iter()
+                    .map(move |(key, entry)| (Rc::clone(&cell), key, entry))
+            })
             .collect();
-        tabs.iter()
-            .all(|(key, entry)| self.confirm_close(&cell, *key, entry))
+        let quitting = self
+            .windows
+            .borrow()
+            .iter()
+            .all(|window| ids.contains(&window.id));
+        let keeps_untitled = quitting
+            && self.settings.borrow().general.on_startup == StartupBehavior::RestoreSession;
+        let mut asked: Vec<DocId> = Vec::new();
+        closing.iter().all(|(cell, key, entry)| {
+            let tabs = closing
+                .iter()
+                .filter(|(_, _, other)| Rc::ptr_eq(other, entry))
+                .count();
+            if entry.users() > tabs || asked.contains(&entry.id()) {
+                return true;
+            }
+            asked.push(entry.id());
+            self.confirm_close(cell, *key, entry, keeps_untitled)
+        })
     }
 
     fn save_for_close(&self, cell: &Rc<WindowCell>, key: u64, entry: &Rc<DocEntry>) -> bool {
@@ -967,9 +1107,7 @@ impl Controller {
             }
             None => return,
         };
-        for path in launch.files() {
-            self.open_document(&target, path);
-        }
+        self.open_documents(&target, launch.files());
         for folder in launch.folders() {
             let fresh = self.create_window(None, size, 1.0);
             self.new_untitled(&fresh);
@@ -1168,6 +1306,16 @@ fn search_key(id: WindowId) -> JobKey {
 fn close_first_tab(cell: &WindowCell) -> Option<TabView> {
     let key = cell.view.borrow().tabs().first()?.key;
     cell.view.borrow_mut().close_tab(key)
+}
+
+/// The tabs of `cell`, left to right, as their keys and documents.
+fn tab_entries(cell: &WindowCell) -> Vec<(u64, Rc<DocEntry>)> {
+    cell.view
+        .borrow()
+        .tabs()
+        .iter()
+        .map(|tab| (tab.key, Rc::clone(&tab.entry)))
+        .collect()
 }
 
 /// The work of a folder search (it runs on a worker): the files with matches and the totals,
@@ -1636,9 +1784,8 @@ impl AppActions for WindowActions<'_> {
                 true
             }
             CommandId::FileOpen => {
-                for path in controller.open_dialog() {
-                    controller.open_document(&cell, &path);
-                }
+                let paths = controller.open_dialog();
+                controller.open_documents(&cell, &paths);
                 true
             }
             CommandId::FileOpenFolder => {

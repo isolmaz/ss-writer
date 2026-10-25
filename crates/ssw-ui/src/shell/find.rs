@@ -309,6 +309,7 @@ pub struct FindBar {
     current: Option<usize>,
     error: Option<String>,
     version: u64,
+    generation: u64,
     focus_request: Option<WidgetId>,
     events: Vec<FindEvent>,
 }
@@ -365,6 +366,7 @@ impl FindBar {
             current: None,
             error: None,
             version,
+            generation: 0,
             focus_request: None,
             events: Vec::new(),
         }
@@ -387,10 +389,13 @@ impl FindBar {
         self
     }
 
-    /// Searches another document (the active tab changed).
+    /// Searches another document (the active tab changed). A hidden bar searches it when it is
+    /// shown.
     pub fn set_document(&mut self, doc: SharedDocument) {
         self.doc = doc;
-        self.recompute();
+        if self.visible {
+            self.recompute();
+        }
     }
 
     #[must_use]
@@ -441,6 +446,12 @@ impl FindBar {
     #[must_use]
     pub fn matches(&self) -> &[TextRange] {
         &self.matches
+    }
+
+    /// How many searches the bar has run: [`matches`](Self::matches) only changes when this does.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Index into [`matches`](Self::matches) of the match the counter shows.
@@ -686,6 +697,7 @@ impl FindBar {
             (doc.text(), doc.version(), doc.primary_selection().start())
         };
         self.version = version;
+        self.generation += 1;
         self.matches.clear();
         self.error = None;
         self.searcher = None;

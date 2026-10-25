@@ -19,9 +19,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ssw_core::i18n::Localizer;
+use ssw_core::settings::StartupBehavior;
 use ssw_io::fs::RealFs;
 use ssw_io::logging::{Level, Logger};
 use ssw_io::net::{Http, WinHttp};
+use ssw_io::recovery::{RecoveryKind, RecoveryStore, now_millis};
 use ssw_io::session::{RecentKind, Session, WindowPlacement};
 use ssw_ui::geometry::Point;
 use ssw_ui::services::{Clock, Dialogs, Shell};
@@ -60,6 +62,8 @@ use super::shell_view::ShellAction;
 use super::window::{WindowEnv, WindowGlue, WindowLink};
 use crate::app::{AppCore, EXIT_NO_DEVICE, EXIT_NO_SHELL, ShellHost};
 use crate::args::{Args, Launch};
+use crate::documents::DocEntry;
+use crate::emergency::{CachedDoc, EmergencyCache};
 use crate::startup::{InstanceError, InstanceHook, InstanceRole};
 use crate::workers::{Waker, WindowId};
 
@@ -342,6 +346,9 @@ pub struct UiApp {
     /// When a window last asked for a repaint (the spelling checks wait for a quiet moment).
     last_repaint: Cell<Instant>,
     final_session: RefCell<Option<Session>>,
+    /// The untitled buffers of the final session: their windows are gone by the time
+    /// [`UiApp::finish`] stores the session.
+    final_untitled: RefCell<Vec<Rc<DocEntry>>>,
     exit: Cell<Option<i32>>,
     // Declared last: every native window is gone before the message window.
     message_window: MessageWindow,
@@ -480,6 +487,7 @@ impl UiApp {
             frame_interval: ssw_win::services::timers::refresh_interval(),
             last_repaint: Cell::new(Instant::now()),
             final_session: RefCell::new(None),
+            final_untitled: RefCell::new(Vec::new()),
             exit: Cell::new(None),
             message_window,
         };
@@ -666,6 +674,8 @@ impl UiApp {
             Request::Settings(event) => self.controller.settings_event(event),
             Request::CloseSettings => self.close_settings(),
             Request::Activated(id) => self.controller.check_external_changes(id),
+            Request::OpenFiles(id, paths) => self.controller.open_files(id, &paths),
+            Request::Deactivated(id) => self.controller.window_deactivated(id),
         }
     }
 
@@ -757,14 +767,17 @@ impl UiApp {
         }
     }
 
-    /// File → Exit: asks about every window, then leaves.
+    /// File → Exit: asks about the unsaved documents of every window, then leaves.
     fn quit(&self) {
-        for cell in self.controller.windows() {
-            if !self.controller.request_close_window(cell.id) {
-                return;
-            }
+        let ids: Vec<WindowId> = self
+            .controller
+            .windows()
+            .iter()
+            .map(|cell| cell.id)
+            .collect();
+        if self.controller.request_close_windows(&ids) {
+            self.finish_quit();
         }
-        self.finish_quit();
     }
 
     /// Every window agreed to close: the session is captured while the tabs still exist, then
@@ -780,6 +793,13 @@ impl UiApp {
             .borrow()
             .session
             .untitled_texts(&session);
+        *self.final_untitled.borrow_mut() = self
+            .controller
+            .docs()
+            .all()
+            .into_iter()
+            .filter(|entry| entry.is_untitled())
+            .collect();
         *self.final_session.borrow_mut() = Some(session);
         for cell in self.controller.windows() {
             self.controller.close_window(cell.id);
@@ -871,6 +891,8 @@ impl UiApp {
         };
         for launch in link.take_launches() {
             self.controller.open_launch(&launch);
+            // A launch can add recent files and drop the ones that are gone, without a request.
+            self.recent_stale.set(true);
             self.drain_requests();
             // A hidden application (tests) has nothing to bring to the foreground.
             if !self.hidden
@@ -978,10 +1000,22 @@ impl UiApp {
         self.drain_requests();
         // After the requests: a window made in this turn is shown before the devices count.
         self.attach_devices();
-        let report = self.controller.core().borrow_mut().pump();
+        // A worker result can open a message box, and the system can end the session while it is
+        // up: the results are delivered with the core not borrowed.
+        let workers = Rc::clone(&self.controller.core().borrow().workers);
+        let jobs = workers.poll();
+        let report = self.controller.core().borrow_mut().housekeeping(jobs);
         self.controller.pump_files();
         if report.jobs > 0 || !report.external.is_empty() || !report.tick.saved.is_empty() {
             self.controller.refresh_all();
+        }
+        if report.jobs > 0 {
+            // An import or a download that finished added a recent file, or found it gone.
+            self.recent_stale.set(true);
+        }
+        for outcome in &report.external {
+            let doc = outcome.entry.id();
+            self.controller.note_reload(doc, Some(outcome));
         }
         for (_, error) in &report.tick.failed {
             self.controller.report(error);
@@ -1030,7 +1064,9 @@ impl UiApp {
     }
 
     /// Leaves the application cleanly: stores the session of the moment the user quit (or of
-    /// the windows that are left) and flushes autosave.
+    /// the windows that are left) and flushes autosave. The untitled buffers, which the quit
+    /// left to the session without asking, go to the recovery folder when the session cannot be
+    /// stored.
     pub fn finish(&self) {
         let session = self
             .final_session
@@ -1038,7 +1074,12 @@ impl UiApp {
             .clone()
             .unwrap_or_else(|| self.controller.session());
         self.controller.flush_settings();
-        self.controller.core().borrow_mut().shutdown(&session);
+        let mut core = self.controller.core().borrow_mut();
+        if !core.shutdown(&session)
+            && self.controller.settings().general.on_startup == StartupBehavior::RestoreSession
+        {
+            keep_text_of(&core, &self.final_untitled.borrow(), true);
+        }
     }
 }
 
@@ -1247,6 +1288,107 @@ impl ShellHost for UiShell {
         }
         app.finish();
         code
+    }
+}
+
+/// The system is ending the session (shutdown, restart, sign-out). The process can be killed as
+/// soon as the window procedure returns, so nothing is asked: it does what a quit does, the
+/// documents autosave covers are saved, the session is stored with the text of the untitled
+/// buffers, and the text of every file with changes nobody saved goes to the recovery folder,
+/// where the next start offers it. The untitled buffers go there too when the next start does
+/// not restore the session or the session could not be stored.
+///
+/// Every window receives the message; the first one does the work. While a dialog holds the
+/// core, what the crash copy has of the documents with unsaved changes goes to the recovery
+/// folder instead, and the session is not stored.
+pub fn end_session(controller: &Controller) {
+    if controller.session_ended.replace(true) {
+        return;
+    }
+    let cell = controller.core();
+    if let Ok(mut core) = cell.try_borrow_mut() {
+        let session = controller.session();
+        let stored = core.shutdown(&session);
+        let restored =
+            stored && controller.settings().general.on_startup == StartupBehavior::RestoreSession;
+        keep_unsaved_text(&core, !restored);
+    } else {
+        controller.logger.log(
+            Level::Warn,
+            "shutdown",
+            "the core is busy: unsaved text kept from the crash copy",
+        );
+        write_recovery(
+            &controller.crash_copy,
+            &controller.docs().env().recovery,
+            &controller.logger,
+        );
+    }
+    // Last, so that nothing waits for the settings file before the session is stored; a change
+    // that cannot be written is logged, because nobody is there to read a message box.
+    if cell.try_borrow().is_ok() {
+        controller.flush_settings_quietly();
+    }
+}
+
+/// Writes the text of the files with unsaved changes to the recovery folder, and that of the
+/// untitled buffers when `untitled` is set: otherwise the session stores them.
+fn keep_unsaved_text(core: &AppCore, untitled: bool) {
+    keep_text_of(core, &core.docs.all(), untitled);
+}
+
+/// [`keep_unsaved_text`] for the documents `entries`.
+fn keep_text_of(core: &AppCore, entries: &[Rc<DocEntry>], untitled: bool) {
+    let unsaved = EmergencyCache::new();
+    for entry in entries.iter().filter(|entry| entry.is_dirty()) {
+        let text = entry.document().borrow().text();
+        let (kind, original_path, display_name) = match entry.path() {
+            Some(path) => {
+                let name = path
+                    .file_name()
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+                (RecoveryKind::Dirty, Some(path), name)
+            }
+            None if untitled && !text.is_empty() => {
+                (RecoveryKind::Untitled, None, entry.title(&core.i18n))
+            }
+            None => continue,
+        };
+        unsaved.put(
+            &core.autosave.recovery_id(entry),
+            CachedDoc {
+                kind,
+                original_path,
+                display_name,
+                text,
+                format: entry.format(),
+                version: entry.document().borrow().version(),
+            },
+        );
+    }
+    write_recovery(&unsaved, &core.recovery, &core.logger);
+}
+
+/// Writes `unsaved` to the recovery folder; what cannot be written is logged.
+fn write_recovery(unsaved: &EmergencyCache, recovery: &RecoveryStore, logger: &Logger) {
+    let saved = unsaved
+        .save_all(recovery, now_millis())
+        .map(Option::unwrap_or_default);
+    match saved {
+        Ok(report) => {
+            for (id, error) in &report.failed {
+                logger.log(
+                    Level::Error,
+                    "shutdown",
+                    &format!("unsaved text of {id} not kept: {error}"),
+                );
+            }
+        }
+        Err(error) => logger.log(
+            Level::Error,
+            "shutdown",
+            &format!("unsaved text not kept: {error}"),
+        ),
     }
 }
 

@@ -352,6 +352,73 @@ fn closing_a_comment_rescans_the_lines_it_covered() {
 }
 
 #[test]
+fn a_line_break_rescans_only_the_lines_around_it() {
+    let text: String = (0..1000)
+        .map(|i| {
+            format!(
+                "let a{i} = {i};
+"
+            )
+        })
+        .collect();
+    let mut highlighter = Highlighter::new();
+    highlighter.highlight(0, Language::Rust, &text);
+    assert_eq!(highlighter.last_scanned_lines(), 1000);
+    let split_at = text.find("a2 ").expect("line 2 exists") + 2;
+    let split = format!(
+        "{}
+{}",
+        &text[..split_at],
+        &text[split_at..]
+    );
+    let tokens = highlighter.highlight(0, Language::Rust, &split);
+    assert_eq!(
+        highlighter.last_scanned_lines(),
+        2,
+        "the two halves of the line"
+    );
+    assert_eq!(tokens, tokenize(Language::Rust, &split));
+    let joined = highlighter.highlight(0, Language::Rust, &text);
+    assert_eq!(highlighter.last_scanned_lines(), 1, "the joined line");
+    assert_eq!(joined, tokenize(Language::Rust, &text));
+}
+
+#[test]
+fn a_line_break_that_changes_the_state_below_still_rescans_those_lines() {
+    let text: String = (0..1000)
+        .map(|i| {
+            format!(
+                "int a{i};
+"
+            )
+        })
+        .collect();
+    let mut highlighter = Highlighter::new();
+    highlighter.highlight(0, Language::C, &text);
+    let open_at = text.find("int a10;").expect("line 10 exists");
+    let opened = format!(
+        "{}/*
+{}",
+        &text[..open_at],
+        &text[open_at..]
+    );
+    let tokens = highlighter.highlight(0, Language::C, &opened);
+    assert_eq!(highlighter.last_scanned_lines(), 991);
+    assert_eq!(tokens, tokenize(Language::C, &opened));
+    assert_eq!(tokens.last().map(|token| token.kind), Some(Comment));
+    let close_at = opened.find("int a20;").expect("line 20 exists");
+    let closed = format!(
+        "{}*/
+{}",
+        &opened[..close_at],
+        &opened[close_at..]
+    );
+    let tokens = highlighter.highlight(0, Language::C, &closed);
+    assert_eq!(tokens, tokenize(Language::C, &closed));
+    assert_eq!(tokens.last().map(|token| token.kind), Some(Type));
+}
+
+#[test]
 fn the_cache_is_bounded() {
     let mut highlighter = Highlighter::new();
     for key in 0..300 {

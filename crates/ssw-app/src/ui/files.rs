@@ -326,15 +326,16 @@ enum Deferred {
     /// A background open of a file the user only browsed to found it is no text: its default
     /// app starts instead.
     Launch(PathBuf),
-    /// A background open failed.
-    Report(Box<DocError>),
+    /// A background open of this file failed.
+    OpenFailed(PathBuf, Box<DocError>),
 }
 
-/// Queues the failure `error` of background work for [`Controller::pump_files`] to show.
-fn report_later(outbox: &RefCell<Vec<Deferred>>, error: impl Into<DocError>) {
+/// Queues the failure `error` of a background open of `path` for [`Controller::pump_files`] to
+/// show, together with the other files that failed in the same turn.
+fn open_failed_later(outbox: &RefCell<Vec<Deferred>>, path: PathBuf, error: impl Into<DocError>) {
     outbox
         .borrow_mut()
-        .push(Deferred::Report(Box::new(error.into())));
+        .push(Deferred::OpenFailed(path, Box::new(error.into())));
 }
 
 /// The index upkeep of one workspace root.
@@ -758,6 +759,7 @@ impl Controller {
     /// Hands what workers finished to the places that can show it.
     fn forward_deferred(&self) {
         let pending = std::mem::take(&mut *self.files.outbox.borrow_mut());
+        let mut failures = Vec::new();
         for item in pending {
             match item {
                 Deferred::Progress(window, progress) => {
@@ -766,9 +768,21 @@ impl Controller {
                 Deferred::Launch(path) => {
                     let _ = self.shell.borrow_mut().open_path(&path);
                 }
-                Deferred::Report(error) => self.report(&error),
+                Deferred::OpenFailed(path, error) => {
+                    if let DocError::Load(load) = &*error {
+                        self.docs().forget_missing(&path, load);
+                    }
+                    failures.push((path, *error));
+                }
             }
         }
+        self.report_open_failures(&failures);
+    }
+
+    /// Queues the failure of a background open of `path` (an import) to be shown by the next
+    /// housekeeping turn, in one box with the other files that failed to open meanwhile.
+    pub(super) fn open_failed_later(&self, path: &Path, error: impl Into<DocError>) {
+        open_failed_later(&self.files.outbox, path.to_path_buf(), error);
     }
 
     /// Keeps one watcher per workspace root and returns what happened since the last call.
@@ -776,11 +790,12 @@ impl Controller {
         let mut slot = self.files.watches.borrow_mut();
         let watches = slot.get_or_insert_with(|| {
             let waker: Arc<dyn Waker> = self.core().borrow().waker.clone();
-            FolderWatches::new(waker)
+            FolderWatches::new(waker, true)
         });
         let mut watched = self.files.watched.borrow_mut();
         if watched.as_slice() != roots {
-            for (folder, error) in watches.sync(roots) {
+            let now = self.core().borrow().docs.env().clock.monotonic();
+            for (folder, error) in watches.sync(roots, now) {
                 self.core().borrow().logger.log(
                     Level::Warn,
                     "watch",
@@ -1008,25 +1023,21 @@ impl Controller {
                     Ok(Err(LoadError::NotText(_))) if launch_binary => {
                         return outbox.borrow_mut().push(Deferred::Launch(done_path));
                     }
-                    Ok(Err(error)) => return report_later(&outbox, error),
+                    Ok(Err(error)) => return open_failed_later(&outbox, done_path, error),
                     // The read panicked: all that is known is that the file could not be read.
                     Err(_) => {
                         let error = FsError::Os {
                             code: 0,
-                            path: done_path,
+                            path: done_path.clone(),
                         };
-                        return report_later(&outbox, error);
+                        return open_failed_later(&outbox, done_path, error);
                     }
                 };
-                match docs.open_loaded(&done_path, loaded) {
-                    Ok(entry) => {
-                        let mut view = target.view.borrow_mut();
-                        let workspace = view.active_tab().and_then(|tab| tab.workspace.clone());
-                        view.open_tab(entry, workspace, &docs);
-                        target.dirty.set(true);
-                    }
-                    Err(error) => report_later(&outbox, error),
-                }
+                let entry = docs.open_loaded(&done_path, loaded);
+                let mut view = target.view.borrow_mut();
+                let workspace = view.active_tab().and_then(|tab| tab.workspace.clone());
+                view.open_tab(entry, workspace, &docs);
+                target.dirty.set(true);
             },
         );
         if submitted.is_err() {

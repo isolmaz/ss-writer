@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use ssw_core::edit::{Edit, Transaction};
 use ssw_core::i18n::Localizer;
 use ssw_io::encoding::TextEncoding;
-use ssw_io::fs::{FaultFs, FsFailure, FsOp, RealFs};
+use ssw_io::fs::{Attributes, DirEntry, FaultFs, FileMeta, FsFailure, FsOp, RealFs};
 use ssw_io::save::ThreadSleeper;
 use ssw_io::session::ViewState;
 use ssw_io::watch::{FsEvent, FsEventKind};
@@ -489,6 +489,10 @@ fn every_error_has_a_message_id_in_the_app_catalog() {
         DocError::Save(SaveError::DiskFull(PathBuf::from("a"))),
         DocError::Save(SaveError::AccessDenied(PathBuf::from("a"))),
         DocError::Save(SaveError::Fs(FsError::NotFound(PathBuf::from("a")))),
+        DocError::Save(SaveError::TempKept {
+            temp: PathBuf::from("a"),
+            source: FsError::NotFound(PathBuf::from("a")),
+        }),
     ];
     let missing: Vec<&str> = errors
         .iter()
@@ -749,27 +753,66 @@ fn mixed_line_endings_are_announced_once_and_debug_output_names_its_parts() {
     let env = format!("{:?}", f.docs.env());
     assert!(env.starts_with("DocEnv {"), "{env}");
     assert!(env.contains("tld: None"), "{env}");
-    let watches = FolderWatches::new(Arc::new(crate::workers::DeferredWaker::new()));
+    let watches = FolderWatches::new(Arc::new(crate::workers::DeferredWaker::new()), false);
     assert_eq!(format!("{watches:?}"), "FolderWatches { folders: [], .. }");
 }
 
 #[test]
-fn a_database_that_refuses_the_recent_list_leaves_no_open_document_to_report() {
+fn a_recent_list_the_database_refuses_does_not_fail_the_open() {
     let f = fixture();
     let path = f.write("a.md", b"one\n");
     rusqlite::Connection::open(f.tmp.path().join("state").join("state.db"))
         .unwrap()
         .execute_batch("DROP TABLE recent_items")
         .unwrap();
-    let error = f.docs.open(&path).unwrap_err();
-    assert_eq!(error.message_id(), "app-error-file");
-    assert!(f.docs.all().is_empty());
-    // The file stays known to the change tracker, but nobody shows it: its events are ignored.
+    let entry = f.docs.open(&path).unwrap();
+    assert_eq!(entry.document().borrow().text(), "one\n");
+    assert_eq!(f.docs.all().len(), 1);
+    // The file is tracked like any other: another program's change reloads it.
     std::fs::write(&path, b"two, longer\n").unwrap();
     let outcomes = f
         .docs
         .handle_fs_events(&[Fixture::event(&path, FsEventKind::Modified)]);
-    assert!(outcomes.is_empty());
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(action_name(&outcomes[0].action), "reloaded");
+    assert_eq!(entry.document().borrow().text(), "two, longer\n");
+}
+
+/// The paths of the recent files, newest first.
+fn recent_files(f: &Fixture) -> Vec<PathBuf> {
+    let items = f.store.borrow().recent_items(RecentKind::File).unwrap();
+    items.into_iter().map(|item| item.path).collect()
+}
+
+#[test]
+fn a_file_that_no_longer_exists_is_taken_off_the_recent_list_when_it_fails_to_open() {
+    let f = fixture();
+    let kept = f.write("kept.md", b"kept\n");
+    let gone = f.write("gone.md", b"gone\n");
+    for path in [&gone, &kept] {
+        let entry = f.docs.open(path).unwrap();
+        f.docs.release(&entry);
+    }
+    assert_eq!(recent_files(&f), [kept.clone(), gone.clone()]);
+
+    std::fs::remove_file(&gone).unwrap();
+    let error = f.docs.open(&gone).unwrap_err();
+    assert_eq!(error.message_id(), "app-error-not-found");
+    assert_eq!(recent_files(&f), [kept]);
+}
+
+#[test]
+fn a_file_that_fails_to_open_for_another_reason_stays_on_the_recent_list() {
+    let fault = Arc::new(FaultFs::new());
+    let f = fixture_on(fault.clone());
+    let path = f.write("a.md", b"one\n");
+    let entry = f.docs.open(&path).unwrap();
+    f.docs.release(&entry);
+
+    fault.fail(FsOp::Read, FsFailure::AccessDenied, 1);
+    let error = f.docs.open(&path).unwrap_err();
+    assert_eq!(error.message_id(), "app-error-file");
+    assert_eq!(recent_files(&f), [path]);
 }
 
 #[test]
@@ -895,7 +938,7 @@ fn a_file_read_elsewhere_joins_the_document_that_is_open_already() {
     let path = f.write("a.md", b"one\n");
     let entry = f.docs.open(&path).unwrap();
     let loaded = load_file(&RealFs, &path, None).unwrap();
-    let again = f.docs.open_loaded(&path, loaded).unwrap();
+    let again = f.docs.open_loaded(&path, loaded);
     assert!(Rc::ptr_eq(&entry, &again));
     assert_eq!(entry.users(), 2);
     assert_eq!(f.docs.all().len(), 1);
@@ -1097,4 +1140,99 @@ fn save_as_in_an_encoding_that_cannot_hold_the_text_writes_nothing() {
     assert_eq!(error.message_id(), "app-error-encoding");
     assert!(!target.exists());
     assert_eq!(entry.path(), Some(path));
+}
+
+/// A disk whose replace removes the target and then fails, as `ReplaceFileW` does when it cannot
+/// move the replacement into place. Every other call goes to `inner`, which can fail on script.
+#[derive(Debug)]
+struct LosingFs {
+    inner: Arc<FaultFs>,
+}
+
+impl FileSystem for LosingFs {
+    fn read(&self, path: &Path) -> Result<Vec<u8>, FsError> {
+        self.inner.read(path)
+    }
+    fn read_prefix(&self, path: &Path, max: usize) -> Result<Vec<u8>, FsError> {
+        self.inner.read_prefix(path, max)
+    }
+    fn metadata(&self, path: &Path) -> Result<FileMeta, FsError> {
+        self.inner.metadata(path)
+    }
+    fn write_new(&self, path: &Path, data: &[u8]) -> Result<(), FsError> {
+        self.inner.write_new(path, data)
+    }
+    fn replace_file(&self, target: &Path, _replacement: &Path) -> Result<(), FsError> {
+        std::fs::remove_file(target).unwrap();
+        Err(FsError::ReplaceUnsupported(target.to_path_buf()))
+    }
+    fn move_replace(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.inner.move_replace(from, to)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.inner.rename(from, to)
+    }
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.inner.copy_file(from, to)
+    }
+    fn delete_file(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.delete_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.remove_dir(path)
+    }
+    fn create_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.create_dir(path)
+    }
+    fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &Path) -> Result<Vec<DirEntry>, FsError> {
+        self.inner.list_dir(path)
+    }
+    fn set_attributes(&self, path: &Path, attrs: Attributes) -> Result<(), FsError> {
+        self.inner.set_attributes(path, attrs)
+    }
+    fn is_writable(&self, path: &Path) -> Result<bool, FsError> {
+        self.inner.is_writable(path)
+    }
+    fn recycle(&self, paths: &[PathBuf]) -> Result<(), FsError> {
+        self.inner.recycle(paths)
+    }
+}
+
+#[test]
+fn a_save_that_loses_the_file_names_the_temp_file_that_holds_the_text() {
+    let fault = Arc::new(FaultFs::new());
+    let f = fixture_on(Arc::new(LosingFs {
+        inner: Arc::clone(&fault),
+    }));
+    let path = f.write("a.md", b"old\n");
+    let entry = f.docs.open(&path).unwrap();
+    type_at_end(&entry, "new\n");
+    // The replace removes the file, and neither the fallback nor the last move can finish it.
+    fault.fail(FsOp::MoveReplace, FsFailure::AccessDenied, 1);
+    fault.fail(FsOp::Rename, FsFailure::AccessDenied, 1);
+
+    let error = f.docs.save(&entry).unwrap_err();
+    let DocError::Save(SaveError::TempKept { temp, .. }) = &error else {
+        panic!("expected the temp file to be kept: {error:?}");
+    };
+    assert_eq!(std::fs::read(temp).unwrap(), b"old\nnew\n");
+    assert!(!path.exists());
+    let i18n = crate::i18n::localizer_for("en");
+    let message = error.message(&i18n);
+    assert!(
+        message.contains(&temp.display().to_string()),
+        "the message names the temp file: {message}"
+    );
+    assert_ne!(message, i18n.text("app-error-file"));
+    assert!(entry.is_dirty());
+}
+
+#[test]
+fn every_other_failure_is_described_by_its_message_id() {
+    let i18n = crate::i18n::localizer_for("en");
+    let error = DocError::Save(SaveError::DiskFull(PathBuf::from("a")));
+    assert_eq!(error.message(&i18n), i18n.text("app-error-disk-full"));
 }

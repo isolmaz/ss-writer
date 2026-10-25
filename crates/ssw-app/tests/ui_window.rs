@@ -301,6 +301,29 @@ fn closing_the_last_window_saves_the_document_and_quits() {
 }
 
 #[test]
+fn deactivating_a_window_saves_its_documents_before_the_delay_is_over() {
+    // The idle delay is an hour: only the deactivation can write the document.
+    with_window_using(
+        "hello",
+        Some(r#"{"general":{"autosave_delay_ms":3600000}}"#),
+        &ScriptedServices::new(),
+        |app, file| {
+            let id = app.controller().windows()[0].id;
+            let hwnd = first_window_hwnd(app);
+            send_message(hwnd, WM_KEYDOWN, VK_END, 0);
+            send_message(hwnd, WM_CHAR, usize::from(b'!'), 0);
+            app.pump();
+            assert_eq!(document_text(app), "hello!");
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "hello");
+
+            app.controller().push(Request::Deactivated(id));
+            app.pump();
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "hello!");
+        },
+    );
+}
+
+#[test]
 fn a_system_theme_change_message_applies_the_system_theme() {
     with_window("hello", |app, _| {
         let hwnd = first_window_hwnd(app);

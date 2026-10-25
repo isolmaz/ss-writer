@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 use ssw_io::encoding::TextEncoding;
 use ssw_io::fs::FsError;
@@ -66,10 +67,13 @@ struct Watching {
     events: Receiver<FsEvent>,
 }
 
-/// One recursive watcher per folder that contains an open file.
+/// One watcher per watched folder: of the folder alone, or of the whole tree below it.
 pub struct FolderWatches {
     waker: Arc<dyn Waker>,
+    recursive: bool,
     watchers: HashMap<String, (PathBuf, Watching)>,
+    /// When a folder that could not be watched may be tried again (monotonic time).
+    retry_at: HashMap<String, Duration>,
 }
 
 impl std::fmt::Debug for FolderWatches {
@@ -81,12 +85,19 @@ impl std::fmt::Debug for FolderWatches {
 }
 
 impl FolderWatches {
+    /// How long a folder that could not be watched is left alone before the next attempt: an
+    /// offline share keeps the attempt waiting for a long time, and the caller is the UI thread.
+    pub const RETRY_AFTER: Duration = Duration::from_secs(30);
+
     /// No folders watched; `waker` is called from the reader threads after each batch of events.
+    /// Every folder is watched with the whole tree below it when `recursive`, alone otherwise.
     #[must_use]
-    pub fn new(waker: Arc<dyn Waker>) -> Self {
+    pub fn new(waker: Arc<dyn Waker>, recursive: bool) -> Self {
         Self {
             waker,
+            recursive,
             watchers: HashMap::new(),
+            retry_at: HashMap::new(),
         }
     }
 
@@ -103,18 +114,23 @@ impl FolderWatches {
     }
 
     /// Starts watchers for new folders and stops those no longer wanted. Returns the folders
-    /// that could not be watched (deleted, access denied) with the reason.
-    pub fn sync(&mut self, wanted: &[PathBuf]) -> Vec<(PathBuf, FsError)> {
+    /// that could not be watched (deleted, access denied) with the reason; such a folder is
+    /// tried again [`FolderWatches::RETRY_AFTER`] later (`now` is the monotonic time), and at
+    /// once when it was not wanted in between.
+    pub fn sync(&mut self, wanted: &[PathBuf], now: Duration) -> Vec<(PathBuf, FsError)> {
         let keys: Vec<String> = wanted.iter().map(|folder| path_key(folder)).collect();
         self.watchers.retain(|key, _| keys.contains(key));
+        self.retry_at.retain(|key, _| keys.contains(key));
         let mut failed = Vec::new();
         for (folder, key) in wanted.iter().zip(keys) {
-            if self.watchers.contains_key(&key) {
+            let waiting = self.retry_at.get(&key).is_some_and(|at| now < *at);
+            if waiting || self.watchers.contains_key(&key) {
                 continue;
             }
             let waker = Arc::clone(&self.waker);
-            match Watcher::start(folder, move || waker.wake()) {
+            match Watcher::start(folder, self.recursive, move || waker.wake()) {
                 Ok((watcher, events)) => {
+                    self.retry_at.remove(&key);
                     self.watchers.insert(
                         key,
                         (
@@ -126,7 +142,10 @@ impl FolderWatches {
                         ),
                     );
                 }
-                Err(error) => failed.push((folder.clone(), error)),
+                Err(error) => {
+                    self.retry_at.insert(key, now + Self::RETRY_AFTER);
+                    failed.push((folder.clone(), error));
+                }
             }
         }
         failed
@@ -185,14 +204,12 @@ impl Documents {
         let decisions = self.tracker.borrow().classify(events);
         let mut outcomes = Vec::new();
         for (path, change) in decisions {
-            let Some(entry) = self.find_by_key(&path_key(&path)) else {
-                continue;
-            };
-            // `classify` never reports an unchanged document, so every decision has an action.
-            outcomes.extend(
+            // `classify` decides only for tracked paths and never reports an unchanged
+            // document, so every decision has a document and an action.
+            outcomes.extend(self.find_by_key(&path_key(&path)).and_then(|entry| {
                 self.apply_change(&entry, &path, change)
-                    .map(|action| ExternalOutcome { entry, action }),
-            );
+                    .map(|action| ExternalOutcome { entry, action })
+            }));
         }
         outcomes
     }

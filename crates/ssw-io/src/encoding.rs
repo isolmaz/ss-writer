@@ -102,7 +102,6 @@ impl TextEncoding {
             "iso-8859-2",
             "iso-8859-5",
             "iso-8859-7",
-            "iso-8859-9",
             "iso-8859-15",
             "koi8-r",
             "koi8-u",

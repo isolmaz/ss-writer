@@ -106,12 +106,25 @@ impl DocError {
             Self::Save(SaveError::SharingViolation(_)) => "app-error-in-use",
             Self::Save(SaveError::DiskFull(_)) => "app-error-disk-full",
             Self::Save(SaveError::AccessDenied(_)) => "app-error-access-denied",
-            Self::Save(SaveError::Fs(_)) => "app-error-file",
+            Self::Save(SaveError::Fs(_) | SaveError::TempKept { .. }) => "app-error-file",
             Self::Encode(_) => "app-error-encoding",
             Self::Untitled => "app-error-untitled",
             Self::NeedsSaveAs => "app-error-needs-save-as",
             Self::Unsupported(_) => "app-error-unsupported",
             Self::AlreadyOpen(_) => "app-error-already-open",
+        }
+    }
+
+    /// The message describing the failure to the user. A save that lost the original file
+    /// names the temp file that holds the new content.
+    #[must_use]
+    pub fn message(&self, i18n: &Localizer) -> String {
+        match self {
+            Self::Save(SaveError::TempKept { temp, .. }) => i18n.format(
+                "app-error-temp-kept",
+                &[("path", Arg::Str(&temp.to_string_lossy()))],
+            ),
+            _ => i18n.text(self.message_id()),
         }
     }
 }
@@ -500,7 +513,7 @@ impl Documents {
 
     /// Opens `path`: the shared document when it is open already, otherwise the file is read
     /// (importers included), the stored caret restored, the file added to the recent list and
-    /// tracked for external changes.
+    /// tracked for external changes. A file that no longer exists is taken off the recent list.
     ///
     /// # Errors
     /// [`DocError::Load`] when the file cannot be read or imported.
@@ -510,20 +523,31 @@ impl Documents {
             return Ok(entry);
         }
         let canonical = canonical_path(path);
-        let loaded = load_file(self.env.fs.as_ref(), &canonical, self.env.tld.as_deref())?;
-        self.open_loaded(&canonical, loaded)
+        let loaded = load_file(self.env.fs.as_ref(), &canonical, self.env.tld.as_deref())
+            .inspect_err(|error| self.forget_missing(&canonical, error))?;
+        Ok(self.open_loaded(&canonical, loaded))
+    }
+
+    /// Takes `path` off the recent list when `error`, the failure to read it, says that the file
+    /// no longer exists. For a file that was read elsewhere (a worker thread).
+    pub fn forget_missing(&self, path: &Path, error: &LoadError) {
+        if matches!(error, LoadError::Fs(FsError::NotFound(_))) {
+            // A recent list that cannot be written keeps the entry, nothing else.
+            let _ = self
+                .env
+                .store
+                .borrow()
+                .recent_remove(RecentKind::File, &canonical_path(path));
+        }
     }
 
     /// Opens a file that was read elsewhere (a worker thread). When the file was opened in the
     /// meantime the existing document is shared and `loaded` is dropped.
-    ///
-    /// # Errors
-    /// [`DocError::Store`] when the recent list cannot be updated.
-    pub fn open_loaded(&self, path: &Path, loaded: Loaded) -> Result<Rc<DocEntry>, DocError> {
+    pub fn open_loaded(&self, path: &Path, loaded: Loaded) -> Rc<DocEntry> {
         let canonical = canonical_path(path);
         if let Some(entry) = self.find(&canonical) {
             entry.users.set(entry.users.get() + 1);
-            return Ok(entry);
+            return entry;
         }
         let mut document = Document::new(&loaded.text);
         ssw_win::perf::mark_latest(crate::perf::DOC_PARSED);
@@ -560,11 +584,13 @@ impl Documents {
             self.tracker.borrow_mut().track(&canonical, loaded.stamp);
         }
         let now = self.env.clock.unix_seconds();
-        self.env
+        // A recent list that cannot be written costs the entry in it, nothing else.
+        let _ = self
+            .env
             .store
             .borrow_mut()
-            .recent_add(RecentKind::File, &canonical, now)?;
-        Ok(self.register(document, state))
+            .recent_add(RecentKind::File, &canonical, now);
+        self.register(document, state)
     }
 
     fn next_untitled_number(&self) -> u32 {

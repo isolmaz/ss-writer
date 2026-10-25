@@ -51,7 +51,9 @@
 //! offsets. It is built from [`TextStoreHost::text`] once, when TSF first reads, and then
 //! follows every edit incrementally (the `removed` / `inserted` text of
 //! [`TextStore::text_changed`] and the edits TSF itself requests), so an edit costs
-//! `O(edit + document / 4096)`. Host edits not reported through `text_changed` are not seen.
+//! `O(edit + document / 4096)`. Host edits not reported through `text_changed` are not seen; a
+//! host that shows another document reports it with [`TextServices::document_replaced`], which
+//! drops the cache and any composition.
 
 mod com;
 mod session;

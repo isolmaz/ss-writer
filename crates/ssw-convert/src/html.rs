@@ -89,14 +89,16 @@ pub fn render_fragment(src: &str, provider: &dyn AssetProvider) -> String {
     out
 }
 
-/// Escapes `&`, `<` and `>` for element content.
+/// Escapes `&`, `<` and `>` for element content and drops the characters XML 1.0 cannot carry
+/// (control characters other than tab, line feed and carriage return, U+FFFE and U+FFFF).
 pub fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     push_escaped(&mut out, s, false);
     out
 }
 
-/// Escapes `&`, `<`, `>` and `"` for a double-quoted attribute value.
+/// Escapes `&`, `<`, `>` and `"` for a double-quoted attribute value and drops the characters
+/// XML 1.0 cannot carry, like [`escape_text`].
 pub fn escape_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     push_escaped(&mut out, s, true);
@@ -110,6 +112,8 @@ pub(crate) fn push_escaped(out: &mut String, s: &str, attr: bool) {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' if attr => out.push_str("&quot;"),
+            '\t' | '\n' | '\r' => out.push(c),
+            '\0'..='\u{1F}' | '\u{FFFE}' | '\u{FFFF}' => {}
             _ => out.push(c),
         }
     }
@@ -735,6 +739,13 @@ mod tests {
         for (input, expected) in table {
             assert_eq!(safe_href(input), expected, "{input:?}");
         }
+    }
+
+    #[test]
+    fn characters_xml_cannot_carry_are_dropped() {
+        let raw = "a\u{0}b\u{c}c\u{1F}d\u{FFFE}e\u{FFFF}f\tg\nh\ri\u{7F}j";
+        assert_eq!(escape_text(raw), "abcdef\tg\nh\ri\u{7F}j");
+        assert_eq!(escape_attr("x\u{1}\"y"), "x&quot;y");
     }
 
     #[test]

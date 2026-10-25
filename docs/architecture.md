@@ -22,7 +22,8 @@ crates/
   ssw-app       binary `SSWriter.exe`: wiring + main loop
   ssw-preview   cdylib Explorer preview handler
 third_party/    vendored + patched upstream crates (mermaid-rs-renderer, mitex-spec) with their licenses
-xtask/          cargo xtask: coverage, mutants, screenshots, docs sync check, icons, dist (MSI/zip/winget)
+xtask/          cargo xtask: coverage, mutants, screenshots, perf, docs sync check, wiring check, icons,
+                dist (MSI/zip/winget)
 assets/         i18n/<locale>/*.ftl, welcome/<locale>.md, fonts/CascadiaMono.ttf (OFL),
                 icons/ (app.svg + document.svg masters, committed app.ico + document.ico from `cargo xtask icons`;
                 ssw-app's build.rs links them as RT_GROUP_ICON 1 = app, 2 = document, plus VERSIONINFO)
@@ -60,7 +61,7 @@ Prototype code and full reports live outside the repo in `ssw-spikes/{a-window,b
 ## Threading
 
 - All windows run on one UI thread (documents are shared between tabs/windows).
-- Workers: a pool for IO, parsing large files, image decode, math/Mermaid scenes, indexing, search, export. Results post back via `PostMessageW(WM_APP + n)` + channel.
+- Workers: a pool for IO, parsing large files, image reads, math/Mermaid scenes, indexing, search, export. Images are decoded (WIC) on the UI thread when their bytes arrive. Results post back via `PostMessageW(WM_APP + n)` + channel.
 - Every async result carries a generation number (document version / request id); stale results are dropped. Closing a window cancels its jobs.
 - `panic = "unwind"`; worker panics are caught per job and reported as job errors.
 

@@ -7,7 +7,9 @@
 //! Allow editing, Keep mine / Load theirs / Compare (the diff against the file on disk is the
 //! history panel, see [`super::history`]), Don't load remote images, and the recovery offer's
 //! Restore / Discard. [`Controller::check_external_changes`] is the window activation check:
-//! files that another program changed meanwhile reload (or raise the conflict banner).
+//! files that another program changed meanwhile reload (or raise the conflict banner). A reload
+//! that fails, found by that check or by a watcher, is reported once per document, until a check
+//! of the document gets through again.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -25,7 +27,8 @@ use super::controller::{Controller, WindowCell};
 use super::remote_images::is_remote;
 use super::shell_view::ShellView;
 use crate::documents::{
-    DocEntry, DocError, DocId, DocMode, ExternalAction, ExternalState, Resolution, loss_message_id,
+    DocEntry, DocError, DocId, DocMode, ExternalAction, ExternalOutcome, ExternalState, Resolution,
+    loss_message_id,
 };
 use crate::workers::WindowId;
 
@@ -56,6 +59,9 @@ pub struct FlowState {
     remote: RefCell<HashMap<DocId, (u64, bool)>>,
     /// The recovery offer, until the user answered it.
     recovery: RefCell<Option<RecoveryOffer>>,
+    /// Documents whose reload after an external change failed and was reported; the failure is
+    /// not reported again until a later check of the document does not fail.
+    reload_failed: RefCell<HashSet<DocId>>,
 }
 
 impl FlowState {
@@ -79,6 +85,7 @@ impl FlowState {
         let is_open = |doc: &DocId| open.iter().any(|entry| entry.id() == *doc);
         self.dismissed.borrow_mut().retain(|(doc, _)| is_open(doc));
         self.remote.borrow_mut().retain(|doc, _| is_open(doc));
+        self.reload_failed.borrow_mut().retain(is_open);
     }
 
     /// Whether the text of `entry` shows an image from the network.
@@ -311,7 +318,8 @@ impl Controller {
 
     /// The window `window` was activated: its files are compared with the disk now (the
     /// watchers may have missed a change, spec §4.3). A clean document reloads, one with
-    /// unsaved edits raises the conflict banner; a file that cannot be read is reported.
+    /// unsaved edits raises the conflict banner; a file that cannot be read is reported once
+    /// ([`Controller::note_reload`]), not at every activation.
     pub fn check_external_changes(&self, window: WindowId) {
         let Some(cell) = self.window(window) else {
             return;
@@ -327,19 +335,33 @@ impl Controller {
             .collect();
         let mut changed = false;
         for entry in &entries {
-            let Some(outcome) = self.docs().check_external(entry) else {
-                continue;
-            };
-            changed = true;
-            if let ExternalAction::ReloadFailed(error) = &outcome.action {
-                self.report(error);
-            }
+            let outcome = self.docs().check_external(entry);
+            self.note_reload(entry.id(), outcome.as_ref());
+            changed |= outcome.is_some();
         }
         if changed {
             for other in self.windows() {
                 other.dirty.set(true);
             }
             self.refresh_all();
+        }
+    }
+
+    /// What the latest check of the document `doc` found (`None`: nothing changed on disk). A
+    /// failed reload is reported the first time only: a file that stays unreadable (locked by a
+    /// sync client, a share that is offline) would otherwise bring the box back at every check,
+    /// and closing the box activates the window, which checks again. Any other outcome ends the
+    /// failure, so the next one is news.
+    pub(super) fn note_reload(&self, doc: DocId, outcome: Option<&ExternalOutcome>) {
+        match outcome.map(|outcome| &outcome.action) {
+            Some(ExternalAction::ReloadFailed(error)) => {
+                if self.flows.reload_failed.borrow_mut().insert(doc) {
+                    self.report(error);
+                }
+            }
+            _ => {
+                self.flows.reload_failed.borrow_mut().remove(&doc);
+            }
         }
     }
 

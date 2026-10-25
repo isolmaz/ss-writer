@@ -462,6 +462,15 @@ mod tests {
     }
 
     #[test]
+    fn heading_prefix_follows_the_list_items_of_the_tree() {
+        // Only a list starting with 1 interrupts a paragraph; `2.` is paragraph text.
+        check("a\n2. fo‸o", "a\n# 2. fo‸o", |c| toggle_heading(c, 1));
+        check("a\n1. fo‸o", "a\n1. # fo‸o", |c| toggle_heading(c, 1));
+        check("a\n- fo‸o", "a\n- # fo‸o", |c| toggle_heading(c, 1));
+        check("> 2. fo‸o", "> 2. # fo‸o", |c| toggle_heading(c, 1));
+    }
+
+    #[test]
     fn heading_over_several_lines() {
         check("«a\n\nb»", "# «a\n\n# b»", |c| toggle_heading(c, 1));
         check("«# a\n## b»", "«# a\n# b»", |c| toggle_heading(c, 1));

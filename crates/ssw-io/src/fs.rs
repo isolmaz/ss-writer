@@ -33,6 +33,7 @@ use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
     IBindCtx,
 };
+use windows::Win32::System::SystemServices::{IO_REPARSE_TAG_MOUNT_POINT, IO_REPARSE_TAG_SYMLINK};
 use windows::Win32::UI::Shell::{
     FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FileOperation, IFileOperation,
     IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
@@ -119,14 +120,13 @@ pub enum FsError {
 }
 
 impl FsError {
-    /// Classifies a Win32 error code.
+    /// Classifies a Win32 error code. `ERROR_BAD_NETPATH` stays an [`FsError::Os`]: an
+    /// unreachable share does not mean the file is gone.
     #[must_use]
     pub fn from_code(code: u32, path: &Path) -> Self {
         let path = path.to_path_buf();
         match code {
-            win32::FILE_NOT_FOUND | win32::PATH_NOT_FOUND | win32::BAD_NETPATH => {
-                Self::NotFound(path)
-            }
+            win32::FILE_NOT_FOUND | win32::PATH_NOT_FOUND => Self::NotFound(path),
             win32::ALREADY_EXISTS | win32::FILE_EXISTS => Self::AlreadyExists(path),
             win32::ACCESS_DENIED => Self::AccessDenied(path),
             win32::SHARING_VIOLATION | win32::LOCK_VIOLATION => Self::SharingViolation(path),
@@ -340,6 +340,9 @@ pub struct FileMeta {
     pub modified: FileTime,
     /// Attribute bits.
     pub attrs: Attributes,
+    /// A symbolic link or a junction: it stands for another file or folder that operations on
+    /// whole trees must not follow. Cloud placeholders are reparse points but not links.
+    pub link: bool,
 }
 
 impl FileMeta {
@@ -494,14 +497,23 @@ impl RealFs {
         modified: FILETIME,
         high: u32,
         low: u32,
+        link: bool,
     ) -> FileMeta {
         FileMeta {
             size: (u64::from(high) << 32) | u64::from(low),
             created: FileTime::from_filetime(created),
             modified: FileTime::from_filetime(modified),
             attrs: Attributes(attributes),
+            link,
         }
     }
+}
+
+/// Whether an item with `attributes` and the reparse `tag` of its directory entry is a symbolic
+/// link or a junction (a mount point): the reparse points that name another path.
+fn is_link(attributes: u32, tag: u32) -> bool {
+    attributes & Attributes::REPARSE_POINT != 0
+        && matches!(tag, IO_REPARSE_TAG_SYMLINK | IO_REPARSE_TAG_MOUNT_POINT)
 }
 
 impl FileSystem for RealFs {
@@ -532,12 +544,17 @@ impl FileSystem for RealFs {
             )
         };
         win(result, path)?;
+        // The reparse tag is not part of these attributes; asking for it needs a handle, which
+        // only a reparse point is worth.
+        let link = data.dwFileAttributes & Attributes::REPARSE_POINT != 0
+            && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
         Ok(Self::meta_from(
             data.dwFileAttributes,
             data.ftCreationTime,
             data.ftLastWriteTime,
             data.nFileSizeHigh,
             data.nFileSizeLow,
+            link,
         ))
     }
 
@@ -656,6 +673,7 @@ impl FileSystem for RealFs {
                         data.ftLastWriteTime,
                         data.nFileSizeHigh,
                         data.nFileSizeLow,
+                        is_link(data.dwFileAttributes, data.dwReserved0),
                     ),
                 });
             }
@@ -1038,6 +1056,18 @@ impl FileSystem for FaultFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_symbolic_links_and_junctions_are_links() {
+        let reparse = Attributes::REPARSE_POINT;
+        let junction = reparse | Attributes::DIRECTORY;
+        assert!(is_link(junction, IO_REPARSE_TAG_MOUNT_POINT));
+        assert!(is_link(reparse, IO_REPARSE_TAG_SYMLINK));
+        // A cloud placeholder is a reparse point as well, with the tag IO_REPARSE_TAG_CLOUD.
+        assert!(!is_link(reparse, 0x9000_001A));
+        // Without the attribute the field holds no tag.
+        assert!(!is_link(Attributes::DIRECTORY, IO_REPARSE_TAG_SYMLINK));
+    }
 
     #[test]
     fn write_and_sync_stores_the_data() {

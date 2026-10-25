@@ -194,6 +194,18 @@ impl TextServices {
         .ctx("ITfContext::RequestEditSession")
     }
 
+    /// The host shows another document now (a tab switch): [`TextStore::document_replaced`],
+    /// and a composition under way is terminated on the text service's side as well. What it
+    /// holds is not committed to the new document.
+    pub fn document_replaced(&self) {
+        let composing = self.store.is_composing();
+        self.store.document_replaced();
+        if composing {
+            // The store dropped the composition already; a refused request leaves nothing to undo.
+            let _ = self.terminate_composition();
+        }
+    }
+
     /// Asks the text service to commit the current composition, e.g. before the host moves
     /// the caret by mouse or replaces the document.
     ///

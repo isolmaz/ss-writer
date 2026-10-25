@@ -52,6 +52,7 @@ use windows::Win32::System::Threading::{
     CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{TBPF_NOPROGRESS, TBPF_NORMAL, TBPFLAG};
+use windows::Win32::UI::TextServices::{TF_ANCHOR_END, TF_ES_READ, TF_ES_SYNC};
 use windows::Win32::UI::WindowsAndMessaging::{
     DM_POINTERHITTEST, HMENU, WM_CHAR, WM_GETOBJECT, WM_PAINT, WM_POINTERDOWN, WM_SETTINGCHANGE,
 };
@@ -960,6 +961,53 @@ fn text_services_are_told_only_what_changed_while_the_view_is_free() {
     });
 }
 
+/// The whole text as the text services read it through an edit session of the real thread
+/// manager.
+fn tsf_text(platform: &Platform) -> String {
+    let slot = platform.tsf.borrow();
+    let services = slot.as_ref().expect("text services are running");
+    services.set_focus();
+    let context = services.context().clone();
+    let text = Rc::new(RefCell::new(String::new()));
+    let read = Rc::clone(&text);
+    let session = services
+        .edit_session(TF_ES_READ | TF_ES_SYNC, move |ec| {
+            // SAFETY: plain calls on the live context of the window and the ranges it hands out;
+            // the buffer outlives the call.
+            unsafe {
+                let range = context.GetStart(ec).expect("the start of the text");
+                let end = context.GetEnd(ec).expect("the end of the text");
+                range
+                    .ShiftEndToRange(ec, &end, TF_ANCHOR_END)
+                    .expect("the range spans the text");
+                let mut buffer = vec![0u16; 256];
+                let mut got = 0u32;
+                range
+                    .GetText(ec, 0, &mut buffer, &mut got)
+                    .expect("the text is read");
+                *read.borrow_mut() = String::from_utf16_lossy(&buffer[..got as usize]);
+            }
+            Ok(())
+        })
+        .expect("the edit session is requested");
+    assert!(session.is_ok(), "read session: {session:?}");
+    text.take()
+}
+
+#[test]
+fn a_tab_switch_gives_text_services_the_text_of_the_new_document() {
+    with_app("first\n", |_app, platform, _| {
+        platform.notify_text_services();
+        // The text services read the first document: the store caches its text.
+        assert_eq!(tsf_text(platform), "first\n");
+
+        platform.env.controller.new_untitled(&platform.cell);
+        assert!(text_host(platform).replace(0..0, "second\n"));
+        platform.notify_text_services();
+        assert_eq!(tsf_text(platform), "second\n");
+    });
+}
+
 #[test]
 fn a_synced_window_without_a_tab_or_with_a_busy_view_keeps_what_it_has() {
     with_app("hello\n", |_app, platform, _| {
@@ -1281,7 +1329,7 @@ fn dragged_text_shows_a_drop_caret_until_the_drag_leaves() {
 
 #[test]
 fn dropped_text_lands_under_the_pointer_and_dropped_files_open_in_tabs() {
-    with_app("hello world\n", |_app, platform, file| {
+    with_app("hello world\n", |app, platform, file| {
         layout_now(platform);
         let drops = drops_of(platform);
         let host = text_host(platform);
@@ -1317,14 +1365,28 @@ fn dropped_text_lands_under_the_pointer_and_dropped_files_open_in_tabs() {
         assert_eq!(drops.dropped(&event, &text("more ")), Effect::None);
         assert_eq!(doc_text(platform), "hello big world\n");
 
-        // Files are opened, in order; the answer is a copy.
+        // Files are not opened inside the drop, which the drag source waits for and which can
+        // arrive while a dialog is up: the drop queues them, in order, and answers with a copy.
         let second = file.with_file_name("second.md");
         std::fs::write(&second, "second\n").unwrap();
         let content = DragContent {
-            files: vec![second],
+            files: vec![second.clone()],
             ..DragContent::default()
         };
+        drain_requests(platform);
+        {
+            let _dialog_up = platform.env.controller.dialogs.borrow_mut();
+            assert_eq!(drops.dropped(&event, &content), Effect::Copy);
+        }
+        assert_eq!(platform.cell.view.borrow().tabs().len(), 1);
+        assert_eq!(
+            drain_requests(platform),
+            [Request::OpenFiles(platform.cell.id, vec![second])]
+        );
+
+        // The loop owner opens the queued files in the window that got them.
         assert_eq!(drops.dropped(&event, &content), Effect::Copy);
+        app.pump();
         let view = platform.cell.view.borrow();
         let path = view.active_tab().unwrap().entry.path().unwrap();
         assert_eq!(path.file_name().unwrap(), "second.md");

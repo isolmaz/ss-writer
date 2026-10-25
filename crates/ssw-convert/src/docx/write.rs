@@ -136,6 +136,8 @@ struct Writer<'a, 'r> {
     bookmark_id: u32,
     footnotes: Vec<String>,
     footnote_defs: HashMap<String, &'a Block>,
+    /// Set while a footnote body is written; a reference inside it stays plain text.
+    in_note: bool,
     /// (start, level) of every ordered list instance; instance `i` is `w:numId` `100 + i`.
     ordered: Vec<(u32, u8)>,
     /// Heading anchor (`#slug`) → bookmark name.
@@ -220,6 +222,7 @@ impl<'a, 'r> Writer<'a, 'r> {
             bookmark_id: 0,
             footnotes: Vec::new(),
             footnote_defs: HashMap::new(),
+            in_note: false,
             ordered: Vec::new(),
             anchors: HashMap::new(),
             heading_bookmarks: HashMap::new(),
@@ -361,12 +364,16 @@ impl<'a, 'r> Writer<'a, 'r> {
     }
 
     fn footnote_ref(&mut self, label: &str) -> String {
+        if self.in_note {
+            return self.text_run(&RunFmt::default(), &format!("[^{label}]"));
+        }
         // the parser only produces a `FootnoteRef` for a label that has a definition, and
         // `export_docx` registers every definition block up front
         let definition = self.footnote_defs[&normalize_label(label)];
         let id = self.footnotes.len() + 1;
         let mut paragraphs = String::new();
         let mut first = true;
+        self.in_note = true;
         let children: Vec<&Block> = definition.children.iter().collect();
         for child in children {
             let runs = match child.kind {
@@ -391,6 +398,7 @@ impl<'a, 'r> Writer<'a, 'r> {
             ));
             first = false;
         }
+        self.in_note = false;
         if first {
             paragraphs.push_str(
                 r#"<w:p><w:pPr><w:pStyle w:val="FootnoteText"/></w:pPr><w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteRef/></w:r></w:p>"#,
@@ -771,7 +779,10 @@ pub fn export_docx(
     let mut writer = Writer::new(markdown, options, resources);
     for block in document.iter_blocks() {
         if let BlockKind::FootnoteDefinition { label } = &block.kind {
-            writer.footnote_defs.insert(normalize_label(label), block);
+            writer
+                .footnote_defs
+                .entry(normalize_label(label))
+                .or_insert(block);
         }
     }
     let mut used: HashMap<String, usize> = HashMap::new();
@@ -1380,6 +1391,41 @@ mod tests {
         assert_eq!(real[1].descendants(Ns::W, "p").len(), 1);
         assert_eq!(real[1].descendants(Ns::W, "footnoteRef").len(), 1);
         assert_eq!(real[1].text().trim(), "");
+    }
+
+    fn note_texts(bytes: &[u8]) -> Vec<String> {
+        part(bytes, "word/footnotes.xml")
+            .elements()
+            .filter(|n| n.attr_ns(Ns::W, "type").is_none())
+            .map(|n| n.text())
+            .collect()
+    }
+
+    #[test]
+    fn a_footnote_that_references_itself_keeps_the_reference_as_text() {
+        let bytes = export("x[^a]\n\n[^a]: see [^a]\n");
+        let texts = note_texts(&bytes);
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contains("see [^a]"), "{texts:?}");
+        let document = part(&bytes, "word/document.xml");
+        assert_eq!(document.descendants(Ns::W, "footnoteReference").len(), 1);
+    }
+
+    #[test]
+    fn footnotes_that_reference_each_other_end_at_the_first_level() {
+        let bytes = export("x[^a] y[^b]\n\n[^a]: A [^b]\n\n[^b]: B [^a]\n");
+        let texts = note_texts(&bytes);
+        assert_eq!(texts.len(), 2);
+        assert!(texts[0].contains("A [^b]"), "{texts:?}");
+        assert!(texts[1].contains("B [^a]"), "{texts:?}");
+    }
+
+    #[test]
+    fn the_first_definition_of_a_footnote_label_wins() {
+        let bytes = export("x[^a]\n\n[^a]: first\n\n[^a]: second\n");
+        let texts = note_texts(&bytes);
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contains("first") && !texts[0].contains("second"));
     }
 
     #[test]

@@ -217,7 +217,9 @@ pub fn new_untitled_folder(
     new_folder(fs, dir, &name)
 }
 
-/// Recursively copies the folder `from` to the new folder `to`.
+/// Recursively copies the folder `from` to the new folder `to`. Folder links (symbolic links and
+/// junctions) inside `from` are left out: recreating one needs privileges, and following it
+/// would copy what it points to a second time (or, for a link back into the tree, forever).
 ///
 /// # Errors
 /// The first failing OS call.
@@ -226,29 +228,41 @@ pub fn copy_tree(fs: &dyn FileSystem, from: &Path, to: &Path) -> Result<(), FsEr
     for entry in fs.list_dir(from)? {
         let source = from.join(&entry.name);
         let target = to.join(&entry.name);
-        if entry.meta.is_dir() {
-            copy_tree(fs, &source, &target)?;
-        } else {
+        if !entry.meta.is_dir() {
             fs.copy_file(&source, &target)?;
+        } else if !entry.meta.link {
+            copy_tree(fs, &source, &target)?;
         }
     }
     Ok(())
 }
 
-/// Recursively deletes the folder `path` permanently.
+/// Recursively deletes the folder `path` permanently. A folder link (symbolic link or
+/// junction), `path` itself or inside it, is removed as the link it is, never through to what it
+/// points to.
 ///
 /// # Errors
 /// The first failing OS call.
 pub fn remove_tree(fs: &dyn FileSystem, path: &Path) -> Result<(), FsError> {
-    for entry in fs.list_dir(path)? {
-        let child = path.join(&entry.name);
-        if entry.meta.is_dir() {
-            remove_tree(fs, &child)?;
-        } else {
-            fs.delete_file(&child)?;
-        }
+    if !fs.metadata(path)?.link {
+        remove_children(fs, path)?;
     }
     fs.remove_dir(path)
+}
+
+fn remove_children(fs: &dyn FileSystem, path: &Path) -> Result<(), FsError> {
+    for entry in fs.list_dir(path)? {
+        let child = path.join(&entry.name);
+        if !entry.meta.is_dir() {
+            fs.delete_file(&child)?;
+            continue;
+        }
+        if !entry.meta.link {
+            remove_children(fs, &child)?;
+        }
+        fs.remove_dir(&child)?;
+    }
+    Ok(())
 }
 
 /// Whether `candidate` is `folder` or below it (case-insensitive like NTFS).
@@ -304,7 +318,9 @@ pub fn copy_into(
 }
 
 /// Moves `source` into the folder `dest_dir`; a name clash becomes `name (2).ext`. Moving into
-/// the current folder is a no-op. Folders across volumes are copied and then removed.
+/// the current folder is a no-op. Folders across volumes are copied and then removed; a folder
+/// link (symbolic link or junction) is not moved across volumes, which would copy what it points
+/// to.
 ///
 /// # Errors
 /// [`FileOpError::IntoSelf`] when a folder would be moved into itself, OS failures.
@@ -313,7 +329,8 @@ pub fn move_into(
     source: &Path,
     dest_dir: &Path,
 ) -> Result<PathBuf, FileOpError> {
-    let is_dir = fs.metadata(source)?.is_dir();
+    let meta = fs.metadata(source)?;
+    let is_dir = meta.is_dir();
     if is_dir && is_inside(source, dest_dir) {
         return Err(FileOpError::IntoSelf(source.to_path_buf()));
     }
@@ -324,7 +341,7 @@ pub fn move_into(
     let target = dest_dir.join(free_name(fs, dest_dir, &stem, &ext, NameStyle::Conflict)?);
     match fs.rename(source, &target) {
         Ok(()) => {}
-        Err(FsError::Os { code, .. }) if code == win32::NOT_SAME_DEVICE => {
+        Err(FsError::Os { code, .. }) if code == win32::NOT_SAME_DEVICE && !meta.link => {
             copy_tree(fs, source, &target)?;
             remove_tree(fs, source)?;
         }

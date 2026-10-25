@@ -148,6 +148,12 @@ pub trait DialogHost {
     /// # Errors
     /// The OS rejected the configuration or failed to show the dialog.
     fn task_dialog(&mut self, config: &TASKDIALOGCONFIG) -> windows::core::Result<i32>;
+
+    /// The window of the calling thread that is active: the owner of the dialogs shown for a
+    /// caller that named none.
+    fn active_window(&self) -> Option<HWND> {
+        super::active_window()
+    }
 }
 
 /// The real [`DialogHost`]: `IModalWindow::Show` and `TaskDialogIndirect`.
@@ -251,7 +257,8 @@ pub struct WindowsDialogs<H = SystemDialogHost> {
 }
 
 impl WindowsDialogs {
-    /// Dialogs shown by the system, parented to `owner`.
+    /// Dialogs shown by the system, parented to `owner`; without one, to the window of the
+    /// thread that is active when a dialog is shown.
     #[must_use]
     pub fn new(owner: Option<HWND>, strings: DialogStrings) -> Self {
         Self::with_host(owner, strings, SystemDialogHost)
@@ -269,10 +276,17 @@ impl<H: DialogHost> WindowsDialogs<H> {
         }
     }
 
+    /// The window a dialog shown now belongs to: the one named at construction, else the one
+    /// that is active.
+    fn owner_window(&self) -> Option<HWND> {
+        self.owner.or_else(|| self.host.active_window())
+    }
+
     fn pick_paths(&mut self, dialog: &IFileDialog) -> Result<Vec<PathBuf>, ServiceError> {
+        let owner = self.owner_window();
         let items = self
             .host
-            .pick(dialog, self.owner)
+            .pick(dialog, owner)
             .map_err(|error| failed(SERVICE, error))?;
         items
             .iter()
@@ -384,7 +398,7 @@ impl<H: DialogHost> Dialogs for WindowsDialogs<H> {
         };
         let config = TASKDIALOGCONFIG {
             cbSize: size_of::<TASKDIALOGCONFIG>() as u32,
-            hwndParent: self.owner.unwrap_or_default(),
+            hwndParent: self.owner_window().unwrap_or_default(),
             dwCommonButtons: TASKDIALOG_COMMON_BUTTON_FLAGS(plan.common_flags),
             pszWindowTitle: PCWSTR(title.as_ptr()),
             Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: icon },

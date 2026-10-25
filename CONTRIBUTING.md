@@ -19,7 +19,7 @@ You need a Windows 11 x64 machine (the app and most of its tests are Windows-onl
    ```
 
 3. Only to build the installer: .NET and WiX 7 (`dotnet tool install --global wix --version 7.0.0`).
-4. Clone, build and run:
+4. Clone, build and run (on a machine that can spare the cores; see [The gate](#the-gate)):
 
    ```powershell
    git clone https://github.com/isolmaz/ss-writer.git
@@ -69,7 +69,7 @@ Dependency direction (no cycles): `core` <- `io`, `convert`, `render`, `ui` <- `
 
 ## The gate
 
-**The gate runs on GitHub, not on the development machine.** Push the change and read the run: `.github/workflows/ci.yml` runs format, clippy with `-D warnings`, `cargo xtask docs-check --strict` and `cargo xtask wiring` first; only when that job is green do the whole suite under `cargo nextest`, the doc tests and the 100 % coverage gate follow on `windows-latest`. Both stages run for every push and pull request, and the coverage job names the lines it is missing. A second push cancels the run in flight (`concurrency: cancel-in-progress`), so push a batch, not a stream of fixes. Mutation testing (`.github/workflows/mutants.yml`) runs there too, by hand or weekly, in eight shards, and the tag-triggered release workflow builds the installer and the portable zip. A change is ready when that run is green.
+**The gate runs on GitHub, not on the development machine.** Push the change and read the run: `.github/workflows/ci.yml` runs format, clippy with `-D warnings`, `cargo xtask docs-check --strict` and `cargo xtask wiring` first; only when that job is green do the whole suite under `cargo nextest`, the doc tests and the 100 % coverage gate follow on `windows-latest`. Both stages run for every pull request and every push to `main` (a pushed branch without a pull request runs nothing), and the coverage job names the lines it is missing. A second push cancels the run in flight (`concurrency: cancel-in-progress`), so push a batch, not a stream of fixes. Mutation testing (`.github/workflows/mutants.yml`) runs there too, by hand or weekly, in eight shards, and the tag-triggered release workflow builds the installer and the portable zip. A change is ready when that run is green.
 
 ```powershell
 git push                      # the checks run on GitHub
@@ -77,7 +77,7 @@ gh run watch --exit-status    # read the result
 gh run view --log-failed      # what failed, in full
 ```
 
-Do not build or test this workspace locally: the machine it is developed on has six cores and a local run of the suite, and above all of the coverage gate, makes it unusable for everything else. If a local check is unavoidable (debugging a failure CI cannot explain), ask first, run one cargo process, never the full workspace, and keep it inside the cap in `.cargo/config.toml` (`jobs = 4`, `--test-threads` 4 or below). A test that hangs is stopped after three minutes (`.config/nextest.toml`).
+The maintainer does not build or test this workspace locally: the machine it is developed on has six cores and a local run of the suite, and above all of the coverage gate, makes it unusable for everything else. If a local check is unavoidable (debugging a failure CI cannot explain), ask first, run one cargo process, never the full workspace, and keep it inside the cap in `.cargo/config.toml` (`jobs = 4`, `--test-threads` 4 or below). A test that hangs is stopped after three minutes (`.config/nextest.toml`).
 
 Workspace lints are strict: `clippy::all` is denied, `clippy::undocumented_unsafe_blocks` is denied, `unsafe_op_in_unsafe_fn` is denied and every public type implements `Debug`. Rustfmt uses `max_width = 100`; files use LF line endings (`.gitattributes`).
 

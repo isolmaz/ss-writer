@@ -1,9 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ssw_io::fs::{Attributes, FaultFs, FileSystem, FsError, FsFailure, FsOp, RealFs};
+use ssw_io::fs::{
+    Attributes, DirEntry, FaultFs, FileMeta, FileSystem, FsError, FsFailure, FsOp, RealFs,
+};
 use ssw_io::save::{
     SHARING_BACKOFF, SaveError, SaveStamp, Sleeper, ThreadSleeper, WriteAccess, allow_editing,
     content_hash, save_atomic, write_access,
@@ -311,6 +313,113 @@ fn replace_failure_falls_back_to_move_with_attributes() {
         SaveError::AccessDenied(_)
     ));
     assert_eq!(names(dir.path()), ["share.md"]);
+}
+
+/// A disk whose replace removes the target and then fails, as `ReplaceFileW` does when it cannot
+/// move the replacement into place. Every other call goes to `inner`, which can fail on script.
+#[derive(Debug, Default)]
+struct LosingFs {
+    inner: FaultFs,
+}
+
+impl FileSystem for LosingFs {
+    fn read(&self, path: &Path) -> Result<Vec<u8>, FsError> {
+        self.inner.read(path)
+    }
+    fn read_prefix(&self, path: &Path, max: usize) -> Result<Vec<u8>, FsError> {
+        self.inner.read_prefix(path, max)
+    }
+    fn metadata(&self, path: &Path) -> Result<FileMeta, FsError> {
+        self.inner.metadata(path)
+    }
+    fn write_new(&self, path: &Path, data: &[u8]) -> Result<(), FsError> {
+        self.inner.write_new(path, data)
+    }
+    fn replace_file(&self, target: &Path, _replacement: &Path) -> Result<(), FsError> {
+        std::fs::remove_file(target).unwrap();
+        Err(FsError::ReplaceUnsupported(target.to_path_buf()))
+    }
+    fn move_replace(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.inner.move_replace(from, to)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.inner.rename(from, to)
+    }
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.inner.copy_file(from, to)
+    }
+    fn delete_file(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.delete_file(path)
+    }
+    fn remove_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.remove_dir(path)
+    }
+    fn create_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.create_dir(path)
+    }
+    fn create_dir_all(&self, path: &Path) -> Result<(), FsError> {
+        self.inner.create_dir_all(path)
+    }
+    fn list_dir(&self, path: &Path) -> Result<Vec<DirEntry>, FsError> {
+        self.inner.list_dir(path)
+    }
+    fn set_attributes(&self, path: &Path, attrs: Attributes) -> Result<(), FsError> {
+        self.inner.set_attributes(path, attrs)
+    }
+    fn is_writable(&self, path: &Path) -> Result<bool, FsError> {
+        self.inner.is_writable(path)
+    }
+    fn recycle(&self, paths: &[PathBuf]) -> Result<(), FsError> {
+        self.inner.recycle(paths)
+    }
+}
+
+#[test]
+fn a_replace_that_loses_the_target_keeps_the_new_content_in_the_temp_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("doc.md");
+    std::fs::write(&path, b"old text").unwrap();
+    let fs = LosingFs::default();
+    // The fallback and the last attempt to move the temp file into place fail as well.
+    fs.inner.fail(FsOp::MoveReplace, FsFailure::AccessDenied, 1);
+    fs.inner.fail(FsOp::Rename, FsFailure::AccessDenied, 1);
+
+    let error = save_atomic(&fs, &RecordingSleeper::default(), &path, b"new text").unwrap_err();
+    assert!(!path.exists(), "the replace removed the old file");
+    let SaveError::TempKept { temp, source } = &error else {
+        panic!("expected the temp file to be kept: {error:?}");
+    };
+    assert_eq!(std::fs::read(temp).unwrap(), b"new text");
+    assert_eq!(*source, FsError::AccessDenied(path.clone()));
+    assert!(error.to_string().contains(&temp.display().to_string()));
+    let kept = temp.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(names(dir.path()), [kept], "nothing else is left");
+}
+
+#[test]
+fn a_replace_that_loses_the_target_is_finished_by_moving_the_temp_file_into_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("doc.md");
+    std::fs::write(&path, b"old text").unwrap();
+    let fs = LosingFs::default();
+    fs.inner.fail(FsOp::MoveReplace, FsFailure::AccessDenied, 1);
+
+    let stamp = save_atomic(&fs, &RecordingSleeper::default(), &path, b"new text").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new text");
+    assert_eq!(stamp.hash, content_hash(b"new text"));
+    assert_eq!(names(dir.path()), ["doc.md"], "no temp file is left");
+}
+
+#[test]
+fn a_new_file_that_cannot_be_moved_into_place_leaves_no_temp_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fresh.md");
+    let fs = FaultFs::new();
+    fs.fail(FsOp::Rename, FsFailure::AccessDenied, 1);
+    let error = save_atomic(&fs, &RecordingSleeper::default(), &path, b"data").unwrap_err();
+    assert_eq!(error, SaveError::AccessDenied(path.clone()));
+    assert!(names(dir.path()).is_empty());
+    assert_eq!(fs.calls(FsOp::DeleteFile), 1, "the temp file was removed");
 }
 
 #[test]

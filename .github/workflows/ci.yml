@@ -38,10 +38,9 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      # README.md is optional until the first release; once it exists the check is strict
-      # (every feature in docs/features.toml needs a README line).
+      # Strict: every feature in docs/features.toml needs a README line.
       - name: Docs sync (spec, keymap, features, README, Fluent ids)
-        run: cargo xtask docs-check ${{ hashFiles('README.md') != '' && '--strict' || '' }}
+        run: cargo xtask docs-check --strict
       # Coverage cannot see this: a widget's own tests cover it while no user path reaches it.
       - name: Wiring (every UI module is reachable from the application)
         run: cargo xtask wiring
@@ -74,6 +73,7 @@ jobs:
 
   coverage:
     name: coverage gate (100 % lines, regions, functions)
+    needs: lint
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

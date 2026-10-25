@@ -60,8 +60,8 @@ pub struct AppCore {
     pub autosave: Autosave,
     /// Session persistence and the reopen stack.
     pub session: SessionManager,
-    /// Command routing.
-    pub commands: CommandDispatcher,
+    /// Command routing; shared so a command runs without the core borrowed.
+    pub commands: Rc<CommandDispatcher>,
     /// Worker pool.
     pub workers: Rc<Workers>,
     /// Watchers of the folders of open files.
@@ -74,6 +74,9 @@ pub struct AppCore {
     pub recoverable: Vec<RecoveryEntry>,
     /// Crash-recovery folder.
     pub recovery: Arc<RecoveryStore>,
+    /// What `recoverable` held at startup. The offer takes `recoverable` away, so this is what
+    /// tells a clean exit which entries an earlier run left and the user has not answered yet.
+    inherited: Vec<RecoveryEntry>,
     devices: Option<DeviceStartup>,
 }
 
@@ -106,9 +109,9 @@ impl AppCore {
         Self {
             autosave: Autosave::new(Rc::clone(&docs), Arc::clone(&started.emergency), policy),
             session: SessionManager::new(Rc::clone(&docs)),
-            commands: CommandDispatcher::new(Rc::clone(&docs)),
+            commands: Rc::new(CommandDispatcher::new(Rc::clone(&docs))),
             workers: Rc::new(Workers::new(Workers::default_thread_count(), waker.clone())),
-            watches: FolderWatches::new(waker.clone()),
+            watches: FolderWatches::new(waker.clone(), false),
             docs,
             waker,
             plan,
@@ -116,6 +119,7 @@ impl AppCore {
             settings: started.settings,
             i18n: started.i18n,
             logger: started.logger,
+            inherited: started.recoverable.clone(),
             recoverable: started.recoverable,
             recovery: started.recovery,
             devices: Some(started.devices),
@@ -146,7 +150,15 @@ impl AppCore {
     /// tick.
     pub fn pump(&mut self) -> PumpReport {
         let jobs = self.workers.poll();
-        let failed = self.watches.sync(&self.docs.watch_folders());
+        self.housekeeping(jobs)
+    }
+
+    /// [`AppCore::pump`] after `jobs` worker results were delivered. The message loop delivers
+    /// them itself with the core not borrowed: a result can open a message box, and the system
+    /// can end the session while it is up.
+    pub fn housekeeping(&mut self, jobs: usize) -> PumpReport {
+        let now = self.docs.env().clock.monotonic();
+        let failed = self.watches.sync(&self.docs.watch_folders(), now);
         for (folder, error) in failed {
             self.logger.log(
                 Level::Warn,
@@ -170,20 +182,34 @@ impl AppCore {
         }
     }
 
-    /// Clean exit: flushes autosave, stores `session` and removes the recovery entries (a clean
-    /// exit has nothing to recover).
-    pub fn shutdown(&mut self, session: &Session) {
+    /// Clean exit: flushes autosave, stores `session` and removes the recovery entries this run
+    /// wrote (a clean exit has nothing to recover from it). What an earlier, crashed run left
+    /// and the user has not answered stays for the next start to offer again. When the session
+    /// cannot be stored the entries this run wrote stay too: they may hold the only copy of an
+    /// untitled buffer. Returns whether the session was stored.
+    pub fn shutdown(&mut self, session: &Session) -> bool {
         let _ = self.autosave.flush_all();
-        if let Err(error) = self.session.save(session) {
-            self.logger.log(
-                Level::Error,
-                "shutdown",
-                &format!("session not saved: {error}"),
-            );
+        let stored = match self.session.save(session) {
+            Ok(()) => true,
+            Err(error) => {
+                self.logger.log(
+                    Level::Error,
+                    "shutdown",
+                    &format!("session not saved: {error}"),
+                );
+                false
+            }
+        };
+        if stored {
+            for entry in self.recovery.list().unwrap_or_default() {
+                if !self.inherited.contains(&entry) {
+                    let _ = self.recovery.discard(&entry.id);
+                }
+            }
         }
-        let _ = self.recovery.discard_all();
         self.logger
             .log(Level::Info, "shutdown", "SS Writer exiting");
+        stored
     }
 }
 

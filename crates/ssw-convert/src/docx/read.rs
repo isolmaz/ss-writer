@@ -4,8 +4,9 @@ use std::collections::HashMap;
 
 use ssw_core::markdown::ast::HighlightColor;
 
+use crate::assets::picture_extension;
 use crate::doc::md::flank;
-use crate::import::{Asset, ImportError, ImportResult, LossKind};
+use crate::import::{Asset, ImportError, ImportResult, LossKind, fit_table};
 use crate::omml;
 use crate::ooxml::{
     Container, EMU_PER_PX, Element, Ns, Package, PackageError, Relationships, on_off,
@@ -587,6 +588,7 @@ struct Converter<'m> {
     last_list: Option<String>,
     list_widths: Vec<usize>,
     in_cell: bool,
+    cells_used: usize,
 }
 
 fn val(el: &Element) -> Option<&str> {
@@ -663,6 +665,7 @@ impl<'m> Converter<'m> {
             last_list: None,
             list_widths: Vec::new(),
             in_cell: false,
+            cells_used: 0,
         }
     }
 
@@ -1284,11 +1287,11 @@ impl<'m> Converter<'m> {
             .rsplit_once('.')
             .map_or("bin", |(_, e)| e)
             .to_ascii_lowercase();
-        let ext = if ext == "jpeg" {
-            "jpg".to_string()
-        } else {
-            ext
-        };
+        let ext = match picture_extension(&ext) {
+            "jpeg" => "jpg",
+            known => known,
+        }
+        .to_string();
         if UNSUPPORTED_IMAGE_EXTENSIONS.contains(&ext.as_str()) {
             self.loss(LossKind::UnsupportedImages, 1);
         }
@@ -1509,6 +1512,9 @@ impl<'m> Converter<'m> {
             aligns.push(row_aligns);
         }
         self.loss(LossKind::MergedCells, merged);
+        if fit_table(&mut rows, &mut self.cells_used) {
+            self.loss(LossKind::CorruptParts, 1);
+        }
         let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
         if columns == 0 {
             return;
@@ -2200,6 +2206,20 @@ mod tests {
     }
 
     #[test]
+    fn table_grids_beyond_the_column_and_cell_limits_are_cut() {
+        use crate::import::{MAX_CELLS, MAX_COLUMNS};
+        let cell = "<w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc>";
+        let wide = format!("<w:tr>{}</w:tr>", cell.repeat(MAX_COLUMNS + 1));
+        let narrow = format!("<w:tr>{cell}</w:tr>").repeat(MAX_CELLS / MAX_COLUMNS + 6);
+        let table = format!("<w:tbl>{wide}{narrow}</w:tbl>");
+        let result = convert_with(&Fixture::default(), &table);
+        let lines: Vec<&str> = result.markdown.lines().collect();
+        assert_eq!(lines[0].matches('|').count(), MAX_COLUMNS + 1);
+        assert_eq!(lines.len(), MAX_CELLS / MAX_COLUMNS + 1);
+        assert_eq!(kinds(&result), [(LossKind::CorruptParts, 1)]);
+    }
+
+    #[test]
     fn footnotes_endnotes_and_comments_in_order() {
         let fixture = Fixture {
             footnotes: r#"<w:footnote w:type="separator" w:id="-1"><w:p><w:r><w:separator/></w:r></w:p></w:footnote>
@@ -2260,6 +2280,41 @@ mod tests {
         format!(
             "<w:r><w:drawing><wp:inline><wp:extent {extent}/><wp:docPr id=\"1\" name=\"Picture 1\" {descr}/><a:graphic><a:graphicData><a:blip {blip}/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"
         )
+    }
+
+    #[test]
+    fn picture_extensions_come_from_a_list_of_image_formats() {
+        let fixture = Fixture {
+            rels: r#"<Relationship Id="rId1" Type="http://x/image" Target="media/x.exe"/>
+<Relationship Id="rId2" Type="http://x/image" Target="media/dir.d/blob"/>
+<Relationship Id="rId3" Type="http://x/image" Target="media/photo.PNG"/>"#,
+            media: vec![
+                ("word/media/x.exe", vec![1]),
+                ("word/media/dir.d/blob", vec![2]),
+                ("word/media/photo.PNG", vec![3]),
+            ],
+            ..Fixture::default()
+        };
+        let body = p(&format!(
+            "{}{}{}",
+            drawing("", "r:embed=\"rId1\"", ""),
+            drawing("", "r:embed=\"rId2\"", ""),
+            drawing("", "r:embed=\"rId3\"", "")
+        ));
+        let result = convert_with(&fixture, &body);
+        let paths: Vec<&str> = result
+            .assets
+            .iter()
+            .map(|asset| asset.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "doc_assets/image-1.bin",
+                "doc_assets/image-2.bin",
+                "doc_assets/image-3.png"
+            ]
+        );
     }
 
     #[test]

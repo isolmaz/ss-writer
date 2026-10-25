@@ -50,6 +50,7 @@ use super::clipboard::key_command;
 use super::folds::TabFolds;
 use super::history::HistoryHost;
 use super::overlays::{NoShortcuts, OverlayAction, OverlayEnv, OverlayRects, Overlays};
+use crate::autosave::Autosave;
 use crate::documents::{DocEntry, DocMode, Documents};
 
 /// Something the user did that the window cannot carry out by itself.
@@ -910,10 +911,10 @@ impl ShellView {
             .is_some_and(|table| table.execute(&mut tab.editor, &clipboard, command))
     }
 
-    /// Refreshes the tab titles and dirty dots (`show_dirty`: autosave is off), the way each
-    /// editor presents its document (a Save as can change the file type) and the folds of
-    /// documents that changed.
-    pub fn sync_tabs(&mut self, show_dirty: bool) {
+    /// Refreshes the tab titles and dirty dots, the way each editor presents its document (a
+    /// Save as can change the file type) and the folds of documents that changed. A document
+    /// with unsaved changes has a dot unless `autosave` is on and writes it.
+    pub fn sync_tabs(&mut self, autosave: bool) {
         for tab in &mut self.tabs {
             present_as(&mut tab.editor, &tab.entry);
             tab.folds.sync(&mut tab.editor);
@@ -924,7 +925,8 @@ impl ShellView {
                     tabs.set_path(tab.key, &path);
                 }
             }
-            tabs.set_dirty(tab.key, show_dirty && tab.entry.is_dirty());
+            let autosaved = autosave && Autosave::autosavable(&tab.entry);
+            tabs.set_dirty(tab.key, tab.entry.is_dirty() && !autosaved);
         }
     }
 

@@ -159,11 +159,15 @@ fn unsupported_kind(kind: DiagramKind) -> Option<&'static str> {
 
 fn render_unguarded(src: &str, theme: MermaidTheme) -> Result<(Scene, String), UnsupportedReason> {
     let source = join_multiline_directives(src);
-    let parsed =
+    let mut parsed =
         parse_mermaid(&source).map_err(|err| UnsupportedReason::Syntax(err.to_string()))?;
     if let Some(name) = unsupported_kind(parsed.graph.kind) {
         return Err(UnsupportedReason::DiagramType(name));
     }
+    parsed
+        .graph
+        .node_links
+        .retain(|_, link| is_safe_link(&link.url));
 
     let mut config = front_matter_config(&source).unwrap_or(Value::Null);
     if let Some(init) = parsed.init_config {
@@ -175,6 +179,24 @@ fn render_unguarded(src: &str, theme: MermaidTheme) -> Result<(Scene, String), U
 
     let layout = compute_layout(&parsed.graph, &palette, &layout_config);
     scene_from_svg(render_svg(&layout, &palette, &layout_config))
+}
+
+/// Whether a `click` destination may stay in the SVG: `http`, `https` and `mailto` links, and
+/// relative references. Other schemes (`javascript:`, `data:`, ...) can run script once the SVG
+/// is embedded in a page. White space and control characters inside a scheme are ignored the
+/// way browsers ignore them.
+fn is_safe_link(url: &str) -> bool {
+    let probe = url
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_control())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match probe.split_once(':') {
+        Some((scheme, _)) if !scheme.contains(['/', '?', '#']) => {
+            matches!(scheme, "http" | "https" | "mailto")
+        }
+        _ => true,
+    }
 }
 
 /// The scene of the renderer's SVG, and the SVG itself.

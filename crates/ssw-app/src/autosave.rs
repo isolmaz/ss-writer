@@ -1,17 +1,22 @@
 //! The autosave scheduler (spec §4.3, §4.4, §4.5).
 //!
-//! The UI calls [`Autosave::tick`] from a timer (a few times a second) and [`Autosave::flush`]
-//! on tab switch, window deactivation and close. The scheduler decides, from a fake-able clock:
+//! The UI calls [`Autosave::tick`] from a timer (a few times a second), [`Autosave::flush`] on
+//! close and [`Autosave::flush_without_waiting`] on tab switch and window deactivation. The
+//! scheduler decides, from a fake-able clock:
 //!
-//! - save a changed file document once typing stopped for the configured delay (autosave on),
-//! - save immediately on those triggers (autosave on),
+//! - save a changed file document once typing stopped for the configured delay (autosave on);
+//!   the tick never sleeps: a file another program holds is tried again after the backoff of an
+//!   explicit save (50, 100, 200, 400, 800 ms) and only then reported,
+//! - save immediately on those triggers (autosave on); the tab switch and deactivation
+//!   triggers never wait for a file another program holds and leave it to the tick,
 //! - back up dirty untitled buffers every 30 s (recovery folder and session store),
 //! - snapshot edited files in the version history every 5 minutes,
 //! - delete the history older than the retention every hour (startup purges once as well),
 //! - keep the crash handler's copy of unsaved text current.
 //!
-//! With autosave off only the dirty state is tracked (the UI shows the dirty dot and the close
-//! prompt), the backups and snapshots still run.
+//! With autosave off, and for a document autosave cannot write ([`Autosave::autosavable`]), only
+//! the dirty state is tracked (the UI shows the dirty dot and the close prompt); the backups and
+//! snapshots still run.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -23,7 +28,8 @@ use ssw_core::i18n::Localizer;
 use ssw_core::settings::Settings;
 use ssw_io::history::{SnapshotOutcome, SnapshotReason, should_snapshot};
 use ssw_io::recovery::{RecoveryDoc, RecoveryKind, UNTITLED_BACKUP_INTERVAL};
-use ssw_io::save::WriteAccess;
+use ssw_io::save::{SHARING_BACKOFF, SaveError, WriteAccess};
+use ssw_io::store::UnixSeconds;
 
 use crate::documents::{DocEntry, DocError, DocId, Documents, ExternalState, Saved, Source};
 use crate::emergency::{CachedDoc, EmergencyCache};
@@ -60,7 +66,8 @@ impl AutosavePolicy {
 pub struct TickReport {
     /// Documents written.
     pub saved: Vec<DocId>,
-    /// Documents whose autosave failed (not retried until the text changes again).
+    /// Documents whose autosave failed for good (not retried until the text changes again) with
+    /// a failure the user has not been told about yet ([`Autosave::is_new_failure`]).
     pub failed: Vec<(DocId, DocError)>,
     /// Untitled buffers backed up.
     pub backed_up: Vec<DocId>,
@@ -80,14 +87,21 @@ struct Track {
     changed_at: Duration,
     /// Version of the last periodic snapshot (or of the document when first seen).
     snapshot_version: u64,
-    /// Version whose autosave failed.
+    /// Version whose autosave failed for good.
     failed_version: Option<u64>,
+    /// How many tries to write `version` found the file held by another program.
+    retries: usize,
+    /// When the write of `version` is tried again.
+    retry_at: Duration,
 }
 
 #[derive(Debug)]
 struct State {
     policy: AutosavePolicy,
     tracks: HashMap<DocId, Track>,
+    /// The kind (`DocError::message_id`) of the failure shown for a document with unsaved
+    /// changes; forgotten when the document is written or has nothing unsaved left.
+    reported: HashMap<DocId, &'static str>,
     last_backup: Option<Duration>,
     /// When the interval to the next history purge started; `None` until the first tick and
     /// after the retention changed.
@@ -99,13 +113,9 @@ struct State {
 pub struct Autosave {
     docs: Rc<Documents>,
     emergency: Arc<EmergencyCache>,
+    /// When the scheduler (this run of the application) started.
+    run: UnixSeconds,
     state: RefCell<State>,
-}
-
-fn recovery_id(entry: &DocEntry) -> String {
-    entry
-        .untitled_id()
-        .unwrap_or_else(|| format!("doc-{}", entry.id().0))
 }
 
 impl Autosave {
@@ -117,15 +127,32 @@ impl Autosave {
         policy: AutosavePolicy,
     ) -> Self {
         Self {
+            run: docs.env().clock.unix_seconds(),
             docs,
             emergency,
             state: RefCell::new(State {
                 policy,
                 tracks: HashMap::new(),
+                reported: HashMap::new(),
                 last_backup: None,
                 purge_since: None,
             }),
         }
+    }
+
+    /// The crash copy this scheduler keeps current.
+    #[must_use]
+    pub fn emergency(&self) -> &Arc<EmergencyCache> {
+        &self.emergency
+    }
+
+    /// The id of `entry` in the crash copy and the recovery folder. An untitled buffer has its
+    /// own id; a file's holds the start of this run, because document numbers begin at 1 in
+    /// every run while the recovery folder keeps what earlier runs left unrecovered.
+    pub fn recovery_id(&self, entry: &DocEntry) -> String {
+        entry
+            .untitled_id()
+            .unwrap_or_else(|| format!("doc-{}-{}", self.run, entry.id().0))
     }
 
     /// Applies new settings (autosave toggled, delay or history retention changed). A new
@@ -146,9 +173,11 @@ impl Autosave {
         self.state.borrow().policy
     }
 
-    /// A document that may be written without asking: a file (not a converted document), not
-    /// read-only, no unresolved external change, no lossy decode.
-    fn autosavable(entry: &DocEntry) -> bool {
+    /// Whether a document may be written without asking: a file (not a converted document),
+    /// not read-only, no unresolved external change, no lossy decode. Autosave never writes any
+    /// other document, so the user has to be asked about its unsaved changes.
+    #[must_use]
+    pub fn autosavable(entry: &DocEntry) -> bool {
         entry.path().is_some()
             && !matches!(entry.source(), Source::Converted(_))
             && entry.access() == WriteAccess::Writable
@@ -157,7 +186,7 @@ impl Autosave {
     }
 
     fn refresh_emergency(&self, entry: &DocEntry, version: u64) {
-        let id = recovery_id(entry);
+        let id = self.recovery_id(entry);
         if self.emergency.version(&id) == Some(version) {
             return;
         }
@@ -263,53 +292,42 @@ impl Autosave {
             }
             (state.policy, due, purge)
         };
+        let mut unsaved = Vec::new();
+        let mut crash_ids = Vec::new();
         for entry in &entries {
             let version = entry.document().borrow().version();
             let dirty = entry.is_dirty();
-            let (idle_for, snapshot_pending, failed_here) = {
+            let (save_due, snapshot_pending, retries) = {
                 let mut state = self.state.borrow_mut();
                 let track = state.tracks.entry(entry.id()).or_insert(Track {
                     version,
                     changed_at: now,
                     snapshot_version: version,
                     failed_version: None,
+                    retries: 0,
+                    retry_at: Duration::ZERO,
                 });
                 if track.version != version {
                     track.version = version;
                     track.changed_at = now;
+                    track.retries = 0;
+                    track.retry_at = Duration::ZERO;
                 }
                 (
-                    now.saturating_sub(track.changed_at),
+                    now.saturating_sub(track.changed_at) >= policy.delay
+                        && track.failed_version != Some(version)
+                        && now >= track.retry_at,
                     track.snapshot_version != version,
-                    track.failed_version == Some(version),
+                    track.retries,
                 )
             };
             if dirty {
                 self.refresh_emergency(entry, version);
-            } else {
-                self.emergency.remove(&recovery_id(entry));
+                unsaved.push(entry.id());
+                crash_ids.push(self.recovery_id(entry));
             }
-            if dirty
-                && policy.enabled
-                && idle_for >= policy.delay
-                && !failed_here
-                && Self::autosavable(entry)
-            {
-                match self.docs.save(entry) {
-                    Ok(Saved { .. }) => {
-                        report.saved.push(entry.id());
-                        self.emergency.remove(&recovery_id(entry));
-                    }
-                    Err(error) => {
-                        // The track of this document was created above.
-                        self.state
-                            .borrow_mut()
-                            .tracks
-                            .entry(entry.id())
-                            .and_modify(|track| track.failed_version = Some(version));
-                        report.failed.push((entry.id(), error));
-                    }
-                }
+            if dirty && policy.enabled && save_due && Self::autosavable(entry) {
+                self.write_for_tick(entry, version, retries, now, &mut report);
             }
             if dirty
                 && backup_due
@@ -327,6 +345,14 @@ impl Autosave {
                     .and_modify(|track| track.snapshot_version = version);
             }
         }
+        // Only a document with unsaved changes keeps a crash copy: one closed without saving,
+        // or saved under another name, must not come back from a crash with its old text. A
+        // failure counts as shown only while its document has unsaved changes.
+        self.emergency.keep_only(&crash_ids);
+        self.state
+            .borrow_mut()
+            .reported
+            .retain(|id, _| unsaved.contains(id));
         if purge_due {
             match self.purge_history(policy.history_retention_days) {
                 Ok(purged) => report.purged = purged,
@@ -336,16 +362,92 @@ impl Autosave {
         report
     }
 
-    /// Saves `entry` now when autosave is on and it has unsaved changes: the tab switch, window
-    /// deactivation and close triggers. `None` when there is nothing to do (autosave off,
-    /// clean, not autosavable).
+    /// Writes `entry` for the tick without sleeping. A file another program holds (antivirus,
+    /// a sync client, the indexer) is tried again by a later tick after the next delay of the
+    /// backoff of an explicit save, and nothing is reported meanwhile. Any other failure, and
+    /// the violation that outlasts the backoff, is final: the document is not tried again until
+    /// its text changes, and the report gets the failure when it is news.
+    fn write_for_tick(
+        &self,
+        entry: &DocEntry,
+        version: u64,
+        retries: usize,
+        now: Duration,
+        report: &mut TickReport,
+    ) {
+        let Err(error) = self.docs.save_without_waiting(entry) else {
+            report.saved.push(entry.id());
+            self.written(entry);
+            return;
+        };
+        let wait = match &error {
+            DocError::Save(SaveError::SharingViolation(_)) => SHARING_BACKOFF.get(retries),
+            _ => None,
+        };
+        // The track of this document was created by the tick.
+        self.state
+            .borrow_mut()
+            .tracks
+            .entry(entry.id())
+            .and_modify(|track| match wait {
+                Some(delay) => {
+                    track.retries = retries + 1;
+                    track.retry_at = now + *delay;
+                }
+                None => track.failed_version = Some(version),
+            });
+        if wait.is_none() && self.is_new_failure(entry, &error) {
+            report.failed.push((entry.id(), error));
+        }
+    }
+
+    /// Whether `error`, the failure of a save of `entry`, is news to the user: the first failure
+    /// of the document since it was written, or one of another kind than the failure shown
+    /// last. The same failure again, after every pause in typing and at every tab switch, is
+    /// not. Asking counts the failure as shown.
+    pub fn is_new_failure(&self, entry: &DocEntry, error: &DocError) -> bool {
+        let kind = error.message_id();
+        self.state.borrow_mut().reported.insert(entry.id(), kind) != Some(kind)
+    }
+
+    /// `entry` is on disk: it needs no crash copy and no failure counts as shown for it.
+    fn written(&self, entry: &DocEntry) {
+        self.emergency.remove(&self.recovery_id(entry));
+        self.state.borrow_mut().reported.remove(&entry.id());
+    }
+
+    /// Saves `entry` now when autosave is on and it has unsaved changes: the close trigger; a
+    /// file another program holds is tried again after 50 to 800 ms. `None`
+    /// when there is nothing to do (autosave off, clean, not autosavable). A failure is returned
+    /// as it is; whether it is news is [`Autosave::is_new_failure`].
     pub fn flush(&self, entry: &DocEntry) -> Option<Result<Saved, DocError>> {
+        self.flush_by(entry, Documents::save)
+    }
+
+    /// [`Autosave::flush`] for the triggers that must not stall the UI (a tab switch, and window
+    /// deactivation: a message box or an Alt+Tab deactivates the window while a spreadsheet may
+    /// hold the file).
+    /// It never sleeps. A file another program holds is not a failure here: the document stays
+    /// unsaved and `None` is returned, and the tick tries again after its backoff and reports
+    /// the file if it stays held.
+    pub fn flush_without_waiting(&self, entry: &DocEntry) -> Option<Result<Saved, DocError>> {
+        match self.flush_by(entry, Documents::save_without_waiting) {
+            Some(Err(DocError::Save(SaveError::SharingViolation(_)))) => None,
+            outcome => outcome,
+        }
+    }
+
+    fn flush_by(
+        &self,
+        entry: &DocEntry,
+        save: fn(&Documents, &DocEntry) -> Result<Saved, DocError>,
+    ) -> Option<Result<Saved, DocError>> {
         if !self.policy().enabled || !entry.is_dirty() || !Self::autosavable(entry) {
             return None;
         }
-        let result = self.docs.save(entry);
+        let result = save(&self.docs, entry);
         if result.is_ok() {
-            self.emergency.remove(&recovery_id(entry));
+            self.written(entry);
         }
         Some(result)
     }
@@ -358,24 +460,20 @@ impl Autosave {
             .filter_map(|entry| self.flush(entry).map(|result| (entry.id(), result)))
             .collect()
     }
-
-    /// A document was closed: forget its schedule and its crash copy.
-    pub fn forget(&self, entry: &DocEntry) {
-        self.state.borrow_mut().tracks.remove(&entry.id());
-        self.emergency.remove(&recovery_id(entry));
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     use ssw_core::edit::{Edit, Selection, Transaction};
     use ssw_core::text::TextRange;
-    use ssw_io::fs::RealFs;
+    use ssw_io::encoding::TextEncoding;
+    use ssw_io::fs::{FaultFs, FileSystem, FsFailure, FsOp, RealFs};
     use ssw_io::recovery::RecoveryStore;
-    use ssw_io::save::ThreadSleeper;
+    use ssw_io::save::{Sleeper, ThreadSleeper};
     use ssw_io::store::Store;
 
     use super::*;
@@ -397,7 +495,28 @@ mod tests {
         i18n: Localizer,
     }
 
+    /// Remembers how long it was asked to sleep and returns at once.
+    #[derive(Debug, Default)]
+    struct RecordingSleeper(Mutex<Vec<Duration>>);
+
+    impl Sleeper for RecordingSleeper {
+        fn sleep(&self, duration: Duration) {
+            self.0.lock().unwrap().push(duration);
+        }
+    }
+
+    impl RecordingSleeper {
+        fn slept(&self) -> Vec<Duration> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
     fn rig(enabled: bool) -> Rig {
+        rig_on(Arc::new(RealFs), Arc::new(ThreadSleeper), enabled)
+    }
+
+    /// A rig whose documents reach the disk through `fs` and wait with `sleeper`.
+    fn rig_on(fs: Arc<dyn FileSystem>, sleeper: Arc<dyn Sleeper>, enabled: bool) -> Rig {
         let tmp = tempfile::tempdir().unwrap();
         let clock = Rc::new(ManualClock::new(START));
         let shared: Rc<dyn crate::clock::AppClock> = clock.clone();
@@ -405,8 +524,8 @@ mod tests {
             Store::open(&tmp.path().join("state.db")).unwrap(),
         ));
         let docs = Rc::new(Documents::new(DocEnv {
-            fs: Arc::new(RealFs),
-            sleeper: Arc::new(ThreadSleeper),
+            fs,
+            sleeper,
             clock: shared,
             store,
             recovery: Arc::new(RecoveryStore::new(
@@ -548,7 +667,6 @@ mod tests {
             rig.autosave.flush(&entry).is_none(),
             "clean documents are skipped"
         );
-        rig.autosave.forget(&entry);
     }
 
     #[test]
@@ -565,6 +683,62 @@ mod tests {
         rig.autosave.tick(&rig.i18n);
         rig.advance(2000);
         assert!(rig.autosave.tick(&rig.i18n).saved.is_empty());
+        assert!(rig.autosave.flush(&entry).is_none());
+    }
+
+    #[test]
+    fn only_a_writable_file_in_sync_and_without_decoding_loss_is_autosavable() {
+        let rig = rig(true);
+        let (path, entry) = rig.file("a\n");
+        assert!(Autosave::autosavable(&entry));
+
+        let scratch = rig.docs.new_untitled();
+        type_text(&scratch, "draft\n");
+        assert!(!Autosave::autosavable(&scratch));
+        assert!(rig.autosave.flush(&scratch).is_none());
+
+        let locked_path = rig.tmp.path().join("locked.md");
+        std::fs::write(&locked_path, "x\n").unwrap();
+        set_readonly(&locked_path, true);
+        let locked = rig.docs.open(&locked_path).unwrap();
+        set_readonly(&locked_path, false);
+        type_text(&locked, "y\n");
+        assert!(!Autosave::autosavable(&locked));
+        assert!(rig.autosave.flush(&locked).is_none());
+
+        let word = rig.tmp.path().join("w.docx");
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/docx/mammoth_empty.docx"),
+            &word,
+        )
+        .unwrap();
+        let converted = rig.docs.open(&word).unwrap();
+        type_text(&converted, "z\n");
+        assert!(!Autosave::autosavable(&converted));
+        assert!(rig.autosave.flush(&converted).is_none());
+
+        let latin = rig.tmp.path().join("latin.txt");
+        std::fs::write(&latin, b"caf\xE9\n").unwrap();
+        let lossy = rig.docs.open(&latin).unwrap();
+        rig.docs.reload_as(&lossy, TextEncoding::Utf8).unwrap();
+        type_text(&lossy, "!\n");
+        assert!(!Autosave::autosavable(&lossy));
+        assert!(rig.autosave.flush(&lossy).is_none());
+
+        let gone_path = rig.tmp.path().join("gone.md");
+        std::fs::write(&gone_path, "g\n").unwrap();
+        let gone = rig.docs.open(&gone_path).unwrap();
+        std::fs::remove_file(&gone_path).unwrap();
+        rig.docs.check_external(&gone).unwrap();
+        assert_eq!(gone.external(), ExternalState::Deleted);
+        assert!(!Autosave::autosavable(&gone));
+
+        type_text(&entry, "b\n");
+        std::fs::write(&path, "elsewhere\n").unwrap();
+        rig.docs.check_external(&entry).unwrap();
+        assert_eq!(entry.external(), ExternalState::Conflict);
+        assert!(!Autosave::autosavable(&entry));
         assert!(rig.autosave.flush(&entry).is_none());
     }
 
@@ -785,9 +959,12 @@ mod tests {
         // The same text is not tried again at every tick.
         rig.advance(5000);
         assert!(rig.autosave.tick(&rig.i18n).failed.is_empty());
-        // A tab switch (flush) does try, fails the same way and keeps the crash copy.
+        // A tab switch (flush) does try, fails the same way and keeps the crash copy; the user
+        // has been told already.
         let flushed = rig.autosave.flush(&entry).expect("dirty and autosavable");
-        assert_eq!(flushed.unwrap_err().message_id(), "app-error-read-only");
+        let error = flushed.unwrap_err();
+        assert_eq!(error.message_id(), "app-error-read-only");
+        assert!(!rig.autosave.is_new_failure(&entry, &error));
         assert_eq!(rig.emergency.len(), 1);
         // Once the file is writable again, new typing is saved.
         set_readonly(&path, false);
@@ -819,5 +996,291 @@ mod tests {
             .unwrap();
         assert_eq!(rig.autosave.tick(&rig.i18n).snapshots, 1);
         assert_eq!(rig.versions(&entry).len(), 1);
+    }
+
+    /// How many saves reached the disk's first step through `fault`.
+    fn attempts(fault: &FaultFs) -> usize {
+        fault.calls(FsOp::WriteNew)
+    }
+
+    /// Types `text`, lets the delay pass and ticks: what the tick does about the new text.
+    fn type_and_wait(rig: &Rig, entry: &DocEntry, text: &str) -> TickReport {
+        type_text(entry, text);
+        rig.autosave.tick(&rig.i18n);
+        rig.advance(1000);
+        rig.autosave.tick(&rig.i18n)
+    }
+
+    /// The kinds of the failures a tick leaves for the user.
+    fn shown(report: &TickReport) -> Vec<&'static str> {
+        report
+            .failed
+            .iter()
+            .map(|(_, error)| error.message_id())
+            .collect()
+    }
+
+    #[test]
+    fn the_tick_never_sleeps_for_a_file_another_program_holds_and_reports_it_after_the_backoff() {
+        let fault = Arc::new(FaultFs::new());
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let rig = rig_on(fault.clone(), sleeper.clone(), true);
+        let (path, entry) = rig.file("a\n");
+        rig.autosave.tick(&rig.i18n);
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::SharingViolation);
+        type_text(&entry, "b\n");
+        rig.autosave.tick(&rig.i18n);
+        rig.advance(1000);
+
+        // One try, then one more after each delay of the backoff of an explicit save, and not
+        // a word about it meanwhile.
+        for (index, delay) in SHARING_BACKOFF.iter().enumerate() {
+            let report = rig.autosave.tick(&rig.i18n);
+            assert!(report.saved.is_empty(), "try {index}");
+            assert!(report.failed.is_empty(), "try {index}");
+            assert_eq!(attempts(&fault), index + 1);
+            rig.clock.advance(*delay - Duration::from_millis(1));
+            rig.autosave.tick(&rig.i18n);
+            assert_eq!(attempts(&fault), index + 1, "{delay:?} has not passed");
+            rig.advance(1);
+        }
+        let report = rig.autosave.tick(&rig.i18n);
+        assert_eq!(attempts(&fault), SHARING_BACKOFF.len() + 1);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, entry.id());
+        assert_eq!(report.failed[0].1.message_id(), "app-error-in-use");
+        assert!(sleeper.slept().is_empty(), "the tick never sleeps");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+        assert!(entry.is_dirty());
+        assert_eq!(rig.emergency.len(), 1, "the crash copy stays");
+
+        // That was the last try for this text.
+        rig.advance(10_000);
+        assert!(rig.autosave.tick(&rig.i18n).failed.is_empty());
+        assert_eq!(attempts(&fault), SHARING_BACKOFF.len() + 1);
+
+        // A save the user asks for waits through the whole backoff, and has nothing new to say.
+        let flushed = rig.autosave.flush(&entry).expect("dirty and autosavable");
+        let error = flushed.unwrap_err();
+        assert_eq!(error.message_id(), "app-error-in-use");
+        assert_eq!(sleeper.slept(), SHARING_BACKOFF);
+        assert!(!rig.autosave.is_new_failure(&entry, &error));
+    }
+
+    #[test]
+    fn a_file_released_during_the_backoff_is_saved_without_a_word() {
+        let fault = Arc::new(FaultFs::new());
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let rig = rig_on(fault.clone(), sleeper.clone(), true);
+        let (path, entry) = rig.file("a\n");
+        rig.autosave.tick(&rig.i18n);
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::SharingViolation);
+        let report = type_and_wait(&rig, &entry, "b\n");
+        assert!(report.saved.is_empty() && report.failed.is_empty());
+        assert_eq!(attempts(&fault), 1);
+
+        fault.clear();
+        rig.advance(50);
+        let report = rig.autosave.tick(&rig.i18n);
+        assert_eq!(report.saved, [entry.id()]);
+        assert!(report.failed.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
+        assert!(!entry.is_dirty());
+        assert!(rig.emergency.is_empty());
+        assert!(sleeper.slept().is_empty());
+    }
+
+    #[test]
+    fn a_flush_without_waiting_leaves_a_held_file_to_the_tick() {
+        let fault = Arc::new(FaultFs::new());
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let rig = rig_on(fault.clone(), sleeper.clone(), true);
+        let (path, entry) = rig.file("a\n");
+        rig.autosave.tick(&rig.i18n);
+        assert!(
+            rig.autosave.flush_without_waiting(&entry).is_none(),
+            "nothing to write"
+        );
+        type_text(&entry, "b\n");
+        rig.autosave.tick(&rig.i18n);
+
+        // The file is held: one try, no sleep, no failure, and the text stays unsaved.
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::SharingViolation);
+        assert!(rig.autosave.flush_without_waiting(&entry).is_none());
+        assert_eq!(attempts(&fault), 1);
+        assert!(sleeper.slept().is_empty());
+        assert!(entry.is_dirty());
+        assert_eq!(rig.emergency.len(), 1, "the crash copy stays");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+
+        // Any other failure is returned for the caller to report.
+        fault.clear();
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::AccessDenied);
+        let error = rig
+            .autosave
+            .flush_without_waiting(&entry)
+            .expect("dirty and autosavable")
+            .unwrap_err();
+        assert_eq!(error.message_id(), "app-error-access-denied");
+        assert_eq!(attempts(&fault), 2);
+
+        // Released, the tick writes it after the delay, as it would have without the flush.
+        fault.clear();
+        rig.advance(1000);
+        let report = rig.autosave.tick(&rig.i18n);
+        assert_eq!(report.saved, [entry.id()]);
+        assert!(report.failed.is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\n");
+
+        // A flush that finds the file free writes it.
+        type_text(&entry, "c\n");
+        rig.autosave.tick(&rig.i18n);
+        assert!(
+            rig.autosave
+                .flush_without_waiting(&entry)
+                .expect("dirty and autosavable")
+                .is_ok()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb\nc\n");
+        assert!(rig.emergency.is_empty());
+        assert!(sleeper.slept().is_empty());
+    }
+
+    #[test]
+    fn new_text_starts_the_backoff_over() {
+        let fault = Arc::new(FaultFs::new());
+        let rig = rig_on(fault.clone(), Arc::new(ThreadSleeper), true);
+        let (_, entry) = rig.file("a\n");
+        rig.autosave.tick(&rig.i18n);
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::SharingViolation);
+        type_and_wait(&rig, &entry, "b\n");
+        assert_eq!(attempts(&fault), 1);
+
+        // Typing on while the file is held: the delay counts from the new text, and the first
+        // delay of the backoff (50 ms, not 100 ms) follows its first try.
+        type_text(&entry, "c\n");
+        rig.autosave.tick(&rig.i18n);
+        rig.advance(999);
+        rig.autosave.tick(&rig.i18n);
+        assert_eq!(attempts(&fault), 1);
+        rig.advance(1);
+        rig.autosave.tick(&rig.i18n);
+        assert_eq!(attempts(&fault), 2);
+        rig.advance(50);
+        rig.autosave.tick(&rig.i18n);
+        assert_eq!(attempts(&fault), 3);
+    }
+
+    #[test]
+    fn a_failure_is_shown_once_until_the_document_is_written() {
+        let fault = Arc::new(FaultFs::new());
+        let rig = rig_on(fault.clone(), Arc::new(ThreadSleeper), true);
+        let (_, entry) = rig.file("a\n");
+        rig.autosave.tick(&rig.i18n);
+
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::AccessDenied);
+        let report = type_and_wait(&rig, &entry, "b\n");
+        assert_eq!(shown(&report), ["app-error-access-denied"]);
+        // The next text fails the same way: it is tried, and the user knows already.
+        let report = type_and_wait(&rig, &entry, "c\n");
+        assert!(shown(&report).is_empty());
+        assert_eq!(attempts(&fault), 2);
+
+        // Another failure is news.
+        fault.clear();
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::DiskFull);
+        let report = type_and_wait(&rig, &entry, "d\n");
+        assert_eq!(shown(&report), ["app-error-disk-full"]);
+
+        // A write that works ends the story, and so does a save the user made.
+        fault.clear();
+        let report = type_and_wait(&rig, &entry, "e\n");
+        assert_eq!(report.saved, [entry.id()]);
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::DiskFull);
+        let report = type_and_wait(&rig, &entry, "f\n");
+        assert_eq!(shown(&report), ["app-error-disk-full"]);
+        fault.clear();
+        rig.docs.save(&entry).unwrap();
+        rig.autosave.tick(&rig.i18n);
+        fault.fail_always(FsOp::ReplaceFile, FsFailure::DiskFull);
+        let report = type_and_wait(&rig, &entry, "g\n");
+        assert_eq!(shown(&report), ["app-error-disk-full"]);
+    }
+
+    #[test]
+    fn a_document_closed_without_saving_leaves_no_crash_copy() {
+        let rig = rig(false);
+        let (_, entry) = rig.file("a\n");
+        type_text(&entry, "b\n");
+        rig.autosave.tick(&rig.i18n);
+        assert_eq!(rig.emergency.len(), 1);
+
+        // "Don't save": the tab closes with the edits.
+        assert!(rig.docs.release(&entry));
+        rig.autosave.tick(&rig.i18n);
+        assert!(rig.emergency.is_empty());
+        let recovery = RecoveryStore::new(Arc::new(RealFs), rig.tmp.path().join("crash"));
+        rig.emergency.save_all(&recovery, 1).unwrap();
+        assert!(recovery.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_untitled_buffer_saved_under_a_name_leaves_no_crash_copy_under_its_old_id() {
+        let rig = rig(false);
+        let scratch = rig.docs.new_untitled();
+        type_text(&scratch, "words");
+        rig.autosave.tick(&rig.i18n);
+        let old_id = scratch.untitled_id().unwrap();
+        assert!(rig.emergency.version(&old_id).is_some());
+
+        rig.docs
+            .save_as(&scratch, &rig.tmp.path().join("named.md"))
+            .unwrap();
+        rig.autosave.tick(&rig.i18n);
+        assert!(rig.emergency.is_empty(), "saved: nothing to recover");
+
+        // Edited again, the crash copy belongs to the file.
+        type_text(&scratch, " more");
+        rig.autosave.tick(&rig.i18n);
+        assert_eq!(rig.emergency.len(), 1);
+        assert_eq!(rig.emergency.version(&old_id), None);
+    }
+
+    #[test]
+    fn crash_copies_of_two_runs_do_not_overwrite_each_other() {
+        let rig = rig(false);
+        let (_, entry) = rig.file("a\n");
+        let recovery = RecoveryStore::new(Arc::new(RealFs), rig.tmp.path().join("crash"));
+
+        // One run crashes with its text of the document...
+        type_text(&entry, "first run\n");
+        rig.autosave.tick(&rig.i18n);
+        rig.emergency.save_all(&recovery, 1).unwrap();
+
+        // ...the next run, a minute later, numbers its documents from 1 again and crashes too.
+        rig.advance(60_000);
+        let cache = Arc::new(EmergencyCache::new());
+        let later = Autosave::new(
+            Rc::clone(&rig.docs),
+            Arc::clone(&cache),
+            rig.autosave.policy(),
+        );
+        type_text(&entry, "second run\n");
+        later.tick(&rig.i18n);
+        cache.save_all(&recovery, 2).unwrap();
+
+        let mut saved = recovery.list().unwrap();
+        saved.sort_by_key(|doc| doc.saved_at_ms);
+        let ids: Vec<String> = saved.iter().map(|doc| doc.id.clone()).collect();
+        let number = entry.id().0;
+        let first = format!("doc-{START}-{number}");
+        let second = format!("doc-{}-{number}", START + 60);
+        assert_eq!(ids, [first, second]);
+        assert!(saved.iter().all(|doc| doc.original_path == entry.path()));
+        assert_eq!(recovery.restore(&ids[0]).unwrap().text, "a\nfirst run\n");
+        assert_eq!(
+            recovery.restore(&ids[1]).unwrap().text,
+            "a\nfirst run\nsecond run\n"
+        );
     }
 }

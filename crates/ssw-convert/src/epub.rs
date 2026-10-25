@@ -660,6 +660,29 @@ mod tests {
     }
 
     #[test]
+    fn characters_xml_cannot_carry_are_left_out_of_every_part() {
+        let md = "# T\u{1}itle\n\nbody\u{c}text `co\u{FFFF}de` end\n";
+        let epub = export_epub(md, "t.md", &NoAssets, &EpubOptions::default()).unwrap();
+        let chapter = read(&epub, "OEBPS/chapter_1.xhtml");
+        assert!(chapter.contains("<h1 id=\"title\">Title</h1>"), "{chapter}");
+        assert!(
+            chapter.contains("bodytext <code>code</code> end"),
+            "{chapter}"
+        );
+        for name in [
+            "OEBPS/content.opf",
+            "OEBPS/toc.ncx",
+            "OEBPS/nav.xhtml",
+            "OEBPS/chapter_1.xhtml",
+        ] {
+            let xml = read(&epub, name);
+            assert!(!xml.contains(['\u{1}', '\u{c}', '\u{FFFF}']), "{name}");
+        }
+        let opf = read(&epub, "OEBPS/content.opf");
+        assert!(opf.contains("<dc:title>Title</dc:title>"), "{opf}");
+    }
+
+    #[test]
     fn the_well_formedness_check_reports_mismatched_tags() {
         assert_eq!(xml_error("<a><b/></a>"), None);
         assert!(xml_error("<a><b></a>").is_some());

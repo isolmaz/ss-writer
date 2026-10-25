@@ -143,6 +143,43 @@ fn zoom_scales_the_text_and_is_reported() {
     assert_eq!(h.view.zoom_percent(), 390);
 }
 
+#[test]
+fn zooming_keeps_the_same_text_at_the_top_of_the_view() {
+    // Every paragraph wraps into three lines but is estimated as one, so rebuilding the heights
+    // after a zoom would put a much later paragraph under the scroll offset.
+    let text: String = (0..300)
+        .map(|i| format!("p{i:03} {}
+
+", "y".repeat(100)))
+        .collect();
+    let mut h = Harness::new(&text);
+    h.view.set_scroll_y(4_000.0);
+    h.arrange();
+    let top = |h: &Harness| {
+        let texts = h.painted_texts();
+        texts[0][..4].to_owned()
+    };
+    let before = top(&h);
+    assert_ne!(before, "p000", "the view is scrolled into the document");
+    assert!(h.view.execute(CommandId::ViewZoomIn));
+    h.arrange();
+    assert_eq!(top(&h), before);
+    assert!(h.view.execute(CommandId::ViewZoomOut));
+    assert!(h.view.execute(CommandId::ViewZoomOut));
+    h.arrange();
+    assert_eq!(top(&h), before);
+}
+
+#[test]
+fn zooming_at_the_top_keeps_the_document_start() {
+    let text = numbered_paragraphs(50);
+    let mut h = Harness::new(&text);
+    h.view.execute(CommandId::ViewZoomOut);
+    h.arrange();
+    assert_eq!(h.view.scroll_y(), 0.0);
+    assert_eq!(h.painted_texts()[0], "paragraph 0");
+}
+
 fn typewriter_document() -> (String, usize) {
     let mut text = String::new();
     for i in 0..40 {

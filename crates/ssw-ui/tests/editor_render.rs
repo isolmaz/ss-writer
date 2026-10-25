@@ -346,6 +346,43 @@ fn ime_composition_is_displayed_with_an_underline_and_not_written() {
 }
 
 #[test]
+fn ime_composition_on_a_blank_line_is_displayed_with_the_caret_inside_it() {
+    let mut h = Harness::new("a
+
+b
+");
+    h.set_caret(2);
+    h.ime(ImeEvent::Start);
+    h.ime(ImeEvent::Update {
+        text: "か".into(),
+        caret: 3,
+        attrs: vec![],
+    });
+    let canvas = h.paint();
+    assert_eq!(canvas.texts(), ["a", "か", "b"]);
+    assert_eq!(h.text(), "a
+
+b
+", "nothing is written before the commit");
+    let shown = canvas
+        .recorded()
+        .iter()
+        .find_map(|entry| match &entry.op {
+            DrawOp::Text { text, .. } if text == "か" => entry.bounds,
+            _ => None,
+        })
+        .expect("the composition is painted");
+    let caret = h.view.caret_rect().expect("caret");
+    assert!(close(caret.x, h.left + ADVANCE), "{caret:?}");
+    assert!(
+        caret.y >= shown.y - 0.01 && caret.bottom() <= shown.bottom() + 0.01,
+        "caret {caret:?} inside {shown:?}"
+    );
+    h.ime(ImeEvent::End);
+    assert_eq!(h.painted_texts(), ["a", "b"], "the blank line is blank again");
+}
+
+#[test]
 fn composition_replaces_a_selection_and_end_cancels() {
     let mut h = Harness::new("abcd\n");
     h.view.set_selection(Selection::new(1, 3));
